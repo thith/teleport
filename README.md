@@ -63,7 +63,7 @@ Add the snippet below to your project's `CLAUDE.md`, `GEMINI.md`, or `AGENTS.md`
 ````markdown
 ## Telegram Reporting
 
-**WHENEVER** the user asks to "send a Telegram report" (variants: "send tele", "send via tele", "ping me when done"…), you **MUST** read `../teleport/rules/telegram-guide.md` and follow it. Look up your identity prefix in the guide's prefix table (this project does not duplicate it).
+**WHENEVER** the user asks to "send a Telegram report" (variants: "send via tele", "tele me", "ping me when done"…), you **MUST** read `../teleport/rules/telegram-guide.md` and follow it. Look up your identity prefix in the guide's prefix table (this project does not duplicate it).
 
 Scripts + guide are centralized at `../teleport/` (sibling of every project). This project keeps no local copy. Invocation:
 
