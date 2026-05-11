@@ -48,6 +48,14 @@ node ../teleport/scripts/tele-listen.mjs \
 
 `PROJECT_CODE` (the `[XXX]` prefix on every message) is auto-derived from `basename(process.cwd())`. Override with `TELE_PROJECT_CODE=...` env var if needed.
 
+## Onboarding a new project (the one-liner)
+
+Tell your AI agent (Claude, Codex, Gemini, etc.) inside the new project:
+
+> Enable Telegram reporting for this project by following `../teleport/README.md` — add the wiring snippet to my agent context file (CLAUDE.md / GEMINI.md / AGENTS.md), then test it once.
+
+That single instruction is enough. The agent will (a) read this README, (b) paste the snippet from the next section into the right context file, and (c) send a "hello" message to confirm the wiring.
+
 ## Wiring it into a project
 
 Add the snippet below to your project's `CLAUDE.md`, `GEMINI.md`, or `AGENTS.md` — any file the agent reads at startup. Paste it verbatim; no edits required.
