@@ -432,7 +432,7 @@ async function main() {
       }
     }
     if (failures === adminIds.length) process.exit(1);
-    if (failures < adminIds.length) console.log('[send-telegram] ⚠️ You MUST now start a reply listener (Monitor tool or foreground loop). See docs/telegram-guide.md §Listening for Replies.');
+    if (failures < adminIds.length) console.log('[send-telegram] ⚠️ You MUST now start a reply listener (Monitor tool or foreground loop). See telegram-guide.md §Listening for Replies.');
     return;
   }
 
@@ -470,7 +470,7 @@ async function main() {
   }
 
   if (failures === adminIds.length) process.exit(1);
-  if (failures < adminIds.length) console.log('[send-telegram] ⚠️ You MUST now start a reply listener (Monitor tool or foreground loop). See docs/telegram-guide.md §Listening for Replies.');
+  if (failures < adminIds.length) console.log('[send-telegram] ⚠️ You MUST now start a reply listener (Monitor tool or foreground loop). See telegram-guide.md §Listening for Replies.');
 }
 
 const isDirectRun = fileURLToPath(import.meta.url) === path.resolve(process.argv[1] ?? '');
