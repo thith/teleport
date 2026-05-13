@@ -46,15 +46,29 @@ export function readOffset(offsetFile = DEFAULT_OFFSET_FILE) {
   }
 }
 
-export function writeOffset(updateId, offsetFile = DEFAULT_OFFSET_FILE) {
-  const dir = path.dirname(offsetFile);
+// Atomic write to `targetFile`: write to a process-unique temp path, then
+// rename. A naked writeFileSync risks a torn/empty file if the process dies
+// mid-write; subsequent readers would see 0 and (under the new-loop init path
+// in resolveStartOffset) replay every still-cached update. On any failure the
+// temp file is cleaned up so we don't leak `*.tmp` artifacts.
+let atomicWriteCounter = 0;
+function atomicWriteFileSync(targetFile, content) {
+  const dir = path.dirname(targetFile);
   fs.mkdirSync(dir, { recursive: true });
-  // Atomic write: temp + rename. A naked writeFileSync risks a torn/empty file
-  // if the process dies mid-write; the next reader would see 0 and (under the
-  // new-loop init path in resolveStartOffset) replay every still-cached update.
-  const tmp = `${offsetFile}.${process.pid}.${Date.now()}.tmp`;
-  fs.writeFileSync(tmp, String(updateId + 1), 'utf8');
-  fs.renameSync(tmp, offsetFile);
+  // Suffix uses pid + ms + monotonic counter to avoid collisions if two writes
+  // land in the same millisecond inside one process (e.g. tests, batch runs).
+  const tmp = `${targetFile}.${process.pid}.${Date.now()}.${atomicWriteCounter++}.tmp`;
+  try {
+    fs.writeFileSync(tmp, content, 'utf8');
+    fs.renameSync(tmp, targetFile);
+  } catch (e) {
+    try { fs.unlinkSync(tmp); } catch {}
+    throw e;
+  }
+}
+
+export function writeOffset(updateId, offsetFile = DEFAULT_OFFSET_FILE) {
+  atomicWriteFileSync(offsetFile, String(updateId + 1));
 }
 
 export async function fetchUpdates(token, offset) {
@@ -195,10 +209,13 @@ export function resolveStartOffset(
   // Known limitation: the cache is shared across all conversations on this bot.
   // If the caller's filter happens to match an old cached reply (e.g. resuming
   // an older conversation whose IDS list still contains messageIds replied to
-  // long ago), that reply will be re-surfaced and 👍-reacted again. Telegram's
-  // setMessageReaction is idempotent so admin-side this is harmless; redundant
-  // work only. A future fix can persist a per-loop "highest update_id ever
-  // processed" set instead of relying on a single offset.
+  // long ago), that reply will be re-surfaced. The script does not maintain a
+  // "processed update_id" ledger, so a prompt file may be written for an update
+  // that an earlier session already handled — the Monitor will fire, and the
+  // owning agent may re-reply unless it is defensive about the notification
+  // (see telegram-guide.md §Notes — "Duplicate safety (partial)"). A future
+  // fix can persist a per-loop highest-processed update_id set instead of
+  // relying on a single offset.
   const cache = readCache(cacheFile);
   if (cache.length > 0) {
     // Use reduce instead of Math.min(...spread) to avoid call-stack limits if
@@ -212,12 +229,7 @@ export function resolveStartOffset(
     }
   }
 
-  if (startOffset > 0) {
-    fs.mkdirSync(path.dirname(offsetFile), { recursive: true });
-    const tmp = `${offsetFile}.${process.pid}.${Date.now()}.init.tmp`;
-    fs.writeFileSync(tmp, String(startOffset), 'utf8');
-    fs.renameSync(tmp, offsetFile);
-  }
+  if (startOffset > 0) atomicWriteFileSync(offsetFile, String(startOffset));
   return startOffset;
 }
 
@@ -359,9 +371,6 @@ async function main() {
     process.exit(2);
   }
 
-  // Resolve per-loop offset BEFORE fetch so new loops initialize against pre-fetch state.
-  const loopOffset = resolveStartOffset(offsetFile);
-
   // Centralized fetch: acquire lock, fetch updates, cache locally.
   // Orphans are detected and excluded from cache under lock; reaction happens after.
   let fetchFailed = false;
@@ -427,6 +436,14 @@ async function main() {
   if (pendingOrphans.length > 0) {
     await reactToOrphans(token, pendingOrphans);
   }
+
+  // Resolve per-loop offset AFTER fetch+prune so a new loop's min(cache)
+  // initialization reflects what is actually still buffered. Calling it before
+  // pruning races: pruneCache may remove the oldest cached entries that the
+  // new loop's offset would have pointed at, and the subsequent cache read
+  // would then yield only newer entries while `advanceLoopOffset` jumped past
+  // the now-deleted ones, permanently skipping any matching updates.
+  const loopOffset = resolveStartOffset(offsetFile);
 
   // Read from local cache using per-loop offset.
   let updates = readCacheSinceOffset(loopOffset);

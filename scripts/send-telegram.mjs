@@ -358,14 +358,23 @@ async function postSendDocument(token, chatId, filePath, caption, parseMode, rep
  * (readable in Telegram's file preview), instead of collapsing to plain text.
  */
 export async function sendTextChunk(token, chatId, rawChunk, { raw, plain, replyTo = null }) {
+  // Helper: refuse to claim success if Telegram returned ok with no message_id.
+  // The agent relies on the printed messageId to start its reply listener; a
+  // silent miss would log a successful send but leave the agent unable to
+  // track replies.
+  const assertMessageId = (res, label) => {
+    if (!res.messageId) throw new Error(`${label}: Telegram returned ok but no message_id \u2014 refusing to claim success`);
+    return res.messageId;
+  };
+
   if (plain) {
     const res = await postSendMessage(token, chatId, rawChunk, null, replyTo);
-    if (res.ok) return { ok: true, fallback: false, messageId: res.messageId };
+    if (res.ok) return { ok: true, fallback: false, messageId: assertMessageId(res, 'plain send') };
     throw new Error(res.description ?? `HTTP ${res.status}`);
   }
   const payload = raw ? rawChunk : escapeMarkdownV2(rawChunk);
   const first = await postSendMessage(token, chatId, payload, 'MarkdownV2', replyTo);
-  if (first.ok) return { ok: true, fallback: false, messageId: first.messageId };
+  if (first.ok) return { ok: true, fallback: false, messageId: assertMessageId(first, 'markdown send') };
 
   const desc = first.description ?? `HTTP ${first.status}`;
   if (/can't parse entities|can\u2019t parse entities/i.test(desc)) {
@@ -378,7 +387,7 @@ export async function sendTextChunk(token, chatId, rawChunk, { raw, plain, reply
     try {
       const firstLine = rawChunk.split('\n')[0].slice(0, 100);
       const retry = await postSendDocument(token, chatId, tmpPath, firstLine, null, replyTo);
-      if (retry.ok) return { ok: true, fallback: true, messageId: retry.messageId };
+      if (retry.ok) return { ok: true, fallback: true, messageId: assertMessageId(retry, 'markdown-file fallback') };
       throw new Error(`markdown-file fallback upload failed: ${retry.description ?? `HTTP ${retry.status}`}`);
     } finally {
       try { fs.unlinkSync(tmpPath); } catch {}
@@ -393,6 +402,13 @@ async function sendTextToAdmin(token, chatId, text, opts) {
   // messages. Rationale: chunked sends give each chunk its own messageId, so
   // a user reply to any chunk other than the first won't match the agent's
   // filter (one bug we hit in practice). One file = one messageId = simple.
+  //
+  // Note: opts.plain and opts.raw are intentionally ignored in this branch.
+  // The body of a sent .md file is displayed verbatim by Telegram (no Markdown
+  // parsing), so plain-vs-markdown distinction is moot. For opts.raw, callers
+  // who pre-escaped MarkdownV2 will see literal backslashes in the file body;
+  // that's an acceptable trade-off because (a) --raw is rare, (b) the agent
+  // can choose not to combine --raw with very long content.
   if (text.length > MESSAGE_CHUNK_LIMIT) {
     let tmpPath;
     try {
