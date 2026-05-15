@@ -100,3 +100,4 @@ The agent reads `telegram-guide.md` (already wired in Step 2 of setup) and handl
 - **Reactions on your replies:** 👍 means a listener picked it up. 💔 means you sent a plain message (not a reply to a bot message) — agents only see direct replies.
 - **Multiple recipients:** `TELEGRAM_ADMIN_CHAT_ID` is one chat ID. For a team, make a Telegram group, add the bot + people, use the group's chat ID.
 - **Requirements:** `node` on `PATH`; every consumer project sits as a sibling of `teleport/`; one bot, one chat, one shared `.env`.
+- **Don't rely on it for critical work.** Agents sometimes forget to send follow-up Telegram messages, so don't rely solely on Teleport for critical communication with the agents.
