@@ -112,13 +112,17 @@ Each loop only processes **direct matches** — replies to messages in its `--fi
 
 Every `tele-listen` invocation registers `{pid, filter, offsetFile, startedAt, startTime}` (pid = the long-lived bash wrapper, i.e. `process.ppid`; startTime = the wrapper's `ps lstart` snapshot, used to detect PID reuse) into `listener-registry.jsonl` under a `registry.lock`. Before polling, it checks the registry: if **another live listener has a strict-superset filter**, the current listener exits cleanly so its outer `until …; do sleep N; done` wrapper also exits.
 
-Why "strict superset": when a conversation moves to a new Monitor, the agent always appends new messageIds — the new filter is a strict superset of the old. So an older listener detects a newer one and self-exits within at most one poll cycle (~20s for Monitor, ~5s for foreground) of the newer one's first run.
+Why "strict superset": when a conversation moves to a new Monitor, the agent always appends new messageIds — the new filter is a strict superset of the old. So an older listener detects a newer one and self-exits within one to two poll cycles (~20s for Monitor, ~5s for foreground); the second cycle only matters if the newer listener loses its first registry-lock race, which is rare.
 
 **Cross-conversation safety is by convention, not construction.** Each agent must only put bot-sent messageIds it itself sent into `--filter-reply-to`. Two such IDS sets are disjoint (each bot-sent messageId belongs to exactly one conversation), so strict-superset can only match intra-conversation. If an agent ever invokes `tele-listen` **without** `--filter-reply-to` (catch-all / debug run), it would have no filter constraint — to prevent it from wiping every legitimate filtered listener, the supersede check treats catch-all (`filter == null`) as **neither superseding nor being superseded by** anything. So a catch-all listener runs in parallel, harmlessly, and a filtered listener is never killed by an unintended catch-all.
 
 **This does NOT remove the agent's obligation to TaskStop the previous Monitor.** TaskStop ends the harness-level task immediately; auto-supersede is a safety net for the case where the agent forgets (catches up within one poll cycle). Belt and suspenders.
 
-**Failure mode this does NOT cover:** if the agent calls `TaskStop` *without* starting a new Monitor, the OS-level bash wrapper keeps spinning (TaskStop does not SIGTERM children). With no newer listener to detect, supersede never fires. Mitigation: always either start a new Monitor after TaskStop, or kill the wrapper specifically with `pkill -f "until.*tele-listen"` (matches the wrapper bash, not just node). A future change may add an idle-timeout exit.
+**Failure modes this does NOT cover:**
+- If the agent calls `TaskStop` *without* starting a new Monitor, the OS-level bash wrapper keeps spinning (TaskStop does not SIGTERM children). With no newer listener to detect, supersede never fires.
+- If the new Monitor's filter is **identical** (not a strict superset) to the previous one — e.g. the agent re-triggers a Monitor without sending a new message first — neither is a strict superset of the other, so neither self-exits and they coexist until TaskStop.
+
+Mitigation for both: either start a new Monitor with a broader filter (the canonical flow already does this), or kill the wrapper specifically with `pkill -f "until.*tele-listen"` (matches the wrapper bash, not just node). A future change may add an idle-timeout exit.
 
 ## Listening for Replies (MUST follow after every successful send)
 

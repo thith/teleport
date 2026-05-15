@@ -377,10 +377,15 @@ export function isProcessAlive(pid) {
 export function getProcessStartTime(pid) {
   if (!Number.isFinite(pid) || pid <= 0) return null;
   try {
+    // LC_ALL=C pins month/day names so writer-vs-reader locale skew can't
+    // make a live process look like a different one. `ps -o lstart=` is on
+    // macOS and GNU ps; BusyBox / Alpine ps lacks it (returns empty → null,
+    // and isLiveEntry falls back to plain liveness on null startTime).
     const out = execFileSync('ps', ['-o', 'lstart=', '-p', String(pid)], {
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'ignore'],
-      timeout: 2000,
+      timeout: 500,
+      env: { ...process.env, LC_ALL: 'C' },
     }).trim();
     return out || null;
   } catch {
@@ -439,7 +444,10 @@ function writeRegistry(entries, file = REGISTRY_FILE) {
 async function acquireLockWithRetry(lockFile, { maxAttempts = 50, retryMs = 20 } = {}) {
   for (let i = 0; i < maxAttempts; i++) {
     if (acquirePollLock(lockFile)) return true;
-    await new Promise((r) => setTimeout(r, retryMs));
+    // Jitter: two listeners launched at the same instant otherwise retry in
+    // lockstep and keep colliding on the same windows.
+    const jitter = Math.floor(Math.random() * retryMs);
+    await new Promise((r) => setTimeout(r, retryMs + jitter));
   }
   return false;
 }
@@ -468,9 +476,12 @@ export async function refreshRegistry({
 }) {
   const locked = await acquireLockWithRetry(lockFile);
   if (!locked) {
-    console.error('[tele-listen] could not acquire registry lock; supersede check may be stale');
-    const fallback = readRegistry(file);
-    return fallback;
+    // Read-only fallback: peers still see whatever was on disk last write,
+    // so we can detect *being* superseded. We do NOT write our own entry
+    // this cycle, which means *being detected as a superseder* by older
+    // peers is delayed by one poll. Acceptable: the next 20s poll retries.
+    console.error('[tele-listen] could not acquire registry lock; will retry next poll');
+    return readRegistry(file);
   }
   try {
     const all = readRegistry(file);
@@ -481,7 +492,9 @@ export async function refreshRegistry({
       filter,
       offsetFile,
       startedAt: existing && Number.isFinite(existing.startedAt) ? existing.startedAt : now,
-      startTime: startTime ?? null,
+      // If a transient `ps` failure returned null, keep the prior valid startTime
+      // rather than downgrade liveness checks to fallback mode next round.
+      startTime: startTime ?? existing?.startTime ?? null,
     };
     // Cap registry size as defense in depth — keep newest entries.
     let next = [...live, mine];
@@ -543,6 +556,12 @@ async function main() {
     process.exit(1);
   }
   const { filterReplyTo, offsetFile } = args;
+
+  // Ensure the shared tmp dir exists before any writer touches it. Several
+  // codepaths (audit log, atomicWriteFileSync, lock files) recreate it on
+  // demand, but the audit-log appendFileSync at fetch time would silently
+  // drop the first line of the first-ever run if we don't ensure it here.
+  fs.mkdirSync(DEFAULT_TMP_DIR, { recursive: true });
 
   const envFromFile = loadEnvFromFile(ENV_FILE);
   const token = process.env.REPORT_BOT_TOKEN || envFromFile.REPORT_BOT_TOKEN;
