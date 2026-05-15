@@ -30,7 +30,7 @@ Report on the phone screen, not in a console. Keep it tight.
 
   - `<topic>` = short summary of the task, **max 9 words**.
   - `<emoji>` = a random emoji picked once per conversation thread (see "Thread emoji" below). Codex / Gemini currently do not use an emoji — keep their existing minimal form unless the user asks otherwise.
-  - **Language: English by default** — `<emoji> *<Agent> on <topic>:*`. Only switch to English if the user explicitly requested English for this conversation, in which case use `<emoji> *<Agent> on <topic>:*`. Keep one language for the entire thread (do not mix VN and EN messages in the same thread).
+  - **Language:** Match the user's language for this conversation. Default to English if unset. Keep one language for the entire thread (do not mix languages in the same thread). The wording in the prefix table (`on <topic>`) is the English form — substitute the equivalent phrasing in the chosen language.
 - **Thread emoji:** On your **first** Telegram send in a conversation, pick a random emoji unrelated to the topic (randomness reduces collisions between concurrent conversations). Use the **same emoji** for all subsequent messages in that thread (replies, follow-ups).
 - **Project code:** The script auto-prefixes `[CODE]` derived from `basename(process.cwd())`. Override with the `TELE_PROJECT_CODE` env var if needed. Agents do NOT need to add this manually.
 
@@ -57,7 +57,7 @@ Multi-line works inside `"..."` as long as the content has no `"` / `$` / `` ` `
 1. Content > ~320 chars and won't naturally trim.
 2. Inline send failed (markdown parse reject, shell-quote bug).
 3. The payload is genuinely a file (spec, RFC, log) — then use `--file` instead.
-4. The user explicitly asks to send a file ("send file", "send the spec", "attach the log", …) — use `--file`.
+4. The user explicitly asks to send a file ("send the spec", "attach the log", …) — use `--file`.
 
 ```bash
 mkdir -p ./tmp
