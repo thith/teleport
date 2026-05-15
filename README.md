@@ -1,103 +1,101 @@
 # Teleport — Telegram reporting for AI agents
 
-Centralized Telegram bot scripts shared across multiple projects on the same machine. Replaces per-project copies of `scripts/send-telegram.mjs` + `scripts/tele-listen.mjs` to avoid race conditions when several projects use the same bot.
+## What
 
-## Why centralize
+A tiny Telegram bridge so AI coding agents (Claude Code, Codex, Gemini, …) can **send you short progress reports and take short instructions back over Telegram while you're away from the desk**.
 
-When multiple projects on the same machine share one bot token but each holds its own script + cache, concurrent monitor processes call Telegram's `getUpdates` independently and "steal" each other's replies. Centralizing one cache, one poll lock, and one global offset eliminates that race.
+Extracted from the internal tooling I built for **[trumviahe.com](https://trumviahe.com)**, where several agents run in parallel and the only way to stay sane on mobile was *report + reply*, not full chat mirroring.
 
-## Layout
+## Why
 
-```
-~/Projects/teleport/
-├── .env                  ← REPORT_BOT_TOKEN + TELEGRAM_ADMIN_CHAT_ID (shared by all projects)
-├── rules/
-│   └── telegram-guide.md ← canonical guide every agent reads
-├── scripts/
-│   ├── send-telegram.mjs
-│   ├── tele-listen.mjs
-│   └── tmp/tele-reply/   ← shared cache + lock + offset (gitignored)
-└── README.md
-```
+Think of it as a human assistant working in the next room. You drink your tea, glance at the report when it lands, give a one-line nudge if something's off, go back to your tea. You're not watching them type — you're checking outcomes.
 
-## Path convention
+Existing alternatives (Claude Code's `/remote-control`, Codex's equivalent, several third-party Telegram-mirror products) do the opposite: they reflect the **entire local session** to your phone. That works for short stretches, but the moment you actually leave the desk you end up scrolling thinking tokens, tool calls, and partial diffs on a 6-inch screen and micro-managing line by line — which defeats the point of going AFK.
 
-All paths use `../teleport/...`, relative to the *calling project root*. Convention: every project lives as a sibling of `teleport/`:
+Teleport keeps the full conversation on your laptop where it belongs and forwards only what matters: **short report in, short instruction out**.
 
-```
-~/Projects/
-├── teleport/
-├── ProjectA/
-├── ProjectB/
-└── <other-project>/
-```
+If you're not comfortable letting the agent run unattended on a given project, teleport is the wrong tool — use `/remote-control` and mirroring instead.
 
-Agents always invoke with `cwd = project root` and refer to `../teleport/...`. There are no hardcoded absolute paths anywhere.
+## How to set up
 
-## Usage
+### Step 1 — Clone into the same parent folder as your projects
 
-```bash
-# Send (from project root, e.g. ~/Projects/ProjectA/)
-node ../teleport/scripts/send-telegram.mjs "<message>"
-
-# Listen (from project root)
-node ../teleport/scripts/tele-listen.mjs \
-  --filter-reply-to <messageIDs> \
-  --offset-file ../teleport/scripts/tmp/tele-reply/<offset-file>
-```
-
-`PROJECT_CODE` (the `[XXX]` prefix on every message) is auto-derived from `basename(process.cwd())`. Override with `TELE_PROJECT_CODE=...` env var if needed.
-
-## Onboarding a new project (the one-liner)
-
-Tell your AI agent (Claude, Codex, Gemini, etc.) inside the new project:
-
-> Enable Telegram reporting for this project by following `../teleport/README.md` — add the wiring snippet to my agent context file (CLAUDE.md / GEMINI.md / AGENTS.md), then test it once.
-
-That single instruction is enough. The agent will (a) read this README, (b) paste the snippet from the next section into the right context file, and (c) send a "hello" message to confirm the wiring.
-
-## Wiring it into a project
-
-Add the snippet below to your project's `CLAUDE.md`, `GEMINI.md`, or `AGENTS.md` — any file the agent reads at startup. Paste it verbatim; no edits required.
-
-````markdown
-## Telegram Reporting
-
-**WHENEVER** the user asks to "send a Telegram report" (variants: "send via tele", "tele me", "ping me when done"…), you **MUST** read `../teleport/rules/telegram-guide.md` and follow it. Look up your identity prefix in the guide's prefix table (this project does not duplicate it).
-
-Scripts + guide are centralized at `../teleport/` (sibling of every project). This project keeps no local copy. Invocation:
-
-- Send: `node ../teleport/scripts/send-telegram.mjs "<message>"` (PROJECT_CODE auto-derived from `basename(cwd)`).
-- Listen: `node ../teleport/scripts/tele-listen.mjs --filter-reply-to <IDS> --offset-file ../teleport/scripts/tmp/tele-reply/<offset-file>`.
-- Cache + lock + audit log live in `../teleport/scripts/tmp/tele-reply/` (shared across all projects using the same bot).
-
-After sending, you **MUST immediately** start the reply-listener loop described in the guide's "Listening for Replies" section. Capture the `messageId` from the send output, then start the Monitor. **MUST NOT** skip this step even if the task feels complete — the user may reply via Telegram at any time.
-````
-
-The snippet is agent-agnostic — Claude, Codex, Gemini, and others each look up their own prefix in the guide. No need to fork the snippet per agent.
-
-## First-time setup on a new machine
+Teleport assumes it sits as a sibling of every project that uses it. If your projects live in `~/Projects/`, clone there:
 
 ```bash
 cd ~/Projects
 git clone <teleport-repo-url> teleport
 cd teleport
 cp .env.example .env
-# Edit .env: fill in REPORT_BOT_TOKEN and TELEGRAM_ADMIN_CHAT_ID
+# fill in REPORT_BOT_TOKEN and TELEGRAM_ADMIN_CHAT_ID
 ```
 
-No `npm install`, no `npm link`, no symlink, no shell config required.
+Final layout:
 
-## How the bot reacts to your messages
+```
+~/Projects/
+├── teleport/
+├── ProjectA/
+└── ProjectB/
+```
 
-When you reply to a bot message, you should see a 👍 reaction appear within seconds — that's the listener acknowledging your reply has been picked up by an agent's loop. If you instead see a 🤔 (wondering face) on your message, it means you sent a **plain message** that isn't a reply to any bot message — there's no listener waiting on it, so it will be ignored. To talk to a specific agent, long-press one of its bot messages and choose *Reply*.
+No `npm install`, no symlinks, no shell config — the scripts use Node's built-ins.
 
-## Multiple recipients
+### Step 2 — Wire it into a project (pick one)
 
-`TELEGRAM_ADMIN_CHAT_ID` is treated as a **single chat ID**. If you want several people to receive the reports, create a Telegram group, add the bot + all the people to the group, and use the **group's chat ID** here. The bot will post once into the group and everyone sees it. This avoids the complexity (and message-tracking bugs) of fan-out to N individual chats.
+**Option A — let the agent do it (recommended).** Open the project, then paste this into the agent's prompt:
 
-## Requirements
+> Enable Telegram reporting for this project by following `../teleport/README.md` — add the wiring snippet from the README into my agent context file (CLAUDE.md / GEMINI.md / AGENTS.md), then test it once by sending a "hello" message.
 
-- `node` on `PATH` (the scripts use Node's built-in fetch, fs, etc. — no dependencies).
-- Every project that uses Teleport must sit as a sibling of `teleport/`.
-- One Telegram bot, one chat (single user or a group), one shared `.env`.
+The agent will read this README, paste the snippet below into the right file, and confirm with a test send.
+
+**Option B — paste it manually** into your project's `CLAUDE.md`, `GEMINI.md`, or `AGENTS.md`:
+
+````markdown
+## Telegram Reporting
+
+**WHENEVER** the user asks to "send a Telegram report" (variants: "send via tele", "tele me", "ping me when done"…), you **MUST** read `../teleport/rules/telegram-guide.md` and follow it. Look up your identity prefix in the guide's prefix table.
+
+Scripts + guide are centralized at `../teleport/` (sibling of every project). This project keeps no local copy.
+
+- Send: `node ../teleport/scripts/send-telegram.mjs "<message>"`
+- Listen: `node ../teleport/scripts/tele-listen.mjs --filter-reply-to <IDS> --offset-file ../teleport/scripts/tmp/tele-reply/<offset-file>`
+
+After sending, you **MUST immediately** start the reply-listener loop described in the guide's "Listening for Replies" section. **MUST NOT** skip — the user may reply at any time.
+````
+
+## How to use
+
+### Step 1 — Put the agent in non-attended mode
+
+Teleport does **not** bridge permission confirmations. If the agent stops to ask "may I run this?", nobody on the Telegram side can answer, and the agent stalls. So before going AFK, flip the agent into a mode where it acts without prompting:
+
+- **Claude Code (4.7+):** **Auto Mode** — a classifier lets safe actions through and blocks risky ones (different behavior from the older "auto-accept edits" mode, even though both live on the same `shift+tab` cycle). Cycle to it with `shift+tab`, configure via `/config` → `autoMode`. Max / Team / Enterprise / API plans. [Docs](https://code.claude.com/docs/en/auto-mode-config.md).
+- **Codex:** **Auto-Review** — a secondary reviewer agent auto-approves low-risk actions in the sandbox. [Docs](https://developers.openai.com/codex/concepts/sandboxing/auto-review).
+- **Gemini:** **YOLO** (`-y` / accept-all).
+
+> **On older versions** that don't have Auto / Auto-Review: use Claude Code's "dangerously skip permissions" mode (`--dangerously-skip-permissions`) or Codex's "Full Access" mode. Same idea — let the agent run without confirmation dialogs.
+
+**Also: keep the host machine awake.** The agent and the reply listener live on the same machine you started them from (laptop, desktop, home server, cloud VM, whatever). If the OS sleeps, both die. Display sleep is fine — system sleep is the killer. Quick fixes:
+
+- macOS: `caffeinate -i` in a terminal for the duration of the session, or System Settings → Battery → *Prevent automatic sleeping when display is off* while plugged in.
+- Linux desktop: `systemd-inhibit --what=sleep -- sleep infinity` in a spare terminal, or set "Suspend when inactive" to *Never* in your power settings. (Most server distros don't sleep by default — nothing to do.)
+- Windows: change the active power plan's sleep timer to *Never* while plugged in.
+- Cloud VM / always-on server: already fine, no action needed.
+
+### Step 2 — Tell the agent what you want, in natural language
+
+Mention "Telegram" or "tele" so the agent knows to use the bridge. Examples:
+
+- *"Ping me on Telegram when done."*
+- *"Report to me via Telegram and wait for instructions."*
+- *"Schedule a wakeup in 30 minutes; when you wake up, tele me."*
+- *"Send me a tele report after each PR you open."*
+
+The agent reads `telegram-guide.md` (already wired in Step 2 of setup) and handles the rest — short report, listener loop for your reply, the lot.
+
+## Notes
+
+- **Reactions on your replies:** 👍 means a listener picked it up. 💔 means you sent a plain message (not a reply to a bot message) — agents only see direct replies.
+- **Multiple recipients:** `TELEGRAM_ADMIN_CHAT_ID` is one chat ID. For a team, make a Telegram group, add the bot + people, use the group's chat ID.
+- **Requirements:** `node` on `PATH`; every consumer project sits as a sibling of `teleport/`; one bot, one chat, one shared `.env`.
