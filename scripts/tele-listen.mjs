@@ -2,6 +2,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { loadEnvFromFile, parseAdminChatIds, postReaction } from './send-telegram.mjs';
 
@@ -18,6 +19,8 @@ export const DEFAULT_PROMPT_PROCESSING_FILE = path.join(DEFAULT_TMP_DIR, 'prompt
 export const UPDATES_CACHE_FILE = path.join(DEFAULT_TMP_DIR, 'updates-cache.jsonl');
 export const POLL_LOCK_FILE = path.join(DEFAULT_TMP_DIR, 'poll.lock');
 export const REGISTRY_FILE = path.join(DEFAULT_TMP_DIR, 'listener-registry.jsonl');
+export const REGISTRY_LOCK_FILE = path.join(DEFAULT_TMP_DIR, 'registry.lock');
+export const REGISTRY_MAX_ENTRIES = 100;
 const LOCK_STALE_MS = 30_000;
 
 export function filterKey(filterReplyTo) {
@@ -340,63 +343,174 @@ export async function reactToMessages(token, messages) {
 
 // Listener registry: lets a listener detect that another listener with a strictly
 // broader filter (= the same conversation's newer Monitor) is alive, and self-exit.
-// Cross-conversation safe: different conversations have disjoint messageId sets, so
-// "strict superset" can only match within one conversation. See telegram-guide.md.
+// Cross-conversation safety is by *convention*, not construction: each agent must
+// only put its own bot-sent messageIds in `--filter-reply-to`. So two different
+// conversations' filter sets are disjoint, and strict-superset can only match
+// intra-conversation. See telegram-guide.md §Auto-supersede.
 
+/**
+ * Liveness probe. Returns true iff the OS still has a process at `pid`.
+ * `process.kill(pid, 0)` performs the existence check without sending a signal.
+ * EPERM = exists but we can't signal it (still alive). ESRCH = no such process.
+ * Anything else is logged so a future macOS/kernel quirk is visible, not silent.
+ */
 export function isProcessAlive(pid) {
   if (!Number.isFinite(pid) || pid <= 0) return false;
   try {
     process.kill(pid, 0);
     return true;
   } catch (e) {
-    // EPERM means the process exists but we lack permission to signal it — still alive.
-    return e && e.code === 'EPERM';
+    if (!e || typeof e !== 'object') return false;
+    if (e.code === 'EPERM') return true;
+    if (e.code === 'ESRCH') return false;
+    console.error(`[tele-listen] unexpected kill(${pid}, 0) error: ${e.code ?? e.message}`);
+    return false;
   }
+}
+
+/**
+ * Capture a process's start time so we can detect PID reuse later.
+ * Returns a string identifier (lstart from `ps`) or null on failure.
+ * The exact format doesn't matter — we only compare for equality.
+ * Important: pass pid as an arg with `execFileSync` to avoid shell injection.
+ */
+export function getProcessStartTime(pid) {
+  if (!Number.isFinite(pid) || pid <= 0) return null;
+  try {
+    const out = execFileSync('ps', ['-o', 'lstart=', '-p', String(pid)], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: 2000,
+    }).trim();
+    return out || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Liveness with PID-reuse protection. A registry entry is "live" only if the
+ * process at entry.pid is still alive AND its current start time matches what
+ * we recorded when the entry was written. If the recorded `startTime` is
+ * absent (legacy or capture failed), we fall back to plain isProcessAlive —
+ * the entry will eventually be refreshed with a startTime by its owner.
+ */
+export function isLiveEntry(entry) {
+  if (!entry || !Number.isFinite(entry.pid) || entry.pid <= 0) return false;
+  if (!isProcessAlive(entry.pid)) return false;
+  if (!entry.startTime) return true;
+  const current = getProcessStartTime(entry.pid);
+  if (!current) return false;
+  return current === entry.startTime;
 }
 
 export function readRegistry(file = REGISTRY_FILE) {
   let raw;
   try { raw = fs.readFileSync(file, 'utf8'); } catch { return []; }
   const out = [];
+  let parseFailures = 0;
+  let totalLines = 0;
   for (const line of raw.trim().split('\n')) {
     if (!line) continue;
-    try { out.push(JSON.parse(line)); } catch {}
+    totalLines++;
+    try { out.push(JSON.parse(line)); }
+    catch { parseFailures++; }
+  }
+  if (parseFailures > 0) {
+    console.error(`[tele-listen] registry: dropped ${parseFailures}/${totalLines} malformed line(s)`);
   }
   return out;
 }
 
 function writeRegistry(entries, file = REGISTRY_FILE) {
-  if (entries.length === 0) {
-    try { fs.unlinkSync(file); } catch {}
-    return;
+  // Always rewrite via atomic rename — even an empty registry uses an empty
+  // file rather than unlink, so we don't race a peer's read against an
+  // intermediate "file gone" state and silently lose entries.
+  const content = entries.length === 0 ? '' : entries.map((e) => JSON.stringify(e)).join('\n') + '\n';
+  atomicWriteFileSync(file, content);
+}
+
+/**
+ * Acquire `lockFile` via O_EXCL with bounded async retries. Returns true on success.
+ * Pattern mirrors acquirePollLock (sync), wrapped in a polling retry loop so
+ * callers can `await` instead of busy-spinning. Stale locks are inherited from
+ * acquirePollLock's existing LOCK_STALE_MS reclaim.
+ */
+async function acquireLockWithRetry(lockFile, { maxAttempts = 50, retryMs = 20 } = {}) {
+  for (let i = 0; i < maxAttempts; i++) {
+    if (acquirePollLock(lockFile)) return true;
+    await new Promise((r) => setTimeout(r, retryMs));
   }
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  const tmp = file + `.${Date.now()}.${process.pid}.tmp`;
-  fs.writeFileSync(tmp, entries.map((e) => JSON.stringify(e)).join('\n') + '\n', 'utf8');
-  fs.renameSync(tmp, file);
+  return false;
 }
 
 /**
  * Refresh registry: drop dead entries + dedupe by pid + add/update mine.
- * Called once per tele-listen invocation. Returns the live list (incl. mine).
+ * Guarantees at most one entry per `pid` (load-bearing for findSuperseder's
+ * self-exclusion: when iterating, we skip my own pid; with only one entry per
+ * pid that's sufficient).
+ *
+ * Lock-protected: two listeners refreshing concurrently must not lose entries.
+ * If lock can't be acquired (very rare), we fall back to a best-effort
+ * read-only path: we still return the most recent on-disk registry so the
+ * caller's supersede check works, but we don't write our own entry this round.
+ * The next invocation 20s later will retry — eventual consistency.
  */
-export function refreshRegistry({ pid, filter, offsetFile, file = REGISTRY_FILE, now = Date.now() }) {
-  const all = readRegistry(file);
-  const live = all.filter((e) => e.pid !== pid && Number.isFinite(e.pid) && isProcessAlive(e.pid));
-  const mine = { pid, filter, offsetFile, startedAt: now };
-  // Preserve original startedAt if I already had an entry (same pid):
-  const existing = all.find((e) => e.pid === pid);
-  if (existing && Number.isFinite(existing.startedAt)) mine.startedAt = existing.startedAt;
-  const next = [...live, mine];
-  writeRegistry(next, file);
-  return next;
+export async function refreshRegistry({
+  pid,
+  filter,
+  offsetFile,
+  file = REGISTRY_FILE,
+  lockFile = REGISTRY_LOCK_FILE,
+  now = Date.now(),
+  startTime = getProcessStartTime(pid),
+  maxEntries = REGISTRY_MAX_ENTRIES,
+}) {
+  const locked = await acquireLockWithRetry(lockFile);
+  if (!locked) {
+    console.error('[tele-listen] could not acquire registry lock; supersede check may be stale');
+    const fallback = readRegistry(file);
+    return fallback;
+  }
+  try {
+    const all = readRegistry(file);
+    const live = all.filter((e) => e.pid !== pid && isLiveEntry(e));
+    const existing = all.find((e) => e.pid === pid);
+    const mine = {
+      pid,
+      filter,
+      offsetFile,
+      startedAt: existing && Number.isFinite(existing.startedAt) ? existing.startedAt : now,
+      startTime: startTime ?? null,
+    };
+    // Cap registry size as defense in depth — keep newest entries.
+    let next = [...live, mine];
+    if (next.length > maxEntries) next = next.slice(-maxEntries);
+    writeRegistry(next, file);
+    return next;
+  } finally {
+    releasePollLock(lockFile);
+  }
 }
 
-export function isStrictSuperset(other, mine) {
-  if (mine == null) return false; // I have no filter (catch-all) → nothing is broader than me
-  if (other == null) return true; // they have no filter (catch-all) → broader than my filtered view
-  const mineArr = Array.isArray(mine) ? mine : [mine];
-  const otherArr = Array.isArray(other) ? other : [other];
+/**
+ * Strict-superset check, used to decide whether some other listener's filter
+ * (`otherFilter`) covers ours (`myFilter`) and therefore makes us obsolete.
+ *
+ * Null filter means "catch-all" — listening for any reply, no IDS constraint.
+ * We treat catch-all as **neither superseding nor superseded by** any filter:
+ * - If `myFilter == null`, we're catch-all and shouldn't be killed by some
+ *   narrower filtered listener.
+ * - If `otherFilter == null`, treating it as catch-all that supersedes everyone
+ *   would let any unintended catch-all run (debug invocation, future code path)
+ *   wipe out every legitimate filtered listener across all conversations,
+ *   breaking the cross-conversation safety property.
+ * Returning false in both cases keeps the mechanism conservative.
+ */
+export function isStrictSuperset(otherFilter, myFilter) {
+  if (myFilter == null || otherFilter == null) return false;
+  const mineArr = Array.isArray(myFilter) ? myFilter : [myFilter];
+  const otherArr = Array.isArray(otherFilter) ? otherFilter : [otherFilter];
   const mineSet = new Set(mineArr);
   const otherSet = new Set(otherArr);
   if (otherSet.size <= mineSet.size) return false; // must be strictly larger
@@ -444,11 +558,13 @@ async function main() {
   // Registry-based supersede: if another live listener has a strict-superset
   // filter (= the same conversation moved to a newer Monitor with broader IDS),
   // self-exit cleanly so the outer `until ...; do sleep 20; done` loop ends and
-  // the orphaned Monitor wrapper goes away. We track by PPID — the long-lived
-  // bash wrapper that the Monitor tool spawned — not our own PID, which is
-  // short-lived (one poll per invocation).
+  // the orphaned wrapper goes away. We track by PPID — the long-lived bash
+  // wrapper — not our own PID, which is short-lived (one poll per invocation).
+  //
+  // We refresh BEFORE the promptFile/processingFile checks below so the
+  // registry stays current even when this poll is a no-op (peers must see us).
   const myMonitorPid = process.ppid;
-  const registry = refreshRegistry({ pid: myMonitorPid, filter: filterReplyTo, offsetFile });
+  const registry = await refreshRegistry({ pid: myMonitorPid, filter: filterReplyTo, offsetFile });
   const superseder = findSuperseder({ myPid: myMonitorPid, myFilter: filterReplyTo, registry });
   if (superseder) {
     console.log(
