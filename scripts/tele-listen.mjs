@@ -320,12 +320,20 @@ export async function reactToOrphans(token, orphanEntries) {
 
 export async function reactToMessages(token, messages) {
   for (const entry of messages) {
-    try {
-      const { ok, description } = await postReaction(token, String(entry.msg.chat.id), entry.msg.message_id);
-      if (!ok) console.error(`[tele-listen] react rejected for ${entry.msg.message_id}: ${description}`);
-    } catch (e) {
-      console.error(`[tele-listen] react failed for ${entry.msg.message_id}: ${e instanceof Error ? e.message : String(e)}`);
+    const chatId = String(entry.msg.chat.id);
+    const msgId = entry.msg.message_id;
+    let success = false;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const { ok, description } = await postReaction(token, chatId, msgId);
+        if (ok) { success = true; break; }
+        console.error(`[tele-listen] react rejected for ${msgId} (attempt ${attempt + 1}): ${description}`);
+      } catch (e) {
+        console.error(`[tele-listen] react failed for ${msgId} (attempt ${attempt + 1}): ${e instanceof Error ? e.message : String(e)}`);
+      }
+      if (attempt === 0) await new Promise(r => setTimeout(r, 5000));
     }
+    if (!success) console.error(`[tele-listen] react gave up for ${msgId} after 2 attempts`);
   }
 }
 

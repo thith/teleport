@@ -137,8 +137,20 @@ The way you listen depends on your agent capabilities:
 
 **For Claude (Using Monitor Tool):**
 
-> **🚨 ONE CONVERSATION = ONE MONITOR. ALWAYS.**
-> Every send-telegram requires starting a fresh Monitor with the updated IDS. If a previous Monitor is still running, you MUST `TaskStop` it FIRST. Two Monitors in the same conversation is a bug — it leaks background tasks and confuses the user.
+> **🚨🚨🚨 ONE CONVERSATION = ONE MONITOR. ALWAYS. 🚨🚨🚨**
+>
+> Every send-telegram requires starting a fresh Monitor with the updated IDS. If a previous Monitor is still running, you **MUST `TaskStop` it FIRST**. Two Monitors in the same conversation is a **silent data-loss bug**, not just a tidiness issue.
+>
+> **How the silent loss happens (observed in production):**
+> 1. You sent message A. Monitor X is running with IDS that includes A. You then send message B without stopping X. You start Monitor Y with IDS that includes B (and A).
+> 2. Both X and Y share the same `--offset-file`.
+> 3. Admin replies to message B. The update is fetched and cached.
+> 4. Monitor X polls. Its filter doesn't include B → no match → but it STILL calls `advanceLoopOffset`, which moves the shared offset file past the update.
+> 5. Monitor Y polls next. Its filter would match B, but it reads cache from the now-advanced offset → the update is invisible. **Lost forever.**
+>
+> Both Monitors think they did the right thing; the script does the right thing. The bug is the agent running two listeners against the same offset file. There is no script-side fix — only the agent can prevent this by always TaskStopping before starting a new Monitor.
+>
+> **Failure mode tell:** the admin replies to your latest message, you never see a notification, and the offset file is at a value > the update_id of the admin's reply (check `fetch-audit.jsonl` — the update is `classification: cached` but no prompt file was written).
 
 **Canonical pattern (use this EVERY send, no exceptions):**
 
