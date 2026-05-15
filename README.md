@@ -76,12 +76,13 @@ Teleport does **not** bridge permission confirmations. If the agent stops to ask
 
 > **On older versions** that don't have Auto / Auto-Review: use Claude Code's "dangerously skip permissions" mode (`--dangerously-skip-permissions`) or Codex's "Full Access" mode. Same idea — let the agent run without confirmation dialogs.
 
-**Also: keep the host machine awake.** The agent and the reply listener live on the same machine you started them from (laptop, desktop, home server, cloud VM, whatever). If the OS sleeps, both die. Display sleep is fine — system sleep is the killer. Quick fixes:
+**Also: if you're running the agent on a personal computer, keep the host machine awake.** The agent and the reply listener live on the same machine you started them from — if the OS sleeps, both die. Display sleep is fine; system sleep is the killer. (Skip this section if your host is a cloud VM, home server, or anything else that doesn't sleep on idle — those are always-on by default and need no action.)
+
+Quick fixes for a laptop / desktop:
 
 - macOS: `caffeinate -i` in a terminal for the duration of the session, or System Settings → Battery → *Prevent automatic sleeping when display is off* while plugged in.
-- Linux desktop: `systemd-inhibit --what=sleep -- sleep infinity` in a spare terminal, or set "Suspend when inactive" to *Never* in your power settings. (Most server distros don't sleep by default — nothing to do.)
+- Linux desktop: `systemd-inhibit --what=sleep -- sleep infinity` in a spare terminal, or set "Suspend when inactive" to *Never* in your power settings.
 - Windows: change the active power plan's sleep timer to *Never* while plugged in.
-- Cloud VM / always-on server: already fine, no action needed.
 
 ### Step 2 — Tell the agent what you want, in natural language
 
