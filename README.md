@@ -4,6 +4,8 @@ A small tool that lets AI agents (Claude Code, Codex, Gemini, …) send short pr
 
 Short reports, short replies — not a full session mirror.
 
+Extracted from internal tooling built for **[trumviahe.com](https://trumviahe.com)**.
+
 ## Quick start
 
 ### 1. Clone next to your projects
@@ -121,7 +123,3 @@ Teleport does the opposite: full conversation stays on your laptop; only short r
 - **Zero deps:** pure Node built-ins.
 - **Requirements:** `node` on `PATH`; every project sits as a sibling of `teleport/`; one bot, one chat, one shared `.env`.
 - **Don't rely on it for critical work.** Agents sometimes forget to send follow-up messages.
-
----
-
-Extracted from internal tooling built for **[trumviahe.com](https://trumviahe.com)**.
