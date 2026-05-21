@@ -784,7 +784,7 @@ function listenerHintForCurrentAgent(convoId) {
   // Skip the poll-path line when convoId is unknown (every send failed).
   const lines = [
     `[send-telegram] ⚠️ Start a persistent watcher: \`node ../teleport/scripts/tele-listen.mjs --watch${convoArg} &\``,
-    `[send-telegram] ⚠️ Do NOT send a final response while expecting Telegram replies (Codex/Cursor end the turn on final; Gemini can ignore this).`,
+    `[send-telegram] ⚠️ Do NOT end your turn / conclude the conversation while expecting Telegram replies (most agent runtimes stop polling once the assistant turn ends; Gemini's keeps polling and can ignore this).`,
   ];
   if (convoId != null) {
     lines.push(
