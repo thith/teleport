@@ -101,16 +101,14 @@ node ../teleport/scripts/tele-listen.mjs --watch --convo $CONVO_ID &
 ```
 The supervisor process loops internally: poll → write `prompt-convo-<N>.json` → wait until the file is deleted (= agent consumed) → resume. Survives agent turn end at the OS level. Kill via `pkill -f "tele-listen.*--watch.*--convo ${CONVO_ID}( |$)"` when done with the conversation (the `( |$)` word-boundary prevents `--convo 12` from matching `--convo 123`).
 
-**Codex-specific turn rule:** the watcher process survives Codex's turn at the OS level, but **Codex itself stops polling once it sends a final assistant response**. So even with the daemon running, replies pile up in `prompt-convo-<N>.json` with no agent to consume them.
+**Turn rule for all non-Claude agents:** the watcher process survives the agent's turn at the OS level, but Codex / Cursor / Antigravity stop polling once they send a final assistant response — so replies pile up in `prompt-convo-<N>.json` with no agent to consume them. Gemini's runtime keeps polling across turns and is unaffected by this rule (the extra steps are harmless).
 
 After starting `--watch`:
 - Do NOT send a final assistant response while expecting Telegram replies.
 - Capture the convoId from `[send-telegram] convo: <N>` stdout: `export CONVO_ID=<N>`.
-- Keep the Codex turn active and poll the watcher (full path from project root): `until [ -f ../teleport/scripts/tmp/tele-reply/prompt-convo-$CONVO_ID.json ]; do sleep 5; done` then read+reply+delete.
+- Keep the turn active and poll the watcher (full path from the project root): `until [ -f ../teleport/scripts/tmp/tele-reply/prompt-convo-$CONVO_ID.json ]; do sleep 5; done` then read+reply+delete.
 - Loop on the watcher: when prompt appears → read JSON → reply via send-telegram → delete the prompt file → loop.
 - Send the final response only when the user explicitly closes the convo or the task is genuinely done.
-
-**Gemini:** the daemon survives turn end. Foreground wait is bounded ~5 min but agent runtime keeps polling across turns, so consume works naturally.
 
 When the loop / daemon writes `prompt written to <path>`, parse that file as JSON:
 - `text`, `messageId`, `chatId`, `replyToMessageId`, `replyToText`, `quotedText`, `convoId`, `attachments[]`.

@@ -775,32 +775,31 @@ function listenerHintForCurrentAgent(convoId) {
   if (process.env.CLAUDE_CODE_SESSION_ID) {
     return `[send-telegram] ⚠️ Start a reply listener via Monitor: \`until node ../teleport/scripts/tele-listen.mjs${convoArg}; do sleep 12; done\``;
   }
-  if (process.env.CODEX_THREAD_ID) {
-    // The daemon survives turn end at the OS level, BUT Codex stops polling
-    // once it sends a final assistant response — so the prompt would pile up
-    // unconsumed. Spell out the turn-management rule inline.
-    // Skip the file-poll line when convoId is unknown (every send failed) —
-    // we'd otherwise print a path with a literal `<N>` placeholder.
-    const lines = [
-      `[send-telegram] ⚠️ Start a persistent watcher: \`node ../teleport/scripts/tele-listen.mjs --watch${convoArg} &\``,
-      `[send-telegram] ⚠️ CODEX: do NOT send a final response while expecting Telegram replies.`,
-    ];
-    if (convoId != null) {
-      lines.push(
-        `[send-telegram]    Capture the convoId, then keep the turn active and poll the watcher:`,
-        `[send-telegram]      \`export CONVO_ID=${convoId}\``,
-        `[send-telegram]      \`until [ -f ../teleport/scripts/tmp/tele-reply/prompt-convo-$CONVO_ID.json ]; do sleep 5; done\``,
-        `[send-telegram]    When the prompt appears: read JSON → reply via send-telegram → delete the JSON → loop.`,
-        `[send-telegram]    Send final only when the user closes the convo or task is done.`,
-      );
-    } else {
-      lines.push(
-        `[send-telegram]    (convoId unknown — every send failed; cannot describe the poll path)`,
-      );
-    }
-    return lines.join('\n');
+  // All non-Claude agents (Codex, Gemini, Cursor, Antigravity, unknown):
+  // the --watch daemon survives turn end at the OS level. Codex/Cursor
+  // additionally stop polling once they send a final response, so the agent
+  // must keep its turn active and poll the prompt file. Gemini's runtime
+  // keeps polling across turns and the extra rule is harmless for it — so
+  // we print the same hint for every non-Claude case (safe default).
+  // Skip the poll-path line when convoId is unknown (every send failed).
+  const lines = [
+    `[send-telegram] ⚠️ Start a persistent watcher: \`node ../teleport/scripts/tele-listen.mjs --watch${convoArg} &\``,
+    `[send-telegram] ⚠️ Do NOT send a final response while expecting Telegram replies (Codex/Cursor end the turn on final; Gemini can ignore this).`,
+  ];
+  if (convoId != null) {
+    lines.push(
+      `[send-telegram]    Keep the turn active and poll the watcher:`,
+      `[send-telegram]      \`export CONVO_ID=${convoId}\``,
+      `[send-telegram]      \`until [ -f ../teleport/scripts/tmp/tele-reply/prompt-convo-$CONVO_ID.json ]; do sleep 5; done\``,
+      `[send-telegram]    When the prompt appears: read JSON → reply via send-telegram → delete the JSON → loop.`,
+      `[send-telegram]    Send final only when the user closes the convo or task is done.`,
+    );
+  } else {
+    lines.push(
+      `[send-telegram]    (convoId unknown — every send failed; cannot describe the poll path)`,
+    );
   }
-  return `[send-telegram] ⚠️ Start a persistent watcher: \`node ../teleport/scripts/tele-listen.mjs --watch${convoArg} &\``;
+  return lines.join('\n');
 }
 
 function emitConvoLine({ convoId, messageId }) {
