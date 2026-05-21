@@ -81,7 +81,7 @@ Capture `<N>` once; pass to the listener as `--convo <N>`.
 
 ## Listening for replies (MUST after every successful send)
 
-Pick the mode per agent. `send-telegram.mjs` prints an agent-aware hint on stdout — match its suggestion.
+Two cases. `send-telegram.mjs` prints the matching hint on stdout.
 
 **Claude (Monitor tool):** one-shot tele-listen inside an `until` loop. Monitor restarts it after each reply.
 ```
@@ -95,20 +95,18 @@ Monitor({
 })
 ```
 
-**Codex / Gemini / others (`--watch` daemon — REQUIRED):** Codex foreground exec dies when the agent's turn ends; Gemini's foreground wait is bounded ~5 min. A one-shot `until` loop is insufficient.
+**Other agents (foreground loop + `--watch` daemon):** start a persistent watcher and keep the agent turn active.
 ```bash
 node ../teleport/scripts/tele-listen.mjs --watch --convo $CONVO_ID &
 ```
-The supervisor process loops internally: poll → write `prompt-convo-<N>.json` → wait until the file is deleted (= agent consumed) → resume. Survives agent turn end at the OS level. Kill via `pkill -f "tele-listen.*--watch.*--convo ${CONVO_ID}( |$)"` when done with the conversation (the `( |$)` word-boundary prevents `--convo 12` from matching `--convo 123`).
-
-**Turn rule for all non-Claude agents:** the watcher process survives the agent's turn at the OS level, but most agent runtimes (Codex, Cursor, Antigravity, …) stop polling once the assistant turn ends — replies then pile up in `prompt-convo-<N>.json` with no agent to consume them. Gemini's runtime keeps polling across turns and is unaffected (the extra steps are harmless).
+The supervisor loops internally: poll → write `prompt-convo-<N>.json` → wait until the file is deleted (= agent consumed) → resume. Survives the agent's turn at the OS level. Kill via `pkill -f "tele-listen.*--watch.*--convo ${CONVO_ID}( |$)"` when done (`( |$)` word-boundary prevents `--convo 12` matching `--convo 123`).
 
 After starting `--watch`:
-- Do NOT end your turn / conclude the conversation while expecting Telegram replies.
+- Do NOT end your turn / send a "final" or similar response while waiting for replies (most agent runtimes stop polling once the turn ends).
 - Capture the convoId from `[send-telegram] convo: <N>` stdout: `export CONVO_ID=<N>`.
-- Keep the turn active and poll the watcher (full path from the project root): `until [ -f ../teleport/scripts/tmp/tele-reply/prompt-convo-$CONVO_ID.json ]; do sleep 5; done` then read+reply+delete.
-- Loop on the watcher: when prompt appears → read JSON → reply via send-telegram → delete the prompt file → loop.
-- Send the final response only when the user explicitly closes the convo or the task is genuinely done.
+- Keep the turn active and poll the watcher (path from the project root): `until [ -f ../teleport/scripts/tmp/tele-reply/prompt-convo-$CONVO_ID.json ]; do sleep 5; done` then read+reply+delete.
+- Loop: when prompt appears → read JSON → reply via send-telegram → delete the prompt file → loop.
+- End the turn only when the user explicitly closes the convo or the task is genuinely done.
 
 When the loop / daemon writes `prompt written to <path>`, parse that file as JSON:
 - `text`, `messageId`, `chatId`, `replyToMessageId`, `replyToText`, `quotedText`, `convoId`, `attachments[]`.

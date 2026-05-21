@@ -770,21 +770,17 @@ async function maybeRecordConvo({ convoId, messageId, chatId, botId }) {
 //     foreground wait is bounded ~5min).
 // Hint is best-effort; agent can override if it knows better. If env is
 // missing despite running Claude, the agent still has its Monitor tool.
+// Two cases:
+//   1. Claude (CLAUDE_CODE_SESSION_ID set) → Monitor tool.
+//   2. Other → foreground loop + --watch daemon + don't end your turn.
 function listenerHintForCurrentAgent(convoId) {
   const convoArg = convoId != null ? ` --convo ${convoId}` : '';
   if (process.env.CLAUDE_CODE_SESSION_ID) {
     return `[send-telegram] ⚠️ Start a reply listener via Monitor: \`until node ../teleport/scripts/tele-listen.mjs${convoArg}; do sleep 12; done\``;
   }
-  // All non-Claude agents (Codex, Gemini, Cursor, Antigravity, unknown):
-  // the --watch daemon survives turn end at the OS level. Codex/Cursor
-  // additionally stop polling once they send a final response, so the agent
-  // must keep its turn active and poll the prompt file. Gemini's runtime
-  // keeps polling across turns and the extra rule is harmless for it — so
-  // we print the same hint for every non-Claude case (safe default).
-  // Skip the poll-path line when convoId is unknown (every send failed).
   const lines = [
     `[send-telegram] ⚠️ Start a persistent watcher: \`node ../teleport/scripts/tele-listen.mjs --watch${convoArg} &\``,
-    `[send-telegram] ⚠️ Do NOT end your turn / conclude the conversation while expecting Telegram replies (most agent runtimes stop polling once the assistant turn ends; Gemini's keeps polling and can ignore this).`,
+    `[send-telegram] ⚠️ Do NOT end your turn / send a "final" or similar response while waiting for replies.`,
   ];
   if (convoId != null) {
     lines.push(
@@ -792,7 +788,6 @@ function listenerHintForCurrentAgent(convoId) {
       `[send-telegram]      \`export CONVO_ID=${convoId}\``,
       `[send-telegram]      \`until [ -f ../teleport/scripts/tmp/tele-reply/prompt-convo-$CONVO_ID.json ]; do sleep 5; done\``,
       `[send-telegram]    When the prompt appears: read JSON → reply via send-telegram → delete the JSON → loop.`,
-      `[send-telegram]    Send final only when the user closes the convo or task is done.`,
     );
   } else {
     lines.push(
