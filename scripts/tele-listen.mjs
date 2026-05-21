@@ -1385,6 +1385,42 @@ async function main() {
 //       2 (no match / superseded / processing) → sleep 5s
 //   - Network/Telegram errors are reported by the child; supervisor just
 //     backs off and retries.
+// Singleton lock for the watcher supervisor. Agents may invoke `--watch &`
+// after every send (the hint suggests it); without this guard each invocation
+// would spawn a redundant supervisor → many parallel watchers polling the
+// same convo. Listener-registry supersede catches it at the CHILD level
+// (newer wins) but cause the loser-supervisor to spin in a spawn-die loop.
+// Cleaner: refuse to start a second supervisor for the same convo.
+async function acquireWatcherSingletonLock(convo) {
+  fs.mkdirSync(DEFAULT_TMP_DIR, { recursive: true });
+  const lockFile = path.join(DEFAULT_TMP_DIR, `watcher-convo-${convo}.lock`);
+  // Single attempt with stale-reap; we don't retry — if another live watcher
+  // exists the agent's repeated invocations are intentional no-ops.
+  try {
+    const fd = fs.openSync(lockFile, 'wx');
+    fs.writeSync(fd, String(process.pid));
+    fs.closeSync(fd);
+    return lockFile;
+  } catch (e) {
+    if (e.code !== 'EEXIST') throw e;
+    let body = '';
+    try { body = fs.readFileSync(lockFile, 'utf8').trim(); } catch {}
+    const otherPid = parseInt(body, 10);
+    const alive = Number.isInteger(otherPid) && otherPid > 1
+      && (() => { try { process.kill(otherPid, 0); return true; }
+                  catch (err) { return err.code === 'EPERM'; } })();
+    if (alive) return null;
+    // Stale lock: previous watcher died without cleanup. Reap and retry once.
+    try { fs.unlinkSync(lockFile); } catch {}
+    try {
+      const fd = fs.openSync(lockFile, 'wx');
+      fs.writeSync(fd, String(process.pid));
+      fs.closeSync(fd);
+      return lockFile;
+    } catch { return null; }
+  }
+}
+
 async function watchSupervisor(argv) {
   const args = parseArgs(argv);
   if (args.convo == null) {
@@ -1396,6 +1432,14 @@ async function watchSupervisor(argv) {
     }
     args.convo = r.convoId;
   }
+  const singletonLock = await acquireWatcherSingletonLock(args.convo);
+  if (singletonLock == null) {
+    console.log(`[tele-watch] another watcher is already running for convo ${args.convo}; exiting`);
+    process.exit(0);
+  }
+  // Release lock on every exit path. `process.on('exit')` only allows sync ops.
+  const releaseSingleton = () => { try { fs.unlinkSync(singletonLock); } catch {} };
+  process.on('exit', releaseSingleton);
   const promptFile = path.join(DEFAULT_TMP_DIR, `prompt-convo-${args.convo}.json`);
   // Strip --watch from the child argv; pass --convo explicitly.
   const childArgs = [process.argv[1], '--convo', String(args.convo)];
