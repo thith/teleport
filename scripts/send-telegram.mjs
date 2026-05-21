@@ -3,12 +3,36 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import {
+  acquireLock as acquireConvoLock,
+  appendRowLocked as appendConvoRow,
+  buildConvoFilter,
+  CONVO_ID_RE,
+  CONVO_SCHEMA_VERSION,
+  DEFAULT_LOCK_FILE as CONVO_LOCK_FILE,
+  DEFAULT_REGISTRY_FILE as CONVO_REGISTRY_FILE,
+  hasAllocationRow,
+  lookupConvoIdByMessageId,
+  pruneLocked as pruneConvoRegistry,
+  resolveConvoIdFromEnv,
+  readRows as readConvoRows,
+  REGISTRY_CAP as CONVO_REGISTRY_CAP,
+  releaseLock as releaseConvoLock,
+  validateConvoIdString,
+} from './convo-registry.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT_DIR = path.resolve(__dirname, '..');
 const ENV_FILE = path.join(ROOT_DIR, '.env');
 const TELEGRAM_API = 'https://api.telegram.org/bot';
 const SENT_REGISTRY_FILE = path.join(__dirname, 'tmp', 'tele-reply', 'sent-registry.jsonl');
+
+export function extractBotId(token) {
+  if (!token || typeof token !== 'string') return null;
+  const head = token.split(':')[0];
+  if (!/^\d+$/.test(head)) return null;
+  return Number(head);
+}
 
 // Telegram limits: sendMessage 4096 chars, sendDocument caption 1024 chars.
 // We chunk below the hard limits to leave headroom for escape-expansion.
@@ -45,12 +69,87 @@ export function parseAdminChatIds(raw) {
     .filter((s) => s.length > 0);
 }
 
-export function appendToSentRegistry(messageId, chatId, registryFile = SENT_REGISTRY_FILE) {
+/**
+ * Append a convo-registry row for one successful send. Caller MUST hold (or
+ * obtain) the lock around its own append+prune block; this helper does both
+ * acquire+release for one append because callers don't otherwise interact
+ * with the registry inside the loop. If the lock can't be acquired within
+ * the retry budget the caller is told (return value `false`) and decides
+ * whether to surface a repair hint.
+ */
+// Record one send into the convo-registry. `convoId` is REQUIRED (resolved
+// from the env chain or --convo by the caller). First use on a given
+// (botId, chatId, convoId) auto-writes the allocation row.
+// Returns the resolved convoId (so the caller can echo it on stdout).
+export async function recordConvoSend({ convoId, messageId, chatId, botId }, registryFile = CONVO_REGISTRY_FILE, lockFile = CONVO_LOCK_FILE) {
+  if (convoId == null) throw new Error('recordConvoSend: convoId is required');
+  const acquired = await acquireConvoLock(lockFile);
+  if (!acquired) return { ok: false, reason: 'lock-timeout' };
+  try {
+    const { rows } = readConvoRows(registryFile);
+    const resolved = convoId;
+    if (!hasAllocationRow(rows, resolved, botId, String(chatId))) {
+      // First send for this convo on this chat — write the allocation row.
+      appendConvoRow(
+        { v: CONVO_SCHEMA_VERSION, convoId: resolved, messageId: resolved, chatId: String(chatId), botId, ts: Date.now() },
+        registryFile,
+      );
+    }
+    if (messageId !== resolved) {
+      // Dedupe against an existing (botId, chatId, messageId) row to avoid
+      // bloating the registry on retried/replayed sends (e.g. after
+      // `import-convo --all` re-runs the recovery sweep).
+      const chatStr = String(chatId);
+      const dup = rows.some((r) =>
+        (typeof r.v !== 'number' || r.v <= CONVO_SCHEMA_VERSION)
+        && r.botId === botId && String(r.chatId) === chatStr && r.messageId === messageId,
+      );
+      if (!dup) {
+        appendConvoRow(
+          { v: CONVO_SCHEMA_VERSION, convoId: resolved, messageId, chatId: String(chatId), botId, ts: Date.now() },
+          registryFile,
+        );
+      }
+    }
+    return { ok: true, convoId: resolved, shouldPrune: rows.length >= CONVO_REGISTRY_CAP };
+  } finally {
+    releaseConvoLock(lockFile);
+  }
+}
+
+// Run prune out-of-band: caller drops the recordConvoSend lock first, then we
+// reacquire briefly to do the read+rewrite. Bounds lock-hold time per send to
+// "one append" instead of "one append + full prune".
+async function pruneAfterSend(registryFile = CONVO_REGISTRY_FILE, lockFile = CONVO_LOCK_FILE) {
+  const acquired = await acquireConvoLock(lockFile);
+  if (!acquired) return; // skip silently; next send will retry
+  try { pruneConvoRegistry(registryFile); }
+  catch (e) {
+    console.error(`[send-telegram] convo-registry prune failed (non-fatal): ${e instanceof Error ? e.message : String(e)}`);
+  } finally {
+    releaseConvoLock(lockFile);
+  }
+}
+
+export function appendToSentRegistry({ messageId, chatId, botId = null, convoId = null, registryFile = SENT_REGISTRY_FILE }) {
   if (!messageId) return;
   const dir = path.dirname(registryFile);
   fs.mkdirSync(dir, { recursive: true });
-  const entry = JSON.stringify({ messageId, chatId, ts: Math.floor(Date.now() / 1000) }) + '\n';
-  fs.appendFileSync(registryFile, entry, 'utf8');
+  const row = { v: 1, messageId, chatId, ts: Math.floor(Date.now() / 1000) };
+  if (botId != null) row.botId = botId;
+  // Persist convoId when known so import-convo can repair env-derived convos
+  // (whose convoId is a UUID-hash and never equals any Telegram messageId).
+  if (convoId != null) row.convoId = convoId;
+  const entry = JSON.stringify(row) + '\n';
+  // Durable append — sent-registry is the recovery source for `import-convo`
+  // when the convo-registry append crashed mid-flight.
+  const fd = fs.openSync(registryFile, 'a');
+  try {
+    fs.writeSync(fd, entry);
+    fs.fsyncSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
 }
 
 export function readSentRegistry(registryFile = SENT_REGISTRY_FILE) {
@@ -84,9 +183,16 @@ export async function postReaction(token, chatId, messageId, emoji = '👍') {
 }
 
 export function parseArgs(argv) {
-  const result = { filePath: null, positional: [], raw: false, plain: false, replyTo: null, react: null };
+  const result = { filePath: null, positional: [], raw: false, plain: false, replyTo: null, react: null, convo: null };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
+    if (arg === '--convo') {
+      const next = argv[i + 1];
+      if (!next) throw new Error('--convo requires a positive-integer convoId');
+      result.convo = validateConvoIdString(next.trim());
+      i++;
+      continue;
+    }
     if (arg === '--react') {
       const next = argv[i + 1];
       if (!next) throw new Error('--react requires a message ID argument');
@@ -497,11 +603,31 @@ async function main() {
     process.exit(1);
   }
 
+  const botId = extractBotId(token);
+  let effectiveAdminIds = adminIds;
+
+  // Pre-resolve from env > --convo. Null = defer to --reply-to inference
+  // (in maybeRecordConvo) which falls back to "new convo = this messageId".
+  let preResolved = null;
+  try {
+    const r = resolveConvoIdFromEnv({ argConvo: typeof args.convo === 'number' ? args.convo : null });
+    preResolved = r.convoId;
+  } catch (e) {
+    console.error(`[send-telegram] ${e instanceof Error ? e.message : String(e)}`);
+    process.exit(1);
+  }
+  // No pre-flight: passing `--convo <N>` auto-allocates on first use and
+  // appends on subsequent uses. We address every admin chat; the chats that
+  // already have an allocation row will get an append, the ones that don't
+  // will get an allocation. Anti-hijack rule (the strict "must already exist"
+  // check) was dropped per user request — agents are responsible for picking
+  // collision-resistant convoIds (e.g. process pid + timestamp).
+
   const opts = { raw: args.raw, plain: args.plain, replyTo: args.replyTo };
 
   if (args.react != null) {
     let failures = 0;
-    for (const chatId of adminIds) {
+    for (const chatId of effectiveAdminIds) {
       try {
         const { ok, description } = await postReaction(token, chatId, args.react);
         if (ok) console.log(`[send-telegram] reacted 👍 to ${args.react} in ${chatId}`);
@@ -512,7 +638,7 @@ async function main() {
         console.error(`[send-telegram] react failed for ${chatId}: ${scrubToken(raw, token)}`);
       }
     }
-    if (failures === adminIds.length) process.exit(1);
+    if (failures === effectiveAdminIds.length) process.exit(1);
     return;
   }
 
@@ -527,23 +653,29 @@ async function main() {
     const caption = projectCode && rawCaption ? `[${projectCode}] ${rawCaption}` : rawCaption;
 
     let failures = 0;
-    for (const chatId of adminIds) {
+    for (const chatId of effectiveAdminIds) {
       try {
+        let convoIdForSend = resolveConvoIdPreSend({ preResolved, replyTo: args.replyTo, chatId, botId });
         const { fallback, messageId } = await sendDocumentToAdmin(token, chatId, args.filePath, caption, opts);
-        appendToSentRegistry(messageId, chatId);
+        if (convoIdForSend == null) convoIdForSend = messageId; // new convo
+        appendToSentRegistry({ messageId, chatId, botId, convoId: convoIdForSend });
+        const recordedConvoId = await maybeRecordConvo({ convoId: convoIdForSend, messageId, chatId, botId });
         const parts = [];
         if (fallback) parts.push('caption sent as plain text');
         if (messageId) parts.push(`messageId: ${messageId}`);
         const note = parts.length > 0 ? ` (${parts.join(', ')})` : '';
         console.log(`[send-telegram] document sent to ${chatId}${note}`);
+        emitConvoLine({ convoId: recordedConvoId, messageId });
       } catch (error) {
         failures++;
         const raw = error instanceof Error ? error.message : String(error);
         console.error(`[send-telegram] failed for ${chatId}: ${scrubToken(raw, token)}`);
       }
     }
-    if (failures === adminIds.length) process.exit(1);
-    if (failures < adminIds.length) console.log('[send-telegram] ⚠️ You MUST now start a reply listener (Monitor tool or foreground loop). See telegram-guide.md §Listening for Replies.');
+    if (failures === effectiveAdminIds.length) process.exit(1);
+    if (failures < effectiveAdminIds.length) {
+      console.log('[send-telegram] ⚠️ You MUST now start a reply listener (Monitor tool or foreground loop). See telegram-guide.md §Listening for Replies.');
+    }
     return;
   }
 
@@ -563,16 +695,20 @@ async function main() {
   }
 
   let failures = 0;
-  for (const chatId of adminIds) {
+  for (const chatId of effectiveAdminIds) {
     try {
+      let convoIdForSend = resolveConvoIdPreSend({ preResolved, replyTo: args.replyTo, chatId, botId });
       const { fallback, messageId, allMessageIds } = await sendTextToAdmin(token, chatId, message, opts);
-      for (const mid of allMessageIds) appendToSentRegistry(mid, chatId);
+      if (convoIdForSend == null) convoIdForSend = messageId; // new convo
+      for (const mid of allMessageIds) appendToSentRegistry({ messageId: mid, chatId, botId, convoId: convoIdForSend });
+      const recordedConvoId = await maybeRecordConvo({ convoId: convoIdForSend, messageId, chatId, botId });
       const parts = [];
       if (fallback === 'auto-file') parts.push('long-message → .md file');
       else if (fallback === 'parse-error-file') parts.push('markdown-parse-error → .md file');
       if (messageId) parts.push(`messageId: ${messageId}`);
       const note = parts.length > 0 ? ` (${parts.join(', ')})` : '';
       console.log(`[send-telegram] sent to ${chatId}${note}`);
+      emitConvoLine({ convoId: recordedConvoId, messageId });
     } catch (error) {
       failures++;
       const raw = error instanceof Error ? error.message : String(error);
@@ -580,8 +716,51 @@ async function main() {
     }
   }
 
-  if (failures === adminIds.length) process.exit(1);
-  if (failures < adminIds.length) console.log('[send-telegram] ⚠️ You MUST now start a reply listener (Monitor tool or foreground loop). See telegram-guide.md §Listening for Replies.');
+  if (failures === effectiveAdminIds.length) process.exit(1);
+  if (failures < effectiveAdminIds.length) {
+    console.log('[send-telegram] ⚠️ You MUST now start a reply listener (Monitor tool or foreground loop). See telegram-guide.md §Listening for Replies.');
+  }
+}
+
+// Convo book-keeping helpers used by both the document and text send paths.
+
+// Resolve convoId BEFORE the send so sent-registry can persist it (needed for
+// import-convo to recover env-derived convos whose convoId is a UUID-hash, not
+// a real messageId). Order:
+//   1. preResolved (env or --convo).
+//   2. --reply-to inference: lookup replyTo in registry for this (botId, chatId).
+//   3. null → caller will use messageId as convoId (new convo, post-send).
+export function resolveConvoIdPreSend({ preResolved, replyTo, chatId, botId }) {
+  if (preResolved != null) return preResolved;
+  if (replyTo != null) {
+    const { rows } = readConvoRows();
+    const found = lookupConvoIdByMessageId(rows, botId, String(chatId), replyTo);
+    if (found != null) return found;
+  }
+  return null;
+}
+
+// Record the send into convo-registry. `convoId` is the final value (caller
+// substitutes messageId for new-convo case).
+async function maybeRecordConvo({ convoId, messageId, chatId, botId }) {
+  if (!messageId || convoId == null) return null;
+  const result = await recordConvoSend({ convoId, messageId, chatId, botId });
+  if (result.ok && result.shouldPrune) await pruneAfterSend();
+  if (!result.ok) {
+    // Surface convoId so the operator can repair via import-convo without
+    // having to grep stdout for the env-derived integer.
+    const botSuffix = botId != null ? ` --bot ${botId}` : '';
+    console.error(
+      `[send-telegram] convo-registry lock-timeout (convoId=${convoId}) — registry append SKIPPED for messageId=${messageId}. Run: node import-convo.mjs --convo ${convoId}${botSuffix}`,
+    );
+    return convoId; // still echo so the agent can log + start its listener
+  }
+  return result.convoId;
+}
+
+function emitConvoLine({ convoId, messageId }) {
+  if (!messageId || convoId == null) return;
+  console.log(`[send-telegram] convo: ${convoId} messageId: ${messageId} pid: ${process.pid}`);
 }
 
 const isDirectRun = fileURLToPath(import.meta.url) === path.resolve(process.argv[1] ?? '');

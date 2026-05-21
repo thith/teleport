@@ -51,7 +51,7 @@ You should see the message land in your Telegram. If not, fix `.env` before cont
 
 ### 4. Wire it into your AI agents (one-time, global)
 
-Open Claude Code, Codex, or Gemini CLI **inside any project under `~/Projects/`** (so `../teleport/` resolves correctly), then paste this prompt — the agent does the rest:
+Open Claude Code, Codex, or Gemini CLI **inside any project sibling of `teleport/`** (so `../teleport/` resolves correctly), then paste this prompt — the agent does the rest:
 
 > Enable Telegram reporting **globally for all my AI agents** by following `../teleport/README.md`. Copy the canonical snippet **verbatim** (do not paraphrase or rewrite) from the "Wiring snippet" section of that README into **all three** global config files so it works whichever agent I run later — `~/.claude/CLAUDE.md` (Claude Code), `~/.gemini/GEMINI.md` (Gemini), `~/.codex/AGENTS.md` (Codex). Create any file that does not exist yet. On Windows use the equivalent under `%USERPROFILE%`. After writing, send a test "hello" from whichever agent I am running now.
 

@@ -5,7 +5,20 @@ import crypto from 'node:crypto';
 import https from 'node:https';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { loadEnvFromFile, parseAdminChatIds, postReaction, sendTextChunk } from './send-telegram.mjs';
+import { loadEnvFromFile, parseAdminChatIds, postReaction, sendTextChunk, extractBotId, readSentRegistry } from './send-telegram.mjs';
+import {
+  acquireLock as acquireConvoLock,
+  appendRowLocked as appendConvoRow,
+  buildConvoFilter,
+  CONVO_SCHEMA_VERSION,
+  DEFAULT_LOCK_FILE as CONVO_LOCK_FILE,
+  DEFAULT_REGISTRY_FILE as CONVO_REGISTRY_FILE,
+  hasAllocationRow,
+  readRows as readConvoRows,
+  releaseLock as releaseConvoLock,
+  resolveConvoIdFromEnv,
+  validateConvoIdString,
+} from './convo-registry.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT_DIR = path.resolve(__dirname, '..');
@@ -157,7 +170,14 @@ export async function fetchUpdates(token, offset) {
 export function parseArgs(argv) {
   let filterReplyTo = null;
   let offsetFile = DEFAULT_OFFSET_FILE;
+  let offsetFileProvided = false;
+  let convo = null;
+  let legacyFilter = false;
   for (let i = 0; i < argv.length; i++) {
+    if (argv[i] === '--legacy-filter') {
+      legacyFilter = true;
+      continue;
+    }
     if (argv[i] === '--filter-reply-to') {
       const next = argv[i + 1];
       if (!next) throw new Error('--filter-reply-to requires a message ID argument');
@@ -173,6 +193,12 @@ export function parseArgs(argv) {
       const next = argv[i + 1];
       if (!next) throw new Error('--offset-file requires a path argument');
       offsetFile = next;
+      offsetFileProvided = true;
+      i++;
+    } else if (argv[i] === '--convo') {
+      const next = argv[i + 1];
+      if (!next) throw new Error('--convo requires a positive integer convoId');
+      convo = validateConvoIdString(next.trim());
       i++;
     } else if (argv[i].startsWith('--')) {
       throw new Error(`Unknown flag: ${argv[i]}`);
@@ -180,19 +206,16 @@ export function parseArgs(argv) {
       throw new Error(`Unexpected positional argument: ${argv[i]}`);
     }
   }
-  return { filterReplyTo, offsetFile };
+  if (convo != null && filterReplyTo != null) {
+    throw new Error('--convo and --filter-reply-to are mutually exclusive');
+  }
+  if (legacyFilter && filterReplyTo == null) {
+    throw new Error('--legacy-filter requires --filter-reply-to (it suppresses the env check applied to legacy mode)');
+  }
+  return { filterReplyTo, offsetFile, offsetFileProvided, convo, legacyFilter };
 }
 
-// Telegram bot tokens are formatted `<bot_id>:<auth_hash>`. We use bot_id as a
-// namespace for attachment dirs so a teleport tree shared by multiple bots (or
-// recycled across token swaps) does not let two bots' update_id sequences
-// collide on disk.
-function extractBotId(token) {
-  if (!token || typeof token !== 'string') return null;
-  const head = token.split(':')[0];
-  if (!/^\d+$/.test(head)) return null;
-  return Number(head);
-}
+// extractBotId is imported from send-telegram.mjs (single source of truth).
 
 function hasUserContent(msg) {
   return Boolean(
@@ -395,16 +418,31 @@ function summarizeMediaReplyTarget(replyTo) {
   return null;
 }
 
-export function filterAdminMessages(updates, adminIds, filterReplyTo = null) {
-  const replyToSet = filterReplyTo == null ? null
-    : Array.isArray(filterReplyTo) ? new Set(filterReplyTo)
-    : new Set([filterReplyTo]);
+export function filterAdminMessages(updates, adminIds, filterReplyTo = null, mode = 'legacy') {
+  // mode = 'legacy' : filterReplyTo is null | number | number[] | Set<number>;
+  //                   matches `reply_to_message.message_id` only.
+  // mode = 'convo'  : filterReplyTo is a Set<string> of `${chatId}:${messageId}`;
+  //                   match requires BOTH chat and reply-target.
+  let replyToSet = null;
+  if (filterReplyTo != null) {
+    if (filterReplyTo instanceof Set) replyToSet = filterReplyTo;
+    else if (Array.isArray(filterReplyTo)) replyToSet = new Set(filterReplyTo);
+    else replyToSet = new Set([filterReplyTo]);
+  }
   return updates
     .filter((u) => {
       const msg = u.message;
       if (!hasUserContent(msg)) return false;
       if (adminIds.length > 0 && !adminIds.includes(String(msg.chat.id))) return false;
-      if (replyToSet != null && !replyToSet.has(msg.reply_to_message?.message_id)) return false;
+      if (replyToSet != null) {
+        const replyId = msg.reply_to_message?.message_id;
+        if (replyId == null) return false;
+        if (mode === 'convo') {
+          if (!replyToSet.has(`${msg.chat.id}:${replyId}`)) return false;
+        } else {
+          if (!replyToSet.has(replyId)) return false;
+        }
+      }
       return true;
     })
     .map((u) => ({ update: u, msg: u.message }));
@@ -434,7 +472,7 @@ export function buildPromptData(msg, updateId = null, botId = null) {
  * LAST message (newest) so the AI replies to the right thread. Reply/quote
  * metadata from earlier messages in the batch is intentionally dropped.
  */
-export function buildCombinedPromptData(messages, botId = null) {
+export function buildCombinedPromptData(messages, botId = null, convoId = null) {
   if (!messages.length) throw new Error('messages must not be empty');
   const [first, ...rest] = messages;
   const getText = (m) => m.text ?? m.caption ?? '';
@@ -450,7 +488,7 @@ export function buildCombinedPromptData(messages, botId = null) {
     attachments.push(...extractAttachments(m.msg, m.update?.update_id ?? null, botId));
   }
   
-  return {
+  const out = {
     text,
     messageId: last.message_id,
     chatId: String(last.chat.id),
@@ -461,6 +499,8 @@ export function buildCombinedPromptData(messages, botId = null) {
     timestamp: last.date,
     attachments,
   };
+  if (convoId != null) out.convoId = convoId;
+  return out;
 }
 
 export function findOrphanMessages(updates, adminIds, systemMsgIds = new Set()) {
@@ -481,8 +521,8 @@ export function findOrphanMessages(updates, adminIds, systemMsgIds = new Set()) 
   }).map((u) => ({ update: u, msg: u.message, orphan: true }));
 }
 
-export function collectMessagesToProcess(updates, adminIds, filterReplyTo) {
-  return filterAdminMessages(updates, adminIds, filterReplyTo);
+export function collectMessagesToProcess(updates, adminIds, filterReplyTo, mode = 'legacy') {
+  return filterAdminMessages(updates, adminIds, filterReplyTo, mode);
 }
 
 /**
@@ -502,12 +542,13 @@ export function resolveStartOffset(
   offsetFile,
   globalOffsetFile = GLOBAL_OFFSET_FILE,
   cacheFile = UPDATES_CACHE_FILE,
+  seedFloor = 0,
 ) {
   const perLoop = readOffset(offsetFile);
   if (perLoop > 0) return perLoop;
 
   const globalOffset = readOffset(globalOffsetFile);
-  let startOffset = globalOffset;
+  let startOffset = Math.max(globalOffset, seedFloor);
 
   // If the cache has entries older than globalOffset, prefer the oldest cached
   // update_id so we don't miss updates that other loops have already pulled in.
@@ -531,7 +572,10 @@ export function resolveStartOffset(
       Infinity,
     );
     if (Number.isFinite(minCached) && minCached > 0 && (startOffset === 0 || minCached < startOffset)) {
-      startOffset = minCached;
+      // seedFloor (e.g. globalOffset for a brand-new --convo) takes precedence
+      // over cache-min: a new convo must NOT replay updates that landed before
+      // it was allocated.
+      startOffset = Math.max(seedFloor, minCached);
     }
   }
 
@@ -596,7 +640,7 @@ export function pruneCache(maxEntries = 500, cacheFile = UPDATES_CACHE_FILE) {
   if (all.length <= maxEntries) return;
   const kept = all.slice(-maxEntries);
   fs.mkdirSync(path.dirname(cacheFile), { recursive: true });
-  const tmp = cacheFile + `.${Date.now()}.tmp`;
+  const tmp = cacheFile + `.${process.pid}.${Date.now()}.tmp`;
   fs.writeFileSync(tmp, kept.map((u) => JSON.stringify(u)).join('\n') + '\n', 'utf8');
   fs.renameSync(tmp, cacheFile);
 }
@@ -680,7 +724,11 @@ export async function reactToMessages(token, messages) {
  * Anything else is logged so a future macOS/kernel quirk is visible, not silent.
  */
 export function isProcessAlive(pid) {
-  if (!Number.isFinite(pid) || pid <= 0) return false;
+  // Reject PID 1 (init/launchd) explicitly — a listener reparented to init
+  // would otherwise look "alive forever" because kill(1,0) returns EPERM and
+  // we treat that as alive. There is no legitimate scenario for the Monitor
+  // wrapper to be PID 1, so refuse it.
+  if (!Number.isFinite(pid) || pid <= 1) return false;
   try {
     process.kill(pid, 0);
     return true;
@@ -812,6 +860,7 @@ export async function refreshRegistry({
   pid,
   filter,
   offsetFile,
+  convoId = null,
   file = REGISTRY_FILE,
   lockFile = REGISTRY_LOCK_FILE,
   now = Date.now(),
@@ -833,8 +882,9 @@ export async function refreshRegistry({
     const existing = all.find((e) => e.pid === pid);
     const mine = {
       pid,
-      filter,
+      filter: filter instanceof Set ? Array.from(filter) : filter,
       offsetFile,
+      convoId,
       startedAt: existing && Number.isFinite(existing.startedAt) ? existing.startedAt : now,
       // If a transient `ps` failure returned null, keep the prior valid startTime
       // rather than downgrade liveness checks to fallback mode next round.
@@ -866,18 +916,44 @@ export async function refreshRegistry({
  */
 export function isStrictSuperset(otherFilter, myFilter) {
   if (myFilter == null || otherFilter == null) return false;
-  const mineArr = Array.isArray(myFilter) ? myFilter : [myFilter];
-  const otherArr = Array.isArray(otherFilter) ? otherFilter : [otherFilter];
-  const mineSet = new Set(mineArr);
-  const otherSet = new Set(otherArr);
+  const toSet = (v) =>
+    v instanceof Set ? v
+    : Array.isArray(v) ? new Set(v)
+    : new Set([v]);
+  const mineSet = toSet(myFilter);
+  const otherSet = toSet(otherFilter);
   if (otherSet.size <= mineSet.size) return false; // must be strictly larger
   for (const m of mineSet) if (!otherSet.has(m)) return false;
   return true;
 }
 
-export function findSuperseder({ myPid, myFilter, registry }) {
+// Same-convo winner: newer `startedAt` wins; tie-break by lower `pid`. Returns
+// positive if A wins, negative if B wins, 0 only if pid and startedAt match
+// (same physical entry).
+export function compareSameConvo(a, b) {
+  const aT = Number.isFinite(a.startedAt) ? a.startedAt : 0;
+  const bT = Number.isFinite(b.startedAt) ? b.startedAt : 0;
+  if (aT !== bT) return aT - bT; // higher startedAt wins
+  return b.pid - a.pid; // lower pid wins on tie
+}
+
+export function findSuperseder({ myPid, myFilter, myConvoId = null, registry }) {
+  // Locate my own registry row up front. If it's missing (read-only-fallback
+  // path or eviction), treat the supersede check as inconclusive — return a
+  // sentinel that the caller interprets as "retry next poll".
+  const mineEntry = registry.find((x) => x.pid === myPid);
   for (const e of registry) {
     if (e.pid === myPid) continue;
+    // Cross-mode never supersedes (convo vs legacy).
+    const eConvo = e.convoId ?? null;
+    if ((myConvoId == null) !== (eConvo == null)) continue;
+    if (myConvoId != null) {
+      // Same-mode convo: peer with same convoId wins by (startedAt, pid).
+      if (eConvo !== myConvoId) continue;
+      if (!mineEntry) return { __inconclusive: true, reason: 'my-entry-missing' };
+      if (compareSameConvo(e, mineEntry) > 0) return e;
+      continue;
+    }
     if (isStrictSuperset(e.filter, myFilter)) return e;
   }
   return null;
@@ -950,6 +1026,43 @@ function pruneAttachmentDirs(baseDir, globalOffset, promptDir) {
   }
 }
 
+// Append admin reply rows into the convo tree under convoId. Skips messageIds
+// already present (any convo). De-dupes within the batch. On lock-timeout
+// returns {ok:false} — caller MUST skip the subsequent prompt write so the
+// agent doesn't process replies whose reply-to chain we can't route later.
+async function recordAdminMessagesInConvo({ messages, convoId, botId, registryFile = CONVO_REGISTRY_FILE, lockFile = CONVO_LOCK_FILE }) {
+  if (!messages.length || convoId == null) return { ok: true };
+  const acquired = await acquireConvoLock(lockFile);
+  if (!acquired) {
+    console.error('[tele-listen] convo-registry lock-timeout — admin messageId recording skipped');
+    return { ok: false, reason: 'lock-timeout' };
+  }
+  try {
+    const { rows } = readConvoRows(registryFile);
+    const existing = new Set();
+    for (const r of rows) {
+      if (typeof r.v === 'number' && r.v > CONVO_SCHEMA_VERSION) continue;
+      if (r.botId !== botId) continue;
+      existing.add(`${r.chatId}:${r.messageId}`);
+    }
+    const seenInBatch = new Set();
+    for (const { msg } of messages) {
+      const chatId = String(msg.chat.id);
+      const messageId = msg.message_id;
+      const key = `${chatId}:${messageId}`;
+      if (existing.has(key) || seenInBatch.has(key)) continue;
+      seenInBatch.add(key);
+      appendConvoRow(
+        { v: CONVO_SCHEMA_VERSION, convoId, messageId, chatId, botId, ts: Date.now(), sender: 'admin' },
+        registryFile,
+      );
+    }
+  } finally {
+    releaseConvoLock(lockFile);
+  }
+  return { ok: true };
+}
+
 async function main() {
   let args;
   try {
@@ -958,7 +1071,33 @@ async function main() {
     console.error(`[tele-listen] ${e instanceof Error ? e.message : String(e)}`);
     process.exit(1);
   }
-  const { filterReplyTo, offsetFile } = args;
+  let { filterReplyTo, offsetFile, offsetFileProvided, convo, legacyFilter } = args;
+
+  // Env resolution.
+  // - No --convo / --filter-reply-to → consult env.
+  // - --filter-reply-to + env set → mode mismatch. Pass `--legacy-filter` to
+  //   intentionally bypass the env (operator debugging an old IDS loop on a
+  //   machine where CLAUDE_CODE_SESSION_ID is always set).
+  if (filterReplyTo != null && convo == null && !legacyFilter) {
+    // Check raw env presence, not parseability. A future runtime change to a
+    // non-UUID id would yield convoId=null but the agent IS in a session;
+    // legacy mode would silently mis-route admin replies.
+    const envName = ['CLAUDE_CODE_SESSION_ID', 'CODEX_THREAD_ID']
+      .find((n) => process.env[n] != null && process.env[n] !== '');
+    if (envName) {
+      console.error(
+        `[tele-listen] --filter-reply-to is incompatible with ${envName} env (send-side is in convo mode). ` +
+        `Drop --filter-reply-to OR pass --legacy-filter to override.`,
+      );
+      process.exit(1);
+    }
+  }
+  if (convo == null && filterReplyTo == null) {
+    const r = resolveConvoIdFromEnv({ argConvo: null });
+    if (r.convoId != null) convo = r.convoId;
+  }
+  // Note: `--convo` overrides env (explicit > implicit). No disagreement
+  // check — the operator's explicit value is authoritative for the listener.
 
   // Ensure the shared tmp dir exists before any writer touches it. Several
   // codepaths (audit log, atomicWriteFileSync, lock files) recreate it on
@@ -977,26 +1116,77 @@ async function main() {
     process.exit(1);
   }
 
-  // Registry-based supersede: if another live listener has a strict-superset
-  // filter (= the same conversation moved to a newer Monitor with broader IDS),
-  // self-exit cleanly so the outer `until ...; do sleep 12; done` loop ends and
-  // the orphaned wrapper goes away. We track by PPID — the long-lived bash
-  // wrapper — not our own PID, which is short-lived (one poll per invocation).
-  //
-  // We refresh BEFORE the promptFile/processingFile checks below so the
-  // registry stays current even when this poll is a no-op (peers must see us).
+  const botId = extractBotId(token);
+  let mode = 'legacy';
+  let convoMalformed = 0;
+
+  if (convo != null) {
+    mode = 'convo';
+    // Synthesize a per-(convo,ppid) offset file when the operator didn't pass
+    // one. PPID = the bash wrapper (`until ... done`) that re-spawns
+    // tele-listen each iteration — stable across iterations so the offset
+    // progresses; rotates when Monitor itself restarts (new wrapper). Convo
+    // isolates across conversations.
+    if (!offsetFileProvided) {
+      offsetFile = path.join(DEFAULT_TMP_DIR, `convo-${convo}-${process.ppid}-offset.txt`);
+    }
+    const { rows, malformed } = readConvoRows();
+    convoMalformed = malformed;
+    const set = buildConvoFilter(rows, convo, botId, adminIds);
+    if (set.size === 0) {
+      // Crash-window hint: if sent-registry has a matching allocation row, the
+      // operator can repair via import-convo before the next poll.
+      const sent = readSentRegistry();
+      // Match either the convoId field (modern; env-derived convos) OR
+      // messageId === convo (legacy / new-convo case).
+      const allocCandidate = sent.find((r) =>
+        (r.convoId === convo || r.messageId === convo)
+        && (r.botId == null || r.botId === botId),
+      );
+      if (allocCandidate) {
+        console.error(
+          `[tele-listen] convo ${convo} has no registered messages for bot ${botId} / chats ${adminIds.join(',')}, ` +
+          `but sent-registry has a matching allocation send. Run: node ${__dirname}/import-convo.mjs --convo ${convo} --bot ${botId}`,
+        );
+      } else {
+        console.error(`[tele-listen] convo ${convo} has no registered messages for bot ${botId} / chats ${adminIds.join(',')}`);
+      }
+      // Exit WITHOUT advancing the offset; offset stays put so a successful
+      // repair resumes routing on the next poll.
+      process.exit(1);
+    }
+    filterReplyTo = set;
+    if (malformed > 0) {
+      console.error(`[tele-listen] convo-registry: ${malformed} malformed line(s) skipped this poll`);
+    }
+  }
+
+  // Registry-based supersede.
   const myMonitorPid = process.ppid;
-  const registry = await refreshRegistry({ pid: myMonitorPid, filter: filterReplyTo, offsetFile });
-  const superseder = findSuperseder({ myPid: myMonitorPid, myFilter: filterReplyTo, registry });
+  if (myMonitorPid <= 1) {
+    console.error('[tele-listen] refusing to run with reparented PPID ≤ 1 (init/launchd) — Monitor wrapper appears dead');
+    process.exit(1);
+  }
+  const registry = await refreshRegistry({ pid: myMonitorPid, filter: filterReplyTo, offsetFile, convoId: convo });
+  const superseder = findSuperseder({ myPid: myMonitorPid, myFilter: filterReplyTo, myConvoId: convo, registry });
+  if (superseder && superseder.__inconclusive) {
+    console.log(`[tele-listen] supersede check inconclusive (${superseder.reason}); retry next poll`);
+    process.exit(2);
+  }
   if (superseder) {
     console.log(
-      `[tele-listen] superseded by listener pid=${superseder.pid} with broader filter — exiting`,
+      `[tele-listen] superseded by listener pid=${superseder.pid} — exiting`,
     );
     process.exit(0);
   }
 
-  const promptFile = getPromptFile(filterReplyTo);
-  const processingFile = getProcessingFile(filterReplyTo);
+  // Prompt file path: stable per-convo for `--convo`, filter-keyed for legacy.
+  const promptFile = convo != null
+    ? path.join(DEFAULT_TMP_DIR, `prompt-convo-${convo}.json`)
+    : getPromptFile(filterReplyTo);
+  const processingFile = convo != null
+    ? path.join(DEFAULT_TMP_DIR, `prompt-convo-${convo}.processing.json`)
+    : getProcessingFile(filterReplyTo);
 
   if (fs.existsSync(processingFile)) {
     console.log(`[tele-listen] ${path.basename(processingFile)} exists — still processing, skipping`);
@@ -1017,10 +1207,15 @@ async function main() {
   let fetchFailed = false;
   let pendingOrphans = [];
   let systemMsgIdsSnapshot = new Set();
+  // Captured before fetch so a brand-new --convo listener that runs in the
+  // same poll an admin reply arrives in does not seed past the reply's
+  // update_id. The post-fetch writeOffset(maxUpdateId+1) would otherwise make
+  // the seed-floor land above every update fetched this same poll.
+  let preFetchGlobalOffset = readOffset(GLOBAL_OFFSET_FILE);
   const lockAcquired = acquirePollLock();
   if (lockAcquired) {
     try {
-      const globalOffset = readOffset(GLOBAL_OFFSET_FILE);
+      const globalOffset = preFetchGlobalOffset;
       const fetched = await fetchUpdates(token, globalOffset);
       if (fetched.length > 0) {
         systemMsgIdsSnapshot = readSystemMsgIds();
@@ -1089,7 +1284,12 @@ async function main() {
   // new loop's offset would have pointed at, and the subsequent cache read
   // would then yield only newer entries while `advanceLoopOffset` jumped past
   // the now-deleted ones, permanently skipping any matching updates.
-  const loopOffset = resolveStartOffset(offsetFile);
+  const loopOffset = resolveStartOffset(
+    offsetFile,
+    GLOBAL_OFFSET_FILE,
+    UPDATES_CACHE_FILE,
+    convo != null ? preFetchGlobalOffset : 0,
+  );
 
   // Read from local cache using per-loop offset.
   let updates = readCacheSinceOffset(loopOffset);
@@ -1098,7 +1298,7 @@ async function main() {
     process.exit(1);
   }
 
-  const toProcess = collectMessagesToProcess(updates, adminIds, filterReplyTo);
+  const toProcess = collectMessagesToProcess(updates, adminIds, filterReplyTo, mode);
 
   const advanceLoopOffset = () => {
     if (updates.length > 0) {
@@ -1112,11 +1312,48 @@ async function main() {
     process.exit(2);
   }
 
-  let data;
-  data = buildCombinedPromptData(toProcess, extractBotId(token));
+  const data = buildCombinedPromptData(toProcess, extractBotId(token), convo);
   if (data.attachments.length) {
     const baseDir = path.join(path.dirname(promptFile), 'attachments');
     await downloadAttachments(token, data.attachments, baseDir);
+  }
+  // Record each matched admin reply into the convo tree BEFORE writing the
+  // prompt. If the listener is SIGKILL'd between admin-record and prompt-write,
+  // the prompt is absent → agent doesn't process → next poll replays the admin
+  // messages (still in cache, per-loop offset unchanged). Recording-first means
+  // a future bot `--reply-to <X>` routes back via lookupConvoIdByMessageId
+  // even if the agent never got the prompt. Skip if convoId unknown.
+  if (convo != null) {
+    const rec = await recordAdminMessagesInConvo({ messages: toProcess, convoId: convo, botId });
+    if (!rec.ok) {
+      // Lock timed out → admin msgIds NOT in registry. Skip the prompt write
+      // so the agent doesn't process replies whose reply-to chain we can't
+      // route later. Per-loop offset stays put (no advance below) → next poll
+      // replays from cache.
+      console.error('[tele-listen] skipping prompt write due to admin-record lock-timeout; will retry next poll');
+      process.exit(2);
+    }
+  }
+  // Same-convo prompt-write race guard: re-check listener-registry immediately
+  // before writing the prompt so a peer that registered after our last check
+  // can still take precedence (otherwise both peers would write the same
+  // prompt-convo-<N>.json path, and the second writer's rename clobbers the
+  // first — one prompt silently lost).
+  if (convo != null) {
+    const fresh = readRegistry();
+    const mineEntry = fresh.find((e) => e.pid === myMonitorPid);
+    if (!mineEntry) {
+      console.log('[tele-listen] my registry row missing pre-write; deferring to next poll');
+      process.exit(2);
+    }
+    for (const e of fresh) {
+      if (e.pid === myMonitorPid) continue;
+      if ((e.convoId ?? null) !== convo) continue;
+      if (compareSameConvo(e, mineEntry) > 0) {
+        console.log(`[tele-listen] same-convo peer pid=${e.pid} won pre-write race — exiting`);
+        process.exit(0);
+      }
+    }
   }
   writePromptAtomic(data, promptFile);
   // React 👍 AFTER successful prompt write to avoid false ack on failure.
