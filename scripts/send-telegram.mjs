@@ -20,6 +20,16 @@ import {
   releaseLock as releaseConvoLock,
   validateConvoIdString,
 } from './convo-registry.mjs';
+import {
+  clearThreadId,
+  getThreadId,
+  isNoTopicSupportFresh,
+  readTopicsStore,
+  recordNoTopicSupport,
+  recordThreadId,
+  updateTopicsStore,
+  writeTopicsStore,
+} from './topics-store.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT_DIR = path.resolve(__dirname, '..');
@@ -532,9 +542,10 @@ export function createTempMarkdownFile(content, tmpDir = os.tmpdir()) {
   return filePath;
 }
 
-async function postSendMessage(token, chatId, text, parseMode, replyToMessageId) {
+async function postSendMessage(token, chatId, text, parseMode, replyToMessageId, messageThreadId = null) {
   const payload = { chat_id: chatId, text };
   if (parseMode) payload.parse_mode = parseMode;
+  if (messageThreadId != null) payload.message_thread_id = messageThreadId;
   if (replyToMessageId != null) {
     payload.reply_parameters = { message_id: replyToMessageId, allow_sending_without_reply: true };
   }
@@ -552,9 +563,10 @@ async function postSendMessage(token, chatId, text, parseMode, replyToMessageId)
   };
 }
 
-async function postSendDocument(token, chatId, filePath, caption, parseMode, replyToMessageId) {
+async function postSendDocument(token, chatId, filePath, caption, parseMode, replyToMessageId, messageThreadId = null) {
   const form = new FormData();
   form.append('chat_id', String(chatId));
+  if (messageThreadId != null) form.append('message_thread_id', String(messageThreadId));
   const data = fs.readFileSync(filePath);
   form.append('document', new Blob([data]), path.basename(filePath));
   if (caption) {
@@ -570,12 +582,103 @@ async function postSendDocument(token, chatId, filePath, caption, parseMode, rep
 }
 
 /**
+ * Attempt to create a forum topic. Returns `{ ok, messageThreadId, description }`.
+ * Failure modes we treat as "this chat doesn't support topics":
+ * - HTTP 400 with descriptions like TOPIC_CREATE_DISABLED, FORUM_NOT_ENABLED,
+ *   CHAT_FORUM_REQUIRED, BOT_DOMAIN_INVALID, or any 403 (permission).
+ * Caller wraps the result; non-ok → negative cache + send without thread_id.
+ */
+async function createForumTopic(token, chatId, name) {
+  const payload = { chat_id: chatId, name: String(name).slice(0, 128) };
+  const res = await fetch(`${TELEGRAM_API}${token}/createForumTopic`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  const body = await res.json().catch(() => ({}));
+  return {
+    ok: res.ok && body?.ok === true,
+    status: res.status,
+    description: body?.description,
+    messageThreadId: body?.result?.message_thread_id ?? null,
+  };
+}
+
+/**
+ * Resolve the `message_thread_id` to use for a (chatId, projectCode) pair.
+ *
+ * Returns `null` if no topic should be used — either silently because the
+ * chat doesn't support topics (negative cache active), or because the API
+ * call to create one failed. All paths are silent: this function never
+ * throws, never logs warnings to user-visible stdout. Topic discovery is
+ * opportunistic; sends always proceed.
+ *
+ * `nowFn` and `topicsFile` are injectable for tests.
+ */
+// Telegram error descriptions / statuses that imply "this chat can never host
+// topics from this bot" (vs. transient errors like 429 / network glitch).
+// Only these set the negative cache; transient errors silently fall back
+// without caching, so the next send retries.
+function isPermanentNoTopicError(res) {
+  if (!res) return true; // fetch itself threw
+  if (res.status === 403) return true; // bot lacks permission
+  const d = String(res.description ?? '');
+  return /CHAT_FORUM_REQUIRED|TOPICS_FORBIDDEN|TOPIC_NOT_MODIFIED|FORUM_NOT_ENABLED|NOT_FORUM|TOPIC_CREATE_DISABLED|chat not found|user is deactivated|bot was kicked|not enough rights/i.test(d);
+}
+
+export async function resolveThreadId({ token, chatId, projectCode, nowFn = Date.now, topicsFile, fetcher = createForumTopic }) {
+  if (!projectCode || projectCode.startsWith('_')) return null;
+  // Best-effort: cache reads/writes must never block sending.
+  let store;
+  try { store = readTopicsStore(topicsFile); } catch { return null; }
+  // 1. Positive cache hit — use immediately.
+  const cached = getThreadId(store, chatId, projectCode);
+  if (cached != null) return cached;
+  // 2. Negative cache still fresh — skip API call.
+  if (isNoTopicSupportFresh(store, chatId, nowFn())) return null;
+  // 3. Try create.
+  let res;
+  try {
+    res = await fetcher(token, chatId, projectCode);
+  } catch {
+    res = null; // fetch threw — treat as permanent
+  }
+  if (res && res.ok && res.messageThreadId != null) {
+    // Locked RMW so we don't clobber a sibling process's positive entry.
+    try { updateTopicsStore((s) => recordThreadId(s, chatId, projectCode, res.messageThreadId), topicsFile); } catch {}
+    return res.messageThreadId;
+  }
+  // Transient errors (rate-limit / network) — don't poison the cache, just
+  // skip topic this send. Permanent errors (no permission / forum disabled)
+  // → negative-cache for 1h to avoid hammering Telegram.
+  if (isPermanentNoTopicError(res)) {
+    try { updateTopicsStore((s) => recordNoTopicSupport(s, chatId, nowFn()), topicsFile); } catch {}
+  }
+  return null;
+}
+
+/**
+ * Detect responses that mean "the thread_id we sent no longer exists".
+ * Triggers recovery: clear positive cache for that (chatId, projectCode)
+ * and retry the send without thread_id.
+ */
+export function isTopicGoneError(description) {
+  if (!description) return false;
+  return /MESSAGE_THREAD_NOT_FOUND|TOPIC_DELETED|TOPIC_CLOSED/i.test(description);
+}
+
+export function dropTopicMapping(chatId, projectCode, topicsFile) {
+  // Best-effort: a cache write failure must never block the send retry.
+  try { updateTopicsStore((s) => clearThreadId(s, chatId, projectCode), topicsFile); } catch {}
+}
+
+/**
  * Returns { ok, fallback } — `fallback: true` means Telegram rejected our
  * MarkdownV2 parse and we re-sent the chunk as a temporary `.md` document so
  * the admin still receives the content with its markdown source intact
  * (readable in Telegram's file preview), instead of collapsing to plain text.
  */
-export async function sendTextChunk(token, chatId, rawChunk, { raw, plain, replyTo = null }) {
+export async function sendTextChunk(token, chatId, rawChunk, { raw, plain, replyTo = null, messageThreadId = null }) {
   // Helper: refuse to claim success if Telegram returned ok with no message_id.
   // The agent relies on the printed messageId to start its reply listener; a
   // silent miss would log a successful send but leave the agent unable to
@@ -586,12 +689,12 @@ export async function sendTextChunk(token, chatId, rawChunk, { raw, plain, reply
   };
 
   if (plain) {
-    const res = await postSendMessage(token, chatId, rawChunk, null, replyTo);
+    const res = await postSendMessage(token, chatId, rawChunk, null, replyTo, messageThreadId);
     if (res.ok) return { ok: true, fallback: false, messageId: assertMessageId(res, 'plain send') };
     throw new Error(res.description ?? `HTTP ${res.status}`);
   }
   const payload = raw ? rawChunk : escapeMarkdownV2(rawChunk);
-  const first = await postSendMessage(token, chatId, payload, 'MarkdownV2', replyTo);
+  const first = await postSendMessage(token, chatId, payload, 'MarkdownV2', replyTo, messageThreadId);
   if (first.ok) return { ok: true, fallback: false, messageId: assertMessageId(first, 'markdown send') };
 
   const desc = first.description ?? `HTTP ${first.status}`;
@@ -604,7 +707,7 @@ export async function sendTextChunk(token, chatId, rawChunk, { raw, plain, reply
     }
     try {
       const firstLine = previewLineWithHashtag(rawChunk);
-      const retry = await postSendDocument(token, chatId, tmpPath, firstLine, null, replyTo);
+      const retry = await postSendDocument(token, chatId, tmpPath, firstLine, null, replyTo, messageThreadId);
       if (retry.ok) return { ok: true, fallback: true, messageId: assertMessageId(retry, 'markdown-file fallback') };
       throw new Error(`markdown-file fallback upload failed: ${retry.description ?? `HTTP ${retry.status}`}`);
     } finally {
@@ -636,7 +739,7 @@ async function sendTextToAdmin(token, chatId, text, opts) {
     }
     try {
       const firstLine = previewLineWithHashtag(text);
-      const res = await postSendDocument(token, chatId, tmpPath, firstLine, null, opts.replyTo ?? null);
+      const res = await postSendDocument(token, chatId, tmpPath, firstLine, null, opts.replyTo ?? null, opts.messageThreadId ?? null);
       if (!res.ok) throw new Error(`long-message file fallback upload failed: ${res.description ?? `HTTP ${res.status}`}`);
       if (!res.messageId) throw new Error(`long-message file fallback: Telegram returned ok but no message_id — refusing to claim success`);
       return {
@@ -673,12 +776,13 @@ async function sendDocumentToAdmin(token, chatId, filePath, caption, opts) {
       parseMode = 'MarkdownV2';
     }
   }
-  const first = await postSendDocument(token, chatId, filePath, finalCaption, parseMode, opts.replyTo);
+  const thread = opts.messageThreadId ?? null;
+  const first = await postSendDocument(token, chatId, filePath, finalCaption, parseMode, opts.replyTo, thread);
   if (first.ok) return { fallback: false, messageId: first.messageId };
 
   const desc = first.description ?? `HTTP ${first.status}`;
   if (parseMode && /can't parse entities|can\u2019t parse entities/i.test(desc)) {
-    const retry = await postSendDocument(token, chatId, filePath, caption.slice(0, CAPTION_LIMIT), null, opts.replyTo);
+    const retry = await postSendDocument(token, chatId, filePath, caption.slice(0, CAPTION_LIMIT), null, opts.replyTo, thread);
     if (retry.ok) return { fallback: true, messageId: retry.messageId };
     throw new Error(retry.description ?? `HTTP ${retry.status}`);
   }
@@ -771,7 +875,19 @@ async function main() {
       try {
         let convoIdForSend = resolveConvoIdPreSend({ preResolved, replyTo: args.replyTo, chatId, botId });
         const caption = injectConvoHash(rawCaption, projectCode, convoIdForSend, { pretokensEscaped: opts.raw });
-        const { fallback, messageId } = await sendDocumentToAdmin(token, chatId, args.filePath, caption, opts);
+        const threadId = await resolveThreadId({ token, chatId, projectCode });
+        let sendOpts = { ...opts, messageThreadId: threadId };
+        let result;
+        try {
+          result = await sendDocumentToAdmin(token, chatId, args.filePath, caption, sendOpts);
+        } catch (e) {
+          if (threadId != null && isTopicGoneError(e instanceof Error ? e.message : String(e))) {
+            dropTopicMapping(chatId, projectCode);
+            sendOpts = { ...opts, messageThreadId: null };
+            result = await sendDocumentToAdmin(token, chatId, args.filePath, caption, sendOpts);
+          } else { throw e; }
+        }
+        const { fallback, messageId } = result;
         if (convoIdForSend == null) convoIdForSend = messageId; // new convo
         appendToSentRegistry({ messageId, chatId, botId, convoId: convoIdForSend });
         const recordedConvoId = await maybeRecordConvo({ convoId: convoIdForSend, messageId, chatId, botId });
@@ -816,7 +932,19 @@ async function main() {
     try {
       let convoIdForSend = resolveConvoIdPreSend({ preResolved, replyTo: args.replyTo, chatId, botId });
       const message = injectConvoHash(rawMessage, projectCode, convoIdForSend, { pretokensEscaped: opts.raw });
-      const { fallback, messageId, allMessageIds } = await sendTextToAdmin(token, chatId, message, opts);
+      const threadId = await resolveThreadId({ token, chatId, projectCode });
+      let sendOpts = { ...opts, messageThreadId: threadId };
+      let result;
+      try {
+        result = await sendTextToAdmin(token, chatId, message, sendOpts);
+      } catch (e) {
+        if (threadId != null && isTopicGoneError(e instanceof Error ? e.message : String(e))) {
+          dropTopicMapping(chatId, projectCode);
+          sendOpts = { ...opts, messageThreadId: null };
+          result = await sendTextToAdmin(token, chatId, message, sendOpts);
+        } else { throw e; }
+      }
+      const { fallback, messageId, allMessageIds } = result;
       if (convoIdForSend == null) convoIdForSend = messageId; // new convo
       for (const mid of allMessageIds) appendToSentRegistry({ messageId: mid, chatId, botId, convoId: convoIdForSend });
       const recordedConvoId = await maybeRecordConvo({ convoId: convoIdForSend, messageId, chatId, botId });
