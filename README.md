@@ -33,6 +33,7 @@ The parent folder name doesn't matter — what matters is that `teleport/` is a 
 - **Bot token:** open [@BotFather](https://t.me/BotFather) on Telegram → `/newbot` → follow prompts → copy the token.
 - **Personal chat ID:** open [@userinfobot](https://t.me/userinfobot) → press *Start* → copy your numeric ID.
 - **For a team group chat:** create a group, add your bot + people + [@RawDataBot](https://t.me/RawDataBot) → RawDataBot instantly prints the group ID (a negative number) → remove RawDataBot when done.
+- **(Optional) Multiple projects → enable Topics:** if you'll run teleport from more than one project, enable forum topics so each project lands in its own thread. In [@BotFather](https://t.me/BotFather): `/mybots` → select your bot → `Bot Settings` → `Topics` → *Enable*. Teleport auto-creates one topic per project (named after the cwd basename) on first send. No further setup; if Topics stays off, sends still work and just share one thread.
 
 ### 3. Fill `.env`
 
