@@ -1141,13 +1141,17 @@ async function main() {
 
   if (convo != null) {
     mode = 'convo';
-    // Synthesize a per-(convo,ppid) offset file when the operator didn't pass
-    // one. PPID = the bash wrapper (`until ... done`) that re-spawns
-    // tele-listen each iteration — stable across iterations so the offset
-    // progresses; rotates when Monitor itself restarts (new wrapper). Convo
-    // isolates across conversations.
+    // Synthesize a stable per-convo offset file when the operator didn't
+    // pass one. Must NOT be scoped by ppid: the recommended `until node …;
+    // do sleep …; done` pattern (and any Monitor restart) creates a fresh
+    // wrapper ppid, and a per-ppid offset would start at 0 → resolveStartOffset
+    // replays cached updates the previous wrapper already handled, re-emitting
+    // messages whose prompts have been consumed. Same reasoning as the
+    // `--wait-once` supervisor uses for its own stable offset path.
+    // Concurrent same-convo listeners are prevented by listener-registry
+    // supersede + atomicWriteFileSync, so a single shared file is safe.
     if (!offsetFileProvided) {
-      offsetFile = path.join(DEFAULT_TMP_DIR, `convo-${convo}-${process.ppid}-offset.txt`);
+      offsetFile = path.join(DEFAULT_TMP_DIR, `convo-${convo}-offset.txt`);
     }
     const { rows, malformed } = readConvoRows();
     convoMalformed = malformed;
