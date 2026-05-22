@@ -10,7 +10,7 @@ import {
   resolveConvoIdFromEnv, uuidToConvoInt, validateConvoIdString,
 } from './convo-registry.mjs';
 import { appendToSentRegistry, parseArgs as parseSendArgs, readSentRegistry } from './send-telegram.mjs';
-import { parseArgs as parseListenArgs, compareSameConvo, filterAdminMessages } from './tele-listen.mjs';
+import { parseArgs as parseListenArgs, compareSameConvo, filterAdminMessages, resolveStartOffset } from './tele-listen.mjs';
 
 function tmpFile() {
   return path.join(os.tmpdir(), `convo-reg-test-${Date.now()}-${Math.random().toString(36).slice(2)}.jsonl`);
@@ -248,6 +248,44 @@ test('filterAdminMessages — legacy mode matches by messageId only', () => {
   ];
   const matched = filterAdminMessages(updates, [], 100, 'legacy');
   assert.strictEqual(matched.length, 2); // both match in legacy mode
+});
+
+test('resolveStartOffset — convo listener can replay cached replies fetched by another loop', () => {
+  const offsetFile = tmpFile();
+  const globalFile = tmpFile();
+  const cacheFile = tmpFile();
+  fs.writeFileSync(globalFile, '200', 'utf8');
+  fs.writeFileSync(cacheFile, [
+    JSON.stringify({ update_id: 100, message: { text: 'late cached reply' } }),
+    JSON.stringify({ update_id: 220, message: { text: 'newer reply' } }),
+  ].join('\n') + '\n', 'utf8');
+
+  const start = resolveStartOffset(offsetFile, globalFile, cacheFile, 0);
+
+  assert.strictEqual(start, 100);
+  assert.strictEqual(fs.readFileSync(offsetFile, 'utf8'), '100');
+  fs.unlinkSync(offsetFile);
+  fs.unlinkSync(globalFile);
+  fs.unlinkSync(cacheFile);
+});
+
+test('resolveStartOffset — explicit seedFloor still prevents pre-allocation replay', () => {
+  const offsetFile = tmpFile();
+  const globalFile = tmpFile();
+  const cacheFile = tmpFile();
+  fs.writeFileSync(globalFile, '200', 'utf8');
+  fs.writeFileSync(cacheFile, [
+    JSON.stringify({ update_id: 100, message: { text: 'old cached reply' } }),
+    JSON.stringify({ update_id: 220, message: { text: 'newer reply' } }),
+  ].join('\n') + '\n', 'utf8');
+
+  const start = resolveStartOffset(offsetFile, globalFile, cacheFile, 200);
+
+  assert.strictEqual(start, 200);
+  assert.strictEqual(fs.readFileSync(offsetFile, 'utf8'), '200');
+  fs.unlinkSync(offsetFile);
+  fs.unlinkSync(globalFile);
+  fs.unlinkSync(cacheFile);
 });
 
 test('pruneLocked — preserves allocation rows + newest non-allocation rows', async () => {

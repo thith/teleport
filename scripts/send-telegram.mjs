@@ -772,21 +772,19 @@ async function maybeRecordConvo({ convoId, messageId, chatId, botId }) {
 // missing despite running Claude, the agent still has its Monitor tool.
 // Two cases:
 //   1. Claude (CLAUDE_CODE_SESSION_ID set) → Monitor tool.
-//   2. Other → foreground loop + --watch daemon + don't end your turn.
+//   2. Other → foreground --watch loop + don't end your turn.
 function listenerHintForCurrentAgent(convoId) {
   const convoArg = convoId != null ? ` --convo ${convoId}` : '';
   if (process.env.CLAUDE_CODE_SESSION_ID) {
     return `[send-telegram] ⚠️ Start a reply listener via Monitor: \`until node ../teleport/scripts/tele-listen.mjs${convoArg}; do sleep 12; done\``;
   }
   const lines = [
-    `[send-telegram] ⚠️ Start a persistent watcher: \`node ../teleport/scripts/tele-listen.mjs --watch${convoArg} &\``,
+    `[send-telegram] ⚠️ Start a foreground watcher: \`node ../teleport/scripts/tele-listen.mjs --watch${convoArg}\``,
     `[send-telegram] ⚠️ Do NOT end your turn / send a "final" or similar response while waiting for replies.`,
   ];
   if (convoId != null) {
     lines.push(
-      `[send-telegram]    Keep the turn active and poll the watcher:`,
-      `[send-telegram]      \`export CONVO_ID=${convoId}\``,
-      `[send-telegram]      \`until [ -f ../teleport/scripts/tmp/tele-reply/prompt-convo-$CONVO_ID.json ]; do sleep 5; done\``,
+      `[send-telegram]    Keep the command session open until it prints \`prompt written to .../prompt-convo-${convoId}.json\`.`,
       `[send-telegram]    When the prompt appears: read JSON → reply via send-telegram → delete the JSON → loop.`,
     );
   } else {

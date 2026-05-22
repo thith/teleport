@@ -1215,10 +1215,8 @@ async function main() {
   let fetchFailed = false;
   let pendingOrphans = [];
   let systemMsgIdsSnapshot = new Set();
-  // Captured before fetch so a brand-new --convo listener that runs in the
-  // same poll an admin reply arrives in does not seed past the reply's
-  // update_id. The post-fetch writeOffset(maxUpdateId+1) would otherwise make
-  // the seed-floor land above every update fetched this same poll.
+  // Captured before fetch so this poll uses one stable Telegram getUpdates
+  // offset even if another listener advances the global offset concurrently.
   let preFetchGlobalOffset = readOffset(GLOBAL_OFFSET_FILE);
   const lockAcquired = acquirePollLock();
   if (lockAcquired) {
@@ -1296,7 +1294,7 @@ async function main() {
     offsetFile,
     GLOBAL_OFFSET_FILE,
     UPDATES_CACHE_FILE,
-    convo != null ? preFetchGlobalOffset : 0,
+    0,
   );
 
   // Read from local cache using per-loop offset.
@@ -1385,8 +1383,8 @@ async function main() {
 //       2 (no match / superseded / processing) → sleep 5s.
 //   - SIGTERM/SIGINT forwarded to the current child and supervisor exits.
 const BACKOFF_MS = { success: 0, noMatch: 5000, error: 12000, promptExists: 2000 };
-// Singleton lock for the watcher supervisor. Agents may invoke `--watch &`
-// after every send (the hint suggests it); without this guard each invocation
+// Singleton lock for the watcher supervisor. Agents may invoke `--watch`
+// after every send; without this guard each invocation
 // would spawn a redundant supervisor → many parallel watchers polling the
 // same convo. Listener-registry supersede catches the dup at the CHILD level
 // (newer wins) but causes the loser-supervisor to spin in a spawn-die loop.
