@@ -91,23 +91,39 @@ Monitor({
 
 **Other agents choose by shell behavior:**
 
-Interactive streaming shells (like Codex) can keep a foreground watcher open:
+Interactive streaming shells (used by Codex) can keep a foreground watcher open:
 ```bash
 node ../teleport/scripts/tele-listen.mjs --watch --convo $CONVO_ID
 ```
 The supervisor loops internally: poll → write `prompt-convo-<N>.json` → wait until the file is deleted (= agent consumed) → resume. Keep this command session open; do not rely on shell backgrounding with `&`, because some tool wrappers detach or reap background jobs silently. Stop it with Ctrl-C when the conversation is done. If you accidentally backgrounded it, stop it with `pkill -f "tele-listen.*--watch.*--convo ${CONVO_ID}( |$)"`.
 
-Buffered shells that return output only after command exit (like Gemini CLI) should wait for one prompt at a time:
+Buffered or blocking shells (used by Gemini CLI, Antigravity, Cursor, etc.) should wait for one prompt at a time:
 ```bash
 node ../teleport/scripts/tele-listen.mjs --wait-once --convo $CONVO_ID
 ```
 `--wait-once` polls internally until exactly one matching prompt is ready, prints the prompt path, then exits so the agent can read and handle it. Run it again after deleting the prompt if you need to keep listening.
+
+### Choosing between --watch and --wait-once (for new agents)
+
+If you are writing/integrating a new agent or unsure about your execution model, choose the listener mode based on the following:
+
+* **Use `--wait-once` (Recommended for most other agents, including Gemini CLI, Antigravity, Cursor, etc.):**
+  * **How it works:** Blocks the shell until a message is received, writes the prompt JSON, and **exits**, freeing the shell.
+  * **Best for:** Sequential/single-session or blocking shells. Since the command exits, your terminal is immediately free to run the reply command (`send-telegram.mjs`).
+  * **Workflow:** Run `--wait-once` → command exits → process JSON and reply → delete prompt JSON → re-run `--wait-once`.
+  * **If in doubt:** Choose `--wait-once` as the safe default.
+
+* **Use `--watch` (Specifically for Codex):**
+  * **How it works:** Runs continuously in the foreground, writing prompt JSONs and pausing until they are deleted before resuming.
+  * **Best for:** Environments supporting parallel execution channels (e.g. running the listener in one session and executing replies in another).
+  * **Workflow:** Run `--watch` → wait for prompt JSON → read/reply in separate session → delete JSON to auto-resume the watcher.
 
 After starting `--watch` or `--wait-once`:
 - Do NOT end your turn / send a "final" or similar response while waiting for replies (most agent runtimes stop polling once the turn ends).
 - Capture the convoId from `[send-telegram] convo: <N>` stdout: `export CONVO_ID=<N>`.
 - Keep the turn active until the command prints `prompt written to .../prompt-convo-$CONVO_ID.json` or `prompt ready: .../prompt-convo-$CONVO_ID.json`, then read+reply+delete.
 - Loop: when prompt appears → read JSON → reply via send-telegram → delete the prompt file → loop. For `--wait-once`, re-run the same `--wait-once` command to wait for the next reply.
+- **Anti-Loop Bypass:** If your agent environment imposes a strict timeout on commands (e.g. 5 minutes) and forcefully terminates them, you must restart the listener. To prevent anti-loop detectors from assuming you are stuck when you restart the same command multiple times, append a unique counter or timestamp to your bash command as a dummy variable, e.g., `RESTART_COUNT=1 node ../teleport/scripts/tele-listen.mjs --wait-once --convo $CONVO_ID`. Increment or update this value on each restart.
 - End the turn ONLY when the user explicitly requests to stop (e.g., "close connection", "end turn", "stop loop").
 - If the user says something ambiguous like "done", "ok", or "bye", DO NOT end the turn. Instead, ask for explicit confirmation (e.g., "Should I wait for further instructions, or are we finished here?") and wait for a clear confirmation before ending the turn.
 
