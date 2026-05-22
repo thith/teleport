@@ -74,12 +74,9 @@ This is what the agent copies into each config file when you paste the prompt ab
 
 **WHENEVER** the user asks to "send a Telegram report" (or variants: "send via tele", "tele me", "ping me when done", "gửi tele", "báo cáo qua tele", "tele cho tôi khi xong"…), you **MUST** read `../teleport/rules/telegram-guide.md` and follow it. Look up your identity prefix in the guide's prefix table.
 
-Scripts + guide are centralized at `../teleport/` (sibling of every project). Each project keeps no local copy. Invocation:
+Scripts + guide are centralized at `../teleport/` (sibling of every project). Each project keeps no local copy. Do **NOT** rely on any invocation details from memory or from this config snippet; the guide is the single source of truth and may change as Teleport is updated.
 
-- Send: `node ../teleport/scripts/send-telegram.mjs "<message>"` (PROJECT_CODE auto-derived from `basename(cwd)`).
-- Listen: `node ../teleport/scripts/tele-listen.mjs --filter-reply-to <IDS> --offset-file ../teleport/scripts/tmp/tele-reply/<offset-file>`.
-
-After sending, you **MUST immediately** start the reply-listener loop described in the guide's "Listening for Replies" section. Capture the `messageId` from the send output, then start the Monitor (Claude) or foreground loop (Codex / Gemini). **MUST NOT** skip or defer this step even if the task feels complete — the user may reply via Telegram at any time.
+After sending any Telegram message, you **MUST immediately** start the reply-listener flow described in the guide's "Listening for Replies" section. **MUST NOT** skip or defer this step even if the task feels complete — the user may reply via Telegram at any time.
 ````
 
 ## How to use

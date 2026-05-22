@@ -1,6 +1,6 @@
 # Telegram Reporting Guide
 
-> **Paths:** `teleport/` is a sibling of every project. Agents invoke with `cwd = project root` and refer to `../teleport/...`. No absolute paths.
+> **Paths:** `teleport/` is a sibling of every project. Agents normally invoke with `cwd = project root` and refer to `../teleport/...`. Before running any Teleport script, verify the shell working directory: if you are not at the project root, either set `workdir` to the project root first or adjust the relative path to the actual `teleport/scripts/...` location. Do not use absolute paths in reusable instructions.
 
 `node ../teleport/scripts/send-telegram.mjs` sends messages/files to admins in `../teleport/.env`. `[PROJECT]` prefix auto-derived from `basename(cwd)` (override via `TELE_PROJECT_CODE`).
 
