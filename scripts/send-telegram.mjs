@@ -30,6 +30,16 @@ import {
   updateTopicsStore,
   writeTopicsStore,
 } from './topics-store.mjs';
+import {
+  recordBotSend,
+  updatePendingStore,
+} from './pending-store.mjs';
+import { CONVO_HASH_LONG_LEN, shortConvoHash as _shortConvoHash } from './convo-hash.mjs';
+
+// Re-export so existing imports of `shortConvoHash` from send-telegram keep
+// working. Logic now lives in convo-hash.mjs (leaf, no circular deps).
+export { CONVO_HASH_LONG_LEN } from './convo-hash.mjs';
+export const shortConvoHash = _shortConvoHash;
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT_DIR = path.resolve(__dirname, '..');
@@ -367,30 +377,9 @@ const LEADING_EMOJI_RE = /^(?:(?:(?:\p{Regional_Indicator}\p{Regional_Indicator}
 // (18 chars). Hoisted to module scope to avoid recompile per call.
 const MDV2_ALL_SPECIALS_RE = /[_*\[\]()~`>#+\-=|{}.!\\]/g;
 
-// Build the convo-hashtag suffix. Telegram does NOT render pure-numeric
-// `#1234` as clickable — hashtags must contain at least one letter. Scheme:
-//
-// - Long convoId (≥ 8 chars, e.g. Claude/Codex 16-digit env hash):
-//   take the LAST 8 chars; convert the first of those 8 chars from digit→letter
-//   (0→a, 1→b, ..., 9→j). Total length: 8 chars (1 letter + 7 digits).
-//   Example: `2205483045424020` → `45424020` → `e5424020`.
-//
-// - Short convoId (< 8 chars, e.g. Gemini's 4-char id): prepend literal `t` to
-//   satisfy Telegram's "must contain a letter" rule. Total length: original + 1.
-//   Example: `1234` → `t1234`.
-//
-// `last 8` keeps high-entropy tail; sequential convoIds (messageId-as-convoId
-// for brand-new convos) differ most in low digits.
-export const CONVO_HASH_LONG_LEN = 8;
-const DIGIT_TO_LETTER = 'abcdefghij';
-export function shortConvoHash(convoId) {
-  const s = String(convoId);
-  if (s.length < CONVO_HASH_LONG_LEN) return 't' + s;
-  const tail = s.slice(-CONVO_HASH_LONG_LEN);
-  const first = tail.charCodeAt(0) - 48; // '0'..'9' → 0..9
-  const letter = first >= 0 && first <= 9 ? DIGIT_TO_LETTER[first] : 't';
-  return letter + tail.slice(1);
-}
+// `shortConvoHash` and `CONVO_HASH_LONG_LEN` now live in `./convo-hash.mjs`
+// (leaf module — no circular dep with `pending-store.mjs`). Re-exported at
+// the top of this file for backward compat with existing callers.
 
 // Long-message and Markdown-parse fallback captions previously used
 // `text.split('\n')[0].slice(0, 100)` — which silently dropped the injected
@@ -889,7 +878,13 @@ async function main() {
         }
         const { fallback, messageId } = result;
         if (convoIdForSend == null) convoIdForSend = messageId; // new convo
+        // Sent-registry is durable + load-bearing (lookupConvoIdByMessageId
+        // depends on it). Pending-store is opportunistic. Always durable
+        // first; a phantom pending entry (sent succeeded, pending update
+        // failed) is far less harmful than the inverse (pending listed but
+        // sent-registry has no row → admin reply can't be routed).
         appendToSentRegistry({ messageId, chatId, botId, convoId: convoIdForSend });
+        try { updatePendingStore((s) => recordBotSend(s, { convoId: convoIdForSend, project: projectCode, messageId })); } catch {}
         const recordedConvoId = await maybeRecordConvo({ convoId: convoIdForSend, messageId, chatId, botId });
         if (recordedConvoId != null) lastConvoId = recordedConvoId;
         const parts = [];
@@ -947,6 +942,8 @@ async function main() {
       const { fallback, messageId, allMessageIds } = result;
       if (convoIdForSend == null) convoIdForSend = messageId; // new convo
       for (const mid of allMessageIds) appendToSentRegistry({ messageId: mid, chatId, botId, convoId: convoIdForSend });
+      // Pending-store after — opportunistic, doesn't block on failure.
+      try { updatePendingStore((s) => recordBotSend(s, { convoId: convoIdForSend, project: projectCode, messageId })); } catch {}
       const recordedConvoId = await maybeRecordConvo({ convoId: convoIdForSend, messageId, chatId, botId });
       if (recordedConvoId != null) lastConvoId = recordedConvoId;
       const parts = [];

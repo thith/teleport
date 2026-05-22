@@ -5,7 +5,16 @@ import crypto from 'node:crypto';
 import https from 'node:https';
 import { execFileSync, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { loadEnvFromFile, parseAdminChatIds, postReaction, sendTextChunk, extractBotId, readSentRegistry } from './send-telegram.mjs';
+import { loadEnvFromFile, parseAdminChatIds, postReaction, scrubToken, sendTextChunk, extractBotId, readSentRegistry, shortConvoHash } from './send-telegram.mjs';
+import {
+  formatPendingList,
+  listDueReminders,
+  listPending,
+  markReminded,
+  readPendingStore,
+  recordAdminReply,
+  updatePendingStore,
+} from './pending-store.mjs';
 import {
   acquireLock as acquireConvoLock,
   appendRowLocked as appendConvoRow,
@@ -684,6 +693,156 @@ export function partitionOrphans(fetched, adminIds, systemMsgIds = new Set()) {
   };
 }
 
+/**
+ * Cross-convo `/pending` handler. Scans fetched updates for admin messages
+ * whose text starts with `/pending`, responds with the pending convo list,
+ * and returns the set of update_ids it answered so the caller can skip them
+ * in subsequent classification. Sends use `--plain` semantics (no markdown)
+ * so we never poison the response with parse errors. Reply targets the same
+ * topic the command was typed in (forum-safe). Best-effort — failures are
+ * logged but never propagate.
+ */
+// Strict match: `/pending`, `/pending@botname`, `/pending <args>` but NOT
+// `/pendingabc` or `/pendingfoo`.
+const PENDING_CMD_RE = /^\/pending(?:@[a-zA-Z0-9_]+)?(?:\s+|$)/;
+
+/**
+ * Identify /pending commands and prepare responses WITHOUT making network
+ * calls. Returns { handledIds, responses } where `responses` is an array of
+ * `{ chatId, threadId, replyToMessageId, body }` for the caller to dispatch
+ * AFTER releasing any held locks. Splitting detect/send keeps the pollLock
+ * release latency low (network round-trips no longer block other listeners).
+ */
+export function detectPendingCommands(fetched, adminIds) {
+  const handledIds = new Set();
+  const responses = [];
+  if (!fetched || fetched.length === 0) return { handledIds, responses };
+  // Identify matches first; only read the pending store once if we have any.
+  const matches = [];
+  for (const u of fetched) {
+    const msg = u.message;
+    if (!msg) continue;
+    const text = (msg.text ?? msg.caption ?? '').trim();
+    if (!PENDING_CMD_RE.test(text)) continue;
+    if (adminIds.length > 0 && !adminIds.includes(String(msg.chat.id))) continue;
+    matches.push(u);
+  }
+  if (matches.length === 0) return { handledIds, responses };
+  let body;
+  try {
+    const store = readPendingStore();
+    body = formatPendingList(listPending(store));
+  } catch (e) {
+    console.error(`[tele-listen] /pending detect failed: ${e instanceof Error ? e.message : String(e)}`);
+    return { handledIds, responses };
+  }
+  for (const u of matches) {
+    handledIds.add(u.update_id);
+    responses.push({
+      chatId: u.message.chat.id,
+      threadId: u.message.message_thread_id ?? null,
+      replyToMessageId: u.message.message_id,
+      body,
+    });
+  }
+  return { handledIds, responses };
+}
+
+/** Dispatch /pending responses prepared by `detectPendingCommands`. Network
+ * call lives OUTSIDE pollLock so it does not block other listeners.
+ */
+export async function dispatchPendingResponses(token, responses, { sendText } = {}) {
+  const sendImpl = sendText ?? (async (chatId, text, threadId, replyToMessageId) => {
+    try {
+      await sendTextChunk(token, chatId, text, { raw: false, plain: true, replyTo: replyToMessageId, messageThreadId: threadId });
+      return true;
+    } catch (e) {
+      console.error(`[tele-listen] /pending dispatch failed: ${scrubToken(e instanceof Error ? e.message : String(e), token)}`);
+      return false;
+    }
+  });
+  for (const r of responses) {
+    await sendImpl(r.chatId, r.body, r.threadId, r.replyToMessageId);
+  }
+}
+
+// Backward-compatible wrapper used by tests written before the split.
+export async function handlePendingCommand(token, fetched, adminIds, { sendText } = {}) {
+  const { handledIds, responses } = detectPendingCommands(fetched, adminIds);
+  await dispatchPendingResponses(token, responses, { sendText });
+  return handledIds;
+}
+
+/**
+ * Heartbeat auto-reminder: scan pending-store for entries past REMIND_AFTER_MS
+ * with no remind yet, send one nudge each, mark `remindedAt`. Sent as plain
+ * text to first admin (no convo context — system-level notification).
+ * Best-effort; failures logged but not propagated.
+ */
+// Inter-admin send throttle for fan-out reminders. Telegram global limit is
+// 30 msg/sec; we space at 50ms (= 20 msg/sec headroom) to be safe.
+const ADMIN_FANOUT_DELAY_MS = 50;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+export async function runHeartbeatReminders(token, adminIds, { sendText, now = Date.now(), storeFile } = {}) {
+  const sendImpl = sendText ?? (async (chatId, text) => {
+    try {
+      await sendTextChunk(token, chatId, text, { raw: false, plain: true });
+      return true;
+    } catch (e) {
+      console.error(`[tele-listen] reminder send failed to ${chatId}: ${scrubToken(e instanceof Error ? e.message : String(e), token)}`);
+      return false;
+    }
+  });
+  if (!adminIds || adminIds.length === 0) return 0;
+  let sent = 0;
+  try {
+    const store = readPendingStore(storeFile);
+    const due = listDueReminders(store, { now });
+    for (const entry of due) {
+      // Claim-before-send: mark reminded atomically BEFORE dispatching, so a
+      // second concurrent listener observing the same `due` set sees the mark
+      // and skips (listDueReminders excludes entries with remindedAt set).
+      // Trade-off: a send failure here loses the reminder until the next bot
+      // send resets `remindedAt`. We prefer "missed reminder" over "duplicate
+      // reminder spam" — duplicates are user-facing noise; misses are silent
+      // and self-heal on next send.
+      let claimed = false;
+      try {
+        updatePendingStore((s) => {
+          // Re-read the entry inside the lock; if a peer already marked it,
+          // skip this iteration (proceed === false aborts the write).
+          const e = s[String(entry.convoId)];
+          if (e && e.remindedAt) return false;
+          markReminded(s, { convoId: entry.convoId, now });
+          claimed = true;
+        }, storeFile);
+      } catch (e) {
+        console.error(`[tele-listen] reminder claim failed for convo ${entry.convoId}: ${e instanceof Error ? e.message : String(e)}`);
+      }
+      if (!claimed) continue;
+      const elapsedH = Math.floor(entry.elapsedMs / 3_600_000);
+      const text = `⏰ Pending reminder: ${entry.project ?? '?'} convo #${shortConvoHash(entry.convoId)} has been waiting ${elapsedH}h+ for your reply (msg ${entry.lastBotSendMessageId}).`;
+      // Fan-out to ALL admins so multi-admin setups don't lose reminders.
+      // Throttle inter-admin sends (50ms) to stay under Telegram's 30 msg/sec
+      // global rate limit even when many reminders come due at once.
+      for (let i = 0; i < adminIds.length; i++) {
+        const chatId = adminIds[i];
+        try {
+          await sendImpl(chatId, text);
+        } catch (e) {
+          console.error(`[tele-listen] reminder send failed for convo ${entry.convoId} to ${chatId}: ${scrubToken(e instanceof Error ? e.message : String(e), token)}`);
+        }
+        if (i < adminIds.length - 1) await sleep(ADMIN_FANOUT_DELAY_MS);
+      }
+      sent++;
+    }
+  } catch (e) {
+    console.error(`[tele-listen] heartbeat reminder scan failed: ${e instanceof Error ? e.message : String(e)}`);
+  }
+  return sent;
+}
+
 export async function reactToOrphans(token, orphanEntries, systemMsgIds = new Set()) {
   const reacted = [];
   for (const entry of orphanEntries) {
@@ -1241,6 +1400,7 @@ async function main() {
   let fetchFailed = false;
   let pendingOrphans = [];
   let systemMsgIdsSnapshot = new Set();
+  let pendingResponses = [];
   // Captured before fetch so this poll uses one stable Telegram getUpdates
   // offset even if another listener advances the global offset concurrently.
   let preFetchGlobalOffset = readOffset(GLOBAL_OFFSET_FILE);
@@ -1249,6 +1409,27 @@ async function main() {
     try {
       const globalOffset = preFetchGlobalOffset;
       const fetched = await fetchUpdates(token, globalOffset);
+      // Capture the original batch's max update_id BEFORE we splice handled
+      // /pending updates out — otherwise a /pending-only batch would never
+      // advance the Telegram offset, looping the same command forever.
+      const originalMaxUpdateId = fetched.length > 0
+        ? Math.max(...fetched.map((u) => u.update_id))
+        : 0;
+      // /pending command — detect inside lock, dispatch AFTER releasing lock
+      // (HTTP sends should not block other listeners on pollLock).
+      if (fetched.length > 0) {
+        const { handledIds, responses } = detectPendingCommands(fetched, adminIds);
+        if (handledIds.size > 0) {
+          for (let i = fetched.length - 1; i >= 0; i--) {
+            if (handledIds.has(fetched[i].update_id)) fetched.splice(i, 1);
+          }
+          pendingResponses = responses;
+          // /pending-only batch: ensure offset still advances past these updates.
+          if (fetched.length === 0 && originalMaxUpdateId > 0) {
+            writeOffset(originalMaxUpdateId, GLOBAL_OFFSET_FILE);
+          }
+        }
+      }
       if (fetched.length > 0) {
         systemMsgIdsSnapshot = readSystemMsgIds();
         const { orphans, nonOrphan } = partitionOrphans(fetched, adminIds, systemMsgIdsSnapshot);
@@ -1310,6 +1491,12 @@ async function main() {
     await reactToOrphans(token, pendingOrphans, systemMsgIdsSnapshot);
   }
 
+  // Dispatch /pending responses prepared inside the lock. Network call lives
+  // here so pollLock release latency is unaffected by Telegram round-trip.
+  if (pendingResponses.length > 0) {
+    await dispatchPendingResponses(token, pendingResponses);
+  }
+
   // Resolve per-loop offset AFTER fetch+prune so a new loop's min(cache)
   // initialization reflects what is actually still buffered. Calling it before
   // pruning races: pruneCache may remove the oldest cached entries that the
@@ -1340,6 +1527,9 @@ async function main() {
 
   if (toProcess.length === 0) {
     advanceLoopOffset();
+    // Heartbeat: even when nothing to process, scan for due reminders.
+    // Best-effort; failures are logged inside `runHeartbeatReminders`.
+    await runHeartbeatReminders(token, adminIds);
     process.exit(2);
   }
 
@@ -1355,6 +1545,9 @@ async function main() {
   // a future bot `--reply-to <X>` routes back via lookupConvoIdByMessageId
   // even if the agent never got the prompt. Skip if convoId unknown.
   if (convo != null) {
+    // Pending tracker: admin replied in this convo → bump lastAdminReply,
+    // clear remindedAt. Best-effort; failure must not block prompt write.
+    try { updatePendingStore((s) => recordAdminReply(s, { convoId: convo })); } catch {}
     const rec = await recordAdminMessagesInConvo({ messages: toProcess, convoId: convo, botId });
     if (!rec.ok) {
       // Lock timed out → admin msgIds NOT in registry. Skip the prompt write
@@ -1394,6 +1587,10 @@ async function main() {
   console.log(
     `[tele-listen] prompt written to ${promptFile}: "${preview}${data.text.length > 60 ? '…' : ''}" (messageId: ${data.messageId})`,
   );
+  // Heartbeat after successful prompt write too. Same poll cycle owns the
+  // chance to remind — running it here ensures reminders fire even on busy
+  // convos that always have a fresh admin reply to process.
+  await runHeartbeatReminders(token, adminIds);
   process.exit(0);
 }
 
