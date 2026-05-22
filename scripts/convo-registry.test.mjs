@@ -10,7 +10,7 @@ import {
   pruneLocked, readRows, releaseLock, REGISTRY_CAP, REGISTRY_KEEP_NON_ALLOC,
   resolveConvoIdFromEnv, uuidToConvoInt, validateConvoIdString,
 } from './convo-registry.mjs';
-import { appendToSentRegistry, parseArgs as parseSendArgs, readSentRegistry } from './send-telegram.mjs';
+import { appendToSentRegistry, listenerHintForCurrentAgent, parseArgs as parseSendArgs, readSentRegistry } from './send-telegram.mjs';
 import { parseArgs as parseListenArgs, compareSameConvo, filterAdminMessages, resolveStartOffset, waitOnceSupervisor } from './tele-listen.mjs';
 
 function tmpFile() {
@@ -234,10 +234,34 @@ test('parseArgs (tele-listen) — --wait-once is convo-mode only', () => {
   assert.throws(() => parseListenArgs(['--wait-once', '--watch', '--convo', '100']));
 });
 
+test('parseArgs (tele-listen) — legacy --watch remains parseable', () => {
+  const ok = parseListenArgs(['--watch', '--convo', '100']);
+  assert.strictEqual(ok.watch, true);
+  assert.strictEqual(ok.waitOnce, false);
+  assert.strictEqual(ok.convo, 100);
+});
+
 test('parseArgs (send-telegram) — --convo accepts a positive integer', () => {
   const a = parseSendArgs(['--convo', '5', 'hi']);
   assert.strictEqual(a.convo, 5);
   assert.throws(() => parseSendArgs(['--convo', 'new', 'hi']));
+});
+
+test('listenerHintForCurrentAgent — non-Claude agents use wait-once', () => {
+  const codex = listenerHintForCurrentAgent(123, { CODEX_THREAD_ID: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee' });
+  assert.match(codex, /--wait-once --convo 123/);
+  assert.doesNotMatch(codex, /--watch/);
+
+  const other = listenerHintForCurrentAgent(123, {});
+  assert.match(other, /--wait-once --convo 123/);
+  assert.doesNotMatch(other, /--watch/);
+});
+
+test('listenerHintForCurrentAgent — Claude uses Monitor', () => {
+  const hint = listenerHintForCurrentAgent(123, { CLAUDE_CODE_SESSION_ID: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee' });
+  assert.match(hint, /Monitor/);
+  assert.match(hint, /tele-listen\.mjs --convo 123/);
+  assert.doesNotMatch(hint, /--wait-once/);
 });
 
 test('filterAdminMessages — convo mode uses (chatId, messageId) pair', () => {

@@ -89,34 +89,22 @@ Monitor({
 })
 ```
 
-**Other agents choose by shell behavior:**
+**All other agents:** wait for one prompt at a time.
+```bash
+node ../teleport/scripts/tele-listen.mjs --wait-once --convo $CONVO_ID
+```
+`--wait-once` is synchronous: it blocks until the next prompt file is ready, prints the prompt path, then exits so the agent can read and handle it. A prompt may aggregate consecutive admin messages using `Admin follow-up:` lines. Run it again after deleting the prompt if you need to keep listening.
 
-### Choosing between --watch and --wait-once
-
-If you are writing/integrating a new agent or unsure about your execution model, choose the listener mode based on the following:
-
-* **Use `--wait-once` (Recommended for most other agents, including Gemini CLI, Antigravity, Cursor, etc.):**
-  * **How it works:** Blocks the shell until a message is received, writes the prompt JSON, and **exits**, freeing the shell.
-  * **Command:** `node ../teleport/scripts/tele-listen.mjs --wait-once --convo $CONVO_ID`
-  * **Workflow:** Run `--wait-once` → command exits → process JSON and reply → delete prompt JSON → re-run `--wait-once`.
-  * **If in doubt:** Choose `--wait-once` as the safe default.
-
-* **Use `--watch` (Specifically for Codex):**
-  * **How it works:** Runs continuously in the foreground, writing prompt JSONs and pausing until they are deleted before resuming.
-  * **Command:** `node ../teleport/scripts/tele-listen.mjs --watch --convo $CONVO_ID`
-  * **Workflow:** Run `--watch` → wait for prompt JSON → read/reply in separate session → delete JSON to auto-resume the watcher.
-  * **Note:** Keep this command session open; do not rely on shell backgrounding with `&`, because some tool wrappers detach or reap background jobs silently. Stop it with Ctrl-C when the conversation is done. If you accidentally backgrounded it, stop it with `pkill -f "tele-listen.*--watch.*--convo ${CONVO_ID}( |$)"`.
-
-After starting `--watch` or `--wait-once`:
+After starting `--wait-once`:
 - Do NOT end your turn / send a "final" or similar response while waiting for replies (most agent runtimes stop polling once the turn ends).
 - Capture the convoId from `[send-telegram] convo: <N>` stdout: `export CONVO_ID=<N>`.
-- Keep the turn active until the command prints `prompt written to .../prompt-convo-$CONVO_ID.json` or `prompt ready: .../prompt-convo-$CONVO_ID.json`, then read+reply+delete.
-- Loop: when prompt appears → read JSON → reply via send-telegram → delete the prompt file → loop. For `--wait-once`, re-run the same `--wait-once` command to wait for the next reply.
-- **Anti-Loop Bypass:** If your agent environment imposes a strict timeout on commands (e.g. 5 minutes) and forcefully terminates them, you must restart the listener. To prevent anti-loop detectors from assuming you are stuck when you restart the same command multiple times, prepend a dummy environment variable to your command (e.g., `RESTART_COUNT=1 node ../teleport/scripts/tele-listen.mjs --wait-once --convo $CONVO_ID`) or append a bash comment (e.g., `... --convo $CONVO_ID # restart=1`). Increment or update this value on each restart.
+- Keep the turn active until the command prints `prompt ready: .../prompt-convo-$CONVO_ID.json`, then read+reply+delete.
+- Loop: when prompt appears → read JSON → reply via send-telegram → delete the prompt file → re-run the same `--wait-once` command to wait for the next reply.
+- **Anti-Loop Bypass:** If your agent environment imposes a strict timeout on commands (e.g. 5 minutes) and forcefully terminates them, you must restart the listener. To prevent anti-loop detectors from assuming you are stuck when you restart the same command multiple times, prepend a dummy environment variable to your command (e.g., `RESTART_COUNT=1 node ../teleport/scripts/tele-listen.mjs --wait-once --convo $CONVO_ID`). Increment or update this value on each restart.
 - End the turn ONLY when the user explicitly requests to stop (e.g., "close connection", "end turn", "stop loop").
 - If the user says something ambiguous like "done", "ok", or "bye", DO NOT end the turn. Instead, ask for explicit confirmation (e.g., "Should I wait for further instructions, or are we finished here?") and wait for a clear confirmation before ending the turn.
 
-When the loop / daemon writes `prompt written to <path>`, parse that file as JSON:
+When the listener writes `prompt ready: <path>`, parse that file as JSON:
 - `text`, `messageId`, `chatId`, `replyToMessageId`, `replyToText`, `quotedText`, `convoId`, `attachments[]`.
 
 Reply:
@@ -143,8 +131,7 @@ Then delete the prompt JSON. Restart the listener (same command).
 
 **tele-listen.mjs:**
 - `--convo <N>` — the conversation thread ID to listen to.
-- `--watch` — start a long-running foreground supervisor (ideal for streaming shells like Codex).
-- `--wait-once` — poll until exactly one new reply is ready, then exit (ideal for buffered shells).
+- `--wait-once` — poll until exactly one new reply is ready, then exit.
 
 ## Troubleshooting
 
