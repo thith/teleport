@@ -774,6 +774,52 @@ export async function handlePendingCommand(token, fetched, adminIds, { sendText 
   return handledIds;
 }
 
+// ---------------------------------------------------------------------------
+// /start command — onboarding guide. Mirrors /pending's detect/dispatch
+// split so the response goes out after pollLock release. Open to anyone
+// (not gated by adminIds) — a public /start is the standard Telegram bot
+// onboarding affordance and reveals no sensitive state.
+// ---------------------------------------------------------------------------
+
+const START_CMD_RE = /^\/start(?:@[a-zA-Z0-9_]+)?(?:\s+|$)/;
+
+const START_BODY = [
+  '👋 Teleport bot — bridge between admins and AI coding agents.',
+  '',
+  'When an agent (Claude / Codex / Gemini …) finishes a task, it pings here. Reply to that message and the agent picks it up on its next poll.',
+  '',
+  'Commands:',
+  '• /pending — list convos waiting for your reply, with 🟢/💀/⚪ liveness markers',
+  '• /start — this guide',
+  '',
+  'Liveness markers in /pending:',
+  '🟢 listener active right now',
+  '💀 listener was alive but went quiet (>90s)',
+  '⚪ no listener registered (fire-and-forget send)',
+  '',
+  '— Created by trumviahe.com team and agents',
+].join('\n');
+
+export function detectStartCommands(fetched) {
+  const handledIds = new Set();
+  const responses = [];
+  if (!fetched || fetched.length === 0) return { handledIds, responses };
+  for (const u of fetched) {
+    const msg = u.message;
+    if (!msg) continue;
+    const text = (msg.text ?? msg.caption ?? '').trim();
+    if (!START_CMD_RE.test(text)) continue;
+    handledIds.add(u.update_id);
+    responses.push({
+      chatId: msg.chat.id,
+      threadId: msg.message_thread_id ?? null,
+      replyToMessageId: msg.message_id,
+      body: START_BODY,
+    });
+  }
+  return { handledIds, responses };
+}
+
 /**
  * Heartbeat auto-reminder: scan pending-store for entries past REMIND_AFTER_MS
  * with no remind yet, send one nudge each, mark `remindedAt`. Sent as plain
@@ -1483,11 +1529,22 @@ async function main() {
             if (handledIds.has(fetched[i].update_id)) fetched.splice(i, 1);
           }
           pendingResponses = responses;
-          // /pending-only batch: ensure offset still advances past these updates.
-          if (fetched.length === 0 && originalMaxUpdateId > 0) {
-            writeOffset(originalMaxUpdateId, GLOBAL_OFFSET_FILE);
-          }
         }
+      }
+      // /start command — public onboarding guide. Same detect/dispatch split.
+      if (fetched.length > 0) {
+        const { handledIds, responses } = detectStartCommands(fetched);
+        if (handledIds.size > 0) {
+          for (let i = fetched.length - 1; i >= 0; i--) {
+            if (handledIds.has(fetched[i].update_id)) fetched.splice(i, 1);
+          }
+          pendingResponses = pendingResponses.concat(responses);
+        }
+      }
+      // Both handlers may have consumed every fetched update; still advance
+      // the Telegram offset past them, else we loop the same command forever.
+      if (fetched.length === 0 && pendingResponses.length > 0 && originalMaxUpdateId > 0) {
+        writeOffset(originalMaxUpdateId, GLOBAL_OFFSET_FILE);
       }
       if (fetched.length > 0) {
         systemMsgIdsSnapshot = readSystemMsgIds();

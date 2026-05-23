@@ -16,7 +16,7 @@ import {
   updatePendingStore,
   writePendingStore,
 } from './pending-store.mjs';
-import { handlePendingCommand, runHeartbeatReminders, isQuietHour } from './tele-listen.mjs';
+import { handlePendingCommand, runHeartbeatReminders, isQuietHour, detectStartCommands } from './tele-listen.mjs';
 
 function tmp() {
   return path.join(os.tmpdir(), `pending-${Date.now()}-${Math.random().toString(36).slice(2)}.json`);
@@ -392,3 +392,59 @@ test('formatPendingList — renders 🟢/💀/⚪ markers + last-alive', () => {
   assert.match(out, /last alive 5m ago/);
 });
 
+
+// ---------------------------------------------------------------------------
+// /start command
+// ---------------------------------------------------------------------------
+
+test('detectStartCommands — bare /start triggers response with guide + footer', () => {
+  const updates = [{
+    update_id: 1,
+    message: { message_id: 50, chat: { id: 99, type: 'private' }, text: '/start' },
+  }];
+  const { handledIds, responses } = detectStartCommands(updates);
+  assert.strictEqual(handledIds.size, 1);
+  assert.strictEqual(responses.length, 1);
+  assert.match(responses[0].body, /Teleport bot/);
+  assert.match(responses[0].body, /\/pending/);
+  assert.match(responses[0].body, /trumviahe\.com/);
+});
+
+test('detectStartCommands — /start@botname accepted', () => {
+  const updates = [{
+    update_id: 2,
+    message: { message_id: 51, chat: { id: 99, type: 'private' }, text: '/start@teleport_bot' },
+  }];
+  const { handledIds } = detectStartCommands(updates);
+  assert.strictEqual(handledIds.size, 1);
+});
+
+test('detectStartCommands — /starting (longer prefix) NOT matched', () => {
+  const updates = [{
+    update_id: 3,
+    message: { message_id: 52, chat: { id: 99, type: 'private' }, text: '/starting' },
+  }];
+  const { handledIds } = detectStartCommands(updates);
+  assert.strictEqual(handledIds.size, 0);
+});
+
+test('detectStartCommands — preserves message_thread_id for forum topics', () => {
+  const updates = [{
+    update_id: 4,
+    message: {
+      message_id: 53,
+      chat: { id: 99, type: 'supergroup' },
+      message_thread_id: 777,
+      text: '/start',
+    },
+  }];
+  const { responses } = detectStartCommands(updates);
+  assert.strictEqual(responses[0].threadId, 777);
+  assert.strictEqual(responses[0].replyToMessageId, 53);
+});
+
+test('detectStartCommands — no fetched updates returns empty', () => {
+  const { handledIds, responses } = detectStartCommands([]);
+  assert.strictEqual(handledIds.size, 0);
+  assert.strictEqual(responses.length, 0);
+});
