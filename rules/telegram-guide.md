@@ -127,6 +127,21 @@ After starting `--wait-once`:
 When the listener writes `prompt ready: <path>`, parse that file as JSON:
 - `text`, `messageId`, `chatId`, `replyToMessageId`, `replyToText`, `quotedText`, `convoId`, `attachments[]`.
 
+**MUST: validate prompt relevance before acting (the "misrouted reply" check).** Multiple agents share one admin chat, and admins occasionally tap "reply" on the wrong message. Before treating a prompt as a directive, cross-check `replyToText` against the most recent message *you* sent in this turn. The strongest positive signal is: `replyToText` starts with the same `[project]` prefix and identity emoji you used in your last send.
+
+Confirm before acting if the relevance check is uncertain OR any of these fire (the list is not exhaustive — when in doubt, confirm):
+- `replyToText`'s `[project]` prefix is different from the one *you* are running under (e.g. you sent a `[md]` report and `replyToText` starts with `[tea_game]`).
+- The reply names a file, PR, branch, ticket, or topic that does not appear in your recent turn at all.
+- The reply asks you to switch project/scope ("switch to tea_game and fix X") — cross-project directives are valid but **MUST** still be confirmed explicitly so the admin sees they're handing the wheel.
+
+If `$CONVO_ID` itself disagrees with the prompt's `convoId`, that is a listener bug (the wait-once was scoped to a specific convo) — log the mismatch and escalate to the user; do not just confirm-and-proceed.
+
+When confirming, reply *to* the suspect prompt with a one-liner in the user's language and stop. Examples — translate to match the user:
+- VI: *"Có vẻ message này gửi cho agent khác (replyToText là `[X]`, em đang làm `[Y]`). Anh confirm em xử lý hay bỏ qua?"*
+- EN: *"This looks misrouted (replyToText is `[X]`, I'm running under `[Y]`). Confirm if you want me to handle it or skip?"*
+
+Treat your reply as a clarification turn, not a task completion. **MUST NOT** start any non-read action (writes, commits, network calls, agent-side state changes) until the admin explicitly confirms.
+
 Reply:
 ```bash
 node ../teleport/scripts/send-telegram.mjs --reply-to <prompt.messageId> --convo $CONVO_ID "..."
