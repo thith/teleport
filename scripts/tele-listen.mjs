@@ -15,6 +15,7 @@ import {
   recordAdminReply,
   updatePendingStore,
 } from './pending-store.mjs';
+import { recordAlive, isAlive, getLastAliveMs, pruneStale as pruneAliveStale, DEFAULT_FRESH_MS as ALIVE_FRESH_MS } from './listener-alive.mjs';
 import {
   acquireLock as acquireConvoLock,
   appendRowLocked as appendConvoRow,
@@ -731,7 +732,7 @@ export function detectPendingCommands(fetched, adminIds) {
   let body;
   try {
     const store = readPendingStore();
-    body = formatPendingList(listPending(store));
+    body = formatPendingList(listPending(store, { getLastAliveMs, aliveFreshMs: ALIVE_FRESH_MS }));
   } catch (e) {
     console.error(`[tele-listen] /pending detect failed: ${e instanceof Error ? e.message : String(e)}`);
     return { handledIds, responses };
@@ -815,7 +816,17 @@ export function isQuietHour(now = new Date(), env = process.env) {
   return start < end ? (h >= start && h < end) : (h >= start || h < end);
 }
 
-export async function runHeartbeatReminders(token, adminIds, { sendText, now = Date.now(), storeFile } = {}) {
+// Per-process throttle for `pruneAliveStale`. Run at most once per hour —
+// files only age out at 24h, so finer cadence wastes syscalls.
+const PRUNE_ALIVE_INTERVAL_MS = 60 * 60 * 1000;
+let lastAlivePruneMs = 0;
+function maybePruneAlive(now) {
+  if (now - lastAlivePruneMs < PRUNE_ALIVE_INTERVAL_MS) return;
+  lastAlivePruneMs = now;
+  try { pruneAliveStale({ now }); } catch {}
+}
+
+export async function runHeartbeatReminders(token, adminIds, { sendText, now = Date.now(), storeFile, getLastAliveMs: getLastAliveMsArg = getLastAliveMs, aliveFreshMs = ALIVE_FRESH_MS } = {}) {
   if (isQuietHour(new Date(now))) return 0;
   const sendImpl = sendText ?? (async (chatId, text) => {
     try {
@@ -830,7 +841,11 @@ export async function runHeartbeatReminders(token, adminIds, { sendText, now = D
   let sent = 0;
   try {
     const store = readPendingStore(storeFile);
-    const due = listDueReminders(store, { now });
+    const due = listDueReminders(store, { now, getLastAliveMs: getLastAliveMsArg, aliveFreshMs });
+    // Throttled prune of stale alive files. readdir+stat per file is cheap,
+    // but the heartbeat runs every 5–15s and there's no signal value in
+    // pruning more than once an hour (files only age out at 24h).
+    maybePruneAlive(now);
     for (const entry of due) {
       // Claim-before-send: mark reminded atomically BEFORE dispatching, so a
       // second concurrent listener observing the same `due` set sees the mark
@@ -1351,6 +1366,10 @@ async function main() {
 
   if (convo != null) {
     mode = 'convo';
+    // Heartbeat: each Monitor restart spawns a fresh `main()` process. Touch
+    // the alive file before any I/O so a slow fetchUpdates can't make us look
+    // dead. waitOnce/watch supervisors touch from their own loop bodies.
+    recordAlive(convo);
     // Synthesize a stable per-convo offset file when the operator didn't
     // pass one. Must NOT be scoped by ppid: the recommended `until node …;
     // do sleep …; done` pattern (and any Monitor restart) creates a fresh

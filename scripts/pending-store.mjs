@@ -182,7 +182,15 @@ export function recordAdminReply(store, { convoId, project = null, now = Date.no
  * Pending = bot sent AND (no admin reply OR admin reply older than bot send) AND
  * elapsed > `minElapsedMs` (default 0 — caller decides threshold).
  */
-export function listPending(store, { now = Date.now(), minElapsedMs = 0, maxAgeMs = PENDING_MAX_AGE_MS } = {}) {
+// Alive-status callback shape: `(convoId) => number | null`. Return the
+// listener's last-touch epoch ms, or null if no listener has ever registered
+// for this convo. Default returns null → entries get `alive: false` but the
+// reminder filter is NOT applied (legacy / unit-test back-compat: callers
+// who don't opt in keep seeing every due entry).
+const NO_ALIVE = () => null;
+
+export function listPending(store, { now = Date.now(), minElapsedMs = 0, maxAgeMs = PENDING_MAX_AGE_MS, getLastAliveMs, aliveFreshMs = 90_000 } = {}) {
+  const aliveFn = typeof getLastAliveMs === 'function' ? getLastAliveMs : NO_ALIVE;
   const out = [];
   for (const [convoId, entry] of Object.entries(store)) {
     const botSendT = Date.parse(entry.lastBotSend ?? '') || 0;
@@ -192,7 +200,9 @@ export function listPending(store, { now = Date.now(), minElapsedMs = 0, maxAgeM
     const age = now - botSendT;
     if (age < minElapsedMs) continue;
     if (age > maxAgeMs) continue; // hard TTL: drop entries too old to be useful
-    out.push({ convoId, ...entry, elapsedMs: age });
+    const lastAliveMs = aliveFn(convoId);
+    const alive = lastAliveMs != null && (now - lastAliveMs) < aliveFreshMs;
+    out.push({ convoId, ...entry, elapsedMs: age, alive, lastAliveMs });
   }
   // Oldest-first: truncation in formatPendingList preserves the most urgent
   // (longest-waiting) entries when the list exceeds PENDING_LIST_CAP.
@@ -202,11 +212,21 @@ export function listPending(store, { now = Date.now(), minElapsedMs = 0, maxAgeM
 
 /**
  * Returns array of pending entries that should trigger an auto-reminder right
- * now: pending AND elapsed > REMIND_AFTER_MS AND `remindedAt` is null.
+ * now: pending AND elapsed > REMIND_AFTER_MS AND `remindedAt` is null AND
+ * the listener for this convo is alive (admin won't get nagged about convos
+ * whose agent has died — they're already orphaned, a 2 AM ping is just noise).
  */
-export function listDueReminders(store, { now = Date.now(), remindAfterMs = REMIND_AFTER_MS } = {}) {
-  return listPending(store, { now, minElapsedMs: remindAfterMs })
-    .filter((p) => p.remindedAt == null);
+export function listDueReminders(store, { now = Date.now(), remindAfterMs = REMIND_AFTER_MS, getLastAliveMs, aliveFreshMs = 90_000 } = {}) {
+  // Opt-in alive filter: only enabled when a real callback is supplied.
+  // Reference-equality against a default sentinel was brittle — explicit
+  // `{ ...opts, getLastAliveMs: undefined }` from a caller would silently
+  // disable the filter and start nagging dead convos again.
+  const aliveFilterEnabled = typeof getLastAliveMs === 'function';
+  return listPending(store, { now, minElapsedMs: remindAfterMs, getLastAliveMs, aliveFreshMs })
+    .filter((p) => p.remindedAt == null)
+    // Dead-listener convos are skipped here. They still appear in /pending
+    // (with a 💀 marker) so admin can `/close` them manually.
+    .filter((p) => !aliveFilterEnabled || p.alive);
 }
 
 export function markReminded(store, { convoId, now = Date.now() }) {
@@ -227,21 +247,45 @@ export function markReminded(store, { convoId, now = Date.now() }) {
 // PENDING_LIST_CAP entries with a tail "...and N more" to stay well under.
 export const PENDING_LIST_CAP = 20;
 
+function formatElapsed(ms) {
+  if (ms == null || !Number.isFinite(ms) || ms < 0) return '?';
+  const totalMin = Math.floor(ms / 60_000);
+  if (totalMin < 1) {
+    const sec = Math.max(1, Math.floor(ms / 1000));
+    return `${sec}s`;
+  }
+  const hours = Math.floor(totalMin / 60);
+  const minutes = totalMin % 60;
+  return hours > 0
+    ? (minutes > 0 ? `${hours}h ${minutes}m` : `${hours}h`)
+    : `${totalMin}m`;
+}
+
 export function formatPendingList(pending, { now = Date.now(), maxEntries = PENDING_LIST_CAP } = {}) {
   if (pending.length === 0) return '📋 No pending convos. Everyone is up to date.';
   const lines = [`📋 ${pending.length} pending convo${pending.length > 1 ? 's' : ''}:`, ''];
   const slice = pending.slice(0, maxEntries);
   for (const p of slice) {
-    const elapsedMin = Math.floor(p.elapsedMs / 60_000);
-    const hours = Math.floor(elapsedMin / 60);
-    const minutes = elapsedMin % 60;
-    const elapsedStr = hours > 0
-      ? (minutes > 0 ? `${hours}h ${minutes}m` : `${hours}h`)
-      : `${elapsedMin}m`;
+    const elapsedStr = formatElapsed(p.elapsedMs);
     const reminded = p.remindedAt ? ' (reminded)' : '';
+    // Liveness marker:
+    //   🟢 — listener touched within freshness window
+    //   💀 — listener known dead (touched at least once, but stale)
+    //   ⚪ — unknown (no alive record; e.g. agent never started a listener)
+    let marker = '⚪';
+    let aliveSuffix = '';
+    if (p.alive) {
+      marker = '🟢';
+      if (p.lastAliveMs != null) {
+        aliveSuffix = ` (alive ${formatElapsed(now - p.lastAliveMs)} ago)`;
+      }
+    } else if (p.lastAliveMs != null) {
+      marker = '💀';
+      aliveSuffix = ` (last alive ${formatElapsed(now - p.lastAliveMs)} ago)`;
+    }
     // Use shortConvoHash so /pending hashtags match the ones embedded in
     // outgoing messages — admin tap → Telegram search hits both.
-    lines.push(`• ${p.project ?? '?'} #${shortConvoHash(p.convoId)}: waiting ${elapsedStr} (msg ${p.lastBotSendMessageId})${reminded}`);
+    lines.push(`• ${marker} ${p.project ?? '?'} #${shortConvoHash(p.convoId)}: waiting ${elapsedStr} (msg ${p.lastBotSendMessageId})${reminded}${aliveSuffix}`);
   }
   if (pending.length > maxEntries) {
     lines.push('', `…and ${pending.length - maxEntries} more`);

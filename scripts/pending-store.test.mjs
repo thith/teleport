@@ -229,7 +229,9 @@ test('runHeartbeatReminders — skips send when isQuietHour is true', async () =
   const t0 = Date.parse('2026-05-22T08:00:00Z');
   const store = readPendingStore(file);
   recordBotSend(store, { convoId: '123', project: 'p', messageId: 1, now: t0 });
-  writePendingStore(store, file);
+  // Pass simulated `now` so the writer's 24h TTL sweep doesn't drop entries
+  // when wall-clock time has moved past t0 + 24h since the test was written.
+  writePendingStore(store, file, { now: t0 });
   // 3h elapsed — would normally be due. Set quiet window covering "now".
   const now = t0 + 3 * 60 * 60 * 1000;
   const hourLocal = new Date(now).getHours();
@@ -301,18 +303,89 @@ test('handlePendingCommand — strict regex accepts /pending@bot_name', async ()
 
 test('runHeartbeatReminders — fans out to ALL admins, throttled between sends', async () => {
   const file = tmp();
-  const t0 = Date.parse('2026-05-22T08:00:00Z');
-  const now = t0 + 3 * 60 * 60_000; // 3h later, past REMIND_AFTER_MS
+  // Use a recent t0 anchored to wall-clock so the 24h TTL sweep doesn't drop
+  // the entry on the markReminded write (the test once used a fixed past date
+  // and went flaky as wall-clock crossed t0 + 24h).
+  const now = Date.now();
+  const t0 = now - 3 * 60 * 60_000; // 3h before "now", past REMIND_AFTER_MS
   let store = {};
   recordBotSend(store, { convoId: 100, project: 'p', messageId: 1, now: t0 });
-  writePendingStore(store, file);
+  writePendingStore(store, file, { now: t0 });
   const callsByChatId = [];
   const sendText = async (chatId, text) => { callsByChatId.push(chatId); return true; };
   // Inject `storeFile` so the test doesn't write to production pending.json.
-  await runHeartbeatReminders('TOKEN', ['adminA', 'adminB', 'adminC'], { sendText, now, storeFile: file });
+  // Force alive=true so the new listener-alive gate doesn't drop our entry —
+  // we're testing the fan-out behavior, not the alive filter.
+  await runHeartbeatReminders('TOKEN', ['adminA', 'adminB', 'adminC'], { sendText, now, storeFile: file, getLastAliveMs: () => now - 1000 });
   assert.deepStrictEqual(callsByChatId, ['adminA', 'adminB', 'adminC']);
   // Verify markReminded persisted to OUR file, not production.
   const after = readPendingStore(file);
   assert.ok(after['100'].remindedAt);
   fs.unlinkSync(file);
 });
+
+// ---------------------------------------------------------------------------
+// listener-alive integration
+// ---------------------------------------------------------------------------
+
+test('listPending — attaches alive flag from getLastAliveMs callback', () => {
+  const store = {};
+  const t0 = Date.parse('2026-05-22T08:00:00Z');
+  recordBotSend(store, { convoId: 'a', project: 'p', messageId: 1, now: t0 });
+  recordBotSend(store, { convoId: 'b', project: 'p', messageId: 2, now: t0 });
+  const now = t0 + 10 * 60 * 1000;
+  const out = listPending(store, {
+    now,
+    getLastAliveMs: (cid) => (cid === 'a' ? now - 10_000 : now - 5 * 60 * 1000),
+    aliveFreshMs: 90_000,
+  });
+  const a = out.find((p) => p.convoId === 'a');
+  const b = out.find((p) => p.convoId === 'b');
+  assert.strictEqual(a.alive, true);
+  assert.strictEqual(b.alive, false);
+  assert.ok(a.lastAliveMs != null && b.lastAliveMs != null);
+});
+
+test('listDueReminders — drops entries whose listener is not alive', () => {
+  const file = tmp();
+  const t0 = Date.parse('2026-05-22T08:00:00Z');
+  const store = readPendingStore(file);
+  recordBotSend(store, { convoId: 'alive', project: 'p', messageId: 1, now: t0 });
+  recordBotSend(store, { convoId: 'dead', project: 'p', messageId: 2, now: t0 });
+  writePendingStore(store, file, { now: t0 });
+  const now = t0 + 3 * 60 * 60 * 1000; // both well past 2h threshold
+  const due = listDueReminders(readPendingStore(file), {
+    now,
+    getLastAliveMs: (cid) => (cid === 'alive' ? now - 10_000 : now - 10 * 60 * 1000),
+    aliveFreshMs: 90_000,
+  });
+  assert.deepStrictEqual(due.map((d) => d.convoId), ['alive']);
+  fs.unlinkSync(file);
+});
+
+test('listDueReminders — without getLastAliveMs callback keeps legacy behavior (all due fire)', () => {
+  // Back-compat guard: existing tests / callers that never pass a callback
+  // must still see every due entry.
+  const t0 = Date.parse('2026-05-22T08:00:00Z');
+  const store = {};
+  recordBotSend(store, { convoId: 'x', project: 'p', messageId: 1, now: t0 });
+  recordBotSend(store, { convoId: 'y', project: 'p', messageId: 2, now: t0 });
+  const now = t0 + 3 * 60 * 60 * 1000;
+  const due = listDueReminders(store, { now });
+  assert.strictEqual(due.length, 2);
+});
+
+test('formatPendingList — renders 🟢/💀/⚪ markers + last-alive', () => {
+  const now = Date.parse('2026-05-22T10:00:00Z');
+  const pending = [
+    { convoId: '1', project: 'p', lastBotSendMessageId: 1, elapsedMs: 60_000, remindedAt: null, alive: true, lastAliveMs: now - 10_000 },
+    { convoId: '2', project: 'p', lastBotSendMessageId: 2, elapsedMs: 60_000, remindedAt: null, alive: false, lastAliveMs: now - 5 * 60_000 },
+    { convoId: '3', project: 'p', lastBotSendMessageId: 3, elapsedMs: 60_000, remindedAt: null, alive: false, lastAliveMs: null },
+  ];
+  const out = formatPendingList(pending, { now });
+  assert.match(out, /• 🟢/);
+  assert.match(out, /• 💀/);
+  assert.match(out, /• ⚪/);
+  assert.match(out, /last alive 5m ago/);
+});
+
