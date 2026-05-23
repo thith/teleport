@@ -142,6 +142,29 @@ When confirming, reply *to* the suspect prompt with a one-liner in the user's la
 
 Treat your reply as a clarification turn, not a task completion. **MUST NOT** start any non-read action (writes, commits, network calls, agent-side state changes) until the admin explicitly confirms.
 
+**MUST: re-poll for late edits / follow-ups before critical actions.** Admins routinely change their mind after sending a directive — they may edit the original message or send a correction ("scratch that, do X instead"). While you're busy executing a 10-minute task, no listener is running, so those updates sit in Telegram unread. Acting on the stale directive can mean committing the wrong code, pushing a bad change, or deleting something the admin no longer wants gone.
+
+Before any **action with non-trivial blast radius**, you **MUST** drain any pending admin messages. Treat as critical: `git commit`/`git push`/`git reset --hard`/`git rebase`, force flags on destructive commands (`push --force`, `rm -rf`, `chmod -R`), `git tag` / release publish / package publish, DB data deletion or schema migration against non-local DB, cloud/IaC apply, secret rotation, `docker compose down -v`, deploying, sending a billable API call, posting to Slack / GitHub / external chat, or anything else that's hard to reverse. Reading files, running tests, drafting a reply — not critical, no re-poll needed.
+
+How to drain — bare `--convo` one-shot (NOT `--wait-once`, NOT `--watch`):
+```bash
+# Delete any prior unconsumed prompt first so a stale file from a previous
+# turn doesn't get re-read as "new" — your prior turn should already have
+# deleted it; this is just belt-and-suspenders.
+PROMPT=../teleport/scripts/tmp/tele-reply/prompt-convo-$CONVO_ID.json
+node ../teleport/scripts/tele-listen.mjs --convo $CONVO_ID
+case $? in
+  0) cat "$PROMPT" ;;                # new prompt landed — read it
+  2) echo "[drain] no new admin messages" ;;
+  *) echo "[drain] error — abort the critical action and investigate" >&2; exit 1 ;;
+esac
+```
+The bare `--convo` mode does one `fetchUpdates` (short-poll, sub-second) and exits — no need to wrap in `timeout`. If a new prompt landed, apply the misrouted-reply check above, then either act on it or confirm with admin BEFORE the critical action.
+
+If you are using the Monitor pattern (Claude), the drain spawn is safe because Monitor's listener already exited when its last `until`-iteration succeeded; you are not racing a live listener. If you somehow have a live listener running for the same convo when you drain, the singleton-supersede will kill the older one — undesirable but recoverable.
+
+Also drain at natural idle moments — e.g. after a long task finishes and before you tell the admin "done", do one drain check. Catches the "I just sent a correction while you were working" case.
+
 Reply:
 ```bash
 node ../teleport/scripts/send-telegram.mjs --reply-to <prompt.messageId> --convo $CONVO_ID "..."
