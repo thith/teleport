@@ -1,9 +1,9 @@
 // Per-convo listener liveness store. Each active tele-listen invocation
 // touches `tmp/listener-alive/<convoId>` at the top of its poll cycle; the
 // file's mtime is the heartbeat. Stale convos (last touch older than
-// `freshMs`) signal an agent that has exited / crashed without cleanup, so
-// pending-store can drop their effective TTL from 24h to 60min and stop
-// nagging the admin with reminders for dead conversations.
+// `freshMs`) signal an agent that has exited or is mid-task without
+// listening, so pending-store's listDueReminders skips them — no point
+// pinging the admin at 2 AM about a convo whose agent is asleep.
 //
 // File-per-convo (not a JSON registry) so concurrent writers never collide —
 // each convo owns its own path, no locks needed. GC is a one-shot rmSync on
@@ -16,10 +16,16 @@ import { fileURLToPath } from 'node:url';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 export const DEFAULT_ALIVE_DIR = path.join(__dirname, 'tmp', 'listener-alive');
-// Default freshness threshold. Poll cycles touch every ~5–15s (5s noMatch
-// backoff worst-case + 12s outer Monitor restart); 90s gives ~6× headroom for
-// transient hiccups (slow fetchUpdates, brief GC pause) without false-stale.
-export const DEFAULT_FRESH_MS = 90_000;
+// Default freshness threshold. Inside an active poll loop, touches arrive
+// every ~5–15s (5s noMatch backoff worst-case + 12s outer Monitor restart),
+// so 90s would suffice for that case alone. But blocking agents (Codex /
+// Gemini using `--wait-once`) only run the listener while waiting for a
+// reply — after admin replies they may do 30 min of work with no touch.
+// During that gap a 90s threshold would mark the convo 💀 even though the
+// agent is alive and will return. 30 min covers typical task duration while
+// still being well below REMIND_AFTER_MS (2h) so a truly dead agent is
+// caught long before the next reminder window.
+export const DEFAULT_FRESH_MS = 30 * 60 * 1000; // 30 min
 // In-process throttle: skip the syscall if we already touched this convo
 // within the last 30s. Heartbeat granularity is minutes — sub-30s writes are
 // pure noise and only matter for SSD wear / inotify spam.

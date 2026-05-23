@@ -794,7 +794,7 @@ const START_BODY = [
   '',
   'Liveness markers in /pending:',
   '🟢 listener active right now',
-  '💀 listener was alive but went quiet (>90s)',
+  '💀 listener was alive but went quiet (no heartbeat within freshness window)',
   '⚪ no listener registered (fire-and-forget send)',
   '',
   '— Created by trumviahe.com team and agents',
