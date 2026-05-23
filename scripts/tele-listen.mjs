@@ -749,21 +749,41 @@ export function detectPendingCommands(fetched, adminIds) {
   return { handledIds, responses };
 }
 
-/** Dispatch /pending responses prepared by `detectPendingCommands`. Network
- * call lives OUTSIDE pollLock so it does not block other listeners.
+/** Dispatch /pending or /start responses prepared by their detect()
+ * helpers. Network call lives OUTSIDE pollLock so it does not block other
+ * listeners. Records each successful send into the system-msg-ids registry
+ * so that admin replies to the command output are routed back through the
+ * orphan path (💔 + "reply to a regular message" hint) rather than being
+ * delivered to an agent as a prompt.
  */
-export async function dispatchPendingResponses(token, responses, { sendText } = {}) {
+export async function dispatchPendingResponses(token, responses, { sendText, recordSystemMsgId = appendSystemMsgId } = {}) {
   const sendImpl = sendText ?? (async (chatId, text, threadId, replyToMessageId) => {
     try {
-      await sendTextChunk(token, chatId, text, { raw: false, plain: true, replyTo: replyToMessageId, messageThreadId: threadId });
-      return true;
+      const res = await sendTextChunk(token, chatId, text, { raw: false, plain: true, replyTo: replyToMessageId, messageThreadId: threadId });
+      return res;
     } catch (e) {
-      console.error(`[tele-listen] /pending dispatch failed: ${scrubToken(e instanceof Error ? e.message : String(e), token)}`);
-      return false;
+      console.error(`[tele-listen] command-response dispatch failed: ${scrubToken(e instanceof Error ? e.message : String(e), token)}`);
+      return null;
     }
   });
   for (const r of responses) {
-    await sendImpl(r.chatId, r.body, r.threadId, r.replyToMessageId);
+    const res = await sendImpl(r.chatId, r.body, r.threadId, r.replyToMessageId);
+    // Match the orphan-reply registration pattern at line ~968: skip if the
+    // text was sent as a .md fallback (Telegram parse failure) — that .md
+    // attachment isn't a [SYSTEM]-class message and shouldn't trigger the
+    // orphan path on future replies.
+    //
+    // Race note: there's a small window between the response landing in
+    // Telegram and `appendSystemMsgId` flushing to disk. If admin replies
+    // within that window AND another listener polls before fsync, the
+    // reply is misclassified as a real convo reply. In practice the
+    // window is tens of milliseconds vs the ~2s Telegram delivery jitter,
+    // so this hasn't bitten us; logged here so a future bug report makes
+    // sense.
+    if (res && typeof res === 'object' && res.messageId && !res.fallback) {
+      try { await recordSystemMsgId(r.chatId, res.messageId); }
+      catch (e) { console.error(`[tele-listen] command-response system-msg-id register failed: ${e instanceof Error ? e.message : String(e)}`); }
+    }
   }
 }
 
@@ -872,11 +892,19 @@ function maybePruneAlive(now) {
   try { pruneAliveStale({ now }); } catch {}
 }
 
-export async function runHeartbeatReminders(token, adminIds, { sendText, now = Date.now(), storeFile, getLastAliveMs: getLastAliveMsArg = getLastAliveMs, aliveFreshMs = ALIVE_FRESH_MS } = {}) {
+export async function runHeartbeatReminders(token, adminIds, { sendText, now = Date.now(), storeFile, getLastAliveMs: getLastAliveMsArg = getLastAliveMs, aliveFreshMs = ALIVE_FRESH_MS, recordSystemMsgId = appendSystemMsgId } = {}) {
   if (isQuietHour(new Date(now))) return 0;
   const sendImpl = sendText ?? (async (chatId, text) => {
     try {
-      await sendTextChunk(token, chatId, text, { raw: false, plain: true });
+      const res = await sendTextChunk(token, chatId, text, { raw: false, plain: true });
+      // Register the reminder message as a system message, same reason as
+      // /pending and /start responses: replying to a "⏰ Pending reminder"
+      // is a natural admin action, and that reply has no agent thread to
+      // belong to — orphan path is the correct routing.
+      if (res && res.messageId && !res.fallback) {
+        try { await recordSystemMsgId(chatId, res.messageId); }
+        catch (e) { console.error(`[tele-listen] reminder system-msg-id register failed: ${e instanceof Error ? e.message : String(e)}`); }
+      }
       return true;
     } catch (e) {
       console.error(`[tele-listen] reminder send failed to ${chatId}: ${scrubToken(e instanceof Error ? e.message : String(e), token)}`);
