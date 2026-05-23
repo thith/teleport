@@ -136,7 +136,10 @@ test('pending-store — writePendingStore enforces PENDING_CAP', () => {
 
 test('pending-store — updatePendingStore round-trip', () => {
   const file = tmp();
-  updatePendingStore((s) => recordBotSend(s, { convoId: 100, project: 'p', messageId: 1, now: Date.parse('2026-05-22T10:00:00Z') }), file);
+  // Anchor to wall-clock so the 24h TTL sweep in writePendingStore never
+  // strips this entry mid-test (older anchor dates went flaky as the test
+  // suite aged past t0 + 24h).
+  updatePendingStore((s) => recordBotSend(s, { convoId: 100, project: 'p', messageId: 1, now: Date.now() }), file);
   const after = readPendingStore(file);
   assert.strictEqual(after['100'].project, 'p');
   fs.unlinkSync(file);

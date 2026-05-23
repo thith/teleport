@@ -28,8 +28,10 @@ test('listener-alive — isAlive false when stale', () => {
   _resetThrottle();
   const dir = tmpDir();
   recordAlive('c1', { dir, now: 1_000_000 });
-  // Force mtime to a known past time via utimesSync (recordAlive uses `now`
-  // only for the throttle key, not the file mtime itself — verify with stat).
+  // recordAlive writes mtime from `now`, but on some filesystems (notably
+  // older ext2 / FAT32 without sub-second support) the truncation could
+  // drift; force a known mtime explicitly so the staleness check below is
+  // not sensitive to filesystem timestamp resolution.
   const t = (1_000_000) / 1000;
   fs.utimesSync(alivePath('c1', dir), t, t);
   assert.strictEqual(isAlive('c1', { dir, now: 1_000_000 + 120_000, freshMs: 90_000 }), false);

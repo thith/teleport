@@ -23,6 +23,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { shortConvoHash } from './convo-hash.mjs';
+import { DEFAULT_FRESH_MS as ALIVE_FRESH_MS } from './listener-alive.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 export const DEFAULT_PENDING_FILE = path.join(__dirname, 'tmp', 'pending.json');
@@ -189,7 +190,7 @@ export function recordAdminReply(store, { convoId, project = null, now = Date.no
 // who don't opt in keep seeing every due entry).
 const NO_ALIVE = () => null;
 
-export function listPending(store, { now = Date.now(), minElapsedMs = 0, maxAgeMs = PENDING_MAX_AGE_MS, getLastAliveMs, aliveFreshMs = 90_000 } = {}) {
+export function listPending(store, { now = Date.now(), minElapsedMs = 0, maxAgeMs = PENDING_MAX_AGE_MS, getLastAliveMs, aliveFreshMs = ALIVE_FRESH_MS } = {}) {
   const aliveFn = typeof getLastAliveMs === 'function' ? getLastAliveMs : NO_ALIVE;
   const out = [];
   for (const [convoId, entry] of Object.entries(store)) {
@@ -216,7 +217,7 @@ export function listPending(store, { now = Date.now(), minElapsedMs = 0, maxAgeM
  * the listener for this convo is alive (admin won't get nagged about convos
  * whose agent has died — they're already orphaned, a 2 AM ping is just noise).
  */
-export function listDueReminders(store, { now = Date.now(), remindAfterMs = REMIND_AFTER_MS, getLastAliveMs, aliveFreshMs = 90_000 } = {}) {
+export function listDueReminders(store, { now = Date.now(), remindAfterMs = REMIND_AFTER_MS, getLastAliveMs, aliveFreshMs = ALIVE_FRESH_MS } = {}) {
   // Opt-in alive filter: only enabled when a real callback is supplied.
   // Reference-equality against a default sentinel was brittle — explicit
   // `{ ...opts, getLastAliveMs: undefined }` from a caller would silently
@@ -224,8 +225,11 @@ export function listDueReminders(store, { now = Date.now(), remindAfterMs = REMI
   const aliveFilterEnabled = typeof getLastAliveMs === 'function';
   return listPending(store, { now, minElapsedMs: remindAfterMs, getLastAliveMs, aliveFreshMs })
     .filter((p) => p.remindedAt == null)
-    // Dead-listener convos are skipped here. They still appear in /pending
-    // (with a 💀 marker) so admin can `/close` them manually.
+    // Skip convos whose listener is NOT currently alive. This drops both
+    // 💀 (last-touched > freshness window) AND ⚪ (no alive file at all,
+    // e.g. fire-and-forget sender that never started a listener). Per
+    // product spec: no auto-reminder when there's nothing/nobody to
+    // receive it — silence beats a 2 AM ping into the void.
     .filter((p) => !aliveFilterEnabled || p.alive);
 }
 

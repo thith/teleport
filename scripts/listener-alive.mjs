@@ -85,12 +85,14 @@ export function isAlive(convoId, { dir = DEFAULT_ALIVE_DIR, now = Date.now(), fr
     const st = fs.statSync(alivePath(convoId, dir));
     return now - st.mtimeMs < freshMs;
   } catch (e) {
-    if (e && e.code === 'ENOENT') return false;
-    // Unexpected error (permissions, etc.) — bias to "alive" so we don't
-    // start dropping reminders due to a transient FS hiccup. Stale detection
-    // is an optimization; false-fresh just preserves current behavior.
+    if (!e || e.code === 'ENOENT') return false;
+    // Unexpected error (permissions, EIO, etc.) — return false so this
+    // function stays consistent with `getLastAliveMs` (also returns null on
+    // such errors). The pending-store filter uses getLastAliveMs; both must
+    // agree on the same convo, or /pending markers will diverge from the
+    // reminder filter for the same admin in the same poll cycle.
     console.error(`[listener-alive] stat failed for ${convoId}: ${e instanceof Error ? e.message : String(e)}`);
-    return true;
+    return false;
   }
 }
 

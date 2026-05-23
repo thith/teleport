@@ -1899,6 +1899,9 @@ async function watchSupervisor(argv) {
   //   "prompt consumed — resuming polling"
   let pendingLogged = false;
   while (!stopping) {
+    // Heartbeat from the watch supervisor itself; child spawns alone aren't
+    // enough when the loop is paused on promptExists backoff.
+    recordAlive(args.convo);
     // Don't overwrite an unconsumed prompt — the agent hasn't read it yet.
     // NOTE: while paused here, this supervisor's child is NOT polling Telegram.
     // Other listeners (e.g. Claude Monitor) may still fetch + cache updates;
@@ -2033,6 +2036,11 @@ export async function waitOnceSupervisor(argv, deps = {}) {
   logFn(`[tele-wait-once] waiting for one reply in convo ${args.convo}`);
   while (true) {
     if (stopping) return;
+    // Defensive heartbeat from the supervisor itself: if a child stalls or
+    // the spawn-die loop is in promptExists backoff (no child spawning), we
+    // still want admins to see this convo as alive while the supervisor is
+    // active. recordAlive's 30s in-process throttle keeps this cheap.
+    recordAlive(args.convo);
     if (existsFn(promptFile)) {
       logFn(`[tele-wait-once] prompt ready: ${promptFile}`);
       finish(0);
