@@ -16,7 +16,7 @@ import {
   updatePendingStore,
   writePendingStore,
 } from './pending-store.mjs';
-import { handlePendingCommand, runHeartbeatReminders } from './tele-listen.mjs';
+import { handlePendingCommand, runHeartbeatReminders, isQuietHour } from './tele-listen.mjs';
 
 function tmp() {
   return path.join(os.tmpdir(), `pending-${Date.now()}-${Math.random().toString(36).slice(2)}.json`);
@@ -185,6 +185,76 @@ test('handlePendingCommand — ignores non-/pending text', async () => {
   }];
   const handled = await handlePendingCommand('TOKEN', updates, ['144242180'], { sendText: async () => true });
   assert.strictEqual(handled.size, 0);
+});
+
+function atHour(h) {
+  const d = new Date(2026, 4, 23, h, 30, 0);
+  return d;
+}
+
+test('isQuietHour — disabled when env vars unset or empty', () => {
+  assert.strictEqual(isQuietHour(atHour(2), {}), false);
+  assert.strictEqual(isQuietHour(atHour(2), { QUIET_HOURS_START: '', QUIET_HOURS_END: '' }), false);
+});
+
+test('isQuietHour — non-numeric or out-of-range silently disables (no partial-window surprises)', () => {
+  const env = (s, e) => ({ QUIET_HOURS_START: s, QUIET_HOURS_END: e });
+  assert.strictEqual(isQuietHour(atHour(2), env('8h', '22')), false);
+  assert.strictEqual(isQuietHour(atHour(2), env('22', '8 am')), false);
+  assert.strictEqual(isQuietHour(atHour(2), env('-1', '8')), false);
+  assert.strictEqual(isQuietHour(atHour(2), env('22', '24')), false);
+  assert.strictEqual(isQuietHour(atHour(2), env('5', '5')), false);
+});
+
+test('isQuietHour — wrap-around 22→8 covers night, excludes day', () => {
+  const env = { QUIET_HOURS_START: '22', QUIET_HOURS_END: '8' };
+  assert.strictEqual(isQuietHour(atHour(22), env), true);
+  assert.strictEqual(isQuietHour(atHour(2), env), true);
+  assert.strictEqual(isQuietHour(atHour(7), env), true);
+  assert.strictEqual(isQuietHour(atHour(8), env), false, 'END is exclusive');
+  assert.strictEqual(isQuietHour(atHour(12), env), false);
+  assert.strictEqual(isQuietHour(atHour(21), env), false, 'START is inclusive — 21 is just before');
+});
+
+test('isQuietHour — non-wrapping 1→5 (sanity for start<end branch)', () => {
+  const env = { QUIET_HOURS_START: '1', QUIET_HOURS_END: '5' };
+  assert.strictEqual(isQuietHour(atHour(0), env), false);
+  assert.strictEqual(isQuietHour(atHour(1), env), true);
+  assert.strictEqual(isQuietHour(atHour(4), env), true);
+  assert.strictEqual(isQuietHour(atHour(5), env), false);
+});
+
+test('runHeartbeatReminders — skips send when isQuietHour is true', async () => {
+  const file = tmp();
+  const t0 = Date.parse('2026-05-22T08:00:00Z');
+  const store = readPendingStore(file);
+  recordBotSend(store, { convoId: '123', project: 'p', messageId: 1, now: t0 });
+  writePendingStore(store, file);
+  // 3h elapsed — would normally be due. Set quiet window covering "now".
+  const now = t0 + 3 * 60 * 60 * 1000;
+  const hourLocal = new Date(now).getHours();
+  const start = String(hourLocal);
+  const end = String((hourLocal + 1) % 24);
+  const prevStart = process.env.QUIET_HOURS_START;
+  const prevEnd = process.env.QUIET_HOURS_END;
+  process.env.QUIET_HOURS_START = start;
+  process.env.QUIET_HOURS_END = end;
+  try {
+    let calls = 0;
+    const sent = await runHeartbeatReminders('TOKEN', ['144242180'], {
+      sendText: async () => { calls++; return true; },
+      now,
+      storeFile: file,
+    });
+    assert.strictEqual(calls, 0);
+    assert.strictEqual(sent, 0);
+    // Entry must remain unmarked so it fires after quiet ends.
+    const after = readPendingStore(file);
+    assert.strictEqual(after['123'].remindedAt, null);
+  } finally {
+    if (prevStart === undefined) delete process.env.QUIET_HOURS_START; else process.env.QUIET_HOURS_START = prevStart;
+    if (prevEnd === undefined) delete process.env.QUIET_HOURS_END; else process.env.QUIET_HOURS_END = prevEnd;
+  }
 });
 
 test('runHeartbeatReminders — no due → no send', async () => {

@@ -784,7 +784,39 @@ export async function handlePendingCommand(token, fetched, adminIds, { sendText 
 const ADMIN_FANOUT_DELAY_MS = 50;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+/**
+ * Quiet hours: when `QUIET_HOURS_START` and `QUIET_HOURS_END` (0–23) are set,
+ * the heartbeat skips auto-reminders during that window. END is exclusive
+ * (start=22, end=8 ⇒ 22:00–07:59). Wraps across midnight.
+ *
+ * Timezone is whatever `Date.getHours()` resolves to in the listener
+ * process — set `TZ=...` in the service env if the host TZ differs from
+ * the user's local time.
+ *
+ * Pending entries are NOT marked reminded while quiet, so they fire on the
+ * next heartbeat after the window ends. Note `PENDING_MAX_AGE_MS` (24h) still
+ * applies — a very long quiet window can leave little headroom before TTL.
+ */
+function parseHour(raw) {
+  if (raw == null) return NaN;
+  const s = String(raw).trim();
+  // Reject empty or non-numeric (e.g. "8h", "8 am") — parseInt would silently
+  // accept these and quietly mis-configure the window.
+  if (!/^\d{1,2}$/.test(s)) return NaN;
+  return parseInt(s, 10);
+}
+export function isQuietHour(now = new Date(), env = process.env) {
+  const start = parseHour(env.QUIET_HOURS_START);
+  const end = parseHour(env.QUIET_HOURS_END);
+  if (!Number.isInteger(start) || !Number.isInteger(end)) return false;
+  if (start < 0 || start > 23 || end < 0 || end > 23) return false;
+  if (start === end) return false;
+  const h = (now instanceof Date ? now : new Date(now)).getHours();
+  return start < end ? (h >= start && h < end) : (h >= start || h < end);
+}
+
 export async function runHeartbeatReminders(token, adminIds, { sendText, now = Date.now(), storeFile } = {}) {
+  if (isQuietHour(new Date(now))) return 0;
   const sendImpl = sendText ?? (async (chatId, text) => {
     try {
       await sendTextChunk(token, chatId, text, { raw: false, plain: true });
@@ -1295,6 +1327,14 @@ async function main() {
   fs.mkdirSync(DEFAULT_TMP_DIR, { recursive: true });
 
   const envFromFile = loadEnvFromFile(ENV_FILE);
+  // Bubble optional config from .env into process.env so consumers that read
+  // process.env directly (e.g. isQuietHour) pick up values without having to
+  // thread envFromFile through every call site.
+  for (const k of ['QUIET_HOURS_START', 'QUIET_HOURS_END']) {
+    if ((process.env[k] == null || process.env[k] === '') && envFromFile[k]) {
+      process.env[k] = envFromFile[k];
+    }
+  }
   const token = process.env.REPORT_BOT_TOKEN || envFromFile.REPORT_BOT_TOKEN;
   const adminIds = parseAdminChatIds(
     process.env.TELEGRAM_ADMIN_CHAT_ID || envFromFile.TELEGRAM_ADMIN_CHAT_ID,
