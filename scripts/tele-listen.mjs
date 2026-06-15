@@ -499,7 +499,33 @@ export function formatFromName(from) {
   return null;
 }
 
-export function buildPromptData(msg, updateId = null, botId = null) {
+/**
+ * Parse a `TELE_ROLES` string into a Map<userId, role> (RFC 01 P4). Format:
+ * `"144242180:admin, 555:dev"`. Whitespace-tolerant; malformed pairs skipped.
+ * Roles are advisory metadata attached to prompts — ENFORCEMENT of privileged
+ * actions (commit/deploy) is agent-side per the guide, since teleport itself
+ * never performs them.
+ */
+export function parseRoles(str) {
+  const map = new Map();
+  if (!str) return map;
+  for (const pair of String(str).split(',')) {
+    const i = pair.indexOf(':');
+    if (i < 0) continue;
+    const id = pair.slice(0, i).trim();
+    const role = pair.slice(i + 1).trim();
+    if (id && role) map.set(id, role);
+  }
+  return map;
+}
+
+/** Resolve a user's role from a roles Map (null when unmapped = least privilege). */
+export function resolveRole(roles, userId) {
+  if (!roles || userId == null) return null;
+  return roles.get(String(userId)) ?? null;
+}
+
+export function buildPromptData(msg, updateId = null, botId = null, roles = null) {
   const replyTo = msg.reply_to_message;
   return {
     text: msg.text ?? msg.caption ?? '',
@@ -507,6 +533,7 @@ export function buildPromptData(msg, updateId = null, botId = null) {
     chatId: String(msg.chat.id),
     fromUserId: String(msg.from?.id ?? msg.chat.id),
     fromName: formatFromName(msg.from),
+    fromRole: resolveRole(roles, msg.from?.id),
     replyToMessageId: replyTo?.message_id ?? null,
     // Media-only messages have `.caption` instead of `.text`; fall back so the
     // agent still sees the human-readable context.
@@ -524,7 +551,7 @@ export function buildPromptData(msg, updateId = null, botId = null) {
  * LAST message (newest) so the AI replies to the right thread. Reply/quote
  * metadata from earlier messages in the batch is intentionally dropped.
  */
-export function buildCombinedPromptData(messages, botId = null, convoId = null) {
+export function buildCombinedPromptData(messages, botId = null, convoId = null, roles = null) {
   if (!messages.length) throw new Error('messages must not be empty');
   const [first, ...rest] = messages;
   const getText = (m) => m.text ?? m.caption ?? '';
@@ -546,6 +573,7 @@ export function buildCombinedPromptData(messages, botId = null, convoId = null) 
     chatId: String(last.chat.id),
     fromUserId: String(last.from?.id ?? last.chat.id),
     fromName: formatFromName(last.from),
+    fromRole: resolveRole(roles, last.from?.id),
     replyToMessageId: replyTo?.message_id ?? null,
     replyToText: replyTo?.text ?? replyTo?.caption ?? (replyTo ? summarizeMediaReplyTarget(replyTo) : null),
     quotedText: last.quote?.text ?? null,
@@ -1458,6 +1486,8 @@ async function main() {
   // on non-forum chats and is what creates the topic, so an absent mapping just
   // falls back to reply-to matching.
   const teamEnabled = (process.env.TELE_TEAM ?? envFromFile.TELE_TEAM) === '1';
+  // Role map (RFC 01 P4) — advisory attribution; agent-side enforcement.
+  const roles = parseRoles(process.env.TELE_ROLES ?? envFromFile.TELE_ROLES);
 
   if (!token) {
     console.error('[tele-listen] Missing REPORT_BOT_TOKEN');
@@ -1718,7 +1748,7 @@ async function main() {
     process.exit(2);
   }
 
-  const data = buildCombinedPromptData(toProcess, extractBotId(token), convo);
+  const data = buildCombinedPromptData(toProcess, extractBotId(token), convo, roles);
   if (data.attachments.length) {
     const baseDir = path.join(path.dirname(promptFile), 'attachments');
     await downloadAttachments(token, data.attachments, baseDir);
