@@ -118,15 +118,19 @@ test('pending-store — formatPendingList: marks reminded entries', () => {
 test('pending-store — writePendingStore enforces PENDING_CAP', () => {
   const file = tmp();
   const big = {};
+  const base = Date.parse('2026-05-22T00:00:00Z');
   // Insert PENDING_CAP + 50 entries; oldest by lastBotSend should be evicted.
   for (let i = 0; i < PENDING_CAP + 50; i++) {
     big[String(i)] = {
       project: 'p',
-      lastBotSend: new Date(Date.parse('2026-05-22T00:00:00Z') + i * 1000).toISOString(),
+      lastBotSend: new Date(base + i * 1000).toISOString(),
       lastBotSendMessageId: i,
     };
   }
-  writePendingStore(big, file);
+  // Pin `now` to just after the last entry so the 24h TTL sweep keeps every
+  // entry — this test exercises PENDING_CAP eviction, not the TTL sweep, and
+  // must not depend on wall-clock distance from the hardcoded base date.
+  writePendingStore(big, file, { now: base + (PENDING_CAP + 50) * 1000 });
   const after = readPendingStore(file);
   assert.strictEqual(Object.keys(after).length, PENDING_CAP);
   // Newest entries kept; entry i=PENDING_CAP+49 must survive.
