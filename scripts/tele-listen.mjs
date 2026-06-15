@@ -16,6 +16,7 @@ import {
   updatePendingStore,
 } from './pending-store.mjs';
 import { recordAlive, isAlive, getLastAliveMs, pruneStale as pruneAliveStale, DEFAULT_FRESH_MS as ALIVE_FRESH_MS } from './listener-alive.mjs';
+import { readTopicsStore, getThreadId } from './topics-store.mjs';
 import {
   acquireLock as acquireConvoLock,
   appendRowLocked as appendConvoRow,
@@ -447,11 +448,16 @@ function summarizeMediaReplyTarget(replyTo) {
   return null;
 }
 
-export function filterAdminMessages(updates, adminIds, filterReplyTo = null, mode = 'legacy') {
+export function filterAdminMessages(updates, adminIds, filterReplyTo = null, mode = 'legacy', threadId = null) {
   // mode = 'legacy' : filterReplyTo is null | number | number[] | Set<number>;
   //                   matches `reply_to_message.message_id` only.
   // mode = 'convo'  : filterReplyTo is a Set<string> of `${chatId}:${messageId}`;
   //                   match requires BOTH chat and reply-target.
+  //
+  // threadId (RFC 01 team mode): when set, routing is STRUCTURAL — accept any
+  // admin message whose `message_thread_id` equals the convo's owned forum
+  // topic (posting in the topic = addressing this agent). Reply-to is NOT
+  // required, and General (no thread_id) + foreign topics are ignored.
   let replyToSet = null;
   if (filterReplyTo != null) {
     if (filterReplyTo instanceof Set) replyToSet = filterReplyTo;
@@ -463,6 +469,9 @@ export function filterAdminMessages(updates, adminIds, filterReplyTo = null, mod
       const msg = u.message;
       if (!hasUserContent(msg)) return false;
       if (adminIds.length > 0 && !adminIds.includes(String(msg.chat.id))) return false;
+      if (threadId != null) {
+        return (msg.message_thread_id ?? null) === threadId;
+      }
       if (replyToSet != null) {
         const replyId = msg.reply_to_message?.message_id;
         if (replyId == null) return false;
@@ -561,8 +570,8 @@ export function findOrphanMessages(updates, adminIds, systemMsgIds = new Set()) 
   }).map((u) => ({ update: u, msg: u.message, orphan: true }));
 }
 
-export function collectMessagesToProcess(updates, adminIds, filterReplyTo, mode = 'legacy') {
-  return filterAdminMessages(updates, adminIds, filterReplyTo, mode);
+export function collectMessagesToProcess(updates, adminIds, filterReplyTo, mode = 'legacy', threadId = null) {
+  return filterAdminMessages(updates, adminIds, filterReplyTo, mode, threadId);
 }
 
 /**
@@ -1428,6 +1437,12 @@ async function main() {
   const adminIds = parseAdminChatIds(
     process.env.TELEGRAM_ADMIN_CHAT_ID || envFromFile.TELEGRAM_ADMIN_CHAT_ID,
   );
+  // Team mode (RFC 01) — opt-in, default OFF. When on (and we have a convo),
+  // route by the convo's OWNED forum topic instead of reply-to: posting in the
+  // topic addresses the agent. No network call here — the send side fail-fasts
+  // on non-forum chats and is what creates the topic, so an absent mapping just
+  // falls back to reply-to matching.
+  const teamEnabled = (process.env.TELE_TEAM ?? envFromFile.TELE_TEAM) === '1';
 
   if (!token) {
     console.error('[tele-listen] Missing REPORT_BOT_TOKEN');
@@ -1484,6 +1499,17 @@ async function main() {
     filterReplyTo = set;
     if (malformed > 0) {
       console.error(`[tele-listen] convo-registry: ${malformed} malformed line(s) skipped this poll`);
+    }
+  }
+
+  // Team mode: resolve this convo's owned forum topic (local file read only).
+  // When found, message routing switches from reply-to to thread membership.
+  let teamThreadId = null;
+  if (teamEnabled && convo != null) {
+    const topics = readTopicsStore();
+    for (const chatId of adminIds) {
+      const tid = getThreadId(topics, chatId, String(convo));
+      if (tid != null) { teamThreadId = tid; break; }
     }
   }
 
@@ -1660,7 +1686,7 @@ async function main() {
     process.exit(1);
   }
 
-  const toProcess = collectMessagesToProcess(updates, adminIds, filterReplyTo, mode);
+  const toProcess = collectMessagesToProcess(updates, adminIds, filterReplyTo, mode, teamThreadId);
 
   const advanceLoopOffset = () => {
     if (updates.length > 0) {
