@@ -609,7 +609,56 @@ async function createForumTopic(token, chatId, name) {
 }
 
 /**
- * Resolve the `message_thread_id` to use for a (chatId, projectCode) pair.
+ * Fetch chat metadata. Returns `{ ok, isForum, type, description }`. Never
+ * throws — network/parse errors collapse to `{ ok: false }` so callers decide
+ * whether to fail-fast (team mode) or proceed (default mode).
+ */
+export async function detectForum(token, chatId, fetcher) {
+  const call = fetcher ?? (async () => {
+    const res = await fetch(`${TELEGRAM_API}${token}/getChat?chat_id=${encodeURIComponent(chatId)}`);
+    const body = await res.json().catch(() => ({}));
+    return { ok: res.ok && body?.ok === true, result: body?.result, description: body?.description };
+  });
+  let r;
+  try { r = await call(token, chatId); } catch (e) { return { ok: false, isForum: false, description: String(e?.message ?? e) }; }
+  return {
+    ok: r?.ok === true,
+    isForum: r?.result?.is_forum === true,
+    type: r?.result?.type ?? null,
+    description: r?.description ?? null,
+  };
+}
+
+/**
+ * Build the fail-fast guidance shown when team mode is on but the chat is not
+ * a forum supergroup. Exported so the message can be unit-tested.
+ */
+export function teamModeForumError(chatId) {
+  return [
+    `[send-telegram] TELE_TEAM=1 nhưng chat ${chatId} KHÔNG phải supergroup bật Topics.`,
+    'Teleport team mode chỉ chạy trong group forum. Cách bật:',
+    '  1. Tạo group, bật Topics (Group → Edit → Topics).',
+    '  2. Add bot vào group, đặt làm admin + bật quyền "Manage Topics".',
+    '  3. BotFather → Bot Settings → Group Privacy → Turn OFF (để bot nhận mọi message trong topic).',
+    '  4. Lấy group id (negative) và đặt TELEGRAM_ADMIN_CHAT_ID = id đó.',
+  ].join('\n');
+}
+
+/**
+ * Compute `{ topicKey, topicName }` for resolveThreadId. Team mode (with a
+ * resolved convoId + persona) → key by convoId, title by persona
+ * ("🐷 Heo · luni") so each convo owns a topic. Otherwise → key & title by
+ * projectCode (legacy project→topic).
+ */
+export function topicTarget({ teamEnabled, convoId, persona, projectCode }) {
+  if (teamEnabled && convoId != null && persona) {
+    return { topicKey: String(convoId), topicName: `${persona.emoji} ${persona.name} · ${projectCode}` };
+  }
+  return { topicKey: projectCode, topicName: projectCode };
+}
+
+/**
+ * Resolve the `message_thread_id` to use for a (chatId, topicKey) pair.
  *
  * Returns `null` if no topic should be used — either silently because the
  * chat doesn't support topics (negative cache active), or because the API
@@ -630,26 +679,31 @@ function isPermanentNoTopicError(res) {
   return /CHAT_FORUM_REQUIRED|TOPICS_FORBIDDEN|TOPIC_NOT_MODIFIED|FORUM_NOT_ENABLED|NOT_FORUM|TOPIC_CREATE_DISABLED|chat not found|user is deactivated|bot was kicked|not enough rights/i.test(d);
 }
 
-export async function resolveThreadId({ token, chatId, projectCode, nowFn = Date.now, topicsFile, fetcher = createForumTopic }) {
-  if (!projectCode || projectCode.startsWith('_')) return null;
+export async function resolveThreadId({ token, chatId, projectCode, topicKey = projectCode, topicName = projectCode, nowFn = Date.now, topicsFile, fetcher = createForumTopic }) {
+  // `topicKey` is the topics-store cache key, `topicName` the forum-topic
+  // title. Default mode: both = projectCode (project → one topic). Team mode
+  // (RFC 01): topicKey = convoId, topicName = persona title ("🐷 Heo · luni"),
+  // giving each convo its own topic.
+  if (topicKey == null || String(topicKey).startsWith('_')) return null;
+  topicKey = String(topicKey);
   // Best-effort: cache reads/writes must never block sending.
   let store;
   try { store = readTopicsStore(topicsFile); } catch { return null; }
   // 1. Positive cache hit — use immediately.
-  const cached = getThreadId(store, chatId, projectCode);
+  const cached = getThreadId(store, chatId, topicKey);
   if (cached != null) return cached;
   // 2. Negative cache still fresh — skip API call.
   if (isNoTopicSupportFresh(store, chatId, nowFn())) return null;
   // 3. Try create.
   let res;
   try {
-    res = await fetcher(token, chatId, projectCode);
+    res = await fetcher(token, chatId, topicName);
   } catch {
     res = null; // fetch threw — treat as permanent
   }
   if (res && res.ok && res.messageThreadId != null) {
     // Locked RMW so we don't clobber a sibling process's positive entry.
-    try { updateTopicsStore((s) => recordThreadId(s, chatId, projectCode, res.messageThreadId), topicsFile); } catch {}
+    try { updateTopicsStore((s) => recordThreadId(s, chatId, topicKey, res.messageThreadId), topicsFile); } catch {}
     return res.messageThreadId;
   }
   // Transient errors (rate-limit / network) — don't poison the cache, just
@@ -805,10 +859,14 @@ async function main() {
   const adminIds = parseAdminChatIds(
     process.env.TELEGRAM_ADMIN_CHAT_ID || envFromFile.TELEGRAM_ADMIN_CHAT_ID,
   );
+  // Team mode (RFC 01) — opt-in, default OFF. When on: fail-fast unless the
+  // chat is a forum supergroup, and each convo gets its OWN forum topic
+  // (topic-per-convo) titled with its persona. Team mode implies persona.
+  const teamEnabled = (process.env.TELE_TEAM ?? envFromFile.TELE_TEAM) === '1';
   // Persona mode (RFC 01) — opt-in, default OFF so existing/personal projects
   // keep their current report format unchanged. When enabled, the script
   // auto-assigns a stable {emoji, name} per convoId and renders it in the tag.
-  const personaEnabled = (process.env.TELE_PERSONA ?? envFromFile.TELE_PERSONA) === '1';
+  const personaEnabled = teamEnabled || (process.env.TELE_PERSONA ?? envFromFile.TELE_PERSONA) === '1';
 
   if (!token) {
     console.error('Missing REPORT_BOT_TOKEN in .env or process env.');
@@ -849,6 +907,19 @@ async function main() {
 
   const opts = { raw: args.raw, plain: args.plain, replyTo: args.replyTo };
 
+  // Team mode fail-fast: every target chat MUST be a forum supergroup. Bail
+  // BEFORE any send so the operator fixes setup instead of silently sending
+  // into a non-forum chat (which would break topic-per-convo routing).
+  if (teamEnabled) {
+    for (const chatId of effectiveAdminIds) {
+      const forum = await detectForum(token, chatId);
+      if (!forum.isForum) {
+        console.error(teamModeForumError(chatId));
+        process.exit(1);
+      }
+    }
+  }
+
   if (args.react != null) {
     let failures = 0;
     for (const chatId of effectiveAdminIds) {
@@ -884,14 +955,15 @@ async function main() {
         let convoIdForSend = resolveConvoIdPreSend({ preResolved, replyTo: args.replyTo, chatId, botId });
         const persona = personaEnabled ? personaForConvo(convoIdForSend) : null;
         const caption = injectConvoHash(rawCaption, projectCode, convoIdForSend, { pretokensEscaped: opts.raw, persona });
-        const threadId = await resolveThreadId({ token, chatId, projectCode });
+        const { topicKey, topicName } = topicTarget({ teamEnabled, convoId: convoIdForSend, persona, projectCode });
+        const threadId = await resolveThreadId({ token, chatId, projectCode, topicKey, topicName });
         let sendOpts = { ...opts, messageThreadId: threadId };
         let result;
         try {
           result = await sendDocumentToAdmin(token, chatId, args.filePath, caption, sendOpts);
         } catch (e) {
           if (threadId != null && isTopicGoneError(e instanceof Error ? e.message : String(e))) {
-            dropTopicMapping(chatId, projectCode);
+            dropTopicMapping(chatId, topicKey);
             sendOpts = { ...opts, messageThreadId: null };
             result = await sendDocumentToAdmin(token, chatId, args.filePath, caption, sendOpts);
           } else { throw e; }
@@ -948,14 +1020,15 @@ async function main() {
       let convoIdForSend = resolveConvoIdPreSend({ preResolved, replyTo: args.replyTo, chatId, botId });
       const persona = personaEnabled ? personaForConvo(convoIdForSend) : null;
       const message = injectConvoHash(rawMessage, projectCode, convoIdForSend, { pretokensEscaped: opts.raw, persona });
-      const threadId = await resolveThreadId({ token, chatId, projectCode });
+      const { topicKey, topicName } = topicTarget({ teamEnabled, convoId: convoIdForSend, persona, projectCode });
+      const threadId = await resolveThreadId({ token, chatId, projectCode, topicKey, topicName });
       let sendOpts = { ...opts, messageThreadId: threadId };
       let result;
       try {
         result = await sendTextToAdmin(token, chatId, message, sendOpts);
       } catch (e) {
         if (threadId != null && isTopicGoneError(e instanceof Error ? e.message : String(e))) {
-          dropTopicMapping(chatId, projectCode);
+          dropTopicMapping(chatId, topicKey);
           sendOpts = { ...opts, messageThreadId: null };
           result = await sendTextToAdmin(token, chatId, message, sendOpts);
         } else { throw e; }
