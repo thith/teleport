@@ -486,6 +486,19 @@ export function filterAdminMessages(updates, adminIds, filterReplyTo = null, mod
     .map((u) => ({ update: u, msg: u.message }));
 }
 
+/**
+ * Human-readable sender name for attribution (RFC 01 P2). Prefers full name
+ * ("Thi" / "Thi Truong"), falls back to "@username", then null. Used so a team
+ * group can see WHO issued an instruction, not just a numeric user id.
+ */
+export function formatFromName(from) {
+  if (!from) return null;
+  const full = [from.first_name, from.last_name].filter(Boolean).join(' ').trim();
+  if (full) return full;
+  if (from.username) return `@${from.username}`;
+  return null;
+}
+
 export function buildPromptData(msg, updateId = null, botId = null) {
   const replyTo = msg.reply_to_message;
   return {
@@ -493,6 +506,7 @@ export function buildPromptData(msg, updateId = null, botId = null) {
     messageId: msg.message_id,
     chatId: String(msg.chat.id),
     fromUserId: String(msg.from?.id ?? msg.chat.id),
+    fromName: formatFromName(msg.from),
     replyToMessageId: replyTo?.message_id ?? null,
     // Media-only messages have `.caption` instead of `.text`; fall back so the
     // agent still sees the human-readable context.
@@ -531,6 +545,7 @@ export function buildCombinedPromptData(messages, botId = null, convoId = null) 
     messageId: last.message_id,
     chatId: String(last.chat.id),
     fromUserId: String(last.from?.id ?? last.chat.id),
+    fromName: formatFromName(last.from),
     replyToMessageId: replyTo?.message_id ?? null,
     replyToText: replyTo?.text ?? replyTo?.caption ?? (replyTo ? summarizeMediaReplyTarget(replyTo) : null),
     quotedText: last.quote?.text ?? null,
