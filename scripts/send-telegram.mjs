@@ -632,13 +632,13 @@ export async function detectForum(token, chatId, fetcher) {
 }
 
 /**
- * Build the fail-fast guidance shown when team mode is on but the chat is not
- * a forum supergroup. Exported so the message can be unit-tested.
+ * Build the fail-fast guidance shown when the target chat is not a forum
+ * supergroup. Exported so the message can be unit-tested.
  */
 export function teamModeForumError(chatId) {
   return [
-    `[send-telegram] TELE_TEAM=1 nhưng chat ${chatId} KHÔNG phải supergroup bật Topics.`,
-    'Teleport team mode chỉ chạy trong group forum. Cách bật:',
+    `[send-telegram] chat ${chatId} KHÔNG phải supergroup bật Topics.`,
+    'Teleport chỉ chạy trong group forum. Cách bật:',
     '  1. Tạo group, bật Topics (Group → Edit → Topics).',
     '  2. Add bot vào group, đặt làm admin + bật quyền "Manage Topics".',
     '  3. BotFather → Bot Settings → Group Privacy → Turn OFF (để bot nhận mọi message trong topic).',
@@ -647,13 +647,13 @@ export function teamModeForumError(chatId) {
 }
 
 /**
- * Compute `{ topicKey, topicName }` for resolveThreadId. Team mode (with a
- * resolved convoId + persona) → key by convoId, title by persona
- * ("🐷 Heo · luni") so each convo owns a topic. Otherwise → key & title by
- * projectCode (legacy project→topic).
+ * Compute `{ topicKey, topicName }` for resolveThreadId — one forum topic per
+ * convo. Key by convoId, title by persona ("🐷 Heo · luni"). Falls back to
+ * projectCode only at the edge where convoId/persona can't be resolved (e.g. a
+ * brand-new convo with no session env), so a send never crashes.
  */
-export function topicTarget({ teamEnabled, convoId, persona, projectCode }) {
-  if (teamEnabled && convoId != null && persona) {
+export function topicTarget({ convoId, persona, projectCode }) {
+  if (convoId != null && persona) {
     return { topicKey: String(convoId), topicName: `${persona.emoji} ${persona.name} · ${projectCode}` };
   }
   return { topicKey: projectCode, topicName: projectCode };
@@ -913,14 +913,9 @@ async function main() {
   const adminIds = parseAdminChatIds(
     process.env.TELEGRAM_ADMIN_CHAT_ID || envFromFile.TELEGRAM_ADMIN_CHAT_ID,
   );
-  // Team mode (RFC 01) — opt-in, default OFF. When on: fail-fast unless the
-  // chat is a forum supergroup, and each convo gets its OWN forum topic
-  // (topic-per-convo) titled with its persona. Team mode implies persona.
-  const teamEnabled = (process.env.TELE_TEAM ?? envFromFile.TELE_TEAM) === '1';
-  // Persona mode (RFC 01) — opt-in, default OFF so existing/personal projects
-  // keep their current report format unchanged. When enabled, the script
-  // auto-assigns a stable {emoji, name} per convoId and renders it in the tag.
-  const personaEnabled = teamEnabled || (process.env.TELE_PERSONA ?? envFromFile.TELE_PERSONA) === '1';
+  // RFC 01: teleport runs ONE mode — team. Every target chat MUST be a forum
+  // supergroup; each convo gets its OWN forum topic titled with its persona,
+  // and the persona is always rendered. No flags, no DM/legacy path.
 
   if (!token) {
     console.error('Missing REPORT_BOT_TOKEN in .env or process env.');
@@ -982,16 +977,14 @@ async function main() {
     return;
   }
 
-  // Team mode fail-fast: every target chat MUST be a forum supergroup. Bail
-  // BEFORE any send so the operator fixes setup instead of silently sending
-  // into a non-forum chat (which would break topic-per-convo routing).
-  if (teamEnabled) {
-    for (const chatId of effectiveAdminIds) {
-      const forum = await detectForum(token, chatId);
-      if (!forum.isForum) {
-        console.error(teamModeForumError(chatId));
-        process.exit(1);
-      }
+  // Fail-fast: every target chat MUST be a forum supergroup. Bail BEFORE any
+  // send so the operator fixes setup instead of silently sending into a
+  // non-forum chat (which would break topic-per-convo routing).
+  for (const chatId of effectiveAdminIds) {
+    const forum = await detectForum(token, chatId);
+    if (!forum.isForum) {
+      console.error(teamModeForumError(chatId));
+      process.exit(1);
     }
   }
 
@@ -1028,9 +1021,9 @@ async function main() {
     for (const chatId of effectiveAdminIds) {
       try {
         let convoIdForSend = resolveConvoIdPreSend({ preResolved, replyTo: args.replyTo, chatId, botId });
-        const persona = personaEnabled ? personaForConvo(convoIdForSend) : null;
+        const persona = personaForConvo(convoIdForSend);
         const caption = injectConvoHash(rawCaption, projectCode, convoIdForSend, { pretokensEscaped: opts.raw, persona });
-        const { topicKey, topicName } = topicTarget({ teamEnabled, convoId: convoIdForSend, persona, projectCode });
+        const { topicKey, topicName } = topicTarget({ convoId: convoIdForSend, persona, projectCode });
         const threadId = await resolveThreadId({ token, chatId, projectCode, topicKey, topicName });
         let sendOpts = { ...opts, messageThreadId: threadId };
         let result;
@@ -1093,9 +1086,9 @@ async function main() {
   for (const chatId of effectiveAdminIds) {
     try {
       let convoIdForSend = resolveConvoIdPreSend({ preResolved, replyTo: args.replyTo, chatId, botId });
-      const persona = personaEnabled ? personaForConvo(convoIdForSend) : null;
+      const persona = personaForConvo(convoIdForSend);
       const message = injectConvoHash(rawMessage, projectCode, convoIdForSend, { pretokensEscaped: opts.raw, persona });
-      const { topicKey, topicName } = topicTarget({ teamEnabled, convoId: convoIdForSend, persona, projectCode });
+      const { topicKey, topicName } = topicTarget({ convoId: convoIdForSend, persona, projectCode });
       const threadId = await resolveThreadId({ token, chatId, projectCode, topicKey, topicName });
       let sendOpts = { ...opts, messageThreadId: threadId };
       let result;

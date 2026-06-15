@@ -1028,16 +1028,14 @@ export async function reactToOrphans(token, orphanEntries, systemMsgIds = new Se
     } catch (e) {
       console.error(`[tele-listen] orphan react failed for ${msgId}: ${e instanceof Error ? e.message : String(e)}`);
     }
-    // Send an explanatory reply so first-time users understand why their message
-    // was ignored. Two variants: one for users who sent a plain message (no reply
-    // target), one for users who replied to a [SYSTEM] message by mistake. Once
-    // per orphan (orphans are partitioned out of the cache by the centralized
-    // fetch, so this never duplicates across loops).
-    const repliedToSystem = entry.msg.reply_to_message
-      && systemMsgIds.has(`${chatId}:${entry.msg.reply_to_message.message_id}`);
-    const text = repliedToSystem
-      ? '[SYSTEM] Please reply to a regular message, not [SYSTEM] message.'
-      : "[SYSTEM] You need to reply to one of AI agent's previous messages.";
+    // Orphans are private-chat messages (findOrphanMessages is private-only).
+    // Teleport now runs ONLY in forum groups, so a private DM to the bot is the
+    // wrong place — guide the user to the group instead of leaving them confused.
+    // Once per orphan (orphans are partitioned out of the cache by the
+    // centralized fetch, so this never duplicates across loops).
+    const text =
+      '[SYSTEM] Teleport chạy trong GROUP bật Topics, không qua chat riêng với bot. '
+      + 'Hãy nhắn trong group (đúng topic của agent). Xem README để setup group.';
     try {
       const res = await sendTextChunk(token, chatId, text, { plain: true, replyTo: msgId });
       // Track the system message's own messageId so a user replying to *it*
@@ -1480,12 +1478,6 @@ async function main() {
   const adminIds = parseAdminChatIds(
     process.env.TELEGRAM_ADMIN_CHAT_ID || envFromFile.TELEGRAM_ADMIN_CHAT_ID,
   );
-  // Team mode (RFC 01) — opt-in, default OFF. When on (and we have a convo),
-  // route by the convo's OWNED forum topic instead of reply-to: posting in the
-  // topic addresses the agent. No network call here — the send side fail-fasts
-  // on non-forum chats and is what creates the topic, so an absent mapping just
-  // falls back to reply-to matching.
-  const teamEnabled = (process.env.TELE_TEAM ?? envFromFile.TELE_TEAM) === '1';
   // Role map (RFC 01 P4) — advisory attribution; agent-side enforcement.
   const roles = parseRoles(process.env.TELE_ROLES ?? envFromFile.TELE_ROLES);
 
@@ -1547,10 +1539,12 @@ async function main() {
     }
   }
 
-  // Team mode: resolve this convo's owned forum topic (local file read only).
-  // When found, message routing switches from reply-to to thread membership.
+  // Resolve this convo's owned forum topic (local file read only). Routing is
+  // by thread membership: any message in the convo's topic addresses the agent.
+  // The send side creates the topic, so an absent mapping (brand-new convo that
+  // hasn't sent yet) just leaves teamThreadId null until the first send lands.
   let teamThreadId = null;
-  if (teamEnabled && convo != null) {
+  if (convo != null) {
     const topics = readTopicsStore();
     for (const chatId of adminIds) {
       const tid = getThreadId(topics, chatId, String(convo));

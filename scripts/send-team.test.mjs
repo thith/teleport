@@ -17,9 +17,8 @@ function tmpTopics() {
 
 // ---- topicTarget ---------------------------------------------------------
 
-test('topicTarget: team mode keys by convoId, titles by persona', () => {
+test('topicTarget: keys by convoId, titles by persona', () => {
   const t = topicTarget({
-    teamEnabled: true,
     convoId: '3039138158370420',
     persona: { emoji: '🐷', name: 'Heo' },
     projectCode: 'luni',
@@ -27,23 +26,16 @@ test('topicTarget: team mode keys by convoId, titles by persona', () => {
   assert.deepEqual(t, { topicKey: '3039138158370420', topicName: '🐷 Heo · luni' });
 });
 
-test('topicTarget: default mode keys & titles by projectCode', () => {
+test('topicTarget: no convoId falls back to projectCode', () => {
   assert.deepEqual(
-    topicTarget({ teamEnabled: false, convoId: '1', persona: { emoji: '🐷', name: 'Heo' }, projectCode: 'luni' }),
+    topicTarget({ convoId: null, persona: { emoji: '🐷', name: 'Heo' }, projectCode: 'luni' }),
     { topicKey: 'luni', topicName: 'luni' },
   );
 });
 
-test('topicTarget: team but no convoId falls back to projectCode', () => {
+test('topicTarget: no persona falls back to projectCode', () => {
   assert.deepEqual(
-    topicTarget({ teamEnabled: true, convoId: null, persona: { emoji: '🐷', name: 'Heo' }, projectCode: 'luni' }),
-    { topicKey: 'luni', topicName: 'luni' },
-  );
-});
-
-test('topicTarget: team but no persona falls back to projectCode', () => {
-  assert.deepEqual(
-    topicTarget({ teamEnabled: true, convoId: '1', persona: null, projectCode: 'luni' }),
+    topicTarget({ convoId: '1', persona: null, projectCode: 'luni' }),
     { topicKey: 'luni', topicName: 'luni' },
   );
 });
