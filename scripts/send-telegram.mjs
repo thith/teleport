@@ -35,6 +35,7 @@ import {
   updatePendingStore,
 } from './pending-store.mjs';
 import { CONVO_HASH_LONG_LEN, shortConvoHash as _shortConvoHash } from './convo-hash.mjs';
+import { personaForConvo } from './persona.mjs';
 
 // Re-export so existing imports of `shortConvoHash` from send-telegram keep
 // working. Logic now lives in convo-hash.mjs (leaf, no circular deps).
@@ -419,8 +420,14 @@ export function previewLineWithHashtag(text, maxLen = 100) {
  * MdV2-special characters (`[`, `]`, `#`) in the injected prefix so Telegram's
  * parser doesn't reject the message. The leading `c` of `#c<id>` is plain text
  * and needs no escape; only the `#` character itself is special.
+ *
+ * `persona` (RFC 01): when provided (a `{emoji, name}` derived from convoId),
+ * the SCRIPT owns the identity token — the tag becomes `[<emoji> <name> #hash]`
+ * and any leading emoji the agent typed is stripped so it isn't duplicated.
+ * When null, behaviour is unchanged (the agent's own leading emoji, if any, is
+ * pulled into the tag) — keeps personal/legacy mode byte-for-byte identical.
  */
-export function injectConvoHash(rawMessage, projectCode, convoId, { pretokensEscaped = false } = {}) {
+export function injectConvoHash(rawMessage, projectCode, convoId, { pretokensEscaped = false, persona = null } = {}) {
   // Empty message stays empty UNLESS we have a convoId to surface — document
   // sends with no caption still need a clickable hashtag so admins can filter.
   if (rawMessage == null) return rawMessage;
@@ -441,8 +448,16 @@ export function injectConvoHash(rawMessage, projectCode, convoId, { pretokensEsc
   const hash = `#${shortConvoHash(convoId)}`;
   // Empty body: emit tag with no trailing space (document caption fallback).
   if (rawMessage === '') {
+    const inner = persona ? `[${persona.emoji} ${persona.name} ${hash}]` : `[${hash}]`;
     const head = projectPart ? projectPart.replace(/ $/, '') : '';
-    return head ? `${head} ${esc(`[${hash}]`)}` : esc(`[${hash}]`);
+    return head ? `${head} ${esc(inner)}` : esc(inner);
+  }
+  if (persona) {
+    // Script owns the identity: strip a leading emoji the agent may still type
+    // so it isn't duplicated, then render `[<emoji> <name> #hash]`.
+    const lead = rawMessage.match(LEADING_EMOJI_RE);
+    const rest = lead ? rawMessage.slice(lead[0].length) : rawMessage;
+    return `${projectPart}${esc(`[${persona.emoji} ${persona.name} ${hash}] `)}${rest}`;
   }
   const m = rawMessage.match(LEADING_EMOJI_RE);
   if (m) {
@@ -790,6 +805,10 @@ async function main() {
   const adminIds = parseAdminChatIds(
     process.env.TELEGRAM_ADMIN_CHAT_ID || envFromFile.TELEGRAM_ADMIN_CHAT_ID,
   );
+  // Persona mode (RFC 01) — opt-in, default OFF so existing/personal projects
+  // keep their current report format unchanged. When enabled, the script
+  // auto-assigns a stable {emoji, name} per convoId and renders it in the tag.
+  const personaEnabled = (process.env.TELE_PERSONA ?? envFromFile.TELE_PERSONA) === '1';
 
   if (!token) {
     console.error('Missing REPORT_BOT_TOKEN in .env or process env.');
@@ -863,7 +882,8 @@ async function main() {
     for (const chatId of effectiveAdminIds) {
       try {
         let convoIdForSend = resolveConvoIdPreSend({ preResolved, replyTo: args.replyTo, chatId, botId });
-        const caption = injectConvoHash(rawCaption, projectCode, convoIdForSend, { pretokensEscaped: opts.raw });
+        const persona = personaEnabled ? personaForConvo(convoIdForSend) : null;
+        const caption = injectConvoHash(rawCaption, projectCode, convoIdForSend, { pretokensEscaped: opts.raw, persona });
         const threadId = await resolveThreadId({ token, chatId, projectCode });
         let sendOpts = { ...opts, messageThreadId: threadId };
         let result;
@@ -926,7 +946,8 @@ async function main() {
   for (const chatId of effectiveAdminIds) {
     try {
       let convoIdForSend = resolveConvoIdPreSend({ preResolved, replyTo: args.replyTo, chatId, botId });
-      const message = injectConvoHash(rawMessage, projectCode, convoIdForSend, { pretokensEscaped: opts.raw });
+      const persona = personaEnabled ? personaForConvo(convoIdForSend) : null;
+      const message = injectConvoHash(rawMessage, projectCode, convoIdForSend, { pretokensEscaped: opts.raw, persona });
       const threadId = await resolveThreadId({ token, chatId, projectCode });
       let sendOpts = { ...opts, messageThreadId: threadId };
       let result;
