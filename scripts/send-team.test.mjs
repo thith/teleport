@@ -8,8 +8,10 @@ import {
   teamModeForumError,
   topicTarget,
   resolveThreadId,
+  isForumCached,
+  cacheForum,
 } from './send-telegram.mjs';
-import { readTopicsStore, getThreadId } from './topics-store.mjs';
+import { readTopicsStore, getThreadId, writeTopicsStore } from './topics-store.mjs';
 
 function tmpTopics() {
   return path.join(os.tmpdir(), `topics-test-${process.pid}-${Math.floor(performance.now() * 1000)}.json`);
@@ -60,6 +62,43 @@ test('detectForum: fetcher throws → ok:false, isForum:false', async () => {
   assert.equal(f.isForum, false);
 });
 
+test('detectForum: transient (ok:false) is distinguishable from definitive not-forum', async () => {
+  // Transient: getChat itself failed → ok:false (caller must NOT treat as misconfig).
+  const transient = await detectForum('tok', '1', async () => ({ ok: false, description: 'Too Many Requests' }));
+  assert.equal(transient.ok, false);
+  assert.equal(transient.isForum, false);
+  // Definitive: getChat succeeded but chat is not a forum → ok:true, isForum:false.
+  const definitive = await detectForum('tok', '1', async () => ({ ok: true, result: { is_forum: false, type: 'private' } }));
+  assert.equal(definitive.ok, true);
+  assert.equal(definitive.isForum, false);
+});
+
+// ---- forum cache ---------------------------------------------------------
+
+test('isForumCached / cacheForum round-trip (positive-only)', () => {
+  const file = tmpTopics();
+  assert.equal(isForumCached('-100', file), false);
+  cacheForum('-100', file);
+  assert.equal(isForumCached('-100', file), true);
+  // Unrelated chat stays uncached.
+  assert.equal(isForumCached('-200', file), false);
+  fs.unlinkSync(file);
+});
+
+test('cacheForum preserves existing topic mappings', () => {
+  const file = tmpTopics();
+  cacheForum('-100', file);
+  // Caching forum status must not clobber a convo→thread entry written later.
+  const s = readTopicsStore(file);
+  s['-100']['999'] = 42;
+  writeTopicsStore(s, file);
+  cacheForum('-100', file);
+  const after = readTopicsStore(file);
+  assert.equal(after['-100']._is_forum, true);
+  assert.equal(after['-100']['999'], 42);
+  fs.unlinkSync(file);
+});
+
 // ---- teamModeForumError --------------------------------------------------
 
 test('teamModeForumError mentions chatId and setup steps', () => {
@@ -106,5 +145,19 @@ test('resolveThreadId: positive cache hit returns without calling fetcher', asyn
   await resolveThreadId({ token: 't', chatId: '-100', projectCode: 'luni', topicKey: 'k', topicName: 'n', topicsFile: file, fetcher });
   await resolveThreadId({ token: 't', chatId: '-100', projectCode: 'luni', topicKey: 'k', topicName: 'n', topicsFile: file, fetcher });
   assert.equal(calls, 1);
+  fs.unlinkSync(file);
+});
+
+test('resolveThreadId: forceCreate bypasses the positive cache (topic-gone recovery, S2-M2)', async () => {
+  const file = tmpTopics();
+  let calls = 0;
+  const fetcher = async () => { calls++; return { ok: true, messageThreadId: 100 + calls }; };
+  // First resolve caches thread 101.
+  const a = await resolveThreadId({ token: 't', chatId: '-100', projectCode: 'luni', topicKey: 'k', topicName: 'n', topicsFile: file, fetcher });
+  assert.equal(a, 101);
+  // forceCreate must IGNORE the cache and create a fresh topic (102), never reuse 101.
+  const b = await resolveThreadId({ token: 't', chatId: '-100', projectCode: 'luni', topicKey: 'k', topicName: 'n', topicsFile: file, fetcher, forceCreate: true });
+  assert.equal(b, 102);
+  assert.equal(calls, 2);
   fs.unlinkSync(file);
 });

@@ -331,6 +331,23 @@ test('runHeartbeatReminders — fans out to ALL admins, throttled between sends'
   fs.unlinkSync(file);
 });
 
+test('runHeartbeatReminders — passes convoId to sendImpl (so it can route into the convo topic, G2)', async () => {
+  const file = tmp();
+  const now = Date.now();
+  const t0 = now - 3 * 60 * 60_000;
+  const store = {};
+  recordBotSend(store, { convoId: 777, project: 'p', messageId: 1, now: t0 });
+  writePendingStore(store, file, { now: t0 });
+  const convoIds = [];
+  // sendImpl signature is (chatId, text, convoId) — the default resolves the
+  // convo's forum topic from convoId; here we just assert it's threaded through.
+  const sendText = async (_chatId, _text, convoId) => { convoIds.push(convoId); return true; };
+  await runHeartbeatReminders('TOKEN', ['adminA'], { sendText, now, storeFile: file, getLastAliveMs: () => now - 1000 });
+  // convoId arrives as the pending-store key (a string); sendImpl String()s it.
+  assert.deepStrictEqual(convoIds, ['777']);
+  fs.unlinkSync(file);
+});
+
 // ---------------------------------------------------------------------------
 // listener-alive integration
 // ---------------------------------------------------------------------------

@@ -10,49 +10,74 @@ function tmpTopics() {
   return path.join(os.tmpdir(), `gc-topics-${process.pid}-${Math.floor(performance.now() * 1000)}.json`);
 }
 
+const NOW = 1_000_000_000_000;
+const TTL = 48 * 60 * 60 * 1000;
+const OLD = NOW - TTL - 1; // just past TTL
+const FRESH = NOW - 1000;
+
+// 111 idle past TTL → dead; 222 fresh → alive; 333 has NO _ts → never selected.
 const STORE = {
   '-100': {
-    '111': 10,           // convo 111 → thread 10
-    '222': 20,           // convo 222 → thread 20
-    _no_topic_support: false,
-    _checked_at: 'x',
+    '111': 10,
+    '222': 20,
+    '333': 30,
+    _is_forum: true,
+    _ts: { '111': OLD, '222': FRESH },
   },
 };
 
-test('selectDeadConvoTopics: skips metadata keys, applies isStale', () => {
-  const dead = selectDeadConvoTopics(STORE, '-100', (k) => k === '222');
-  assert.deepEqual(dead, [{ convoKey: '222', threadId: 20 }]);
+test('selectDeadConvoTopics: only topics idle past TTL (with a _ts) are dead', () => {
+  const dead = selectDeadConvoTopics(STORE, '-100', NOW, TTL);
+  assert.deepEqual(dead, [{ convoKey: '111', threadId: 10 }]);
 });
 
-test('selectDeadConvoTopics: none stale → empty', () => {
-  assert.deepEqual(selectDeadConvoTopics(STORE, '-100', () => false), []);
+test('selectDeadConvoTopics: a topic with NO _ts is never selected (brand-new guard)', () => {
+  const dead = selectDeadConvoTopics(STORE, '-100', NOW, TTL);
+  assert.ok(!dead.some((d) => d.convoKey === '333'));
+});
+
+test('selectDeadConvoTopics: nothing dead when all fresh', () => {
+  const s = { '-100': { '1': 5, _ts: { '1': FRESH } } };
+  assert.deepEqual(selectDeadConvoTopics(s, '-100', NOW, TTL), []);
 });
 
 test('selectDeadConvoTopics: unknown chat → empty', () => {
-  assert.deepEqual(selectDeadConvoTopics(STORE, '-999', () => true), []);
+  assert.deepEqual(selectDeadConvoTopics(STORE, '-999', NOW, TTL), []);
 });
 
-test('gcDeadTopics: closes stale topics and clears their mapping', async () => {
+test('gcDeadTopics: closes idle topic, clears mapping AND its _ts', async () => {
   const file = tmpTopics();
-  writeTopicsStore({ '-100': { '111': 10, '222': 20 } }, file);
+  writeTopicsStore({ '-100': { '111': 10, '222': 20, _ts: { '111': OLD, '222': FRESH } } }, file);
   const closedThreads = [];
   const closer = async (_t, _c, threadId) => { closedThreads.push(threadId); return { ok: true }; };
-  const res = await gcDeadTopics({ token: 't', chatId: '-100', isStale: (k) => k === '222', closer, topicsFile: file });
+  const res = await gcDeadTopics({ token: 't', chatId: '-100', now: NOW, ttlMs: TTL, closer, topicsFile: file });
   assert.deepEqual(res, { closed: 1, considered: 1 });
-  assert.deepEqual(closedThreads, [20]);
+  assert.deepEqual(closedThreads, [10]);
   const store = readTopicsStore(file);
-  assert.equal(store['-100']['222'], undefined); // cleared
-  assert.equal(store['-100']['111'], 10);        // kept
+  assert.equal(store['-100']['111'], undefined);     // mapping cleared
+  assert.equal(store['-100']._ts['111'], undefined);  // _ts cleared
+  assert.equal(store['-100']['222'], 20);            // fresh kept
   fs.unlinkSync(file);
 });
 
 test('gcDeadTopics: failed close keeps mapping for next run', async () => {
   const file = tmpTopics();
-  writeTopicsStore({ '-100': { '222': 20 } }, file);
+  writeTopicsStore({ '-100': { '111': 10, _ts: { '111': OLD } } }, file);
   const closer = async () => ({ ok: false, description: 'rate limited' });
-  const res = await gcDeadTopics({ token: 't', chatId: '-100', isStale: () => true, closer, topicsFile: file });
+  const res = await gcDeadTopics({ token: 't', chatId: '-100', now: NOW, ttlMs: TTL, closer, topicsFile: file });
   assert.deepEqual(res, { closed: 0, considered: 1 });
-  const store = readTopicsStore(file);
-  assert.equal(store['-100']['222'], 20); // mapping retained
+  assert.equal(readTopicsStore(file)['-100']['111'], 10); // retained
+  fs.unlinkSync(file);
+});
+
+test('gcDeadTopics: brand-new topic (no _ts) is NOT closed even if GC runs', async () => {
+  const file = tmpTopics();
+  writeTopicsStore({ '-100': { '111': 10 } }, file); // no _ts at all
+  let calls = 0;
+  const closer = async () => { calls++; return { ok: true }; };
+  const res = await gcDeadTopics({ token: 't', chatId: '-100', now: NOW, ttlMs: TTL, closer, topicsFile: file });
+  assert.deepEqual(res, { closed: 0, considered: 0 });
+  assert.equal(calls, 0);
+  assert.equal(readTopicsStore(file)['-100']['111'], 10);
   fs.unlinkSync(file);
 });

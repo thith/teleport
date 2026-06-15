@@ -1,27 +1,32 @@
 // Persistent storage for Telegram forum-topic mappings.
 //
-// Schema (`topics.json`):
+// Schema (`topics.json`), RFC 01 team mode — one topic PER CONVO:
 //
 //   {
 //     "<chatId>": {
-//       "_no_topic_support": true | false,
+//       "<convoId>": <message_thread_id>,   // one entry per convo (key = convoId)
+//       "_is_forum": true,                  // positive forum-detection cache
+//       "_ts": { "<convoId>": <epoch_ms> }, // durable last-use, for GC
+//       "_no_topic_support": true | false,  // negative topic-create cache
 //       "_checked_at": "2026-05-22T10:00:00.000Z",
-//       "<projectCode>": <message_thread_id>,
 //       ...
 //     },
 //     ...
 //   }
 //
+// (Historically the non-`_` key was `<projectCode>` for a project→topic model;
+// single-mode team keys by convoId. The store code is key-agnostic — it just
+// treats any non-`_` key as a topic mapping.)
+//
 // Semantics:
-// - Positive cache (`<projectCode>: <thread_id>`) is sticky. Only cleared by
-//   the consumer on `MESSAGE_THREAD_NOT_FOUND` / `TOPIC_DELETED` errors.
+// - Positive cache (`<convoId>: <thread_id>`) is sticky. Cleared by the consumer
+//   on `MESSAGE_THREAD_NOT_FOUND` / `TOPIC_DELETED`, or by GC when the convo's
+//   `_ts` is older than the topic TTL.
 // - Negative cache (`_no_topic_support: true`) has a TTL: if more than
 //   `NO_SUPPORT_TTL_MS` since `_checked_at`, the caller may retry topic
-//   creation. This handles the case where an admin enables Topics after a
-//   failed first attempt — we self-heal within an hour.
-// - Underscore-prefixed keys are reserved for store metadata; project codes
-//   starting with `_` are not supported (cwd basenames never start with `_`
-//   in practice; defensive check below).
+//   creation. Self-heals within an hour after an admin enables Topics.
+// - Underscore-prefixed keys are reserved for store metadata; topic keys
+//   starting with `_` are not supported (convoIds/cwd basenames never do).
 
 import fs from 'node:fs';
 import path from 'node:path';

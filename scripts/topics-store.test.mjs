@@ -173,15 +173,18 @@ test('resolveThreadId — transient error (429) does NOT set negative cache', as
   try { fs.unlinkSync(file); } catch {}
 });
 
-test('resolveThreadId — fetcher throws → silent fallback, negative cached', async () => {
+test('resolveThreadId — fetcher throws → null, NOT negative-cached (transient)', async () => {
   const file = tmp();
   const fetcher = async () => { throw new Error('network down'); };
   const got = await resolveThreadId({ token: 'X', chatId: 1234, projectCode: 'p', topicsFile: file, fetcher });
   assert.strictEqual(got, null);
-  // Network throw treated as permanent (defensive — we have no signal it's transient).
+  // A thrown fetch is TRANSIENT (review C-Maj2): must NOT set the negative cache,
+  // so the next send retries topic creation instead of being suppressed for 1h.
   const after = readTopicsStore(file);
-  assert.strictEqual(after['1234']._no_topic_support, true);
-  fs.unlinkSync(file);
+  assert.notStrictEqual(after['1234']?._no_topic_support, true);
+  // No store write happened (transient throw → no negative cache), so the file
+  // may not exist — clean up tolerantly.
+  fs.rmSync(file, { force: true });
 });
 
 test('resolveThreadId — projectCode starting with `_` returns null immediately (no API)', async () => {

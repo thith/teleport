@@ -16,7 +16,7 @@ import {
   updatePendingStore,
 } from './pending-store.mjs';
 import { recordAlive, isAlive, getLastAliveMs, pruneStale as pruneAliveStale, DEFAULT_FRESH_MS as ALIVE_FRESH_MS } from './listener-alive.mjs';
-import { readTopicsStore, getThreadId } from './topics-store.mjs';
+import { readTopicsStore, getThreadId, DEFAULT_TOPICS_FILE } from './topics-store.mjs';
 import {
   acquireLock as acquireConvoLock,
   appendRowLocked as appendConvoRow,
@@ -448,16 +448,19 @@ function summarizeMediaReplyTarget(replyTo) {
   return null;
 }
 
-export function filterAdminMessages(updates, adminIds, filterReplyTo = null, mode = 'legacy', threadId = null) {
+export function filterAdminMessages(updates, adminIds, filterReplyTo = null, mode = 'legacy', threadByChat = null) {
   // mode = 'legacy' : filterReplyTo is null | number | number[] | Set<number>;
   //                   matches `reply_to_message.message_id` only.
   // mode = 'convo'  : filterReplyTo is a Set<string> of `${chatId}:${messageId}`;
   //                   match requires BOTH chat and reply-target.
   //
-  // threadId (RFC 01 team mode): when set, routing is STRUCTURAL — accept any
-  // admin message whose `message_thread_id` equals the convo's owned forum
-  // topic (posting in the topic = addressing this agent). Reply-to is NOT
-  // required, and General (no thread_id) + foreign topics are ignored.
+  // threadByChat (RFC 01 team mode): a non-empty Map<chatId, threadId>. When
+  // present, routing is STRUCTURAL and STRICT — a message matches iff its
+  // `message_thread_id` equals this convo's owned topic IN THAT chat (keyed per
+  // chat, since thread ids collide across chats — review G-C1). Reply-to is NOT
+  // consulted (review G-Minor); General (no thread_id) + foreign topics ignored.
+  // An empty/null map means no topic resolved yet → fall back to reply-to.
+  const useThread = threadByChat instanceof Map && threadByChat.size > 0;
   let replyToSet = null;
   if (filterReplyTo != null) {
     if (filterReplyTo instanceof Set) replyToSet = filterReplyTo;
@@ -469,17 +472,20 @@ export function filterAdminMessages(updates, adminIds, filterReplyTo = null, mod
       const msg = u.message;
       if (!hasUserContent(msg)) return false;
       if (adminIds.length > 0 && !adminIds.includes(String(msg.chat.id))) return false;
-      if (threadId != null) {
-        return (msg.message_thread_id ?? null) === threadId;
+      if (useThread) {
+        const want = threadByChat.get(String(msg.chat.id));
+        return want != null && (msg.message_thread_id ?? null) === want;
       }
+      // Team/convo mode with NO resolved topic map → match nothing. Do NOT fall
+      // back to reply-to: a reply to an old bot message (in General or a foreign
+      // topic) must not be delivered to the convo (review C-Maj1). Legacy mode
+      // (IDS-filter, no convo) keeps its reply-to matching below.
+      if (mode === 'convo') return false;
+      // Legacy (IDS-filter) reply-to matching only — convo mode returned above.
       if (replyToSet != null) {
         const replyId = msg.reply_to_message?.message_id;
         if (replyId == null) return false;
-        if (mode === 'convo') {
-          if (!replyToSet.has(`${msg.chat.id}:${replyId}`)) return false;
-        } else {
-          if (!replyToSet.has(replyId)) return false;
-        }
+        if (!replyToSet.has(replyId)) return false;
       }
       return true;
     })
@@ -514,7 +520,11 @@ export function parseRoles(str) {
     if (i < 0) continue;
     const id = pair.slice(0, i).trim();
     const role = pair.slice(i + 1).trim();
-    if (id && role) map.set(id, role);
+    if (!id || !role) continue;
+    if (map.has(id) && map.get(id) !== role) {
+      console.error(`[tele-listen] TELE_ROLES: duplicate id ${id} (${map.get(id)} → ${role}); last wins — check config`);
+    }
+    map.set(id, role);
   }
   return map;
 }
@@ -613,8 +623,8 @@ export function findOrphanMessages(updates, adminIds, systemMsgIds = new Set()) 
   }).map((u) => ({ update: u, msg: u.message, orphan: true }));
 }
 
-export function collectMessagesToProcess(updates, adminIds, filterReplyTo, mode = 'legacy', threadId = null) {
-  return filterAdminMessages(updates, adminIds, filterReplyTo, mode, threadId);
+export function collectMessagesToProcess(updates, adminIds, filterReplyTo, mode = 'legacy', threadByChat = null) {
+  return filterAdminMessages(updates, adminIds, filterReplyTo, mode, threadByChat);
 }
 
 /**
@@ -946,9 +956,17 @@ function maybePruneAlive(now) {
 
 export async function runHeartbeatReminders(token, adminIds, { sendText, now = Date.now(), storeFile, getLastAliveMs: getLastAliveMsArg = getLastAliveMs, aliveFreshMs = ALIVE_FRESH_MS, recordSystemMsgId = appendSystemMsgId } = {}) {
   if (isQuietHour(new Date(now))) return 0;
-  const sendImpl = sendText ?? (async (chatId, text) => {
+  const sendImpl = sendText ?? (async (chatId, text, convoId) => {
     try {
-      const res = await sendTextChunk(token, chatId, text, { raw: false, plain: true });
+      // Team mode: a reminder belongs in the convo's OWN topic, never General
+      // (review G2-Critical). If the convo has no topic in this chat, SKIP the
+      // reminder rather than leak it to General (it self-heals on next bot send).
+      const threadId = getThreadId(readTopicsStore(), chatId, String(convoId));
+      if (threadId == null) {
+        console.error(`[tele-listen] reminder skipped for convo ${convoId} in ${chatId}: no forum topic (won't post to General)`);
+        return false;
+      }
+      const res = await sendTextChunk(token, chatId, text, { raw: false, plain: true, messageThreadId: threadId });
       // Register the reminder message as a system message, same reason as
       // /pending and /start responses: replying to a "⏰ Pending reminder"
       // is a natural admin action, and that reply has no agent thread to
@@ -1002,7 +1020,7 @@ export async function runHeartbeatReminders(token, adminIds, { sendText, now = D
       for (let i = 0; i < adminIds.length; i++) {
         const chatId = adminIds[i];
         try {
-          await sendImpl(chatId, text);
+          await sendImpl(chatId, text, entry.convoId);
         } catch (e) {
           console.error(`[tele-listen] reminder send failed for convo ${entry.convoId} to ${chatId}: ${scrubToken(e instanceof Error ? e.message : String(e), token)}`);
         }
@@ -1488,7 +1506,6 @@ async function main() {
 
   const botId = extractBotId(token);
   let mode = 'legacy';
-  let convoMalformed = 0;
 
   if (convo != null) {
     mode = 'convo';
@@ -1509,7 +1526,6 @@ async function main() {
       offsetFile = path.join(DEFAULT_TMP_DIR, `convo-${convo}-offset.txt`);
     }
     const { rows, malformed } = readConvoRows();
-    convoMalformed = malformed;
     const set = buildConvoFilter(rows, convo, botId, adminIds);
     if (set.size === 0) {
       // Crash-window hint: if sent-registry has a matching allocation row, the
@@ -1539,16 +1555,30 @@ async function main() {
     }
   }
 
-  // Resolve this convo's owned forum topic (local file read only). Routing is
-  // by thread membership: any message in the convo's topic addresses the agent.
-  // The send side creates the topic, so an absent mapping (brand-new convo that
-  // hasn't sent yet) just leaves teamThreadId null until the first send lands.
-  let teamThreadId = null;
+  // Resolve this convo's owned forum topic PER admin chat (local file read).
+  // Routing is by thread membership: a message in the convo's topic addresses
+  // the agent. Must be keyed by chat — thread ids are small per-chat integers
+  // that collide across chats, so a single value would mis-route a foreign
+  // chat's same-numbered thread to this convo (review G-C1). The send side
+  // creates the topic, so an empty map (brand-new convo that hasn't sent yet)
+  // just means no thread routing until the first send lands.
+  const teamThreadByChat = new Map();
+  // Flag genuine corruption (non-ENOENT read/parse error) for a loud log; a
+  // missing file is just "no topics yet". topics.json is written atomically so
+  // there are no torn reads — see the corruption handling in the empty branch.
+  let topicsUnavailable = false;
   if (convo != null) {
-    const topics = readTopicsStore();
-    for (const chatId of adminIds) {
-      const tid = getThreadId(topics, chatId, String(convo));
-      if (tid != null) { teamThreadId = tid; break; }
+    let topics = {};
+    try {
+      topics = JSON.parse(fs.readFileSync(DEFAULT_TOPICS_FILE, 'utf8'));
+    } catch (e) {
+      if (e?.code !== 'ENOENT') topicsUnavailable = true; // missing file = legitimately empty
+    }
+    if (!topicsUnavailable) {
+      for (const chatId of adminIds) {
+        const tid = getThreadId(topics, chatId, String(convo));
+        if (tid != null) teamThreadByChat.set(String(chatId), tid);
+      }
     }
   }
 
@@ -1680,7 +1710,12 @@ async function main() {
         } catch (e) {
           console.error(`[tele-listen] audit log write failed: ${e instanceof Error ? e.message : String(e)}`);
         }
-        const maxUpdateId = Math.max(...fetched.map((u) => u.update_id));
+        // Advance the global offset past the WHOLE fetched batch — including any
+        // /pending or /start updates we spliced out above. Recomputing from the
+        // (spliced) `fetched` would regress the offset when the handled command
+        // was the newest update, re-fetching & re-handling it next poll (G2-M).
+        // Non-command updates are already cached, so advancing past them is safe.
+        const maxUpdateId = Math.max(originalMaxUpdateId, ...fetched.map((u) => u.update_id));
         writeOffset(maxUpdateId, GLOBAL_OFFSET_FILE);
       }
       pruneCache();
@@ -1725,7 +1760,7 @@ async function main() {
     process.exit(1);
   }
 
-  const toProcess = collectMessagesToProcess(updates, adminIds, filterReplyTo, mode, teamThreadId);
+  const toProcess = collectMessagesToProcess(updates, adminIds, filterReplyTo, mode, teamThreadByChat);
 
   const advanceLoopOffset = () => {
     if (updates.length > 0) {
@@ -1735,6 +1770,14 @@ async function main() {
   };
 
   if (toProcess.length === 0) {
+    // topics.json is written atomically (tmp + rename), so a reader never sees a
+    // torn/partial file — a parse failure means GENUINE corruption (persistent),
+    // not a transient blip. Holding the offset would wedge the loop forever
+    // (S2-M3), so we advance regardless and log loudly for the operator. (A
+    // legitimately-empty/missing store has no topic → no convo replies to lose.)
+    if (topicsUnavailable) {
+      console.error('[tele-listen] topics.json unreadable/corrupt — convo routing disabled until fixed; advancing offset');
+    }
     advanceLoopOffset();
     // Heartbeat: even when nothing to process, scan for due reminders.
     // Best-effort; failures are logged inside `runHeartbeatReminders`.

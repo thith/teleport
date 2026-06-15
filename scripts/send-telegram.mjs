@@ -2,6 +2,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import {
   acquireLock as acquireConvoLock,
@@ -36,7 +37,6 @@ import {
 } from './pending-store.mjs';
 import { CONVO_HASH_LONG_LEN, shortConvoHash as _shortConvoHash } from './convo-hash.mjs';
 import { personaForConvo } from './persona.mjs';
-import { getLastAliveMs } from './listener-alive.mjs';
 
 // Re-export so existing imports of `shortConvoHash` from send-telegram keep
 // working. Logic now lives in convo-hash.mjs (leaf, no circular deps).
@@ -423,11 +423,11 @@ export function previewLineWithHashtag(text, maxLen = 100) {
  * parser doesn't reject the message. The leading `c` of `#c<id>` is plain text
  * and needs no escape; only the `#` character itself is special.
  *
- * `persona` (RFC 01): when provided (a `{emoji, name}` derived from convoId),
- * the SCRIPT owns the identity token — the tag becomes `[<emoji> <name> #hash]`
- * and any leading emoji the agent typed is stripped so it isn't duplicated.
- * When null, behaviour is unchanged (the agent's own leading emoji, if any, is
- * pulled into the tag) — keeps personal/legacy mode byte-for-byte identical.
+ * `persona` (RFC 01): normally a `{emoji, name}` derived from convoId — the
+ * SCRIPT owns the identity token, so the tag becomes `[<emoji> <name> #hash]`
+ * and any leading emoji the agent typed is stripped (no duplication). `persona`
+ * is null only at the edge where no convoId/persona resolves; then the tag is
+ * `[#hash]` and the agent's own leading emoji (if any) is pulled in.
  */
 export function injectConvoHash(rawMessage, projectCode, convoId, { pretokensEscaped = false, persona = null } = {}) {
   // Empty message stays empty UNLESS we have a convoId to surface — document
@@ -612,8 +612,11 @@ async function createForumTopic(token, chatId, name) {
 
 /**
  * Fetch chat metadata. Returns `{ ok, isForum, type, description }`. Never
- * throws — network/parse errors collapse to `{ ok: false }` so callers decide
- * whether to fail-fast (team mode) or proceed (default mode).
+ * throws — network/parse errors collapse to `{ ok: false, isForum: false }`.
+ * The caller MUST distinguish `ok === false` (couldn't determine — transient;
+ * do NOT treat as misconfig) from `ok === true && !isForum` (definitively not a
+ * forum → fail-fast). `fetcher` (test seam) must return the getChat shape
+ * `{ ok, result, description }` (NOT the flattened return shape).
  */
 export async function detectForum(token, chatId, fetcher) {
   const call = fetcher ?? (async () => {
@@ -629,6 +632,38 @@ export async function detectForum(token, chatId, fetcher) {
     type: r?.result?.type ?? null,
     description: r?.description ?? null,
   };
+}
+
+// Positive-only forum cache in topics-store (`<chatId>._is_forum`). Once a chat
+// is confirmed a forum we never re-probe (a supergroup can't silently stop
+// being a forum mid-session). No negative cache: a not-yet-forum chat must keep
+// being re-checked so enabling Topics self-heals on the next send.
+export function isForumCached(chatId, topicsFile) {
+  try { return readTopicsStore(topicsFile)[String(chatId)]?._is_forum === true; } catch { return false; }
+}
+export function cacheForum(chatId, topicsFile) {
+  try {
+    updateTopicsStore((s) => {
+      const k = String(chatId);
+      s[k] = s[k] ?? {};
+      s[k]._is_forum = true;
+    }, topicsFile);
+  } catch { /* best-effort cache; never block a send */ }
+}
+
+// Durable last-use timestamp per (chat, topic). Stamped on every send that
+// resolves a topic. GC uses THIS (not the listener heartbeat, which is ephemeral
+// — pruned at 24h and absent for brand-new topics — review G-C2) so TTL is
+// meaningful and a topic is never closed before it's genuinely idle.
+export function touchTopicUse(chatId, topicKey, now, topicsFile) {
+  try {
+    updateTopicsStore((s) => {
+      const k = String(chatId);
+      s[k] = s[k] ?? {};
+      s[k]._ts = s[k]._ts ?? {};
+      s[k]._ts[String(topicKey)] = now;
+    }, topicsFile);
+  } catch { /* best-effort; never block a send */ }
 }
 
 /**
@@ -678,49 +713,72 @@ function isPermanentNoTopicError(res) {
   if (!res) return true; // fetch itself threw
   if (res.status === 403) return true; // bot lacks permission
   const d = String(res.description ?? '');
-  return /CHAT_FORUM_REQUIRED|TOPICS_FORBIDDEN|TOPIC_NOT_MODIFIED|FORUM_NOT_ENABLED|NOT_FORUM|TOPIC_CREATE_DISABLED|chat not found|user is deactivated|bot was kicked|not enough rights/i.test(d);
+  // NB: TOPIC_NOT_MODIFIED is an edit/close no-op signal, NOT a "can't host
+  // topics" signal — excluded from the create-path permanent set (S2-Minor).
+  return /CHAT_FORUM_REQUIRED|TOPICS_FORBIDDEN|FORUM_NOT_ENABLED|NOT_FORUM|TOPIC_CREATE_DISABLED|chat not found|user is deactivated|bot was kicked|not enough rights/i.test(d);
 }
 
-export async function resolveThreadId({ token, chatId, projectCode, topicKey = projectCode, topicName = projectCode, nowFn = Date.now, topicsFile, fetcher = createForumTopic }) {
+export async function resolveThreadId({ token, chatId, projectCode, topicKey = projectCode, topicName = projectCode, nowFn = Date.now, topicsFile, fetcher = createForumTopic, forceCreate = false }) {
   // `topicKey` is the topics-store cache key, `topicName` the forum-topic
-  // title. Default mode: both = projectCode (project → one topic). Team mode
-  // (RFC 01): topicKey = convoId, topicName = persona title ("🐷 Heo · luni"),
-  // giving each convo its own topic.
+  // title. Normally topicKey = convoId and topicName = persona title
+  // ("🐷 Heo · luni"), giving each convo its own topic (RFC 01). The
+  // projectCode default only applies at the edge where convo/persona can't be
+  // resolved (see topicTarget) so a send never crashes.
   if (topicKey == null || String(topicKey).startsWith('_')) return null;
   topicKey = String(topicKey);
   // Best-effort: cache reads/writes must never block sending.
   let store;
   try { store = readTopicsStore(topicsFile); } catch { return null; }
-  // 1. Positive cache hit — use immediately.
-  const cached = getThreadId(store, chatId, topicKey);
-  if (cached != null) return cached;
+  // 1. Positive cache hit — use immediately (stamp last-use for GC). Skipped on
+  // `forceCreate` (topic-gone recovery): we must create a FRESH topic, never
+  // reuse a possibly-dead cached thread a sibling may have re-recorded (S2-M2).
+  if (!forceCreate) {
+    const cached = getThreadId(store, chatId, topicKey);
+    if (cached != null) { touchTopicUse(chatId, topicKey, nowFn(), topicsFile); return cached; }
+  }
   // 2. Negative cache still fresh — skip API call.
   if (isNoTopicSupportFresh(store, chatId, nowFn())) return null;
   // 3. Try create.
   let res;
+  let threw = false;
   try {
     res = await fetcher(token, chatId, topicName);
   } catch {
-    res = null; // fetch threw — treat as permanent
+    threw = true; // network/throw is TRANSIENT, not "forum disabled"
+    res = null;
   }
   if (res && res.ok && res.messageThreadId != null) {
     // Locked RMW so we don't clobber a sibling process's positive entry.
     try { updateTopicsStore((s) => recordThreadId(s, chatId, topicKey, res.messageThreadId), topicsFile); } catch {}
+    touchTopicUse(chatId, topicKey, nowFn(), topicsFile);
     return res.messageThreadId;
   }
-  // Transient errors (rate-limit / network) — don't poison the cache, just
-  // skip topic this send. Permanent errors (no permission / forum disabled)
-  // → negative-cache for 1h to avoid hammering Telegram.
-  if (isPermanentNoTopicError(res)) {
+  // Transient errors (thrown fetch / rate-limit / network) — DON'T poison the
+  // cache; the next send retries creation (review C-Maj2). Only a DEFINITIVE
+  // permanent error (no permission / forum disabled) negative-caches for 1h.
+  if (!threw && isPermanentNoTopicError(res)) {
     try { updateTopicsStore((s) => recordNoTopicSupport(s, chatId, nowFn()), topicsFile); } catch {}
   }
   return null;
 }
 
 /**
+ * Team-mode invariant: a report MUST land in the convo's forum topic, never in
+ * General. If no thread could be resolved/created, throw so the caller's
+ * per-chat catch logs + counts a failure — instead of silently posting to
+ * General (review C-Crit1/C-Crit2/C-Maj2).
+ */
+export function requireTopic(threadId, chatId, convoId) {
+  if (threadId == null) {
+    throw new Error(`team mode: no forum topic for convo ${convoId} in chat ${chatId} (refusing to post into General)`);
+  }
+  return threadId;
+}
+
+/**
  * Detect responses that mean "the thread_id we sent no longer exists".
- * Triggers recovery: clear positive cache for that (chatId, projectCode)
- * and retry the send without thread_id.
+ * Triggers recovery: clear cache for that (chatId, topicKey), RE-CREATE the
+ * topic, and retry into the new thread (never General).
  */
 export function isTopicGoneError(description) {
   if (!description) return false;
@@ -747,37 +805,61 @@ export async function closeForumTopic(token, chatId, messageThreadId) {
 }
 
 /**
- * Select convo→topic mappings considered dead for GC. `isStale(convoKey)` is
- * injected (typically "no listener heartbeat in N hours"). Skips underscore
- * metadata keys and non-numeric values. Pure — no I/O.
+ * Select convo→topic mappings considered dead for GC, using the DURABLE
+ * last-use timestamp (`entry._ts[convoKey]`). A topic is dead iff it HAS a
+ * recorded last-use and that use is older than `ttlMs`. A topic with NO `_ts`
+ * (brand-new, or never stamped) is NEVER selected — we don't close on absence
+ * of a signal (review G-C2). Skips underscore metadata keys + non-numeric
+ * values. Pure — no I/O.
  */
-export function selectDeadConvoTopics(store, chatId, isStale) {
+export function selectDeadConvoTopics(store, chatId, now, ttlMs) {
   const entry = store?.[String(chatId)];
   if (!entry) return [];
+  const ts = entry._ts ?? {};
   const out = [];
   for (const [key, val] of Object.entries(entry)) {
     if (key.startsWith('_')) continue;
     if (typeof val !== 'number') continue;
-    if (isStale(key)) out.push({ convoKey: key, threadId: val });
+    const last = ts[key];
+    if (typeof last === 'number' && now - last > ttlMs) out.push({ convoKey: key, threadId: val });
   }
   return out;
 }
 
 /**
- * GC dead topics for one chat: close each stale topic and clear its mapping.
- * Explicit/opt-in (invoked via `--gc-topics`, never auto-on-send) so an idle
- * convo's topic is never closed mid-task. `closer`/`topicsFile` injectable.
+ * GC dead topics for one chat: close each stale topic and clear its mapping +
+ * timestamp. Explicit/opt-in (invoked via `--gc-topics`, never auto-on-send) so
+ * an idle convo's topic is never closed mid-task. `closer`/`topicsFile`
+ * injectable. Staleness is by durable last-use (`_ts`) vs `now`/`ttlMs`.
  */
-export async function gcDeadTopics({ token, chatId, isStale, closer = closeForumTopic, topicsFile }) {
+export async function gcDeadTopics({ token, chatId, now = Date.now(), ttlMs, closer = closeForumTopic, topicsFile }) {
   const store = readTopicsStore(topicsFile);
-  const dead = selectDeadConvoTopics(store, chatId, isStale);
+  const dead = selectDeadConvoTopics(store, chatId, now, ttlMs);
   let closed = 0;
   for (const { convoKey, threadId } of dead) {
     try {
+      // Re-check immediately before the (network) close: a concurrent send may
+      // have refreshed `_ts` (convo woke up) or re-created the topic since the
+      // snapshot. Skip if it's no longer stale or the threadId changed (review
+      // C-Maj3). Narrows the TOCTOU window; close is reversible regardless.
+      const cur = readTopicsStore(topicsFile)[String(chatId)];
+      const curTs = cur?._ts?.[convoKey];
+      if (cur?.[convoKey] !== threadId || typeof curTs !== 'number' || now - curTs <= ttlMs) continue;
       const r = await closer(token, chatId, threadId);
       if (r && r.ok) {
         closed++;
-        try { updateTopicsStore((s) => clearThreadId(s, chatId, convoKey), topicsFile); } catch {}
+        // Re-validate under the lock: only clear if the mapping STILL points at
+        // the topic we just closed. A concurrent send could have re-created a
+        // fresh topic for this convo between our snapshot and now (review M3).
+        try {
+          updateTopicsStore((s) => {
+            const k = String(chatId);
+            if (s[k] && s[k][convoKey] === threadId) {
+              delete s[k][convoKey];
+              if (s[k]._ts) delete s[k]._ts[convoKey];
+            }
+          }, topicsFile);
+        } catch {}
       }
     } catch { /* best-effort; leave mapping for next GC */ }
   }
@@ -937,8 +1019,8 @@ async function main() {
   const botId = extractBotId(token);
   let effectiveAdminIds = adminIds;
 
-  // Pre-resolve from env > --convo. Null = defer to --reply-to inference
-  // (in maybeRecordConvo) which falls back to "new convo = this messageId".
+  // Pre-resolve from env > --convo. Null = defer to --reply-to inference;
+  // if that also misses, the pid+time fallback below supplies a stable id.
   let preResolved = null;
   try {
     const r = resolveConvoIdFromEnv({ argConvo: typeof args.convo === 'number' ? args.convo : null });
@@ -947,6 +1029,15 @@ async function main() {
     console.error(`[send-telegram] ${e instanceof Error ? e.message : String(e)}`);
     process.exit(1);
   }
+  // RFC 01: in team mode a convo needs a STABLE id BEFORE the send — it keys the
+  // persona + per-convo topic. When neither env nor --convo nor a --reply-to
+  // lookup resolves one (env-less agent, brand-new convo), synthesize a
+  // collision-resistant id UP FRONT, instead of the old post-send "= messageId"
+  // (which mis-keyed/collided the topic — review C1). 56 random bits mod 9e15
+  // → positive integer that round-trips through Number safely (the agent
+  // captures it from stdout and passes it back via `--convo <id>`, which parses
+  // as a Number). Computed once per process; only used when nothing resolves.
+  const fallbackConvoId = Number(BigInt('0x' + crypto.randomBytes(7).toString('hex')) % 9_000_000_000_000_000n) + 1;
   // No pre-flight: passing `--convo <N>` auto-allocates on first use and
   // appends on subsequent uses. We address every admin chat; the chats that
   // already have an allocation row will get an append, the ones that don't
@@ -957,19 +1048,20 @@ async function main() {
   const opts = { raw: args.raw, plain: args.plain, replyTo: args.replyTo };
 
   // GC dead topics (RFC 01 P3): explicit/opt-in. Close topics whose convo has
-  // had no listener heartbeat for TELE_TOPIC_TTL_H hours (default 48), then
-  // clear their mapping. Reversible (closeForumTopic). Intended for cron.
+  // not sent for TELE_TOPIC_TTL_H hours (default 48), then clear their mapping.
+  // Reversible (closeForumTopic). Intended for cron.
+  //
+  // Staleness uses the DURABLE per-topic last-use stamp (`_ts`, written on every
+  // send), NOT the ephemeral listener heartbeat — so a topic is only closed once
+  // genuinely idle for the full TTL, and a brand-new / never-idle topic is never
+  // closed (review G-C2/M2).
   if (args.gcTopics) {
     const ttlH = Number(process.env.TELE_TOPIC_TTL_H ?? envFromFile.TELE_TOPIC_TTL_H);
     const ttlMs = (Number.isFinite(ttlH) && ttlH > 0 ? ttlH : 48) * 60 * 60 * 1000;
     const now = Date.now();
-    const isStale = (convoKey) => {
-      const last = getLastAliveMs(convoKey);
-      return last == null || (now - last) > ttlMs;
-    };
     let totalClosed = 0;
     for (const chatId of effectiveAdminIds) {
-      const { closed, considered } = await gcDeadTopics({ token, chatId, isStale });
+      const { closed, considered } = await gcDeadTopics({ token, chatId, now, ttlMs });
       totalClosed += closed;
       console.log(`[send-telegram] gc-topics ${chatId}: closed ${closed}/${considered}`);
     }
@@ -980,12 +1072,23 @@ async function main() {
   // Fail-fast: every target chat MUST be a forum supergroup. Bail BEFORE any
   // send so the operator fixes setup instead of silently sending into a
   // non-forum chat (which would break topic-per-convo routing).
+  //
+  // Two guards from review:
+  // - Only hard-exit when getChat DEFINITIVELY says not-a-forum (`forum.ok &&
+  //   !forum.isForum`). A transient getChat failure (`!forum.ok`: 429/5xx/
+  //   network) is NOT proof of a misconfig — proceeding is safer than dropping
+  //   every report during a Telegram blip.
+  // - Cache the positive result in topics-store (`_is_forum`) so steady-state
+  //   sends skip the extra getChat round-trip.
   for (const chatId of effectiveAdminIds) {
+    if (isForumCached(chatId)) continue;
     const forum = await detectForum(token, chatId);
-    if (!forum.isForum) {
+    if (forum.ok && !forum.isForum) {
       console.error(teamModeForumError(chatId));
       process.exit(1);
     }
+    if (forum.ok && forum.isForum) cacheForum(chatId);
+    // !forum.ok → couldn't determine; proceed this send, re-check next time.
   }
 
   if (args.react != null) {
@@ -1020,24 +1123,28 @@ async function main() {
     let lastConvoId = null;
     for (const chatId of effectiveAdminIds) {
       try {
-        let convoIdForSend = resolveConvoIdPreSend({ preResolved, replyTo: args.replyTo, chatId, botId });
+        const convoIdForSend = resolveConvoIdPreSend({ preResolved, replyTo: args.replyTo, chatId, botId }) ?? fallbackConvoId;
         const persona = personaForConvo(convoIdForSend);
         const caption = injectConvoHash(rawCaption, projectCode, convoIdForSend, { pretokensEscaped: opts.raw, persona });
         const { topicKey, topicName } = topicTarget({ convoId: convoIdForSend, persona, projectCode });
-        const threadId = await resolveThreadId({ token, chatId, projectCode, topicKey, topicName });
+        let threadId = requireTopic(await resolveThreadId({ token, chatId, projectCode, topicKey, topicName }), chatId, convoIdForSend);
         let sendOpts = { ...opts, messageThreadId: threadId };
         let result;
         try {
           result = await sendDocumentToAdmin(token, chatId, args.filePath, caption, sendOpts);
         } catch (e) {
-          if (threadId != null && isTopicGoneError(e instanceof Error ? e.message : String(e))) {
+          if (isTopicGoneError(e instanceof Error ? e.message : String(e))) {
+            // Topic vanished → clear cache, RE-CREATE a topic, retry into it.
             dropTopicMapping(chatId, topicKey);
-            sendOpts = { ...opts, messageThreadId: null };
+            threadId = requireTopic(await resolveThreadId({ token, chatId, projectCode, topicKey, topicName, forceCreate: true }), chatId, convoIdForSend);
+            sendOpts = { ...opts, messageThreadId: threadId };
             result = await sendDocumentToAdmin(token, chatId, args.filePath, caption, sendOpts);
           } else { throw e; }
         }
         const { fallback, messageId } = result;
-        if (convoIdForSend == null) convoIdForSend = messageId; // new convo
+        // convoIdForSend is always set now (env/--convo/--reply-to or the
+        // pid+time fallback), so the topic was keyed by the SAME id the agent
+        // will listen on — no post-send "= messageId" re-keying needed.
         // Sent-registry is durable + load-bearing (lookupConvoIdByMessageId
         // depends on it). Pending-store is opportunistic. Always durable
         // first; a phantom pending entry (sent succeeded, pending update
@@ -1085,24 +1192,26 @@ async function main() {
   let lastConvoId = null;
   for (const chatId of effectiveAdminIds) {
     try {
-      let convoIdForSend = resolveConvoIdPreSend({ preResolved, replyTo: args.replyTo, chatId, botId });
+      const convoIdForSend = resolveConvoIdPreSend({ preResolved, replyTo: args.replyTo, chatId, botId }) ?? fallbackConvoId;
       const persona = personaForConvo(convoIdForSend);
       const message = injectConvoHash(rawMessage, projectCode, convoIdForSend, { pretokensEscaped: opts.raw, persona });
       const { topicKey, topicName } = topicTarget({ convoId: convoIdForSend, persona, projectCode });
-      const threadId = await resolveThreadId({ token, chatId, projectCode, topicKey, topicName });
+      let threadId = requireTopic(await resolveThreadId({ token, chatId, projectCode, topicKey, topicName }), chatId, convoIdForSend);
       let sendOpts = { ...opts, messageThreadId: threadId };
       let result;
       try {
         result = await sendTextToAdmin(token, chatId, message, sendOpts);
       } catch (e) {
-        if (threadId != null && isTopicGoneError(e instanceof Error ? e.message : String(e))) {
+        if (isTopicGoneError(e instanceof Error ? e.message : String(e))) {
+          // Topic vanished → clear cache, RE-CREATE a topic, retry into it.
           dropTopicMapping(chatId, topicKey);
-          sendOpts = { ...opts, messageThreadId: null };
+          threadId = requireTopic(await resolveThreadId({ token, chatId, projectCode, topicKey, topicName, forceCreate: true }), chatId, convoIdForSend);
+          sendOpts = { ...opts, messageThreadId: threadId };
           result = await sendTextToAdmin(token, chatId, message, sendOpts);
         } else { throw e; }
       }
       const { fallback, messageId, allMessageIds } = result;
-      if (convoIdForSend == null) convoIdForSend = messageId; // new convo
+      // convoIdForSend always set (env/--convo/--reply-to or pid+time fallback).
       for (const mid of allMessageIds) appendToSentRegistry({ messageId: mid, chatId, botId, convoId: convoIdForSend });
       // Pending-store after — opportunistic, doesn't block on failure.
       try { updatePendingStore((s) => recordBotSend(s, { convoId: convoIdForSend, project: projectCode, messageId })); } catch {}
@@ -1135,7 +1244,9 @@ async function main() {
 // a real messageId). Order:
 //   1. preResolved (env or --convo).
 //   2. --reply-to inference: lookup replyTo in registry for this (botId, chatId).
-//   3. null → caller will use messageId as convoId (new convo, post-send).
+//   3. null → caller substitutes the pid+time `fallbackConvoId` (synthesized
+//      pre-send), so persona + topic are keyed by the SAME id the agent listens
+//      on. (No post-send "= messageId" re-keying anymore — review C1.)
 export function resolveConvoIdPreSend({ preResolved, replyTo, chatId, botId }) {
   if (preResolved != null) return preResolved;
   if (replyTo != null) {

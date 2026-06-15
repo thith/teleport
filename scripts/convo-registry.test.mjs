@@ -482,17 +482,17 @@ test('findOrphanMessages — real user reply (non-phantom) is NOT orphan', () =>
   assert.strictEqual(orphans.length, 0);
 });
 
-test('filterAdminMessages — convo mode uses (chatId, messageId) pair', () => {
+test('filterAdminMessages — convo mode without a thread map matches nothing (no reply-to leak)', () => {
+  // RFC 01 single-mode: convo routing is by forum thread (threadByChat), NOT
+  // reply-to. With no thread map, convo mode must match NOTHING rather than fall
+  // back to reply-to — else a reply to an old bot message in General/a foreign
+  // topic would leak into the convo (review C-Maj1).
   const updates = [
-    // reply target msg 100 in chat A: should match
     { message: { text: 'a', chat: { id: 'A', type: 'private' }, reply_to_message: { message_id: 100 } } },
-    // reply target msg 100 in chat B: should NOT match (cross-chat collision)
-    { message: { text: 'b', chat: { id: 'B', type: 'private' }, reply_to_message: { message_id: 100 } } },
   ];
   const filter = new Set(['A:100']);
   const matched = filterAdminMessages(updates, [], filter, 'convo');
-  assert.strictEqual(matched.length, 1);
-  assert.strictEqual(matched[0].msg.chat.id, 'A');
+  assert.strictEqual(matched.length, 0);
 });
 
 test('filterAdminMessages — legacy mode matches by messageId only', () => {
