@@ -36,6 +36,7 @@ import {
 } from './pending-store.mjs';
 import { CONVO_HASH_LONG_LEN, shortConvoHash as _shortConvoHash } from './convo-hash.mjs';
 import { personaForConvo } from './persona.mjs';
+import { getLastAliveMs } from './listener-alive.mjs';
 
 // Re-export so existing imports of `shortConvoHash` from send-telegram keep
 // working. Logic now lives in convo-hash.mjs (leaf, no circular deps).
@@ -204,7 +205,7 @@ export async function postReaction(token, chatId, messageId, emoji = '👍') {
 }
 
 export function parseArgs(argv) {
-  const result = { filePath: null, positional: [], raw: false, plain: false, replyTo: null, react: null, convo: null };
+  const result = { filePath: null, positional: [], raw: false, plain: false, replyTo: null, react: null, convo: null, gcTopics: false };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === '--convo') {
@@ -241,6 +242,7 @@ export function parseArgs(argv) {
     }
     if (arg === '--raw' || arg === '--md-raw') { result.raw = true; continue; }
     if (arg === '--plain') { result.plain = true; continue; }
+    if (arg === '--gc-topics') { result.gcTopics = true; continue; }
     // (mutual exclusion validated after the loop so order doesn't matter)
     if (arg.startsWith('--')) throw new Error(`Unknown flag: ${arg}`);
     result.positional.push(arg);
@@ -725,9 +727,61 @@ export function isTopicGoneError(description) {
   return /MESSAGE_THREAD_NOT_FOUND|TOPIC_DELETED|TOPIC_CLOSED/i.test(description);
 }
 
-export function dropTopicMapping(chatId, projectCode, topicsFile) {
+export function dropTopicMapping(chatId, topicKey, topicsFile) {
   // Best-effort: a cache write failure must never block the send retry.
-  try { updateTopicsStore((s) => clearThreadId(s, chatId, projectCode), topicsFile); } catch {}
+  try { updateTopicsStore((s) => clearThreadId(s, chatId, topicKey), topicsFile); } catch {}
+}
+
+/**
+ * Close a forum topic (RFC 01 P3). Reversible — closing hides it from active
+ * use but Telegram keeps history and it can be reopened. Returns `{ ok }`.
+ */
+export async function closeForumTopic(token, chatId, messageThreadId) {
+  const res = await fetch(`${TELEGRAM_API}${token}/closeForumTopic`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ chat_id: chatId, message_thread_id: messageThreadId }),
+  });
+  const body = await res.json().catch(() => ({}));
+  return { ok: res.ok && body?.ok === true, description: body?.description };
+}
+
+/**
+ * Select convo→topic mappings considered dead for GC. `isStale(convoKey)` is
+ * injected (typically "no listener heartbeat in N hours"). Skips underscore
+ * metadata keys and non-numeric values. Pure — no I/O.
+ */
+export function selectDeadConvoTopics(store, chatId, isStale) {
+  const entry = store?.[String(chatId)];
+  if (!entry) return [];
+  const out = [];
+  for (const [key, val] of Object.entries(entry)) {
+    if (key.startsWith('_')) continue;
+    if (typeof val !== 'number') continue;
+    if (isStale(key)) out.push({ convoKey: key, threadId: val });
+  }
+  return out;
+}
+
+/**
+ * GC dead topics for one chat: close each stale topic and clear its mapping.
+ * Explicit/opt-in (invoked via `--gc-topics`, never auto-on-send) so an idle
+ * convo's topic is never closed mid-task. `closer`/`topicsFile` injectable.
+ */
+export async function gcDeadTopics({ token, chatId, isStale, closer = closeForumTopic, topicsFile }) {
+  const store = readTopicsStore(topicsFile);
+  const dead = selectDeadConvoTopics(store, chatId, isStale);
+  let closed = 0;
+  for (const { convoKey, threadId } of dead) {
+    try {
+      const r = await closer(token, chatId, threadId);
+      if (r && r.ok) {
+        closed++;
+        try { updateTopicsStore((s) => clearThreadId(s, chatId, convoKey), topicsFile); } catch {}
+      }
+    } catch { /* best-effort; leave mapping for next GC */ }
+  }
+  return { closed, considered: dead.length };
 }
 
 /**
@@ -906,6 +960,27 @@ async function main() {
   // collision-resistant convoIds (e.g. process pid + timestamp).
 
   const opts = { raw: args.raw, plain: args.plain, replyTo: args.replyTo };
+
+  // GC dead topics (RFC 01 P3): explicit/opt-in. Close topics whose convo has
+  // had no listener heartbeat for TELE_TOPIC_TTL_H hours (default 48), then
+  // clear their mapping. Reversible (closeForumTopic). Intended for cron.
+  if (args.gcTopics) {
+    const ttlH = Number(process.env.TELE_TOPIC_TTL_H ?? envFromFile.TELE_TOPIC_TTL_H);
+    const ttlMs = (Number.isFinite(ttlH) && ttlH > 0 ? ttlH : 48) * 60 * 60 * 1000;
+    const now = Date.now();
+    const isStale = (convoKey) => {
+      const last = getLastAliveMs(convoKey);
+      return last == null || (now - last) > ttlMs;
+    };
+    let totalClosed = 0;
+    for (const chatId of effectiveAdminIds) {
+      const { closed, considered } = await gcDeadTopics({ token, chatId, isStale });
+      totalClosed += closed;
+      console.log(`[send-telegram] gc-topics ${chatId}: closed ${closed}/${considered}`);
+    }
+    console.log(`[send-telegram] gc-topics done: ${totalClosed} closed`);
+    return;
+  }
 
   // Team mode fail-fast: every target chat MUST be a forum supergroup. Bail
   // BEFORE any send so the operator fixes setup instead of silently sending
