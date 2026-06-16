@@ -86,14 +86,16 @@ After sending any Telegram message, you **MUST immediately** start the reply-lis
 
 #### Per-project setup for spawn
 
-The spawn helper lives at `teleport/scripts/spawn.mjs`. Add these scripts to each project's `package.json` so `pnpm spawn:i` / `pnpm spawn:headless` work (or call the script directly):
+The spawn helper lives at `teleport/scripts/spawn.mjs`. Add these scripts to each project's `package.json` (or call the script directly):
 
 ```json
 "spawn:i": "node ../teleport/scripts/spawn.mjs --interactive",
-"spawn:headless": "node ../teleport/scripts/spawn.mjs"
+"spawn:headless": "node ../teleport/scripts/spawn.mjs",
+"spawn:ls": "node ../teleport/scripts/spawn.mjs --list",
+"spawn:kill": "node ../teleport/scripts/spawn.mjs --kill"
 ```
 
-Interactive mode needs `screen` (preinstalled on macOS) or `tmux` on the host. (Command/billing specifics live in `rules/telegram-guide.md` — the single source of truth — so this README and the wiring snippet never drift.)
+`spawn:i` (interactive, subscription billing) / `spawn:headless` (`claude -p`, SDK pool) launch an agent; `spawn:ls` lists running agents; `spawn:kill <id>` stops one (id = the topic hashtag). Interactive mode needs `screen` (preinstalled on macOS) or `tmux` on the host. (Command/billing specifics live in `rules/telegram-guide.md` — the single source of truth — so this README and the wiring snippet never drift.)
 
 ## How to use
 
