@@ -23,6 +23,10 @@ function tmp() {
   return path.join(os.tmpdir(), `topics-${Date.now()}-${Math.random().toString(36).slice(2)}.json`);
 }
 
+// resolveThreadId now retries transient create failures via sendWithRetry; inject
+// a no-op sleep so transient/throw tests don't incur the real backoff delay.
+const noSleep = async () => {};
+
 test('topics-store — recordThreadId persists positive mapping', () => {
   const file = tmp();
   let store = {};
@@ -165,7 +169,7 @@ test('resolveThreadId — permanent error (403) sets negative cache', async () =
 test('resolveThreadId — transient error (429) does NOT set negative cache', async () => {
   const file = tmp();
   const fetcher = async () => ({ ok: false, status: 429, description: 'Too Many Requests' });
-  const got = await resolveThreadId({ token: 'X', chatId: 1234, projectCode: 'p', topicsFile: file, fetcher });
+  const got = await resolveThreadId({ token: 'X', chatId: 1234, projectCode: 'p', topicsFile: file, fetcher, sleepFn: noSleep });
   assert.strictEqual(got, null);
   const after = readTopicsStore(file);
   // No entry at all → next call will retry, not poisoned. File may not exist.
@@ -176,7 +180,7 @@ test('resolveThreadId — transient error (429) does NOT set negative cache', as
 test('resolveThreadId — fetcher throws → null, NOT negative-cached (transient)', async () => {
   const file = tmp();
   const fetcher = async () => { throw new Error('network down'); };
-  const got = await resolveThreadId({ token: 'X', chatId: 1234, projectCode: 'p', topicsFile: file, fetcher });
+  const got = await resolveThreadId({ token: 'X', chatId: 1234, projectCode: 'p', topicsFile: file, fetcher, sleepFn: noSleep });
   assert.strictEqual(got, null);
   // A thrown fetch is TRANSIENT (review C-Maj2): must NOT set the negative cache,
   // so the next send retries topic creation instead of being suppressed for 1h.

@@ -11,7 +11,9 @@ import {
   isForumCached,
   cacheForum,
 } from './send-telegram.mjs';
-import { readTopicsStore, getThreadId, writeTopicsStore } from './topics-store.mjs';
+import { readTopicsStore, getThreadId, writeTopicsStore, isNoTopicSupportFresh } from './topics-store.mjs';
+
+const noSleep = async () => {};
 
 function tmpTopics() {
   return path.join(os.tmpdir(), `topics-test-${process.pid}-${Math.floor(performance.now() * 1000)}.json`);
@@ -169,5 +171,77 @@ test('resolveThreadId: forceCreate bypasses the positive cache (topic-gone recov
   const b = await resolveThreadId({ token: 't', chatId: '-100', projectCode: 'luni', topicKey: 'k', topicName: 'n', topicsFile: file, fetcher, forceCreate: true });
   assert.equal(b, 102);
   assert.equal(calls, 2);
+  fs.unlinkSync(file);
+});
+
+// ---- resolveThreadId: transient retry on topic creation ------------------
+
+test('resolveThreadId: transient 504 on create retries once then succeeds + caches', async () => {
+  const file = tmpTopics();
+  const seq = [
+    { ok: false, status: 504, description: 'Gateway Timeout' },
+    { ok: true, status: 200, messageThreadId: 555 },
+  ];
+  let calls = 0;
+  const sleeps = [];
+  const fetcher = async () => seq[calls++];
+  const tid = await resolveThreadId({
+    token: 't', chatId: '-100', projectCode: 'luni', topicKey: 'k', topicName: 'n',
+    topicsFile: file, fetcher, sleepFn: async (ms) => { sleeps.push(ms); },
+  });
+  assert.equal(tid, 555);
+  assert.equal(calls, 2);
+  assert.deepEqual(sleeps, [1000]); // capped at exactly one retry, fixed 1s backoff
+  assert.equal(getThreadId(readTopicsStore(file), '-100', 'k'), 555);
+  fs.unlinkSync(file);
+});
+
+test('resolveThreadId: network throw on create retries then succeeds', async () => {
+  const file = tmpTopics();
+  let calls = 0;
+  const fetcher = async () => {
+    calls++;
+    if (calls === 1) throw new Error('ECONNRESET');
+    return { ok: true, status: 200, messageThreadId: 42 };
+  };
+  const tid = await resolveThreadId({
+    token: 't', chatId: '-100', projectCode: 'luni', topicKey: 'k', topicName: 'n',
+    topicsFile: file, fetcher, sleepFn: noSleep,
+  });
+  assert.equal(tid, 42);
+  assert.equal(calls, 2);
+  fs.unlinkSync(file);
+});
+
+test('resolveThreadId: persistent 504 → null, no negative cache (next send retries)', async () => {
+  const file = tmpTopics();
+  let calls = 0;
+  const fetcher = async () => { calls++; return { ok: false, status: 504, description: 'Gateway Timeout' }; };
+  const tid = await resolveThreadId({
+    token: 't', chatId: '-100', projectCode: 'luni', topicKey: 'k', topicName: 'n',
+    topicsFile: file, fetcher, sleepFn: noSleep,
+  });
+  assert.equal(tid, null);
+  assert.equal(calls, 2); // 2 attempts (one retry), then give up
+  // Transient must NOT poison the cache — a later send re-attempts creation.
+  // (Nothing was written at all: no positive thread, no negative marker — so the
+  // store file may not even exist. force:true tolerates that.)
+  assert.equal(isNoTopicSupportFresh(readTopicsStore(file), '-100'), false);
+  fs.rmSync(file, { force: true });
+});
+
+test('resolveThreadId: permanent 403 → null + negative cache, single call (no retry)', async () => {
+  const file = tmpTopics();
+  let calls = 0;
+  const sleeps = [];
+  const fetcher = async () => { calls++; return { ok: false, status: 403, description: 'not enough rights' }; };
+  const tid = await resolveThreadId({
+    token: 't', chatId: '-100', projectCode: 'luni', topicKey: 'k', topicName: 'n',
+    topicsFile: file, fetcher, sleepFn: async (ms) => { sleeps.push(ms); },
+  });
+  assert.equal(tid, null);
+  assert.equal(calls, 1); // permanent error is NOT transient → no wasted retry
+  assert.deepEqual(sleeps, []); // and no wasted backoff sleep on the permanent path
+  assert.equal(isNoTopicSupportFresh(readTopicsStore(file), '-100'), true);
   fs.unlinkSync(file);
 });

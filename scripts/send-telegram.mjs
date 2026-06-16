@@ -556,10 +556,20 @@ export function createTempMarkdownFile(content, tmpDir = os.tmpdir()) {
 // Tradeoff: a 504 can mean "delivered but the gateway timed out replying", so a
 // retry may double-send. For an outbound report bot a rare duplicate message is
 // strictly less harmful than a lost report, so we accept at-least-once here.
-// (Topic CREATION is deliberately NOT retried — a duplicate topic is harmful.)
+// Topic CREATION shares this retry too (resolveThreadId) but capped at ONE extra
+// attempt: the Bot API can't list topics, so a 504-that-actually-created can't
+// be de-duped. That's no worse than the status quo, which ALREADY orphans such a
+// topic on the next send's recreate — the retry just delivers the report as
+// well. Capping at one attempt keeps the duplicate window minimal; a transient
+// failure is NOT negative-cached, so the next send recreates automatically.
 export const TRANSIENT_SEND_STATUSES = new Set([429, 500, 502, 503, 504]);
 const SEND_RETRY_BACKOFF_MS = [500, 1500];
 const MAX_RETRY_AFTER_MS = 8000;
+// Topic create: 2 attempts (one retry), fixed 1s backoff. createForumTopic does
+// NOT surface `retryAfter`, so even a create-path 429 uses this fixed wait (never
+// Telegram's retry_after) — fine, since a 429 on a brand-new convo's first topic
+// create is rare and the retry is capped at one. See note above.
+const TOPIC_CREATE_BACKOFF_MS = [1000];
 
 const defaultSleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -783,7 +793,7 @@ function isPermanentNoTopicError(res) {
   return /CHAT_FORUM_REQUIRED|TOPICS_FORBIDDEN|FORUM_NOT_ENABLED|NOT_FORUM|TOPIC_CREATE_DISABLED|chat not found|user is deactivated|bot was kicked|not enough rights/i.test(d);
 }
 
-export async function resolveThreadId({ token, chatId, projectCode, topicKey = projectCode, topicName = projectCode, nowFn = Date.now, topicsFile, fetcher = createForumTopic, forceCreate = false }) {
+export async function resolveThreadId({ token, chatId, projectCode, topicKey = projectCode, topicName = projectCode, nowFn = Date.now, topicsFile, fetcher = createForumTopic, forceCreate = false, sleepFn = defaultSleep }) {
   // `topicKey` is the topics-store cache key, `topicName` the forum-topic
   // title. Normally topicKey = convoId and topicName = persona title
   // ("🐷 Heo · luni"), giving each convo its own topic (RFC 01). The
@@ -803,13 +813,22 @@ export async function resolveThreadId({ token, chatId, projectCode, topicKey = p
   }
   // 2. Negative cache still fresh — skip API call.
   if (isNoTopicSupportFresh(store, chatId, nowFn())) return null;
-  // 3. Try create.
+  // 3. Try create — retry once on transient (504/502/503/429 + network throw).
+  // A brand-new convo MUST create a topic on its first send, so an un-retried
+  // gateway blip here drops the whole report (existing-topic sends already
+  // survive via sendWithRetry). Permanent errors (403 / forum-disabled) are NOT
+  // in TRANSIENT_SEND_STATUSES, so sendWithRetry returns them on the FIRST call
+  // — no wasted retry, and the negative-cache path below still fires.
   let res;
   let threw = false;
   try {
-    res = await fetcher(token, chatId, topicName);
+    res = await sendWithRetry(() => fetcher(token, chatId, topicName), {
+      attempts: TOPIC_CREATE_BACKOFF_MS.length + 1,
+      backoff: TOPIC_CREATE_BACKOFF_MS,
+      sleepFn,
+    });
   } catch {
-    threw = true; // network/throw is TRANSIENT, not "forum disabled"
+    threw = true; // every attempt threw (network) — TRANSIENT, not "forum disabled"
     res = null;
   }
   if (res && res.ok && res.messageThreadId != null) {
