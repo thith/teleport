@@ -37,6 +37,7 @@ import {
 } from './pending-store.mjs';
 import { CONVO_HASH_LONG_LEN, shortConvoHash as _shortConvoHash } from './convo-hash.mjs';
 import { personaForConvo } from './persona.mjs';
+import { readProjectsConfig, resolveProjectConfig, adminIdsFrom } from './projects-config.mjs';
 
 // Re-export so existing imports of `shortConvoHash` from send-telegram keep
 // working. Logic now lives in convo-hash.mjs (leaf, no circular deps).
@@ -683,13 +684,16 @@ export function teamModeForumError(chatId) {
 
 /**
  * Compute `{ topicKey, topicName }` for resolveThreadId — one forum topic per
- * convo. Key by convoId, title by persona ("🐷 Heo · luni"). Falls back to
- * projectCode only at the edge where convoId/persona can't be resolved (e.g. a
- * brand-new convo with no session env), so a send never crashes.
+ * convo, keyed by convoId. Title = persona; the `· <project>` suffix is added
+ * ONLY in a SHARED group (`dedicated: false`) to disambiguate projects that
+ * coexist there. In a project's OWN group (`dedicated: true`) the suffix is
+ * redundant, so the title is persona-only ("🐷 Heo") (RFC 02). Falls back to
+ * projectCode only at the edge where convoId/persona can't be resolved.
  */
-export function topicTarget({ convoId, persona, projectCode }) {
+export function topicTarget({ convoId, persona, projectCode, dedicated = false }) {
   if (convoId != null && persona) {
-    return { topicKey: String(convoId), topicName: `${persona.emoji} ${persona.name} · ${projectCode}` };
+    const title = dedicated ? `${persona.emoji} ${persona.name}` : `${persona.emoji} ${persona.name} · ${projectCode}`;
+    return { topicKey: String(convoId), topicName: title };
   }
   return { topicKey: projectCode, topicName: projectCode };
 }
@@ -989,12 +993,15 @@ async function main() {
   // Project code: TELE_PROJECT_CODE env override > basename(cwd). No project-local .env reading.
   const projectCode =
     process.env.TELE_PROJECT_CODE ||
-    process.env.REPORT_BOT_PROJECT_CODE ||
     path.basename(process.cwd()) ||
     '';
-  const adminIds = parseAdminChatIds(
-    process.env.TELEGRAM_ADMIN_CHAT_ID || envFromFile.TELEGRAM_ADMIN_CHAT_ID,
-  );
+  // RFC 02: per-project group via projects.json[code].chatId (DEDICATED) →
+  // fallback TELEGRAM_ADMIN_CHAT_ID env (SHARED catch-all). `dedicated` drives
+  // the topic-title form (persona-only vs persona·project).
+  const fallbackChatId = process.env.TELEGRAM_ADMIN_CHAT_ID || envFromFile.TELEGRAM_ADMIN_CHAT_ID;
+  const projCfg = resolveProjectConfig(projectCode, { config: readProjectsConfig(), fallbackChatId });
+  const dedicatedGroup = projCfg.dedicated;
+  const adminIds = adminIdsFrom(projCfg, fallbackChatId, parseAdminChatIds);
   // RFC 01: teleport runs ONE mode — team. Every target chat MUST be a forum
   // supergroup; each convo gets its OWN forum topic titled with its persona,
   // and the persona is always rendered. No flags, no DM/legacy path.
@@ -1004,7 +1011,7 @@ async function main() {
     process.exit(1);
   }
   if (adminIds.length === 0) {
-    console.error('Missing TELEGRAM_ADMIN_CHAT_ID in .env or process env.');
+    console.error(`[send-telegram] project "${projectCode}" chưa cấu hình group: thêm "${projectCode}".chatId vào teleport/projects.json, hoặc đặt TELEGRAM_ADMIN_CHAT_ID (shared catch-all).`);
     process.exit(1);
   }
 
@@ -1126,7 +1133,7 @@ async function main() {
         const convoIdForSend = resolveConvoIdPreSend({ preResolved, replyTo: args.replyTo, chatId, botId }) ?? fallbackConvoId;
         const persona = personaForConvo(convoIdForSend);
         const caption = injectConvoHash(rawCaption, projectCode, convoIdForSend, { pretokensEscaped: opts.raw, persona });
-        const { topicKey, topicName } = topicTarget({ convoId: convoIdForSend, persona, projectCode });
+        const { topicKey, topicName } = topicTarget({ convoId: convoIdForSend, persona, projectCode, dedicated: dedicatedGroup });
         let threadId = requireTopic(await resolveThreadId({ token, chatId, projectCode, topicKey, topicName }), chatId, convoIdForSend);
         let sendOpts = { ...opts, messageThreadId: threadId };
         let result;
@@ -1195,7 +1202,7 @@ async function main() {
       const convoIdForSend = resolveConvoIdPreSend({ preResolved, replyTo: args.replyTo, chatId, botId }) ?? fallbackConvoId;
       const persona = personaForConvo(convoIdForSend);
       const message = injectConvoHash(rawMessage, projectCode, convoIdForSend, { pretokensEscaped: opts.raw, persona });
-      const { topicKey, topicName } = topicTarget({ convoId: convoIdForSend, persona, projectCode });
+      const { topicKey, topicName } = topicTarget({ convoId: convoIdForSend, persona, projectCode, dedicated: dedicatedGroup });
       let threadId = requireTopic(await resolveThreadId({ token, chatId, projectCode, topicKey, topicName }), chatId, convoIdForSend);
       let sendOpts = { ...opts, messageThreadId: threadId };
       let result;

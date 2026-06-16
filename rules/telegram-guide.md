@@ -125,7 +125,19 @@ After starting `--wait-once`:
 - If the user says something ambiguous like "done", "ok", or "bye", DO NOT end the turn. Instead, ask for explicit confirmation (e.g., "Should I wait for further instructions, or are we finished here?") and wait for a clear confirmation before ending the turn.
 
 When the listener writes `prompt ready: <path>`, parse that file as JSON:
-- `text`, `messageId`, `chatId`, `replyToMessageId`, `replyToText`, `quotedText`, `convoId`, `attachments[]`.
+- `text`, `messageId`, `chatId`, `fromUserId`, `fromName`, `fromRole`, `replyToMessageId`, `replyToText`, `quotedText`, `convoId`, `attachments[]`.
+
+### Roles & sensitive actions (MUST)
+
+`fromRole` is the sender's advisory role (`admin` / `maintainer` / `dev` / `member`; unmapped senders are `member`). It comes from `teleport/projects.json` and is **advisory** — teleport does NOT enforce it. **The agent is the enforcement point.**
+
+Anyone in the group can talk to you (membership is the real trust boundary), but before any **sensitive / hard-to-reverse action** you **MUST** check `fromRole`. If it is not `admin` or `maintainer`, **refuse** and ask an authorized member to confirm (reply in the topic) — do not perform the action on a `dev`/`member` request. Sensitive actions include (not exhaustive):
+1. Dangerous git: `commit`, `push`, `revert`, `reset --hard`, `rebase`, force-push, `tag` / release.
+2. Deleting files / folders / DB; data-destroying migrations.
+3. Accessing files OUTSIDE the project folder.
+4. SSH-ing to / editing another machine or server; deploying.
+
+Unknown / typo'd role strings are treated as non-privileged (least privilege) — they will NOT pass the `admin`/`maintainer` check. This complements (does not replace) each project's own admin-whitelist rules. When in doubt, confirm with an `admin`.
 
 **MUST: validate prompt relevance before acting (the "misrouted reply" check).** Multiple agents share one admin chat, and admins occasionally tap "reply" on the wrong message. Before treating a prompt as a directive, cross-check `replyToText` against the most recent message *you* sent in this turn. The strongest positive signal is: `replyToText` starts with the same `[project]` prefix and identity emoji you used in your last send.
 

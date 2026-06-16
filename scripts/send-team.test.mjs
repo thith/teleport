@@ -42,6 +42,16 @@ test('topicTarget: no persona falls back to projectCode', () => {
   );
 });
 
+test('topicTarget: dedicated group → persona-only title (no project suffix, RFC 02)', () => {
+  const t = topicTarget({ convoId: '99', persona: { emoji: '🐷', name: 'Heo' }, projectCode: 'luni', dedicated: true });
+  assert.deepEqual(t, { topicKey: '99', topicName: '🐷 Heo' });
+});
+
+test('topicTarget: shared group → persona + project suffix', () => {
+  const t = topicTarget({ convoId: '99', persona: { emoji: '🐷', name: 'Heo' }, projectCode: 'luni', dedicated: false });
+  assert.deepEqual(t, { topicKey: '99', topicName: '🐷 Heo · luni' });
+});
+
 // ---- detectForum ---------------------------------------------------------
 
 test('detectForum: is_forum true', async () => {

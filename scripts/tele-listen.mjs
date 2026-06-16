@@ -17,6 +17,7 @@ import {
 } from './pending-store.mjs';
 import { recordAlive, isAlive, getLastAliveMs, pruneStale as pruneAliveStale, DEFAULT_FRESH_MS as ALIVE_FRESH_MS } from './listener-alive.mjs';
 import { readTopicsStore, getThreadId, DEFAULT_TOPICS_FILE } from './topics-store.mjs';
+import { readProjectsConfig, resolveProjectConfig, roleFor, adminIdsFrom } from './projects-config.mjs';
 import {
   acquireLock as acquireConvoLock,
   appendRowLocked as appendConvoRow,
@@ -505,35 +506,9 @@ export function formatFromName(from) {
   return null;
 }
 
-/**
- * Parse a `TELE_ROLES` string into a Map<userId, role> (RFC 01 P4). Format:
- * `"144242180:admin, 555:dev"`. Whitespace-tolerant; malformed pairs skipped.
- * Roles are advisory metadata attached to prompts — ENFORCEMENT of privileged
- * actions (commit/deploy) is agent-side per the guide, since teleport itself
- * never performs them.
- */
-export function parseRoles(str) {
-  const map = new Map();
-  if (!str) return map;
-  for (const pair of String(str).split(',')) {
-    const i = pair.indexOf(':');
-    if (i < 0) continue;
-    const id = pair.slice(0, i).trim();
-    const role = pair.slice(i + 1).trim();
-    if (!id || !role) continue;
-    if (map.has(id) && map.get(id) !== role) {
-      console.error(`[tele-listen] TELE_ROLES: duplicate id ${id} (${map.get(id)} → ${role}); last wins — check config`);
-    }
-    map.set(id, role);
-  }
-  return map;
-}
-
-/** Resolve a user's role from a roles Map (null when unmapped = least privilege). */
-export function resolveRole(roles, userId) {
-  if (!roles || userId == null) return null;
-  return roles.get(String(userId)) ?? null;
-}
+// Roles now come from projects.json (RFC 02) as a plain {userId: role} object;
+// resolution + 'member' default live in projects-config.roleFor. (The old
+// TELE_ROLES env Map parser was removed.)
 
 export function buildPromptData(msg, updateId = null, botId = null, roles = null) {
   const replyTo = msg.reply_to_message;
@@ -543,7 +518,7 @@ export function buildPromptData(msg, updateId = null, botId = null, roles = null
     chatId: String(msg.chat.id),
     fromUserId: String(msg.from?.id ?? msg.chat.id),
     fromName: formatFromName(msg.from),
-    fromRole: resolveRole(roles, msg.from?.id),
+    fromRole: roleFor(roles, msg.from?.id),
     replyToMessageId: replyTo?.message_id ?? null,
     // Media-only messages have `.caption` instead of `.text`; fall back so the
     // agent still sees the human-readable context.
@@ -583,7 +558,7 @@ export function buildCombinedPromptData(messages, botId = null, convoId = null, 
     chatId: String(last.chat.id),
     fromUserId: String(last.from?.id ?? last.chat.id),
     fromName: formatFromName(last.from),
-    fromRole: resolveRole(roles, last.from?.id),
+    fromRole: roleFor(roles, last.from?.id),
     replyToMessageId: replyTo?.message_id ?? null,
     replyToText: replyTo?.text ?? replyTo?.caption ?? (replyTo ? summarizeMediaReplyTarget(replyTo) : null),
     quotedText: last.quote?.text ?? null,
@@ -1493,14 +1468,30 @@ async function main() {
     }
   }
   const token = process.env.REPORT_BOT_TOKEN || envFromFile.REPORT_BOT_TOKEN;
-  const adminIds = parseAdminChatIds(
-    process.env.TELEGRAM_ADMIN_CHAT_ID || envFromFile.TELEGRAM_ADMIN_CHAT_ID,
-  );
-  // Role map (RFC 01 P4) — advisory attribution; agent-side enforcement.
-  const roles = parseRoles(process.env.TELE_ROLES ?? envFromFile.TELE_ROLES);
+  // RFC 02: resolve this project's group + roles from teleport/projects.json
+  // (keyed by project code = TELE_PROJECT_CODE env > basename(cwd)), falling
+  // back to TELEGRAM_ADMIN_CHAT_ID env (shared catch-all) for the chat.
+  const projectCode =
+    process.env.TELE_PROJECT_CODE ||
+    path.basename(process.cwd()) ||
+    '';
+  const fallbackChatId = process.env.TELEGRAM_ADMIN_CHAT_ID || envFromFile.TELEGRAM_ADMIN_CHAT_ID;
+  const projCfg = resolveProjectConfig(projectCode, { config: readProjectsConfig(), fallbackChatId });
+  const adminIds = adminIdsFrom(projCfg, fallbackChatId, parseAdminChatIds);
+  // Roles (RFC 02): from projects.json[code].roles ONLY (advisory; agent-side
+  // enforcement). Unmapped sender → 'member' (see roleFor).
+  const roles = projCfg.roles;
 
   if (!token) {
     console.error('[tele-listen] Missing REPORT_BOT_TOKEN');
+    process.exit(1);
+  }
+  // Empty adminIds is a SECURITY hole, not just a misconfig: filterAdminMessages
+  // skips the chat-whitelist when adminIds is empty (`adminIds.length > 0`), so
+  // the listener would accept messages from ANY chat. Fail-fast like the send
+  // side (review G-Critical RFC 02).
+  if (adminIds.length === 0) {
+    console.error(`[tele-listen] project "${projectCode}" chưa cấu hình group: thêm "${projectCode}".chatId vào teleport/projects.json, hoặc đặt TELEGRAM_ADMIN_CHAT_ID (shared catch-all).`);
     process.exit(1);
   }
 
@@ -1979,8 +1970,28 @@ async function readOurLockBody(lockFile) {
   catch { return ''; }
 }
 
+// Resolve this project's admin chat ids (RFC 02) and fail-fast if empty —
+// shared by main() and the --watch/--wait-once supervisors so a misconfigured
+// project stops cleanly UP FRONT instead of looping child failures or
+// short-circuiting on a stale prompt (review C-Major). Self-contained (loads
+// env) so supervisors can call it before any lock/prompt handling.
+function requireProjectAdminIdsOrExit(logPrefix = '[tele-listen]') {
+  const envFromFile = loadEnvFromFile(ENV_FILE);
+  const projectCode = process.env.TELE_PROJECT_CODE || path.basename(process.cwd()) || '';
+  const fallbackChatId = process.env.TELEGRAM_ADMIN_CHAT_ID || envFromFile.TELEGRAM_ADMIN_CHAT_ID;
+  const projCfg = resolveProjectConfig(projectCode, { config: readProjectsConfig(), fallbackChatId });
+  const adminIds = adminIdsFrom(projCfg, fallbackChatId, parseAdminChatIds);
+  if (adminIds.length === 0) {
+    console.error(`${logPrefix} project "${projectCode}" chưa cấu hình group: thêm "${projectCode}".chatId vào teleport/projects.json, hoặc đặt TELEGRAM_ADMIN_CHAT_ID (shared catch-all).`);
+    process.exit(1);
+  }
+  return { envFromFile, projectCode, projCfg, adminIds, roles: projCfg.roles };
+}
+
 async function watchSupervisor(argv) {
   const args = parseArgs(argv);
+  requireProjectAdminIdsOrExit('[tele-listen]'); // fail-fast before supervising
+
   if (args.convo == null) {
     // Fall through to env resolution to find the convo.
     const r = resolveConvoIdFromEnv({ argConvo: null });
@@ -2158,6 +2169,15 @@ export async function waitOnceSupervisor(argv, deps = {}) {
   const promptFile = path.join(DEFAULT_TMP_DIR, `prompt-convo-${args.convo}.json`);
   let singletonLock = null;
   let failureCount = 0;
+  // Note (review S2-Minor): unlike watchSupervisor, this path does NOT fail-fast
+  // on an unconfigured project up front — a pre-existing prompt short-circuits
+  // below before any config check. Residual risk is narrow + low impact: such a
+  // prompt was produced by a previously-valid run and no Telegram fetch happens
+  // on this path. When no prompt pre-exists, the spawned child (main(), --convo)
+  // runs the empty-adminIds fail-fast and exits 1, counted toward the failure
+  // cap. Not calling requireProjectAdminIdsOrExit here is deliberate: this
+  // function takes injected deps (incl. exit) for tests that don't configure a
+  // project, and a hard process-level check would break them.
   while (singletonLock == null) {
     if (existsFn(promptFile)) {
       logFn(`[tele-wait-once] prompt ready: ${promptFile}`);
