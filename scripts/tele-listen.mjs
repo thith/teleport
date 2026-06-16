@@ -18,6 +18,7 @@ import {
 import { recordAlive, isAlive, getLastAliveMs, pruneStale as pruneAliveStale, DEFAULT_FRESH_MS as ALIVE_FRESH_MS } from './listener-alive.mjs';
 import { readTopicsStore, getThreadId, DEFAULT_TOPICS_FILE } from './topics-store.mjs';
 import { readProjectsConfig, resolveProjectConfig, roleFor, memberFor, adminIdsFrom } from './projects-config.mjs';
+import { harvestMembers } from './roster-upsert.mjs';
 import {
   acquireLock as acquireConvoLock,
   appendRowLocked as appendConvoRow,
@@ -1921,6 +1922,16 @@ async function main() {
     await runHeartbeatReminders(token, adminIds);
     process.exit(2);
   }
+
+  // Passive roster harvest (best-effort): record each human sender's id/username
+  // into projects.json so the PO can fill title/name/position by hand. Never
+  // elevates privilege (new rows default to `member`). See roster-upsert.mjs.
+  try {
+    harvestMembers(
+      toProcess.map((m) => m.msg.from),
+      { projectCode },
+    );
+  } catch {}
 
   const data = buildCombinedPromptData(toProcess, extractBotId(token), convo, roles);
   if (data.attachments.length) {

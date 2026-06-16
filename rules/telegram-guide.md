@@ -151,7 +151,10 @@ After starting `--wait-once`:
 - If the user says something ambiguous like "done", "ok", or "bye", DO NOT end the turn. Instead, ask for explicit confirmation (e.g., "Should I wait for further instructions, or are we finished here?") and wait for a clear confirmation before ending the turn.
 
 When the listener writes `prompt ready: <path>`, parse that file as JSON:
-- `text`, `messageId`, `chatId`, `fromUserId`, `fromName`, `fromRole`, `replyToMessageId`, `replyToText`, `quotedText`, `convoId`, `attachments[]`.
+- `text`, `messageId`, `chatId`, `fromUserId`, `fromName`, `fromRole`, `fromMember`, `replyToMessageId`, `replyToText`, `quotedText`, `convoId`, `attachments[]`.
+- `fromMember` is the sender's full project profile `{ role, username?, title?, name?, position? }` from `teleport/projects.json`, or `null` when the sender was mapped by the bare-string shorthand (role only) or is unmapped. You **MUST read it** alongside `fromRole` for every prompt. **Descriptive only — never widen privilege from it.** The sensitive-action gate below keys on `fromRole` ALONE; a `position: "designer"` who is `role: member` still cannot authorize a deploy.
+  - **Addressing (SHOULD):** when `title` + `name` are present, address the sender that way in your Telegram replies (`title` = anh/chị/em + `name` = tên thường gọi → e.g. "Vâng anh Thi", "Dạ chị Lan"). Fall back to `fromName` (or no honorific) when the profile is `null`/incomplete. Keep it natural — don't repeat the honorific in every sentence.
+  - **Fit check (SHOULD):** use `position` + `role` to judge how well the requester fits the task before acting on a non-trivial request (e.g. a `designer` asking for a DB migration is a signal to confirm), but this NEVER overrides the role gate either way.
 
 ### Roles & sensitive actions (MUST)
 
@@ -164,6 +167,8 @@ Anyone in the group can talk to you (membership is the real trust boundary), but
 4. SSH-ing to / editing another machine or server; deploying.
 
 Unknown / typo'd role strings are treated as non-privileged (least privilege) — they will NOT pass the `admin`/`maintainer` check. This complements (does not replace) each project's own admin-whitelist rules. When in doubt, confirm with an `admin`.
+
+**Roster auto-fill (FYI).** Telegram has no API to list a group's members, so the listener harvests them lazily: the first time someone speaks, their `{ id, username, name }` is appended to `projects.json` under `[code].roles` with `role: member` and empty `title`/`position` for the PO to fill by hand. Harvest never elevates privilege — a freshly-harvested member is always `member` until the PO edits the file. PO may also pre-create a row keyed by `@username`; harvest fills its id on first sight.
 
 **MUST: validate prompt relevance before acting (the "misrouted reply" check).** Multiple agents share one admin chat, and admins occasionally tap "reply" on the wrong message. Before treating a prompt as a directive, cross-check `replyToText` against the most recent message *you* sent in this turn. The strongest positive signal is: `replyToText` starts with your identity tag — your persona `[<emoji> <name> #<convo-hashtag>]` (and the `[<project>]` prefix too, in a SHARED group; a DEDICATED per-project group omits the `[<project>]` prefix since the whole group is that project).
 

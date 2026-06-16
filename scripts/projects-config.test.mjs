@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { readProjectsConfig, resolveProjectConfig, roleFor, adminIdsFrom } from './projects-config.mjs';
+import { readProjectsConfig, resolveProjectConfig, roleFor, memberFor, adminIdsFrom } from './projects-config.mjs';
 
 function tmpJson(obj) {
   const f = path.join(os.tmpdir(), `projects-${process.pid}-${Math.floor(performance.now() * 1000)}.json`);
@@ -97,4 +97,24 @@ test('roleFor: mapped → role; unmapped → member; no userId → null', () => 
   assert.equal(roleFor(roles, 999), 'member');   // unmapped user → default member
   assert.equal(roleFor(null, 1), 'member');       // no roles map → member
   assert.equal(roleFor(roles, null), null);       // no sender → null (can't attribute)
+});
+
+test('roleFor: object profile → reads .role; missing .role → member', () => {
+  const roles = {
+    '1': { role: 'admin', title: 'anh', name: 'Thi', position: 'dev' },
+    '2': { title: 'chị', name: 'Lan' }, // profile with no explicit role
+  };
+  assert.equal(roleFor(roles, 1), 'admin'); // pulls .role out of the object
+  assert.equal(roleFor(roles, 2), 'member'); // object lacking role → least privilege
+});
+
+test('memberFor: object → profile; string shorthand/unmapped/no-userId → null', () => {
+  const profile = { role: 'admin', title: 'anh', name: 'Thi', position: 'founder / dev' };
+  const roles = { '1': profile, '2': 'dev' };
+  assert.deepEqual(memberFor(roles, 1), profile); // full profile exposed
+  assert.equal(memberFor(roles, '1'), profile);   // userId coerced to string
+  assert.equal(memberFor(roles, 2), null);        // string shorthand → no profile object
+  assert.equal(memberFor(roles, 999), null);      // unmapped → null
+  assert.equal(memberFor(null, 1), null);         // no roles map → null
+  assert.equal(memberFor(roles, null), null);     // no sender → null
 });

@@ -1,8 +1,49 @@
 {
   "luni": {
-    "chatId": "-1003805278607",
+    "chatId": "-1004470275584",
     "roles": {
-      "144242180": "admin"
+      "144242180": {
+        "role": "admin",
+        "username": "mangcut",
+        "title": "anh",
+        "name": "Thi",
+        "position": "founder"
+      },
+      "462349070": {
+        "role": "member",
+        "username": "Millie_Braze",
+        "title": "chị",
+        "name": "Hà",
+        "position": "designer"
+      },
+      "@Duyenngmy": {
+        "role": "member",
+        "username": "Duyenngmy",
+        "title": "bạn",
+        "name": "Duyên",
+        "position": "PM"
+      },
+      "@ultoxtung": {
+        "role": "dev",
+        "username": "ultoxtung",
+        "title": "em",
+        "name": "Tùng",
+        "position": "dev"
+      },
+      "@mikeducc": {
+        "role": "dev",
+        "username": "mikeducc",
+        "title": "em",
+        "name": "Mike",
+        "position": "dev"
+      },
+      "@tungnpt": {
+        "role": "maintainer",
+        "username": "tungnpt",
+        "title": "bạn",
+        "name": "TùngTee",
+        "position": "reviewer"
+      }
     }
   }
 }
