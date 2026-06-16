@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { buildSpawnPlan, genSessionSeed, runSpawn, hasBinary, screenSessionExists, SPAWN_PROMPT } from './spawn.mjs';
+import { buildSpawnPlan, genSessionSeed, runSpawn, hasBinary, screenSessionExists, normalizeSessionName, parseScreenSessions, listSpawnSessions, SPAWN_PROMPT } from './spawn.mjs';
 import { uuidToConvoInt } from './convo-registry.mjs';
 import { shortConvoHash } from './convo-hash.mjs';
 
@@ -109,6 +109,38 @@ test('hasBinary: probes via `sh -c command -v <bin>`; success â†’ true, throw â†
 
   const throwExec = () => { throw new Error('exit 1'); };
   assert.equal(hasBinary('nope', throwExec), false);
+});
+
+test('normalizeSessionName: strips leading #, prepends tele- when missing', () => {
+  assert.equal(normalizeSessionName('d1331668'), 'tele-d1331668');     // bare hashtag
+  assert.equal(normalizeSessionName('#d1331668'), 'tele-d1331668');    // Telegram hashtag
+  assert.equal(normalizeSessionName('tele-d1331668'), 'tele-d1331668'); // already a name
+  assert.equal(normalizeSessionName('#tele-d1331668'), 'tele-d1331668'); // both
+  assert.equal(normalizeSessionName('  d1331668 '), 'tele-d1331668');   // trims
+});
+
+test('normalizeSessionName: rejects empty / unsafe (shell-safety)', () => {
+  assert.throws(() => normalizeSessionName(''), /invalid session id/);
+  assert.throws(() => normalizeSessionName('#'), /invalid session id/);
+  assert.throws(() => normalizeSessionName('tele-'), /invalid session id/);  // empty after prefix
+  assert.throws(() => normalizeSessionName('#tele-'), /invalid session id/); // empty after strip+prefix
+  assert.throws(() => normalizeSessionName('a; rm -rf /'), /invalid session id/);
+  assert.throws(() => normalizeSessionName('$(whoami)'), /invalid session id/);
+});
+
+test('parseScreenSessions: extracts tele-* sessions (pid+name), ignores others', () => {
+  const out = 'There is a screen on:\n\t68287.tele-d1331668\t(Detached)\n\t60092.tele-9a4bcab622a9\t(Detached)\n\t999.my.bot\t(Attached)\n3 Sockets in /tmp.\n';
+  assert.deepEqual(parseScreenSessions(out), [
+    { pid: '68287', name: 'tele-d1331668' },
+    { pid: '60092', name: 'tele-9a4bcab622a9' },
+  ]);
+  assert.deepEqual(parseScreenSessions('No Sockets found.\n'), []);
+});
+
+test('listSpawnSessions: tolerates screen -ls exiting non-zero (reads stdout off error)', () => {
+  const lsOut = '\t111.tele-abc1234\t(Detached)\n';
+  const throwWithStdout = () => { const e = new Error('exit 1'); e.stdout = lsOut; throw e; };
+  assert.deepEqual(listSpawnSessions(throwWithStdout), [{ pid: '111', name: 'tele-abc1234' }]);
 });
 
 test('runSpawn: delegates to injected runner with the plan (no real process)', () => {

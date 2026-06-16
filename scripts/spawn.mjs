@@ -128,6 +128,45 @@ export function screenSessionExists(name, exec = execFileSync) {
 }
 
 /**
+ * Normalize a user-supplied session id into a screen session name (RFC 03):
+ *   - strip a leading `#` (so the Telegram hashtag `#d1331668` works verbatim)
+ *   - prepend `tele-` if absent (so the bare hashtag `d1331668` works too)
+ * Throws on anything that isn't shell/argv-safe afterwards (the name is passed
+ * to `screen -S` and printed). Pure → unit-testable.
+ */
+export function normalizeSessionName(raw) {
+  let id = String(raw ?? '').trim();
+  if (id.startsWith('#')) id = id.slice(1);
+  if (!id.startsWith('tele-')) id = `tele-${id}`;
+  if (id === 'tele-' || !SAFE_SESSION_NAME.test(id)) {
+    throw new Error(`spawn: invalid session id ${JSON.stringify(raw)} → ${JSON.stringify(id)} (allowed: A-Za-z0-9_.-)`);
+  }
+  return id;
+}
+
+/**
+ * Parse `screen -ls` output into our spawned sessions (`tele-*` only). Pure.
+ * Assumes screen's one-session-per-line layout (it always is) → first match per line.
+ */
+export function parseScreenSessions(lsOut) {
+  const sessions = [];
+  for (const line of String(lsOut).split('\n')) {
+    // screen lists "<pid>.<name>\t(...)"; we only own `tele-` sessions.
+    const m = line.match(/(\d+)\.(tele-[A-Za-z0-9_.-]+)/);
+    if (m) sessions.push({ pid: m[1], name: m[2] });
+  }
+  return sessions;
+}
+
+/** List our spawned screen sessions. `exec` injectable for tests. */
+export function listSpawnSessions(exec = execFileSync) {
+  let out = '';
+  try { out = String(exec('screen', ['-ls'], { encoding: 'utf8' })); }
+  catch (e) { out = String(e?.stdout ?? ''); } // screen -ls can exit non-zero
+  return parseScreenSessions(out);
+}
+
+/**
  * Execute a plan. `runner` is injectable for tests (default actually spawns).
  * - interactive: `screen -dm` self-detaches; we invoke and return.
  * - headless: detached + unref so it survives this process exiting.
@@ -150,6 +189,41 @@ export function runSpawn(plan, { runner } = {}) {
 const isDirectRun = fileURLToPath(import.meta.url) === path.resolve(process.argv[1] ?? '');
 if (isDirectRun) {
   const argv = process.argv.slice(2);
+
+  // --list / --ls: show our spawned screen sessions (name == convo hashtag).
+  if (argv.includes('--list') || argv.includes('--ls')) {
+    if (!hasBinary('screen')) { console.error('[spawn] `screen` not found on PATH.'); process.exit(1); }
+    const sessions = listSpawnSessions();
+    if (!sessions.length) { console.log('[spawn] no agent sessions (tele-*) running.'); process.exit(0); }
+    console.log(`[spawn] ${sessions.length} agent session(s):`);
+    for (const s of sessions) console.log(`  ${s.name}  (pid ${s.pid})  → topic #${s.name.replace(/^tele-/, '')}`);
+    process.exit(0);
+  }
+
+  // --kill <id>: id may be `d1331668`, `#d1331668`, or `tele-d1331668`.
+  const killIdx = argv.findIndex((a) => a === '--kill' || a === '--quit');
+  if (killIdx !== -1) {
+    const raw = argv[killIdx + 1];
+    // A flag-looking next arg means the id was omitted (e.g. `--kill --list`).
+    if (!raw || raw.startsWith('--')) { console.error('[spawn] --kill needs an id, e.g. `pnpm spawn:kill d1331668` (or #d1331668 / tele-d1331668).'); process.exit(1); }
+    if (!hasBinary('screen')) { console.error('[spawn] `screen` not found on PATH.'); process.exit(1); }
+    let name;
+    try { name = normalizeSessionName(raw); }
+    catch (e) { console.error(`[spawn] ${e.message}`); process.exit(1); }
+    if (!screenSessionExists(name)) {
+      console.error(`[spawn] no screen session "${name}" (try: pnpm spawn:ls).`);
+      process.exit(1);
+    }
+    execFileSync('screen', ['-S', name, '-X', 'quit'], { stdio: 'ignore' });
+    execFileSync('sleep', ['0.3'], { stdio: 'ignore' }); // settle, then verify it's gone
+    if (screenSessionExists(name)) {
+      console.error(`[spawn] FAILED to kill "${name}" (still listed). Try: screen -S ${name} -X quit`);
+      process.exit(1);
+    }
+    console.log(`[spawn] killed agent session "${name}".`);
+    process.exit(0);
+  }
+
   const interactive = argv.includes('--interactive') || argv.includes('-i');
   // Preflight: the binaries we need must exist.
   if (!hasBinary('claude')) {
