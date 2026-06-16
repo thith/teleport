@@ -17,7 +17,7 @@ import {
 } from './pending-store.mjs';
 import { recordAlive, isAlive, getLastAliveMs, pruneStale as pruneAliveStale, DEFAULT_FRESH_MS as ALIVE_FRESH_MS } from './listener-alive.mjs';
 import { readTopicsStore, getThreadId, DEFAULT_TOPICS_FILE } from './topics-store.mjs';
-import { readProjectsConfig, resolveProjectConfig, roleFor, adminIdsFrom } from './projects-config.mjs';
+import { readProjectsConfig, resolveProjectConfig, roleFor, memberFor, adminIdsFrom } from './projects-config.mjs';
 import {
   acquireLock as acquireConvoLock,
   appendRowLocked as appendConvoRow,
@@ -111,6 +111,26 @@ export const GLOBAL_OFFSET_FILE = path.join(DEFAULT_TMP_DIR, 'global-offset.txt'
 export const DEFAULT_PROMPT_FILE = path.join(DEFAULT_TMP_DIR, 'prompt.json');
 export const DEFAULT_PROMPT_PROCESSING_FILE = path.join(DEFAULT_TMP_DIR, 'prompt.processing.json');
 export const UPDATES_CACHE_FILE = path.join(DEFAULT_TMP_DIR, 'updates-cache.jsonl');
+
+/**
+ * Per-bot update_id state file paths. `update_id` is a per-bot monotonic
+ * sequence, so a single shared cache/global-offset mixes incomparable
+ * sequences: a swapped/added bot's higher ids poison a lower bot's offsets and
+ * the lower bot then drops every message (see resolveStartOffset self-heal).
+ * Scoping by botId keeps each bot comparing only against its own ids. Returns
+ * the shared defaults when botId is null (no-token / legacy paths) — that path
+ * keeps the old single-bot behavior and is exercised by tests.
+ */
+export function botScopedFiles(botId, tmpDir = DEFAULT_TMP_DIR) {
+  if (botId == null) {
+    return { cacheFile: UPDATES_CACHE_FILE, globalOffsetFile: GLOBAL_OFFSET_FILE };
+  }
+  return {
+    cacheFile: path.join(tmpDir, `updates-cache.${botId}.jsonl`),
+    globalOffsetFile: path.join(tmpDir, `global-offset.${botId}.txt`),
+  };
+}
+
 export const POLL_LOCK_FILE = path.join(DEFAULT_TMP_DIR, 'poll.lock');
 export const REGISTRY_FILE = path.join(DEFAULT_TMP_DIR, 'listener-registry.jsonl');
 export const REGISTRY_LOCK_FILE = path.join(DEFAULT_TMP_DIR, 'registry.lock');
@@ -519,6 +539,7 @@ export function buildPromptData(msg, updateId = null, botId = null, roles = null
     fromUserId: String(msg.from?.id ?? msg.chat.id),
     fromName: formatFromName(msg.from),
     fromRole: roleFor(roles, msg.from?.id),
+    fromMember: memberFor(roles, msg.from?.id),
     replyToMessageId: replyTo?.message_id ?? null,
     // Media-only messages have `.caption` instead of `.text`; fall back so the
     // agent still sees the human-readable context.
@@ -559,6 +580,7 @@ export function buildCombinedPromptData(messages, botId = null, convoId = null, 
     fromUserId: String(last.from?.id ?? last.chat.id),
     fromName: formatFromName(last.from),
     fromRole: roleFor(roles, last.from?.id),
+    fromMember: memberFor(roles, last.from?.id),
     replyToMessageId: replyTo?.message_id ?? null,
     replyToText: replyTo?.text ?? replyTo?.caption ?? (replyTo ? summarizeMediaReplyTarget(replyTo) : null),
     quotedText: last.quote?.text ?? null,
@@ -621,7 +643,55 @@ export function resolveStartOffset(
   cacheFile = UPDATES_CACHE_FILE,
 ) {
   const perLoop = readOffset(offsetFile);
-  if (perLoop > 0) return perLoop;
+  // Stable read: also tells us if the newest line is a torn (in-flight) append,
+  // so the self-heal below doesn't act on a transiently-low maxCached.
+  const { entries: cache, tornTail } = readCacheStable(cacheFile);
+  // Highest update_id this bot has ever cached. Use reduce (not Math.max spread)
+  // for the same call-stack reason as below.
+  const maxCached = cache.reduce(
+    (m, u) => (u.update_id > m ? u.update_id : m),
+    0,
+  );
+
+  if (perLoop > 0) {
+    // Self-heal contaminated offsets. `advanceLoopOffset` only ever sets the
+    // per-loop offset to THIS bot's own cache-max + 1, so a stored offset can
+    // never legitimately exceed `maxCached + 1`. If it does, the offset was
+    // poisoned by another bot's update_id sequence that shared the cache before
+    // per-bot cache files landed (a removed/swapped bot leaves higher ids
+    // behind; `update_id` is per-bot and not comparable across bots). Reset and
+    // re-initialize so the convo can read its own messages again instead of
+    // filtering them all out forever. Only act once the bot's own cache is
+    // populated (maxCached > 0); an empty cache can't tell us anything yet.
+    // Skip on a torn tail (maxCached may be transiently low) — heal next poll.
+    let poisoned = maxCached > 0 && !tornTail && perLoop > maxCached + 1;
+    if (poisoned) {
+      // Confirm against a fresh read before the (destructive) reset. The first
+      // read happens outside the poll lock, so a concurrent appendToCache() can
+      // be observed truncated. A mid-line tear is caught by `tornTail`, but a
+      // tear on a newline boundary parses cleanly and only understates
+      // maxCached — which would look like contamination and trigger a spurious
+      // rollback (duplicate delivery). The write is a single appendFileSync
+      // syscall, so a back-to-back re-read almost always sees the completed
+      // file; only heal if the contamination still holds. Off the hot path —
+      // a caught-up offset returns above without ever reaching here.
+      const confirm = readCacheStable(cacheFile);
+      const confirmMax = confirm.entries.reduce(
+        (m, u) => (u.update_id > m ? u.update_id : m),
+        0,
+      );
+      poisoned = !confirm.tornTail && confirmMax > 0 && perLoop > confirmMax + 1;
+    }
+    if (poisoned) {
+      console.error(
+        `[tele-listen] per-loop offset ${perLoop} exceeds bot cache max ${maxCached}+1 ` +
+        `(cross-bot contamination) — resetting ${path.basename(offsetFile)}`,
+      );
+      // fall through to re-init below
+    } else {
+      return perLoop;
+    }
+  }
 
   const globalOffset = readOffset(globalOffsetFile);
   let startOffset = globalOffset;
@@ -639,7 +709,6 @@ export function resolveStartOffset(
   // (see telegram-guide.md §Notes — "Duplicate safety (partial)"). A future
   // fix can persist a per-loop highest-processed update_id set instead of
   // relying on a single offset.
-  const cache = readCache(cacheFile);
   if (cache.length > 0) {
     // Use reduce instead of Math.min(...spread) to avoid call-stack limits if
     // the cache cap is ever raised above the JS argument limit.
@@ -710,6 +779,42 @@ export function readCache(cacheFile = UPDATES_CACHE_FILE) {
 
 export function readCacheSinceOffset(offset, cacheFile = UPDATES_CACHE_FILE) {
   return readCache(cacheFile).filter((u) => u.update_id >= offset);
+}
+
+/**
+ * Like readCache, but also reports whether the file's final non-empty line
+ * failed to parse — a torn tail, i.e. a concurrent appendToCache() write seen
+ * mid-flight (appendFileSync of a large batch is not guaranteed atomic, and
+ * resolveStartOffset reads the cache OUTSIDE the poll lock). The offset
+ * self-heal skips a torn read so dropping the newest line can't understate the
+ * observed max and make a legitimate caught-up offset look poisoned.
+ *
+ * Caveat: this only catches a MID-LINE tear. A concurrent write observed on a
+ * newline boundary parses cleanly (just understates max), so resolveStartOffset
+ * additionally CONFIRMS a suspected contamination with a second read before
+ * resetting — see the heal branch there.
+ */
+export function readCacheStable(cacheFile = UPDATES_CACHE_FILE) {
+  let raw;
+  try {
+    raw = fs.readFileSync(cacheFile, 'utf8');
+  } catch {
+    return { entries: [], tornTail: false };
+  }
+  const lines = raw.trim().split('\n').filter((l) => l);
+  const entries = [];
+  let tornTail = false;
+  for (let i = 0; i < lines.length; i++) {
+    try {
+      entries.push(JSON.parse(lines[i]));
+    } catch {
+      // Only the LAST line being unparseable indicates an in-flight append;
+      // a malformed interior line is pre-existing corruption (readCache skips
+      // it) and should not block the self-heal.
+      if (i === lines.length - 1) tornTail = true;
+    }
+  }
+  return { entries, tornTail };
 }
 
 export function pruneCache(maxEntries = 500, cacheFile = UPDATES_CACHE_FILE) {
@@ -1351,13 +1456,18 @@ function collectReferencedAttachments(promptDir) {
 //     (botId, updateId) pair
 // Walks one level under each bot directory; non-numeric entries (e.g.
 // "unknown-bot" or stray scratch dirs) are walked the same way.
-function pruneAttachmentDirs(baseDir, globalOffset, promptDir) {
+function pruneAttachmentDirs(baseDir, globalOffset, promptDir, botId = null) {
   try {
     if (!fs.existsSync(baseDir)) return;
     const idThreshold = globalOffset - ATTACHMENT_PRUNE_KEEP;
     const mtimeCutoff = Date.now() - 60 * 60 * 1000;
     const referenced = collectReferencedAttachments(promptDir);
     for (const botEntry of fs.readdirSync(baseDir)) {
+      // `globalOffset` (and thus idThreshold) is a per-bot update_id sequence;
+      // applying it to another bot's attachment dir would compare incomparable
+      // ids and could mis-prune. Only prune the current bot's own subdir. Each
+      // bot prunes its own on its own polls, so overall coverage is unchanged.
+      if (botId != null && botEntry !== String(botId)) continue;
       const botDir = path.join(baseDir, botEntry);
       let botStat;
       try { botStat = fs.statSync(botDir); } catch { continue; }
@@ -1496,6 +1606,22 @@ async function main() {
   }
 
   const botId = extractBotId(token);
+  // A non-empty token that doesn't parse to a numeric bot id is malformed.
+  // Fail fast: botScopedFiles(null) would fall back to the SHARED cache/offset
+  // files, re-introducing the exact cross-bot poisoning this isolation fixes
+  // (the null fallback is only meant for genuinely token-less/legacy callers).
+  // A malformed token can't authenticate getUpdates anyway, so exiting is no
+  // loss of function — just a clearer failure than silently sharing state.
+  if (botId == null) {
+    console.error('[tele-listen] REPORT_BOT_TOKEN malformed (no numeric bot id prefix) — cannot scope per-bot state');
+    process.exit(1);
+  }
+  // Per-bot update_id state (cache + Telegram getUpdates offset). See
+  // botScopedFiles() for why this must be keyed by botId. Per-convo offset
+  // files are already unique per convo; they read these bot-scoped files via
+  // resolveStartOffset.
+  const { cacheFile: botCacheFile, globalOffsetFile: botGlobalOffsetFile } =
+    botScopedFiles(botId);
   let mode = 'legacy';
 
   if (convo != null) {
@@ -1622,7 +1748,7 @@ async function main() {
   let pendingResponses = [];
   // Captured before fetch so this poll uses one stable Telegram getUpdates
   // offset even if another listener advances the global offset concurrently.
-  let preFetchGlobalOffset = readOffset(GLOBAL_OFFSET_FILE);
+  let preFetchGlobalOffset = readOffset(botGlobalOffsetFile);
   const lockAcquired = acquirePollLock();
   if (lockAcquired) {
     try {
@@ -1658,13 +1784,13 @@ async function main() {
       // Both handlers may have consumed every fetched update; still advance
       // the Telegram offset past them, else we loop the same command forever.
       if (fetched.length === 0 && pendingResponses.length > 0 && originalMaxUpdateId > 0) {
-        writeOffset(originalMaxUpdateId, GLOBAL_OFFSET_FILE);
+        writeOffset(originalMaxUpdateId, botGlobalOffsetFile);
       }
       if (fetched.length > 0) {
         systemMsgIdsSnapshot = readSystemMsgIds();
         const { orphans, nonOrphan } = partitionOrphans(fetched, adminIds, systemMsgIdsSnapshot);
         pendingOrphans = orphans;
-        if (nonOrphan.length > 0) appendToCache(nonOrphan);
+        if (nonOrphan.length > 0) appendToCache(nonOrphan, botCacheFile);
         // Audit log: every fetched update with classification + reason. Lets us debug
         // cache-miss issues (e.g. user-reply ended up orphan'd because Telegram stripped
         // reply_to_message). Append-only JSONL; rotation handled by external tooling.
@@ -1707,10 +1833,10 @@ async function main() {
         // was the newest update, re-fetching & re-handling it next poll (G2-M).
         // Non-command updates are already cached, so advancing past them is safe.
         const maxUpdateId = Math.max(originalMaxUpdateId, ...fetched.map((u) => u.update_id));
-        writeOffset(maxUpdateId, GLOBAL_OFFSET_FILE);
+        writeOffset(maxUpdateId, botGlobalOffsetFile);
       }
-      pruneCache();
-      pruneAttachmentDirs(path.join(DEFAULT_TMP_DIR, 'attachments'), globalOffset, DEFAULT_TMP_DIR);
+      pruneCache(undefined, botCacheFile);
+      pruneAttachmentDirs(path.join(DEFAULT_TMP_DIR, 'attachments'), globalOffset, DEFAULT_TMP_DIR, botId);
     } catch (e) {
       fetchFailed = true;
       console.error(`[tele-listen] getUpdates failed: ${e instanceof Error ? e.message : String(e)}`);
@@ -1740,12 +1866,12 @@ async function main() {
   // the now-deleted ones, permanently skipping any matching updates.
   const loopOffset = resolveStartOffset(
     offsetFile,
-    GLOBAL_OFFSET_FILE,
-    UPDATES_CACHE_FILE,
+    botGlobalOffsetFile,
+    botCacheFile,
   );
 
   // Read from local cache using per-loop offset.
-  let updates = readCacheSinceOffset(loopOffset);
+  let updates = readCacheSinceOffset(loopOffset, botCacheFile);
 
   if (fetchFailed && updates.length === 0) {
     process.exit(1);
