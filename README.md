@@ -81,7 +81,7 @@ After sending any Telegram message, you **MUST immediately** start the reply-lis
 
 ## Spawn agent instances
 
-**WHENEVER** the user says "spawn Claude" / "spawn an agent" / "spawn Claude headless" — **or similar phrasings, in any language** (e.g. Vietnamese "spawn Claude đi", "tạo một agent", "spawn con Claude headless") — you **MUST** read `../teleport/rules/telegram-guide.md` section "Spawning a new agent instance" and follow it. Do **NOT** rely on invocation details from this snippet; the guide is the single source of truth.
+**WHENEVER** the user asks to spawn / start / launch a Claude agent — e.g. "spawn Claude", "start an agent", "launch a Claude", "... headless" — **or any similar phrasing in any language** (Vietnamese e.g. "chạy một Claude", "khởi động một agent", "chạy Claude headless") — you **MUST** read `../teleport/rules/telegram-guide.md` section "Spawning a new agent instance" and follow it. Do **NOT** rely on invocation details from this snippet; the guide is the single source of truth.
 ````
 
 #### Per-project setup for spawn

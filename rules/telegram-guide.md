@@ -10,7 +10,7 @@
 
 ## Spawning a new agent instance (RFC 03)
 
-When the user says **"spawn Claude"** (or "spawn an agent", "spawn me a Claude", "spawn Claude headless") — **or any similar phrasing, in any language** (e.g. Vietnamese "spawn Claude đi", "tạo một agent", "spawn con Claude headless") — run the spawn helper from the **project root** so the new instance inherits this project's group:
+When the user asks to **spawn / start / launch** a Claude agent — e.g. "spawn Claude", "start an agent", "launch a Claude", "... headless" — **or any similar phrasing in any language** (Vietnamese e.g. "chạy một Claude", "khởi động một agent", "chạy Claude headless") — run the spawn helper from the **project root** so the new instance inherits this project's group:
 
 - **"spawn Claude"** (default — the user will drive it over Telegram) → `pnpm spawn:i`
   (runs `node ../teleport/scripts/spawn.mjs --interactive`). Starts a real INTERACTIVE
