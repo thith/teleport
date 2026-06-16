@@ -78,7 +78,20 @@ This is what the agent copies into each config file when you paste the prompt ab
 Scripts + guide are centralized at `../teleport/` (sibling of every project). Each project keeps no local copy. Do **NOT** rely on any invocation details from memory or from this config snippet; the guide is the single source of truth and may change as Teleport is updated.
 
 After sending any Telegram message, you **MUST immediately** start the reply-listener flow described in the guide's "Listening for Replies" section. **MUST NOT** skip or defer this step even if the task feels complete — the user may reply via Telegram at any time.
+
+## Spawn agent instances (teleport)
+
+**WHENEVER** the user says "spawn Claude" / "spawn an agent" (or "spawn Claude headless"), you **MUST** read `../teleport/rules/telegram-guide.md` section "Spawning a new agent instance" and follow it. In short, run from the project root: "spawn Claude" → `pnpm spawn:i` (interactive Claude in a detached `screen` session — bills the subscription, the default since the user drives it over Telegram); "spawn Claude headless" → `pnpm spawn:headless` (`claude -p`, detached, auto-exits — bills the Agent SDK pool; only for true automation). The guide is the single source of truth; do not rely on invocation details from this snippet.
 ````
+
+The spawn helper lives at `teleport/scripts/spawn.mjs`. Add these scripts to each project's `package.json` to enable `pnpm spawn:i` / `pnpm spawn:headless` (or call the script directly):
+
+```json
+"spawn:i": "node ../teleport/scripts/spawn.mjs --interactive",
+"spawn:headless": "node ../teleport/scripts/spawn.mjs"
+```
+
+Interactive mode needs `screen` (preinstalled on macOS) or `tmux` on the host. The new instance greets on Telegram in its own persona topic; you assign work there. Teardown an interactive session with `screen -S <name> -X quit` (the helper prints `<name>`).
 
 ## How to use
 
