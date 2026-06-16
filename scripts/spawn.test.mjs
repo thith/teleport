@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { buildSpawnPlan, genSessionSeed, runSpawn, hasBinary, screenSessionExists, normalizeSessionName, parseScreenSessions, listSpawnSessions, SPAWN_PROMPT } from './spawn.mjs';
+import { buildSpawnPlan, genSessionSeed, runSpawn, hasBinary, screenSessionExists, normalizeSessionName, parseScreenSessions, listSpawnSessions, resolveKillId, SPAWN_PROMPT } from './spawn.mjs';
 import { uuidToConvoInt } from './convo-registry.mjs';
 import { shortConvoHash } from './convo-hash.mjs';
 
@@ -52,10 +52,20 @@ test('buildSpawnPlan interactive: auto-seeds when neither name nor seed given (r
   assert.equal(p.command[2], p.sessionName);
 });
 
-test('buildSpawnPlan interactive: explicit name + seed → name overrides but seed session-id still forced (G-Major)', () => {
+test('buildSpawnPlan interactive: explicit name + seed → name wins, seed id DROPPED (name⇄hashtag invariant)', () => {
+  // A seed is an atomic name+UUID pair; if the name is overridden, forcing the
+  // seed's UUID would make the screen name disagree with the child's hashtag.
   const p = buildSpawnPlan({ interactive: true, sessionName: 'tele-custom', seed: genSessionSeed(() => FIXED_UUID) });
   assert.equal(p.sessionName, 'tele-custom'); // explicit name wins
-  assert.equal(p.sessionId, FIXED_UUID); // but the forced id is NOT lost
+  assert.equal(p.sessionId, null);            // seed UUID dropped — NOT forced
+  assert.ok(!p.command.includes('--session-id'));
+  assert.deepEqual(p.command, ['screen', '-dmS', 'tele-custom', 'claude', SPAWN_PROMPT]);
+});
+
+test('buildSpawnPlan interactive: explicit name + explicit valid sessionId → forced (deliberate advanced override)', () => {
+  const p = buildSpawnPlan({ interactive: true, sessionName: 'tele-x', sessionId: FIXED_UUID });
+  assert.equal(p.sessionName, 'tele-x');
+  assert.equal(p.sessionId, FIXED_UUID);
   assert.ok(p.command.includes('--session-id'));
   assert.equal(p.command[p.command.indexOf('--session-id') + 1], FIXED_UUID);
 });
@@ -135,6 +145,26 @@ test('parseScreenSessions: extracts tele-* sessions (pid+name), ignores others',
     { pid: '60092', name: 'tele-9a4bcab622a9' },
   ]);
   assert.deepEqual(parseScreenSessions('No Sockets found.\n'), []);
+});
+
+test('parseScreenSessions: row-shape anchored — no mid-string / pid-miscapture / stateless false matches (review B)', () => {
+  // mid-line substring (e.g. a banner or prose), not a real row → ignored.
+  assert.deepEqual(parseScreenSessions('note 123.tele-x is running\n'), []);
+  // pid.OTHER.tele-x → the name is `other.tele-x`, not `tele-*`; must NOT capture `123`/`tele-x`.
+  assert.deepEqual(parseScreenSessions('\t999.other.tele-x\t(Detached)\n'), []);
+  // a `pid.tele-*` token with no trailing `(state)` is not a session row → ignored.
+  assert.deepEqual(parseScreenSessions('\t111.tele-abc1234 no-state-here\n'), []);
+  // a genuine row still parses.
+  assert.deepEqual(parseScreenSessions('\t111.tele-abc1234\t(Detached)\n'), [{ pid: '111', name: 'tele-abc1234' }]);
+});
+
+test('resolveKillId: finds id, rejects missing / flag-looking next token (review E)', () => {
+  assert.deepEqual(resolveKillId(['--kill', 'd1331668']), { found: true, raw: 'd1331668' });
+  assert.deepEqual(resolveKillId(['--quit', '#d1331668']), { found: true, raw: '#d1331668' });
+  assert.deepEqual(resolveKillId(['--kill']), { found: true, raw: null });          // missing id
+  assert.deepEqual(resolveKillId(['--kill', '--list']), { found: true, raw: null }); // double-dash flag
+  assert.deepEqual(resolveKillId(['--kill', '-i']), { found: true, raw: null });     // single-dash flag
+  assert.deepEqual(resolveKillId(['--interactive']), { found: false, raw: null });   // no kill flag
 });
 
 test('listSpawnSessions: tolerates screen -ls exiting non-zero (reads stdout off error)', () => {

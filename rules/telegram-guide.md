@@ -17,14 +17,22 @@ When the user asks to **spawn / start / launch** a Claude agent — e.g. "spawn 
   `claude` in a detached `screen` session → bills against the **subscription**, not the
   Agent SDK pool. It seeds the hard-coded prompt "Telegram me and wait for instructions",
   so the new agent greets on Telegram in its own persona topic; you then give it work there.
-  Teardown: `screen -S <name> -X quit` (the helper prints `<name>`).
+  The `screen` session is named `tele-<hashtag>` matching the `#<hashtag>` the agent shows
+  in its Telegram topic, so you can map a session to an agent at a glance.
 - **"spawn Claude headless"** (true automation / fire-and-forget) → `pnpm spawn:headless`
   (runs `claude -p` detached). Auto-exits when done; bills against the **Agent SDK pool** —
   use only for genuine non-interactive workflows.
 
+**List / kill running agents:**
+- **"list agents / which agents are running"** → `pnpm spawn:ls` (prints each `tele-<hashtag>`
+  session + its topic hashtag).
+- **"kill / stop agent <id>"** → `pnpm spawn:kill <id>` — `<id>` may be the bare hashtag
+  (`d1331668`), the Telegram form (`#d1331668`), or the full name (`tele-d1331668`); it's
+  normalized then killed (verifies the session is gone). Headless agents need no teardown.
+
 The helper takes NO task argument (prompt is hard-coded); the user assigns work via Telegram
-after the new agent greets. Projects without `spawn:i`/`spawn:headless` in package.json can
-call `node ../teleport/scripts/spawn.mjs [--interactive]` directly.
+after the new agent greets. Projects without these scripts in package.json can call
+`node ../teleport/scripts/spawn.mjs [--interactive | --list | --kill <id>]` directly.
 
 ## Content format
 

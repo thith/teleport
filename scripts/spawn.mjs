@@ -59,10 +59,12 @@ export function buildSpawnPlan({ interactive = false, sessionName, sessionId, se
     // matches the Telegram hashtag. Explicit `sessionName` (power-user override)
     // skips seeding → no forced --session-id, name as given.
     let name = sessionName;
-    // A passed seed still contributes its forced session-id even when an explicit
-    // name overrides the seed's name — otherwise the name⇄hashtag guarantee would
-    // be silently lost (review G-Major).
-    let sid = sessionId ?? seed?.sessionId ?? null;
+    // A `seed` is an atomic name+UUID pair (the screen name IS the hashtag of the
+    // UUID). If an explicit `sessionName` overrides the name, the seed's UUID must
+    // be DROPPED too — forcing it would make the screen name disagree with the
+    // child's hashtag, breaking the very invariant this feature exists for. An
+    // explicit standalone `sessionId` is a deliberate advanced override → honored.
+    let sid = sessionId ?? null;
     if (!name) {
       const s = seed || genSessionSeed();
       name = s.sessionName;
@@ -146,13 +148,15 @@ export function normalizeSessionName(raw) {
 
 /**
  * Parse `screen -ls` output into our spawned sessions (`tele-*` only). Pure.
- * Assumes screen's one-session-per-line layout (it always is) → first match per line.
+ * Anchors to screen's full row shape `<ws><pid>.<name><ws>(<state>)` so a stray
+ * `digits.tele-` substring mid-line, or a `pid.other.tele-x` name, can't be
+ * mis-captured (review B). Header/footer/"No Sockets" lines lack a pid.tele- token
+ * and a trailing `(state)`, so anchoring drops zero real sessions.
  */
 export function parseScreenSessions(lsOut) {
   const sessions = [];
   for (const line of String(lsOut).split('\n')) {
-    // screen lists "<pid>.<name>\t(...)"; we only own `tele-` sessions.
-    const m = line.match(/(\d+)\.(tele-[A-Za-z0-9_.-]+)/);
+    const m = line.match(/^\s*(\d+)\.(tele-[A-Za-z0-9_.-]+)\s+\(/);
     if (m) sessions.push({ pid: m[1], name: m[2] });
   }
   return sessions;
@@ -165,6 +169,22 @@ export function listSpawnSessions(exec = execFileSync) {
   catch (e) { out = String(e?.stdout ?? ''); } // screen -ls can exit non-zero
   return parseScreenSessions(out);
 }
+
+/**
+ * Resolve the `--kill <id>` target from argv. Pure → unit-testable.
+ * Returns `{ found, raw }`: `found` = a --kill/--quit flag is present; `raw` = the
+ * id token, or null when it's missing or flag-looking (a `-`-prefixed next token
+ * means the id was omitted, e.g. `--kill -i` / `--kill --list`).
+ */
+export function resolveKillId(argv) {
+  const i = argv.findIndex((a) => a === '--kill' || a === '--quit');
+  if (i === -1) return { found: false, raw: null };
+  const raw = argv[i + 1];
+  return { found: true, raw: !raw || raw.startsWith('-') ? null : raw };
+}
+
+/** Non-blocking delay (avoids spawning the `sleep` binary + its fractional-second assumption). */
+const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /**
  * Execute a plan. `runner` is injectable for tests (default actually spawns).
@@ -201,21 +221,21 @@ if (isDirectRun) {
   }
 
   // --kill <id>: id may be `d1331668`, `#d1331668`, or `tele-d1331668`.
-  const killIdx = argv.findIndex((a) => a === '--kill' || a === '--quit');
-  if (killIdx !== -1) {
-    const raw = argv[killIdx + 1];
-    // A flag-looking next arg means the id was omitted (e.g. `--kill --list`).
-    if (!raw || raw.startsWith('--')) { console.error('[spawn] --kill needs an id, e.g. `pnpm spawn:kill d1331668` (or #d1331668 / tele-d1331668).'); process.exit(1); }
+  const kill = resolveKillId(argv);
+  if (kill.found) {
+    if (!kill.raw) { console.error('[spawn] --kill needs an id, e.g. `pnpm spawn:kill d1331668` (or #d1331668 / tele-d1331668).'); process.exit(1); }
     if (!hasBinary('screen')) { console.error('[spawn] `screen` not found on PATH.'); process.exit(1); }
     let name;
-    try { name = normalizeSessionName(raw); }
+    try { name = normalizeSessionName(kill.raw); }
     catch (e) { console.error(`[spawn] ${e.message}`); process.exit(1); }
     if (!screenSessionExists(name)) {
       console.error(`[spawn] no screen session "${name}" (try: pnpm spawn:ls).`);
       process.exit(1);
     }
-    execFileSync('screen', ['-S', name, '-X', 'quit'], { stdio: 'ignore' });
-    execFileSync('sleep', ['0.3'], { stdio: 'ignore' }); // settle, then verify it's gone
+    // `screen -X quit` can exit non-zero (race, perms) → don't let it throw a stack
+    // trace; the re-check below is the source of truth (kill verified by absence).
+    try { execFileSync('screen', ['-S', name, '-X', 'quit'], { stdio: 'ignore' }); } catch { /* re-check decides */ }
+    await sleepMs(300); // settle, then verify it's gone
     if (screenSessionExists(name)) {
       console.error(`[spawn] FAILED to kill "${name}" (still listed). Try: screen -S ${name} -X quit`);
       process.exit(1);
@@ -238,8 +258,9 @@ if (isDirectRun) {
   const result = runSpawn(plan);
   if (plan.mode === 'interactive') {
     // Verify the screen session actually came up — `screen -dmS` returns 0 even
-    // if claude failed to exec inside it (review C-Major). Tiny settle delay.
-    execFileSync('sleep', ['0.5'], { stdio: 'ignore' });
+    // if claude failed to exec inside it. Tiny settle delay. (NB: verifies screen
+    // presence, not claude liveness.)
+    await sleepMs(500);
     if (!screenSessionExists(plan.sessionName)) {
       console.error(`[spawn] FAILED: screen session "${plan.sessionName}" not found after launch (claude or screen may have errored). Check: screen -ls`);
       process.exit(1);
