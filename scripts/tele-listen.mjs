@@ -469,6 +469,26 @@ function summarizeMediaReplyTarget(replyTo) {
   return null;
 }
 
+/**
+ * The message a user GENUINELY replied to, for prompt context ("replying to
+ * what?"). Routing is by topic (message_thread_id), but a real reply-to is
+ * still useful context for the agent. Telegram, however, sets
+ * `reply_to_message` to the topic-creation service message for EVERY message
+ * posted in a forum topic — that phantom is not a real reply, so surface it as
+ * "no reply" rather than feeding the agent a bogus "replying to <topic-creation>"
+ * target. Returns null for the phantom (and when there's no reply at all).
+ *
+ * Shares ONLY the `forum_topic_created` phantom signal with findOrphanMessages;
+ * it deliberately does NOT replicate that function's system-message /
+ * external_reply handling — those are orphan-classification concerns, whereas a
+ * genuine reply to a bot message is still valid context to show the agent here.
+ */
+function realReplyTo(msg) {
+  const replyTo = msg?.reply_to_message;
+  if (!replyTo || replyTo.forum_topic_created) return null;
+  return replyTo;
+}
+
 export function filterAdminMessages(updates, adminIds, filterReplyTo = null, mode = 'legacy', threadByChat = null) {
   // mode = 'legacy' : filterReplyTo is null | number | number[] | Set<number>;
   //                   matches `reply_to_message.message_id` only.
@@ -531,7 +551,7 @@ export function formatFromName(from) {
 // TELE_ROLES env Map parser was removed.)
 
 export function buildPromptData(msg, updateId = null, botId = null, roles = null) {
-  const replyTo = msg.reply_to_message;
+  const replyTo = realReplyTo(msg);
   return {
     text: msg.text ?? msg.caption ?? '',
     messageId: msg.message_id,
@@ -566,7 +586,7 @@ export function buildCombinedPromptData(messages, botId = null, convoId = null, 
       ? getText(first.msg)
       : [getText(first.msg), ...rest.map((m) => `Admin follow-up: ${getText(m.msg)}`)].join('\n\n');
   const last = messages[messages.length - 1].msg;
-  const replyTo = last.reply_to_message;
+  const replyTo = realReplyTo(last);
 
   const attachments = [];
   for (const m of messages) {
