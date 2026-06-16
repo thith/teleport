@@ -1132,7 +1132,10 @@ async function main() {
       try {
         const convoIdForSend = resolveConvoIdPreSend({ preResolved, replyTo: args.replyTo, chatId, botId }) ?? fallbackConvoId;
         const persona = personaForConvo(convoIdForSend);
-        const caption = injectConvoHash(rawCaption, projectCode, convoIdForSend, { pretokensEscaped: opts.raw, persona });
+        // In a DEDICATED group the whole group IS this project, so the `[project]`
+        // message prefix is redundant (RFC 02) — drop it (the persona tag still
+        // identifies the agent). Shared group keeps `[project]` to disambiguate.
+        const caption = injectConvoHash(rawCaption, dedicatedGroup ? '' : projectCode, convoIdForSend, { pretokensEscaped: opts.raw, persona });
         const { topicKey, topicName } = topicTarget({ convoId: convoIdForSend, persona, projectCode, dedicated: dedicatedGroup });
         let threadId = requireTopic(await resolveThreadId({ token, chatId, projectCode, topicKey, topicName }), chatId, convoIdForSend);
         let sendOpts = { ...opts, messageThreadId: threadId };
@@ -1201,7 +1204,8 @@ async function main() {
     try {
       const convoIdForSend = resolveConvoIdPreSend({ preResolved, replyTo: args.replyTo, chatId, botId }) ?? fallbackConvoId;
       const persona = personaForConvo(convoIdForSend);
-      const message = injectConvoHash(rawMessage, projectCode, convoIdForSend, { pretokensEscaped: opts.raw, persona });
+      // Dedicated group → drop the redundant `[project]` prefix (see above).
+      const message = injectConvoHash(rawMessage, dedicatedGroup ? '' : projectCode, convoIdForSend, { pretokensEscaped: opts.raw, persona });
       const { topicKey, topicName } = topicTarget({ convoId: convoIdForSend, persona, projectCode, dedicated: dedicatedGroup });
       let threadId = requireTopic(await resolveThreadId({ token, chatId, projectCode, topicKey, topicName }), chatId, convoIdForSend);
       let sendOpts = { ...opts, messageThreadId: threadId };

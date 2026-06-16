@@ -16,6 +16,13 @@ test('persona: no leading emoji in body still renders persona tag', () => {
   assert.equal(out, `[luni] [🦉 Cú ${HASH}] hello`);
 });
 
+test('dedicated group (empty projectCode): NO [project] prefix, persona tag kept (RFC 02)', () => {
+  // Send side passes '' for projectCode when the group is dedicated → the
+  // redundant [luni] is dropped; the persona tag (agent identity) stays.
+  const out = injectConvoHash('🦊 Claude on x', '', ID, { persona: P });
+  assert.equal(out, `[🦉 Cú ${HASH}] Claude on x`);
+});
+
 test('persona: empty body emits tag with no trailing space', () => {
   const out = injectConvoHash('', 'luni', ID, { persona: P });
   assert.equal(out, `[luni] [🦉 Cú ${HASH}]`);
@@ -42,4 +49,12 @@ test('persona path escapes correctly in raw mode', () => {
   const out = injectConvoHash('body', 'luni', ID, { persona: P, pretokensEscaped: true });
   assert.ok(out.includes('🦉 Cú'));
   assert.ok(out.startsWith('\\[luni\\] '));
+});
+
+test('dedicated group raw mode: empty projectCode → no escaped-empty [] artifact', () => {
+  // Raw mode + dedicated: projectPart short-circuits to '' (no esc of an empty
+  // project), persona tag still escaped. Must NOT emit a stray `\[\] `.
+  const out = injectConvoHash('body', '', ID, { persona: P, pretokensEscaped: true });
+  assert.ok(out.startsWith('\\[🦉 Cú '));
+  assert.ok(!out.startsWith('\\[\\]'));
 });

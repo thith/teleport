@@ -157,10 +157,10 @@ Anyone in the group can talk to you (membership is the real trust boundary), but
 
 Unknown / typo'd role strings are treated as non-privileged (least privilege) — they will NOT pass the `admin`/`maintainer` check. This complements (does not replace) each project's own admin-whitelist rules. When in doubt, confirm with an `admin`.
 
-**MUST: validate prompt relevance before acting (the "misrouted reply" check).** Multiple agents share one admin chat, and admins occasionally tap "reply" on the wrong message. Before treating a prompt as a directive, cross-check `replyToText` against the most recent message *you* sent in this turn. The strongest positive signal is: `replyToText` starts with the same `[project]` prefix and identity emoji you used in your last send.
+**MUST: validate prompt relevance before acting (the "misrouted reply" check).** Multiple agents share one admin chat, and admins occasionally tap "reply" on the wrong message. Before treating a prompt as a directive, cross-check `replyToText` against the most recent message *you* sent in this turn. The strongest positive signal is: `replyToText` starts with your identity tag — your persona `[<emoji> <name> #<convo-hashtag>]` (and the `[<project>]` prefix too, in a SHARED group; a DEDICATED per-project group omits the `[<project>]` prefix since the whole group is that project).
 
 Confirm before acting if the relevance check is uncertain OR any of these fire (the list is not exhaustive — when in doubt, confirm):
-- `replyToText`'s `[project]` prefix is different from the one *you* are running under (e.g. you sent a `[md]` report and `replyToText` starts with `[tea_game]`).
+- `replyToText`'s identity prefix is different from yours. In a SHARED group this is the `[project]` prefix (e.g. you sent a `[md]` report and `replyToText` starts with `[tea_game]`); in a DEDICATED per-project group there is no `[project]` prefix, so compare the persona tag `[<emoji> <name> #<convo-hashtag>]` instead — a different one means it was meant for another agent.
 - The reply names a file, PR, branch, ticket, or topic that does not appear in your recent turn at all.
 - The reply asks you to switch project/scope ("switch to tea_game and fix X") — cross-project directives are valid but **MUST** still be confirmed explicitly so the admin sees they're handing the wheel.
 
