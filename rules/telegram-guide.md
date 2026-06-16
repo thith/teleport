@@ -47,9 +47,9 @@ What you type:
 ⬜ skipped
 ```
 
-What admin receives (script auto-prepends `[<project>]` and clickable convo hashtag):
+What admin receives (the script injects the `[<project>]` tag plus the persona identity tag with a clickable convo hashtag):
 ```
-[<project>] [<emoji> #c<convoId>] *<Agent> on <topic>:*
+[<project>] [<emoji> <name> #<hashtag>] *<Agent> on <topic>:*
 
 ✅ done
 
@@ -58,18 +58,18 @@ What admin receives (script auto-prepends `[<project>]` and clickable convo hash
 ⬜ skipped
 ```
 
-- `<project>` is auto-derived from `basename(process.cwd())` (or `TELE_PROJECT_CODE` env). `<convoId>` is the convo identifier resolved per-send.
-- **You do NOT type the `[<project>]` prefix or `#c<convoId>` hashtag** — `send-telegram.mjs` injects both. Just type the emoji + topic line as before.
+- `<project>` is auto-derived from `basename(process.cwd())` (or `TELE_PROJECT_CODE` env). In a **dedicated per-project group** the `[<project>]` prefix is omitted — from both the topic name and the message — since the whole group is that project. `<emoji> <name>` is the **persona** auto-assigned to this convo (a stable emoji+name pair, e.g. `🦄 Kỳ Lân`); `<hashtag>` is the clickable convo hashtag (see encoding below).
+- **You do NOT type the `[<project>]` prefix, the persona tag, or the `#<hashtag>`** — `send-telegram.mjs` injects all of them and replaces the leading emoji you typed with the persona's. Just type the emoji + topic line as before.
 - **Why the hashtag:** Telegram makes `#<letter><digits>` clickable; admin taps it to filter every message of one convo across multiple concurrent threads. The leading letter is required — Telegram does NOT render pure-numeric `#1234` as clickable (hashtags must contain at least one letter).
 - **convoId encoding:** scheme keeps the hashtag short while remaining clickable:
   - **Long convoId** (≥ 8 chars — Claude/Codex env-derived 16-digit hash): take the LAST 8 chars, then convert the first of those 8 digits → letter (`0→a, 1→b, …, 9→j`). Total: 8 chars. Example: `2205483045424020` → last 8 `45424020` → first `4` → `e` → **`#e5424020`**.
   - **Short convoId** (< 8 chars — Gemini's 4-char id): prepend literal `t`. Total: original + 1. Example: `1234` → **`#t1234`**.
   - Constants: `CONVO_HASH_LONG_LEN = 8`. Collision risk between concurrently-active convos is negligible (7-digit tail entropy).
-- **First send of a brand-new convo** (no `CLAUDE_CODE_SESSION_ID` / `CODEX_THREAD_ID` env, no `--convo`, no `--reply-to`): convoId equals the messageId of that very send, so the FIRST message has no hashtag; subsequent sends do.
+- **Brand-new convo with no native session** (no `CLAUDE_CODE_SESSION_ID` / `CODEX_THREAD_ID` env, no `--convo`, no `--reply-to`): the script synthesizes a collision-resistant convoId **up front** (pre-send), so even the first message already carries the persona tag + hashtag. (Older builds re-keyed `convoId = messageId` post-send, leaving the first message bare — no longer the case.)
 - **One blank line between items.** MarkdownV2 treats single `\n` as soft break (one wrapped paragraph) — `\n\n` for hard break. For noisy logs use `--plain` (Telegram skips parsing, every `\n` is a break).
 - **Target < 320 chars.** Don't paste diffs/logs.
 - **Agent:** `Claude` / `Codex` / `Gemini CLI` / `Antigravity` / `Cursor` / `<Other>`.
-- **Emoji:** random per-thread (collision-avoidance for concurrent convos). Pick once on first send; reuse for the lifetime of the thread. All agents must include one.
+- **Emoji:** type any leading emoji on the topic line — `send-telegram.mjs` replaces it with the convo's assigned persona emoji, so each thread keeps a consistent identity automatically (you don't track it). Always include one.
 - **Topic:** ≤ 9 words.
 - **Language:** match user's language; keep consistent in the thread. The "on" wording is the English form — translate.
 
