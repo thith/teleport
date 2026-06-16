@@ -28,18 +28,21 @@ cp .env.example .env
 
 The parent folder name doesn't matter — what matters is that `teleport/` is a **sibling** of your projects.
 
-### 2. Get a bot token and your chat ID
+### 2. Get a bot token and a forum-group chat ID
+
+teleport posts every conversation in its own **forum topic**, so the chat **must be a forum supergroup** — a private DM (personal chat ID) or a plain group will fail the forum check and sends will error.
 
 - **Bot token:** open [@BotFather](https://t.me/BotFather) on Telegram → `/newbot` → follow prompts → copy the token.
-- **Personal chat ID:** open [@userinfobot](https://t.me/userinfobot) → press *Start* → copy your numeric ID.
-- **For a team group chat:** create a group, add your bot + people + [@RawDataBot](https://t.me/RawDataBot) → RawDataBot instantly prints the group ID (a negative number) → remove RawDataBot when done.
-- **(Optional) Multiple projects → enable Topics:** if you'll run teleport from more than one project, enable forum topics so each project lands in its own thread. In [@BotFather](https://t.me/BotFather): `/mybots` → select your bot → `Bot Settings` → `Topics` → *Enable*. Teleport auto-creates one topic per project (named after the cwd basename) on first send. No further setup; if Topics stays off, sends still work and just share one thread.
+- **Create the group + enable Topics (required):** create a Telegram group and enable Topics (*Group → Edit → Topics*) — this auto-upgrades it to a forum supergroup. teleport then auto-creates one topic **per conversation** (named after the agent's persona) on first send.
+- **Add the bot as admin with "Manage Topics" (required):** add your bot (+ teammates) to the group and make the bot an **admin** with the **Manage Topics** permission on — otherwise it can't create topics and every send fails.
+- **Turn Group Privacy OFF (required):** [@BotFather](https://t.me/BotFather) → `/mybots` → your bot → `Bot Settings` → `Group Privacy` → *Turn off* — so the bot receives your replies inside topics (otherwise the listener never sees them).
+- **Group ID:** add [@RawDataBot](https://t.me/RawDataBot) to the group → it instantly prints the group ID (a negative number) → remove RawDataBot when done.
 
 ### 3. Fill `.env`
 
 ```ini
 REPORT_BOT_TOKEN=<bot token from BotFather>
-TELEGRAM_ADMIN_CHAT_ID=<your chat ID or group ID>
+TELEGRAM_ADMIN_CHAT_ID=<forum supergroup ID — a negative number>
 ```
 
 Then verify it works:
