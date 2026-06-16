@@ -20,34 +20,70 @@ import { spawn as cpSpawn, execFileSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { uuidToConvoInt } from './convo-registry.mjs';
+import { shortConvoHash } from './convo-hash.mjs';
 
 export const SPAWN_PROMPT = 'Telegram me and wait for instructions';
 
 // Session names must be shell/argv-safe — they're interpolated into the printed
 // teardown command and passed to `screen`. Reject anything else (review C-Minor).
 export const SAFE_SESSION_NAME = /^[A-Za-z0-9_.-]+$/;
+export const UUID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
 
-/** Short, unique screen session name (for teardown). 48 bits of entropy. */
-export function genSessionName(rand = () => crypto.randomBytes(6).toString('hex')) {
-  return `tele-${rand()}`;
+/**
+ * Derive a spawn seed (RFC 03): a real UUID we FORCE onto the child via
+ * `claude --session-id`, plus the screen name built from the convo hashtag that
+ * UUID will yield. The child computes its own convoId as
+ * `uuidToConvoInt(CLAUDE_CODE_SESSION_ID)`, so naming the screen `tele-<hashtag>`
+ * makes `screen -ls` line up EXACTLY with the `#<hashtag>` the agent shows in its
+ * Telegram topic + every message — no more opaque random `tele-9a4bcab622a9`.
+ * `genUuid` is injectable for tests.
+ */
+export function genSessionSeed(genUuid = () => crypto.randomUUID()) {
+  for (let i = 0; i < 16; i++) {
+    const sessionId = genUuid();
+    const convoId = uuidToConvoInt(sessionId); // null only if first 13 hex ≤ 0 (≈impossible)
+    if (convoId == null) continue;
+    return { sessionId, convoId, sessionName: `tele-${shortConvoHash(convoId)}` };
+  }
+  throw new Error('spawn: failed to derive a valid session seed (uuid → convoId)');
 }
 
 /**
  * Pure: compute the launch plan. No side effects, so it's unit-testable.
  * Returns `{ mode, sessionName, command: [...], teardown }`.
  */
-export function buildSpawnPlan({ interactive = false, sessionName, prompt = SPAWN_PROMPT } = {}) {
+export function buildSpawnPlan({ interactive = false, sessionName, sessionId, seed, prompt = SPAWN_PROMPT } = {}) {
   if (interactive) {
-    const name = sessionName || genSessionName();
+    // Auto path: derive name + forced session-id from a seed so the screen name
+    // matches the Telegram hashtag. Explicit `sessionName` (power-user override)
+    // skips seeding → no forced --session-id, name as given.
+    let name = sessionName;
+    // A passed seed still contributes its forced session-id even when an explicit
+    // name overrides the seed's name — otherwise the name⇄hashtag guarantee would
+    // be silently lost (review G-Major).
+    let sid = sessionId ?? seed?.sessionId ?? null;
+    if (!name) {
+      const s = seed || genSessionSeed();
+      name = s.sessionName;
+      sid = s.sessionId;
+    }
     if (!SAFE_SESSION_NAME.test(name)) {
       throw new Error(`spawn: unsafe session name ${JSON.stringify(name)} (allowed: A-Za-z0-9_.-)`);
     }
+    if (sid != null && !UUID_RE.test(sid)) {
+      throw new Error(`spawn: invalid session id ${JSON.stringify(sid)} (must be a UUID)`);
+    }
+    // `screen -dmS` starts a DETACHED session running an interactive `claude`
+    // seeded with the positional prompt → interactive (subscription) billing.
+    // `--session-id` forces the session UUID so the child's convoId/persona/topic
+    // are predictable from the parent (and the screen name matches the hashtag).
+    const claudeArgs = sid != null ? ['claude', '--session-id', sid, prompt] : ['claude', prompt];
     return {
       mode: 'interactive',
       sessionName: name,
-      // `screen -dmS` starts a DETACHED session running an interactive `claude`
-      // seeded with the positional prompt → interactive (subscription) billing.
-      command: ['screen', '-dmS', name, 'claude', prompt],
+      sessionId: sid,
+      command: ['screen', '-dmS', name, ...claudeArgs],
       teardown: `screen -S ${name} -X quit`,
     };
   }
@@ -135,6 +171,11 @@ if (isDirectRun) {
       process.exit(1);
     }
     console.log(`[spawn] interactive agent launched in screen session "${plan.sessionName}" (subscription billing).`);
+    if (plan.sessionId) {
+      // The session name IS the convo hashtag → it matches the #tag the agent
+      // shows in its Telegram topic, so you can map screen ⇄ topic at a glance.
+      console.log(`[spawn] forced session-id ${plan.sessionId} → topic hashtag #${plan.sessionName.replace(/^tele-/, '')}.`);
+    }
     console.log(`[spawn] it will greet you on Telegram shortly (its own persona topic).`);
     console.log(`[spawn] teardown: ${plan.teardown}`);
   } else {

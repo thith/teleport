@@ -1,6 +1,13 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { buildSpawnPlan, genSessionName, runSpawn, hasBinary, screenSessionExists, SPAWN_PROMPT } from './spawn.mjs';
+import { buildSpawnPlan, genSessionSeed, runSpawn, hasBinary, screenSessionExists, SPAWN_PROMPT } from './spawn.mjs';
+import { uuidToConvoInt } from './convo-registry.mjs';
+import { shortConvoHash } from './convo-hash.mjs';
+
+// A fixed UUID for deterministic seed tests (not a real session — never executed).
+const FIXED_UUID = 'a1b2c3d4-e5f6-4a8b-9c0d-1e2f3a4b5c6d';
+const FIXED_CONVO = uuidToConvoInt(FIXED_UUID);
+const FIXED_NAME = `tele-${shortConvoHash(FIXED_CONVO)}`;
 
 test('SPAWN_PROMPT is the hard-coded greeting (no task passed)', () => {
   assert.equal(SPAWN_PROMPT, 'Telegram me and wait for instructions');
@@ -14,19 +21,47 @@ test('buildSpawnPlan headless (default): claude -p <prompt>, no session/teardown
   assert.equal(p.teardown, null);
 });
 
-test('buildSpawnPlan interactive: screen -dmS <name> claude <prompt> (positional seed, no -p)', () => {
+test('buildSpawnPlan interactive: explicit name (no seed) → screen -dmS <name> claude <prompt>, no -p, no --session-id', () => {
   const p = buildSpawnPlan({ interactive: true, sessionName: 'tele-abc123' });
   assert.equal(p.mode, 'interactive');
   assert.deepEqual(p.command, ['screen', '-dmS', 'tele-abc123', 'claude', SPAWN_PROMPT]);
   assert.equal(p.teardown, 'screen -S tele-abc123 -X quit');
+  assert.equal(p.sessionId, null);
   // CRUCIAL: interactive must NOT use -p (that would bill as SDK pool, not subscription).
   assert.ok(!p.command.includes('-p'));
+  assert.ok(!p.command.includes('--session-id'));
 });
 
-test('buildSpawnPlan interactive: auto-generates a session name when none given', () => {
+test('buildSpawnPlan interactive auto (seed): forces --session-id and names screen after the convo hashtag (RFC 03)', () => {
+  const p = buildSpawnPlan({ interactive: true, seed: genSessionSeed(() => FIXED_UUID) });
+  // Screen name == tele-<hashtag>, matching the #tag the agent shows on Telegram.
+  assert.equal(p.sessionName, FIXED_NAME);
+  assert.equal(p.sessionId, FIXED_UUID);
+  assert.deepEqual(p.command, ['screen', '-dmS', FIXED_NAME, 'claude', '--session-id', FIXED_UUID, SPAWN_PROMPT]);
+  assert.equal(p.teardown, `screen -S ${FIXED_NAME} -X quit`);
+  assert.ok(!p.command.includes('-p')); // still subscription billing
+});
+
+test('buildSpawnPlan interactive: auto-seeds when neither name nor seed given (real UUID → forced --session-id)', () => {
   const p = buildSpawnPlan({ interactive: true });
-  assert.match(p.sessionName, /^tele-[0-9a-f]{12}$/);
+  assert.match(p.sessionName, /^tele-([a-j]\d{7}|t\d+)$/); // shortConvoHash form
+  assert.match(p.sessionId, /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+  // The forced session-id is wired into the command and the name is the screen target.
+  assert.ok(p.command.includes('--session-id'));
+  assert.equal(p.command[p.command.indexOf('--session-id') + 1], p.sessionId);
   assert.equal(p.command[2], p.sessionName);
+});
+
+test('buildSpawnPlan interactive: explicit name + seed → name overrides but seed session-id still forced (G-Major)', () => {
+  const p = buildSpawnPlan({ interactive: true, sessionName: 'tele-custom', seed: genSessionSeed(() => FIXED_UUID) });
+  assert.equal(p.sessionName, 'tele-custom'); // explicit name wins
+  assert.equal(p.sessionId, FIXED_UUID); // but the forced id is NOT lost
+  assert.ok(p.command.includes('--session-id'));
+  assert.equal(p.command[p.command.indexOf('--session-id') + 1], FIXED_UUID);
+});
+
+test('buildSpawnPlan interactive: rejects a non-UUID forced session id', () => {
+  assert.throws(() => buildSpawnPlan({ interactive: true, sessionName: 'tele-x', sessionId: 'not-a-uuid' }), /invalid session id/);
 });
 
 test('buildSpawnPlan interactive: rejects an unsafe session name (shell-safety)', () => {
@@ -36,9 +71,15 @@ test('buildSpawnPlan interactive: rejects an unsafe session name (shell-safety)'
   assert.ok(buildSpawnPlan({ interactive: true, sessionName: 'tele-abc_1.2' }));
 });
 
-test('genSessionName: tele-<hex>, injectable rand, 48-bit default', () => {
-  assert.equal(genSessionName(() => 'deadbeef0011'), 'tele-deadbeef0011');
-  assert.match(genSessionName(), /^tele-[0-9a-f]{12}$/);
+test('genSessionSeed: name = tele-<hashtag of uuidToConvoInt(uuid)>, injectable uuid', () => {
+  const seed = genSessionSeed(() => FIXED_UUID);
+  assert.equal(seed.sessionId, FIXED_UUID);
+  assert.equal(seed.convoId, FIXED_CONVO);
+  assert.equal(seed.sessionName, FIXED_NAME);
+  // Default (real UUID) still yields a well-formed name + convoId.
+  const live = genSessionSeed();
+  assert.match(live.sessionName, /^tele-([a-j]\d{7}|t\d+)$/);
+  assert.ok(Number.isSafeInteger(live.convoId) && live.convoId > 0);
 });
 
 test('screenSessionExists: matches a session in `screen -ls` output, else false', () => {
