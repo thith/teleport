@@ -427,8 +427,8 @@ test('detectStartCommands — bare /start triggers response with guide + footer'
   assert.strictEqual(handledIds.size, 1);
   assert.strictEqual(responses.length, 1);
   assert.match(responses[0].body, /Teleport bot/);
-  assert.match(responses[0].body, /\/pending/);
-  assert.match(responses[0].body, /trumviahe\.com/);
+  assert.match(responses[0].body, /github\.com\/thith\/teleport/);
+  assert.match(responses[0].body, /digesty\.vn/);
 });
 
 test('detectStartCommands — /start@botname accepted', () => {

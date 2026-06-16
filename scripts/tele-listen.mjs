@@ -841,20 +841,20 @@ export async function handlePendingCommand(token, fetched, adminIds, { sendText 
 const START_CMD_RE = /^\/start(?:@[a-zA-Z0-9_]+)?(?:\s+|$)/;
 
 const START_BODY = [
-  '👋 Teleport bot — bridge between admins and AI coding agents.',
+  '👋 Teleport bot — it bridges you and your AI coding agents (Claude / Codex / Gemini …) over Telegram.',
   '',
-  'When an agent (Claude / Codex / Gemini …) finishes a task, it pings here. Reply to that message and the agent picks it up on its next poll.',
+  'How it works:',
+  '• Tell your agent “tele me” / “report on Telegram when done” before you step away.',
+  '• When it finishes — or needs a decision — it posts in its own topic (one per conversation, named after a persona).',
+  '• Just type in that topic to steer it — no need to reply to a specific message; the agent reads whatever lands in its topic on the next poll.',
   '',
-  'Commands:',
-  '• /pending — list convos waiting for your reply, with 🟢/💀/⚪ liveness markers',
-  '• /start — this guide',
+  'Quick setup:',
+  '1. Create a group and enable Topics (this turns it into a forum supergroup).',
+  '2. Add this bot, make it an admin, then turn OFF every admin permission except “Manage Topics”.',
+  '3. Add your teammates too if you want a shared team group.',
+  '4. Then configure the group + .env — details: https://github.com/thith/teleport',
   '',
-  'Liveness markers in /pending:',
-  '🟢 listener active right now',
-  '💀 listener was alive but went quiet (no heartbeat within freshness window)',
-  '⚪ no listener registered (fire-and-forget send)',
-  '',
-  '— Created by trumviahe.com team and agents',
+  '— Created by digesty.vn team and agents',
 ].join('\n');
 
 export function detectStartCommands(fetched) {
