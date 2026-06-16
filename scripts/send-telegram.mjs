@@ -549,6 +549,71 @@ export function createTempMarkdownFile(content, tmpDir = os.tmpdir()) {
   return filePath;
 }
 
+// Transient Telegram send failures — gateway timeouts (502/503/504), internal
+// errors (500), and rate limits (429) — are common and self-clearing. Retry the
+// POST a few times with backoff so a single hiccup doesn't surface to the agent
+// as a hard send failure. 429 honors Telegram's `retry_after` (capped).
+// Tradeoff: a 504 can mean "delivered but the gateway timed out replying", so a
+// retry may double-send. For an outbound report bot a rare duplicate message is
+// strictly less harmful than a lost report, so we accept at-least-once here.
+// (Topic CREATION is deliberately NOT retried — a duplicate topic is harmful.)
+export const TRANSIENT_SEND_STATUSES = new Set([429, 500, 502, 503, 504]);
+const SEND_RETRY_BACKOFF_MS = [500, 1500];
+const MAX_RETRY_AFTER_MS = 8000;
+
+const defaultSleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Normalize a Telegram API `fetch` Response into our result shape.
+async function parseTgResult(res) {
+  const body = await res.json().catch(() => ({}));
+  return {
+    ok: res.ok && body?.ok !== false,
+    status: res.status,
+    description: body?.description,
+    messageId: body?.result?.message_id,
+    messageThreadId: body?.result?.message_thread_id ?? null,
+    retryAfter: body?.parameters?.retry_after,
+  };
+}
+
+/**
+ * Run `attempt` (an async thunk returning a parsed result, or throwing on a
+ * network error) with retry on transient failures. Returns the final result;
+ * rethrows the last error if every attempt threw. `sleepFn`/`backoff` injectable
+ * for tests (so retries don't actually wait).
+ */
+export async function sendWithRetry(attempt, {
+  attempts = SEND_RETRY_BACKOFF_MS.length + 1,
+  sleepFn = defaultSleep,
+  backoff = SEND_RETRY_BACKOFF_MS,
+} = {}) {
+  const maxAttempts = Math.max(1, attempts); // never 0/negative → never return undefined
+  let lastError = null;
+  for (let i = 0; i < maxAttempts; i++) {
+    const isLast = i === maxAttempts - 1;
+    const backoffMs = backoff[Math.min(i, backoff.length - 1)];
+    let result;
+    try {
+      result = await attempt();
+    } catch (e) {
+      lastError = e;
+      if (isLast) throw e;
+      await sleepFn(backoffMs);
+      continue;
+    }
+    if (result.ok || !TRANSIENT_SEND_STATUSES.has(result.status) || isLast) {
+      return result;
+    }
+    // Honor a positive 429 retry_after (capped); ignore 0/negative/NaN → backoff.
+    const retryAfterValid = result.status === 429 && Number.isFinite(result.retryAfter) && result.retryAfter > 0;
+    const waitMs = retryAfterValid
+      ? Math.min(result.retryAfter * 1000, MAX_RETRY_AFTER_MS)
+      : backoffMs;
+    await sleepFn(waitMs);
+  }
+  if (lastError) throw lastError; // unreachable: loop returns/throws on last iter
+}
+
 async function postSendMessage(token, chatId, text, parseMode, replyToMessageId, messageThreadId = null) {
   const payload = { chat_id: chatId, text };
   if (parseMode) payload.parse_mode = parseMode;
@@ -556,36 +621,32 @@ async function postSendMessage(token, chatId, text, parseMode, replyToMessageId,
   if (replyToMessageId != null) {
     payload.reply_parameters = { message_id: replyToMessageId, allow_sending_without_reply: true };
   }
-  const res = await fetch(`${TELEGRAM_API}${token}/sendMessage`, {
+  return sendWithRetry(async () => parseTgResult(await fetch(`${TELEGRAM_API}${token}/sendMessage`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
-  });
-  const body = await res.json().catch(() => ({}));
-  return {
-    ok: res.ok && body?.ok !== false,
-    status: res.status,
-    description: body?.description,
-    messageId: body?.result?.message_id,
-  };
+  })));
 }
 
 async function postSendDocument(token, chatId, filePath, caption, parseMode, replyToMessageId, messageThreadId = null) {
-  const form = new FormData();
-  form.append('chat_id', String(chatId));
-  if (messageThreadId != null) form.append('message_thread_id', String(messageThreadId));
+  // Read the file once; rebuild the FormData per attempt (a consumed body stream
+  // can't be re-sent across fetch calls).
   const data = fs.readFileSync(filePath);
-  form.append('document', new Blob([data]), path.basename(filePath));
-  if (caption) {
-    form.append('caption', caption);
-    if (parseMode) form.append('parse_mode', parseMode);
-  }
-  if (replyToMessageId != null) {
-    form.append('reply_parameters', JSON.stringify({ message_id: replyToMessageId, allow_sending_without_reply: true }));
-  }
-  const res = await fetch(`${TELEGRAM_API}${token}/sendDocument`, { method: 'POST', body: form });
-  const body = await res.json().catch(() => ({}));
-  return { ok: res.ok && body?.ok !== false, status: res.status, description: body?.description, messageId: body?.result?.message_id };
+  const buildForm = () => {
+    const form = new FormData();
+    form.append('chat_id', String(chatId));
+    if (messageThreadId != null) form.append('message_thread_id', String(messageThreadId));
+    form.append('document', new Blob([data]), path.basename(filePath));
+    if (caption) {
+      form.append('caption', caption);
+      if (parseMode) form.append('parse_mode', parseMode);
+    }
+    if (replyToMessageId != null) {
+      form.append('reply_parameters', JSON.stringify({ message_id: replyToMessageId, allow_sending_without_reply: true }));
+    }
+    return form;
+  };
+  return sendWithRetry(async () => parseTgResult(await fetch(`${TELEGRAM_API}${token}/sendDocument`, { method: 'POST', body: buildForm() })));
 }
 
 /**

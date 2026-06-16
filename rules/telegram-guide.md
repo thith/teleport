@@ -69,7 +69,7 @@ What admin receives (the script injects the `[<project>]` tag plus the persona i
 - **One blank line between items.** MarkdownV2 treats single `\n` as soft break (one wrapped paragraph) — `\n\n` for hard break. For noisy logs use `--plain` (Telegram skips parsing, every `\n` is a break).
 - **Target < 320 chars.** Don't paste diffs/logs.
 - **Agent:** `Claude` / `Codex` / `Gemini CLI` / `Antigravity` / `Cursor` / `<Other>`.
-- **Emoji:** type any leading emoji on the topic line — `send-telegram.mjs` replaces it with the convo's assigned persona emoji, so each thread keeps a consistent identity automatically (you don't track it). Always include one.
+- **Emoji:** type any leading emoji on the topic line — `send-telegram.mjs` replaces it with the convo's assigned persona emoji, so each thread keeps a consistent identity automatically (you don't track it). Always include one. **Do NOT assert your identity from the emoji you typed** — it is stripped and replaced, so the emoji you chose is NOT who you are on Telegram. If you need to tell the admin which persona you are, derive it from your convoId (`personaForConvo()` in `scripts/persona.mjs`), never from the glyph you wrote in the body.
 - **Topic:** ≤ 9 words.
 - **Language:** match user's language; keep consistent in the thread. The "on" wording is the English form — translate.
 
