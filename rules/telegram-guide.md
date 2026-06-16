@@ -8,6 +8,24 @@
 - Finished a task while user is away.
 - User asks for a file (spec/RFC/log) → use `--file`.
 
+## Spawning a new agent instance (RFC 03)
+
+When the user says **"spawn Claude"** (or "spawn an agent", "spawn me a Claude", "spawn Claude headless"), run the spawn helper from the **project root** so the new instance inherits this project's group:
+
+- **"spawn Claude"** (default — the user will drive it over Telegram) → `pnpm spawn:i`
+  (runs `node ../teleport/scripts/spawn.mjs --interactive`). Starts a real INTERACTIVE
+  `claude` in a detached `screen` session → bills against the **subscription**, not the
+  Agent SDK pool. It seeds the hard-coded prompt "Telegram me and wait for instructions",
+  so the new agent greets on Telegram in its own persona topic; you then give it work there.
+  Teardown: `screen -S <name> -X quit` (the helper prints `<name>`).
+- **"spawn Claude headless"** (true automation / fire-and-forget) → `pnpm spawn:headless`
+  (runs `claude -p` detached). Auto-exits when done; bills against the **Agent SDK pool** —
+  use only for genuine non-interactive workflows.
+
+The helper takes NO task argument (prompt is hard-coded); the user assigns work via Telegram
+after the new agent greets. Projects without `spawn:i`/`spawn:headless` in package.json can
+call `node ../teleport/scripts/spawn.mjs [--interactive]` directly.
+
 ## Content format
 
 What you type:
