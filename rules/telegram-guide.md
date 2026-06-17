@@ -74,6 +74,7 @@ What admin receives (the script injects the `[<project>]` tag plus the persona i
 - **Emoji:** type any leading emoji on the topic line — `send-telegram.mjs` replaces it with the convo's assigned persona emoji, so each thread keeps a consistent identity automatically (you don't track it). Always include one. **Do NOT assert your identity from the emoji you typed** — it is stripped and replaced, so the emoji you chose is NOT who you are on Telegram. If you need to tell the admin which persona you are, derive it from your convoId (`personaForConvo()` in `scripts/persona.mjs`), never from the glyph you wrote in the body.
 - **Topic:** ≤ 9 words.
 - **Language:** match user's language; keep consistent in the thread. The "on" wording is the English form — translate.
+- **Mentioning someone:** just write `@username` inline — Telegram needs no special syntax, the plain `@handle` becomes a ping. Look the handle up in `projects.json` (`[code].roles[*].username`). Mention only when (1) you genuinely need that person to act — waiting on their reply or approval — or (2) the admin told you to tag them. Don't tag for FYI/decoration; an unnecessary ping is noise. If the person has no `username` in `projects.json` (id-only or unmapped), address them by name instead — there's no handle to ping.
 
 ## How to send
 
