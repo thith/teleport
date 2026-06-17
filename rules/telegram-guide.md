@@ -8,9 +8,11 @@
 - Finished a task while user is away.
 - User asks for a file (spec/RFC/log) → use `--file`.
 
+**MUST NOT send a local file path/link as text** (e.g. `specs/26-foo.md`, `/Users/.../report.md`, a `[file](path)` markdown link) — the recipient cannot open it on their phone. When you want to share the **contents** of a local file (especially `.md` — spec/RFC/doc/report), attach it with `node ../teleport/scripts/send-telegram.mjs --file <path> "<caption>"` so it arrives as a downloadable document. A bare repo-relative path is fine only as a *reference label* inside prose the recipient already has ("updated `specs/26-foo.md`"), never as the delivery mechanism for content they're meant to read.
+
 ## Spawning a new agent instance (RFC 03)
 
-When the user asks to **spawn / start / launch** a Claude agent — e.g. "spawn Claude", "start an agent", "launch a Claude", "... headless" — **or any similar phrasing in any language** (Vietnamese e.g. "chạy một Claude", "khởi động một agent", "chạy Claude headless") — run the spawn helper from the **project root** so the new instance inherits this project's group:
+When the user asks to **spawn / start / launch** a Claude agent — e.g. "spawn Claude", "start an agent", "launch a Claude", "... headless" — **or any similar phrasing in any language** (Vietnamese e.g. "chạy một Claude", "khởi động một agent", "bật agent mới", "khởi động một agent", "chạy Claude headless") — run the spawn helper from the **project root** so the new instance inherits this project's group. **For a spawn request, when the user just says "agent" without naming a tool (e.g. "bật agent mới", "start an agent"), default to spawning Claude.**
 
 - **"spawn Claude"** (default — the user will drive it over Telegram) → `pnpm spawn:i`
   (runs `node ../teleport/scripts/spawn.mjs --interactive`). Starts a real INTERACTIVE
@@ -165,6 +167,7 @@ Anyone in the group can talk to you (membership is the real trust boundary), but
 2. Deleting files / folders / DB; data-destroying migrations.
 3. Accessing files OUTSIDE the project folder.
 4. SSH-ing to / editing another machine or server; deploying.
+5. Spawning / killing agent instances (`pnpm spawn:*` / `spawn.mjs`) — runs a new billable agent; only `admin`/`maintainer` may authorize.
 
 Unknown / typo'd role strings are treated as non-privileged (least privilege) — they will NOT pass the `admin`/`maintainer` check. This complements (does not replace) each project's own admin-whitelist rules. When in doubt, confirm with an `admin`.
 

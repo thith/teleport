@@ -19,30 +19,37 @@
       "@Duyenngmy": {
         "role": "member",
         "username": "Duyenngmy",
-        "title": "bạn",
+        "title": "chị",
         "name": "Duyên",
         "position": "PM"
       },
       "@ultoxtung": {
         "role": "dev",
         "username": "ultoxtung",
-        "title": "em",
-        "name": "Tùng",
+        "title": "anh",
+        "name": "TùngBé",
         "position": "dev"
       },
       "@mikeducc": {
         "role": "dev",
         "username": "mikeducc",
-        "title": "em",
+        "title": "anh",
         "name": "Mike",
         "position": "dev"
       },
       "@tungnpt": {
         "role": "maintainer",
         "username": "tungnpt",
-        "title": "bạn",
+        "title": "anh",
         "name": "TùngTee",
         "position": "reviewer"
+      },
+      "7574369337": {
+        "role": "member",
+        "username": "doanphlinh",
+        "title": "chị",
+        "name": "Linh",
+        "position": "marketing"
       }
     }
   }
