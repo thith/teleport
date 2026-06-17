@@ -7,8 +7,12 @@
 // never has to "remember" or pick one (which historically biased every agent
 // to 🦊 because LLMs have no real RNG).
 //
-// Leaf module: no imports, so any script (send/listen/registry) can pull it in
-// without circular-dependency risk.
+// Leaf module re: INTERNAL deps — it imports no other teleport script, so any
+// script (send/listen/registry) can pull it in without circular-dependency
+// risk. The two node: built-ins below are stdlib (used only by the direct-run
+// CLI guard at the bottom), not internal deps, so they don't break that.
+import { fileURLToPath } from 'node:url';
+import path from 'node:path';
 
 // 40 pairs. Names ≤ 2 words, all unique; emoji all unique. Curated so visually
 // distinct personas don't collide in a busy group. Order is load-bearing:
@@ -89,4 +93,30 @@ export function personaForConvo(convoId) {
 export function formatPersona(persona) {
   if (!persona) return '';
   return `${persona.emoji} ${persona.name}`;
+}
+
+// CLI "whoami" (RFC 04): `node persona.mjs` resolves THIS agent's persona from
+// its native session env (CLAUDE_CODE_SESSION_ID / CODEX_THREAD_ID) and prints
+// it, so an agent can learn the name it answers to without hand-writing an
+// inline import. convo-registry (NOT a leaf — pulls in fs etc.) is imported
+// lazily only on direct run so the export surface stays free of INTERNAL
+// imports (leaf-module invariant — avoids the send/listen ↔ persona cycle).
+async function runCli() {
+  const { resolveConvoIdFromEnv } = await import('./convo-registry.mjs');
+  const { convoId, source } = resolveConvoIdFromEnv();
+  if (convoId == null) {
+    console.error('[persona] no native session env (CLAUDE_CODE_SESSION_ID / CODEX_THREAD_ID) — cannot resolve a persona for this agent.');
+    process.exit(1);
+  }
+  const persona = personaForConvo(convoId);
+  console.log(formatPersona(persona)); // stdout: just "🐷 Heo" — easy to capture
+  console.error(`[persona] convoId ${convoId} (via ${source}) → ${formatPersona(persona)} (index ${persona.index})`);
+}
+
+// Direct-run guard: compare RESOLVED paths, not a hand-built `file://` string —
+// the latter mismatches on paths with spaces/Unicode (URL-encoded in
+// import.meta.url, raw in argv) and on Windows, silently no-op'ing the CLI.
+// Same idiom as send-telegram.mjs.
+if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1])) {
+  runCli().catch((err) => { console.error(err); process.exit(1); });
 }

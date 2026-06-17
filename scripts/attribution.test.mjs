@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { formatFromName, buildPromptData, buildCombinedPromptData } from './tele-listen.mjs';
+import { personaForConvo } from './persona.mjs';
 
 test('formatFromName: full name from first + last', () => {
   assert.equal(formatFromName({ first_name: 'Thi', last_name: 'Truong' }), 'Thi Truong');
@@ -67,4 +68,22 @@ test('buildCombinedPromptData: phantom suppressed, real reply kept (from last ms
   const lastReal = buildCombinedPromptData([mk(1, phantom), mk(2, { message_id: 50, text: 'gốc' })]);
   assert.equal(lastReal.replyToMessageId, 50);
   assert.equal(lastReal.replyToText, 'gốc');
+});
+
+// RFC 04: the agent's own persona is injected into the inbound prompt so it can
+// self-identify and recognize when a human addresses it by name.
+test('buildCombinedPromptData: injects own persona when convoId is known', () => {
+  const mk = (id) => ({ msg: { message_id: id, chat: { id: -100 }, from: { id, first_name: 'Thi' }, text: `m${id}` } });
+  const convoId = 2120524005926900; // → 🐷 Heo (index 16)
+  const out = buildCombinedPromptData([mk(1)], null, convoId);
+  assert.deepEqual(out.persona, personaForConvo(convoId));
+  assert.equal(out.persona.name, 'Heo');
+  assert.equal(out.persona.emoji, '🐷');
+});
+
+test('buildCombinedPromptData: no persona field when convoId absent', () => {
+  const mk = (id) => ({ msg: { message_id: id, chat: { id: -100 }, from: { id, first_name: 'Thi' }, text: `m${id}` } });
+  const out = buildCombinedPromptData([mk(1)]);
+  assert.equal(out.convoId, undefined);
+  assert.equal('persona' in out, false);
 });

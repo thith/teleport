@@ -36,7 +36,7 @@ import {
   updatePendingStore,
 } from './pending-store.mjs';
 import { CONVO_HASH_LONG_LEN, shortConvoHash as _shortConvoHash } from './convo-hash.mjs';
-import { personaForConvo } from './persona.mjs';
+import { personaForConvo, formatPersona } from './persona.mjs';
 import { readProjectsConfig, resolveProjectConfig, adminIdsFrom } from './projects-config.mjs';
 
 // Re-export so existing imports of `shortConvoHash` from send-telegram keep
@@ -1400,6 +1400,11 @@ export function listenerHintForCurrentAgent(convoId, env = process.env) {
 function emitConvoLine({ convoId, messageId }) {
   if (!messageId || convoId == null) return;
   console.log(`[send-telegram] convo: ${convoId} messageId: ${messageId} pid: ${process.pid}`);
+  // RFC 04: echo this convo's persona so the agent reading stdout learns the
+  // name it answers to (e.g. "🐷 Heo") and can self-identify in its prose —
+  // fulfilling the RFC 01 §5 intent. Derived, not stored.
+  const persona = personaForConvo(convoId);
+  if (persona != null) console.log(`[send-telegram] persona: ${formatPersona(persona)}`);
 }
 
 const isDirectRun = fileURLToPath(import.meta.url) === path.resolve(process.argv[1] ?? '');

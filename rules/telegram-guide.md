@@ -8,7 +8,9 @@
 - Finished a task while user is away.
 - User asks for a file (spec/RFC/log) → use `--file`.
 
-**MUST NOT send a local file path/link as text** (e.g. `specs/26-foo.md`, `/Users/.../report.md`, a `[file](path)` markdown link) — the recipient cannot open it on their phone. When you want to share the **contents** of a local file (especially `.md` — spec/RFC/doc/report), attach it with `node ../teleport/scripts/send-telegram.mjs --file <path> "<caption>"` so it arrives as a downloadable document. A bare repo-relative path is fine only as a *reference label* inside prose the recipient already has ("updated `specs/26-foo.md`"), never as the delivery mechanism for content they're meant to read.
+**MUST NOT send a local file path/link as text** (e.g. `specs/26-foo.md`, `/Users/.../report.md`, `tmp/foo.html`, a `[file](path)` markdown link) — the recipient cannot open it on their phone. When you want to share the **contents** of a local file (`.md`, `.html`, spec/RFC/doc/report), attach it with `node ../teleport/scripts/send-telegram.mjs --file <path> "<caption>"` so it arrives as a downloadable document. **This applies to `.html` exactly like `.md`: attach the `.html` file, never paste its path/link.** A bare repo-relative path is fine only as a *reference label* inside prose the recipient already has ("updated `specs/26-foo.md`"), never as the delivery mechanism for content they're meant to read.
+
+**Non-technical recipients can't read Markdown — prefer HTML.** When the audience is a non-dev (e.g. marketing/design team), don't attach raw `.md`; render it to a self-contained `.html` first, then attach the `.html`. (In the `luni` project: `pnpm mkt:html` → `tmp/marketing-html/*.html`, then `--file <that.html>`.) Same delivery rule — attach the file, never the path.
 
 ## Spawning a new agent instance (RFC 03)
 
@@ -25,16 +27,22 @@ When the user asks to **spawn / start / launch** a Claude agent — e.g. "spawn 
   (runs `claude -p` detached). Auto-exits when done; bills against the **Agent SDK pool** —
   use only for genuine non-interactive workflows.
 
-**List / kill running agents:**
+**List / attach / kill running agents:**
 - **"list agents / which agents are running"** → `pnpm spawn:ls` (prints each `tele-<hashtag>`
   session + its topic hashtag).
+- **"attach / open / xem agent <id>"** → `pnpm spawn:attach <id>` — re-attaches your terminal
+  to that interactive `claude` session (it runs `screen -U -d -r tele-<id>`; `-U` = UTF-8 so
+  Vietnamese/multibyte output isn't garbled). Same `<id>` forms as
+  kill. **Detach with `Ctrl-A` then `D`** to leave the agent running; closing/`Ctrl-C` inside
+  may end the session. Interactive sessions only (headless has no pty). NB: an attach takes over
+  the current terminal — don't run it from inside an agent's own automated flow.
 - **"kill / stop agent <id>"** → `pnpm spawn:kill <id>` — `<id>` may be the bare hashtag
   (`d1331668`), the Telegram form (`#d1331668`), or the full name (`tele-d1331668`); it's
   normalized then killed (verifies the session is gone). Headless agents need no teardown.
 
 The helper takes NO task argument (prompt is hard-coded); the user assigns work via Telegram
 after the new agent greets. Projects without these scripts in package.json can call
-`node ../teleport/scripts/spawn.mjs [--interactive | --list | --kill <id>]` directly.
+`node ../teleport/scripts/spawn.mjs [--interactive | --list | --attach <id> | --kill <id>]` directly.
 
 ## Content format
 
@@ -71,7 +79,7 @@ What admin receives (the script injects the `[<project>]` tag plus the persona i
 - **One blank line between items.** MarkdownV2 treats single `\n` as soft break (one wrapped paragraph) — `\n\n` for hard break. For noisy logs use `--plain` (Telegram skips parsing, every `\n` is a break).
 - **Target < 320 chars.** Don't paste diffs/logs.
 - **Agent:** `Claude` / `Codex` / `Gemini CLI` / `Antigravity` / `Cursor` / `<Other>`.
-- **Emoji:** type any leading emoji on the topic line — `send-telegram.mjs` replaces it with the convo's assigned persona emoji, so each thread keeps a consistent identity automatically (you don't track it). Always include one. **Do NOT assert your identity from the emoji you typed** — it is stripped and replaced, so the emoji you chose is NOT who you are on Telegram. If you need to tell the admin which persona you are, derive it from your convoId (`personaForConvo()` in `scripts/persona.mjs`), never from the glyph you wrote in the body.
+- **Emoji:** type any leading emoji on the topic line — `send-telegram.mjs` replaces it with the convo's assigned persona emoji, so each thread keeps a consistent identity automatically (you don't track it). Always include one. **Do NOT assert your identity from the emoji you typed** — it is stripped and replaced, so the emoji you chose is NOT who you are on Telegram. If you need to tell the admin which persona you are, take it from the `persona` field of the inbound prompt (§165), the `[send-telegram] persona: …` stdout line emitted after each send, or run `node ../teleport/scripts/persona.mjs` (prints `🐷 Heo`) — never from the glyph you wrote in the body.
 - **Topic:** ≤ 9 words.
 - **Language:** match user's language; keep consistent in the thread. The "on" wording is the English form — translate.
 - **Mentioning someone:** just write `@username` inline — Telegram needs no special syntax, the plain `@handle` becomes a ping. Look the handle up in `projects.json` (`[code].roles[*].username`). Mention only when (1) you genuinely need that person to act — waiting on their reply or approval — or (2) the admin told you to tag them. Don't tag for FYI/decoration; an unnecessary ping is noise. If the person has no `username` in `projects.json` (id-only or unmapped), address them by name instead — there's no handle to ping.
@@ -118,7 +126,9 @@ Send stdout ends with:
 ```
 [send-telegram] sent to <chatId> (messageId: <M>)
 [send-telegram] convo: <N> messageId: <M> pid: <P>
+[send-telegram] persona: <emoji> <name>
 ```
+(The `persona:` line is your own identity for this convo — see §165.)
 
 Capture `<N>` once; pass to the listener as `--convo <N>`.
 
@@ -154,7 +164,10 @@ After starting `--wait-once`:
 - If the user says something ambiguous like "done", "ok", or "bye", DO NOT end the turn. Instead, ask for explicit confirmation (e.g., "Should I wait for further instructions, or are we finished here?") and wait for a clear confirmation before ending the turn.
 
 When the listener writes `prompt ready: <path>`, parse that file as JSON:
-- `text`, `messageId`, `chatId`, `fromUserId`, `fromName`, `fromRole`, `fromMember`, `replyToMessageId`, `replyToText`, `quotedText`, `convoId`, `attachments[]`.
+- `text`, `messageId`, `chatId`, `fromUserId`, `fromName`, `fromRole`, `fromMember`, `replyToMessageId`, `replyToText`, `quotedText`, `convoId`, `persona`, `attachments[]`.
+- `persona` is **your own** identity on Telegram: `{ emoji, name, index }` (e.g. `{ emoji: "🐷", name: "Heo", index: 16 }`), derived deterministically from `convoId`. **This is the name you answer to.** Use it to (1) **self-identify** in your prose ("Heo đây — đã xong X"), and (2) **recognize when a human is addressing YOU** by name: a message in which your **full `name` appears as a standalone token** — whitespace/`@`/punctuation-delimited (`"Heo ơi…"`, `"@Heo"`, `"nhờ Heo nhé"`) — is meant for you. A different persona name means it's for another agent (treat like a misrouted reply — see the relevance check below).
+  - **MUST match the FULL name, never a substring.** Names may be one or two words (`"Cá Heo"`, `"Sư Tử"`), and several form substring pairs: `🐬 Cá Heo` ⊃ `🐷 Heo`, `🦝 Mèo Rừng` ⊃ `🐱 Mèo`, `🐢 Rùa` ⊂ `🐞 Bọ Rùa`. So `"Cá Heo ơi…"` is for 🐬 Cá Heo and **NOT** for 🐷 Heo; conversely `"Heo ơi…"` is for 🐷 Heo and **NOT** for 🐬 Cá Heo. When two persona names could both appear, prefer the **longest** full-name match. Routing itself is still structural (by `message_thread_id`, per RFC 01) — this rule only governs whether a name *mentioned inside your own topic* is addressing you.
+  - `persona` is absent only when `convoId` couldn't be resolved.
 - `fromMember` is the sender's full project profile `{ role, username?, title?, name?, position? }` from `teleport/projects.json`, or `null` when the sender was mapped by the bare-string shorthand (role only) or is unmapped. You **MUST read it** alongside `fromRole` for every prompt. **Descriptive only — never widen privilege from it.** The sensitive-action gate below keys on `fromRole` ALONE; a `position: "designer"` who is `role: member` still cannot authorize a deploy.
   - **Addressing (SHOULD):** when `title` + `name` are present, address the sender that way in your Telegram replies (`title` = anh/chị/em + `name` = tên thường gọi → e.g. "Vâng anh Thi", "Dạ chị Lan"). Fall back to `fromName` (or no honorific) when the profile is `null`/incomplete. Keep it natural — don't repeat the honorific in every sentence.
   - **Fit check (SHOULD):** use `position` + `role` to judge how well the requester fits the task before acting on a non-trivial request (e.g. a `designer` asking for a DB migration is a signal to confirm), but this NEVER overrides the role gate either way.

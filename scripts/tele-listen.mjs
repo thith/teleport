@@ -17,6 +17,7 @@ import {
 } from './pending-store.mjs';
 import { recordAlive, isAlive, getLastAliveMs, pruneStale as pruneAliveStale, DEFAULT_FRESH_MS as ALIVE_FRESH_MS } from './listener-alive.mjs';
 import { readTopicsStore, getThreadId, DEFAULT_TOPICS_FILE } from './topics-store.mjs';
+import { personaForConvo } from './persona.mjs';
 import { readProjectsConfig, resolveProjectConfig, roleFor, memberFor, adminIdsFrom } from './projects-config.mjs';
 import { harvestMembers } from './roster-upsert.mjs';
 import {
@@ -608,7 +609,16 @@ export function buildCombinedPromptData(messages, botId = null, convoId = null, 
     timestamp: last.date,
     attachments,
   };
-  if (convoId != null) out.convoId = convoId;
+  if (convoId != null) {
+    out.convoId = convoId;
+    // RFC 04: tell the agent its OWN persona so it can self-identify ("Heo đây")
+    // and recognize when a human addresses it by name ("Heo ơi…"). Without this
+    // the persona lives only in the OUTBOUND message tag (injected by
+    // send-telegram); the agent never learns the name it answers to. Derived,
+    // never stored — same deterministic fn the send side uses, so they agree.
+    const persona = personaForConvo(convoId);
+    if (persona != null) out.persona = persona;
+  }
   return out;
 }
 

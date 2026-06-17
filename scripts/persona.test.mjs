@@ -1,11 +1,16 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import {
   PERSONA_POOL,
   convoPersonaIndex,
   personaForConvo,
   formatPersona,
 } from './persona.mjs';
+import { uuidToConvoInt } from './convo-registry.mjs';
+
+const PERSONA_SCRIPT = fileURLToPath(new URL('./persona.mjs', import.meta.url));
 
 test('pool has exactly 40 entries', () => {
   assert.equal(PERSONA_POOL.length, 40);
@@ -77,4 +82,28 @@ test('assignment spreads across the pool (not all one persona)', () => {
 test('formatPersona renders "emoji name"', () => {
   assert.equal(formatPersona({ emoji: '🦉', name: 'Cú' }), '🦉 Cú');
   assert.equal(formatPersona(null), '');
+});
+
+// RFC 04: `node persona.mjs` whoami — resolves THIS agent's persona from its
+// native session env and prints "<emoji> <name>" to stdout.
+test('CLI whoami prints persona from CLAUDE_CODE_SESSION_ID', () => {
+  // d0f29b89… → uuidToConvoInt → known convoId → known persona; cross-check via
+  // personaForConvo so the test tracks the registry instead of hard-coding it.
+  const sessionId = 'd0f29b89-3400-4ecf-8d92-0e49f466db4f';
+  const out = execFileSync(process.execPath, [PERSONA_SCRIPT], {
+    env: { ...process.env, CLAUDE_CODE_SESSION_ID: sessionId, CODEX_THREAD_ID: '' },
+    encoding: 'utf8',
+  }).trim();
+  // Cross-check against PRODUCTION derivation (uuidToConvoInt), not a re-impl,
+  // so a change to the hex-head length can't pass against a stale local copy.
+  const convoId = uuidToConvoInt(sessionId);
+  assert.equal(out, formatPersona(personaForConvo(convoId)));
+});
+
+test('CLI whoami exits non-zero when no session env', () => {
+  assert.throws(() => execFileSync(process.execPath, [PERSONA_SCRIPT], {
+    env: { ...process.env, CLAUDE_CODE_SESSION_ID: '', CODEX_THREAD_ID: '' },
+    encoding: 'utf8',
+    stdio: 'pipe',
+  }));
 });
