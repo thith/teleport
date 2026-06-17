@@ -85,7 +85,10 @@ export function buildSpawnPlan({ interactive = false, sessionName, sessionId, se
       mode: 'interactive',
       sessionName: name,
       sessionId: sid,
-      command: ['screen', '-dmS', name, ...claudeArgs],
+      // `-U` forces screen into UTF-8 mode so the child TUI's multibyte output
+      // (e.g. Vietnamese) renders correctly; without it screen inherits whatever
+      // the spawn-time locale was and garbles non-ASCII on attach.
+      command: ['screen', '-U', '-dmS', name, ...claudeArgs],
       teardown: `screen -S ${name} -X quit`,
     };
   }
@@ -183,6 +186,17 @@ export function resolveKillId(argv) {
   return { found: true, raw: !raw || raw.startsWith('-') ? null : raw };
 }
 
+/**
+ * Resolve the `--attach <id>` target from argv. Same shape/semantics as
+ * resolveKillId (the id may be missing or a flag-looking token). Pure → testable.
+ */
+export function resolveAttachId(argv) {
+  const i = argv.findIndex((a) => a === '--attach' || a === '--resume');
+  if (i === -1) return { found: false, raw: null };
+  const raw = argv[i + 1];
+  return { found: true, raw: !raw || raw.startsWith('-') ? null : raw };
+}
+
 /** Non-blocking delay (avoids spawning the `sleep` binary + its fractional-second assumption). */
 const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -242,6 +256,32 @@ if (isDirectRun) {
     }
     console.log(`[spawn] killed agent session "${name}".`);
     process.exit(0);
+  }
+
+  // --attach <id>: re-attach this terminal to a running agent's screen session.
+  // id may be `d1331668`, `#d1331668`, or `tele-d1331668` (same as --kill).
+  const attach = resolveAttachId(argv);
+  if (attach.found) {
+    if (!attach.raw) { console.error('[spawn] --attach needs an id, e.g. `pnpm spawn:attach d1331668` (or #d1331668 / tele-d1331668).'); process.exit(1); }
+    if (!hasBinary('screen')) { console.error('[spawn] `screen` not found on PATH.'); process.exit(1); }
+    let name;
+    try { name = normalizeSessionName(attach.raw); }
+    catch (e) { console.error(`[spawn] ${e.message}`); process.exit(1); }
+    if (!screenSessionExists(name)) {
+      console.error(`[spawn] no screen session "${name}" (try: pnpm spawn:ls).`);
+      process.exit(1);
+    }
+    // Hand the TTY to screen. `-r` re-attaches; `-d -r` steals it back if the
+    // session is already attached elsewhere (e.g. another terminal). stdio
+    // 'inherit' gives screen the real pty; detach with Ctrl-A D to leave it
+    // running. We exit with screen's own status.
+    console.log(`[spawn] attaching to "${name}" — detach with Ctrl-A then D (leaves the agent running).`);
+    try {
+      execFileSync('screen', ['-U', '-d', '-r', name], { stdio: 'inherit' });
+      process.exit(0);
+    } catch (e) {
+      process.exit(typeof e?.status === 'number' ? e.status : 1);
+    }
   }
 
   const interactive = argv.includes('--interactive') || argv.includes('-i');

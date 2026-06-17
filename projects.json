@@ -16,13 +16,6 @@
         "name": "Hà",
         "position": "designer"
       },
-      "@Duyenngmy": {
-        "role": "member",
-        "username": "Duyenngmy",
-        "title": "chị",
-        "name": "Duyên",
-        "position": "PM"
-      },
       "@ultoxtung": {
         "role": "dev",
         "username": "ultoxtung",
@@ -50,6 +43,13 @@
         "title": "chị",
         "name": "Linh",
         "position": "marketing"
+      },
+      "6167404371": {
+        "role": "member",
+        "username": "Duyenngmy",
+        "title": "chị",
+        "name": "Duyên",
+        "position": "PM"
       }
     }
   }

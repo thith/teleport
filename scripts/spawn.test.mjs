@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { buildSpawnPlan, genSessionSeed, runSpawn, hasBinary, screenSessionExists, normalizeSessionName, parseScreenSessions, listSpawnSessions, resolveKillId, SPAWN_PROMPT } from './spawn.mjs';
+import { buildSpawnPlan, genSessionSeed, runSpawn, hasBinary, screenSessionExists, normalizeSessionName, parseScreenSessions, listSpawnSessions, resolveKillId, resolveAttachId, SPAWN_PROMPT } from './spawn.mjs';
 import { uuidToConvoInt } from './convo-registry.mjs';
 import { shortConvoHash } from './convo-hash.mjs';
 
@@ -24,7 +24,7 @@ test('buildSpawnPlan headless (default): claude -p <prompt>, no session/teardown
 test('buildSpawnPlan interactive: explicit name (no seed) → screen -dmS <name> claude <prompt>, no -p, no --session-id', () => {
   const p = buildSpawnPlan({ interactive: true, sessionName: 'tele-abc123' });
   assert.equal(p.mode, 'interactive');
-  assert.deepEqual(p.command, ['screen', '-dmS', 'tele-abc123', 'claude', SPAWN_PROMPT]);
+  assert.deepEqual(p.command, ['screen', '-U', '-dmS', 'tele-abc123', 'claude', SPAWN_PROMPT]);
   assert.equal(p.teardown, 'screen -S tele-abc123 -X quit');
   assert.equal(p.sessionId, null);
   // CRUCIAL: interactive must NOT use -p (that would bill as SDK pool, not subscription).
@@ -37,7 +37,7 @@ test('buildSpawnPlan interactive auto (seed): forces --session-id and names scre
   // Screen name == tele-<hashtag>, matching the #tag the agent shows on Telegram.
   assert.equal(p.sessionName, FIXED_NAME);
   assert.equal(p.sessionId, FIXED_UUID);
-  assert.deepEqual(p.command, ['screen', '-dmS', FIXED_NAME, 'claude', '--session-id', FIXED_UUID, SPAWN_PROMPT]);
+  assert.deepEqual(p.command, ['screen', '-U', '-dmS', FIXED_NAME, 'claude', '--session-id', FIXED_UUID, SPAWN_PROMPT]);
   assert.equal(p.teardown, `screen -S ${FIXED_NAME} -X quit`);
   assert.ok(!p.command.includes('-p')); // still subscription billing
 });
@@ -49,7 +49,7 @@ test('buildSpawnPlan interactive: auto-seeds when neither name nor seed given (r
   // The forced session-id is wired into the command and the name is the screen target.
   assert.ok(p.command.includes('--session-id'));
   assert.equal(p.command[p.command.indexOf('--session-id') + 1], p.sessionId);
-  assert.equal(p.command[2], p.sessionName);
+  assert.equal(p.command[3], p.sessionName);
 });
 
 test('buildSpawnPlan interactive: explicit name + seed → name wins, seed id DROPPED (name⇄hashtag invariant)', () => {
@@ -59,7 +59,7 @@ test('buildSpawnPlan interactive: explicit name + seed → name wins, seed id DR
   assert.equal(p.sessionName, 'tele-custom'); // explicit name wins
   assert.equal(p.sessionId, null);            // seed UUID dropped — NOT forced
   assert.ok(!p.command.includes('--session-id'));
-  assert.deepEqual(p.command, ['screen', '-dmS', 'tele-custom', 'claude', SPAWN_PROMPT]);
+  assert.deepEqual(p.command, ['screen', '-U', '-dmS', 'tele-custom', 'claude', SPAWN_PROMPT]);
 });
 
 test('buildSpawnPlan interactive: explicit name + explicit valid sessionId → forced (deliberate advanced override)', () => {
@@ -165,6 +165,15 @@ test('resolveKillId: finds id, rejects missing / flag-looking next token (review
   assert.deepEqual(resolveKillId(['--kill', '--list']), { found: true, raw: null }); // double-dash flag
   assert.deepEqual(resolveKillId(['--kill', '-i']), { found: true, raw: null });     // single-dash flag
   assert.deepEqual(resolveKillId(['--interactive']), { found: false, raw: null });   // no kill flag
+});
+
+test('resolveAttachId: finds id (--attach/--resume), rejects missing / flag-looking next token', () => {
+  assert.deepEqual(resolveAttachId(['--attach', 'd1331668']), { found: true, raw: 'd1331668' });
+  assert.deepEqual(resolveAttachId(['--resume', '#d1331668']), { found: true, raw: '#d1331668' });
+  assert.deepEqual(resolveAttachId(['--attach']), { found: true, raw: null });          // missing id
+  assert.deepEqual(resolveAttachId(['--attach', '--list']), { found: true, raw: null }); // double-dash flag
+  assert.deepEqual(resolveAttachId(['--attach', '-i']), { found: true, raw: null });     // single-dash flag
+  assert.deepEqual(resolveAttachId(['--kill', 'x']), { found: false, raw: null });       // no attach flag
 });
 
 test('listSpawnSessions: tolerates screen -ls exiting non-zero (reads stdout off error)', () => {
