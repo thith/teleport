@@ -1,8 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { buildSpawnPlan, genSessionSeed, runSpawn, hasBinary, screenSessionExists, normalizeSessionName, parseScreenSessions, listSpawnSessions, resolveKillId, resolveAttachId, SPAWN_PROMPT } from './spawn.mjs';
+import { buildSpawnPlan, genSessionSeed, runSpawn, hasBinary, screenSessionExists, normalizeSessionName, parseScreenSessions, listSpawnSessions, resolveKillId, resolveAttachId, SPAWN_PROMPT, personaByHashtag } from './spawn.mjs';
 import { uuidToConvoInt } from './convo-registry.mjs';
 import { shortConvoHash } from './convo-hash.mjs';
+import { personaForConvo } from './persona.mjs';
 
 // A fixed UUID for deterministic seed tests (not a real session — never executed).
 const FIXED_UUID = 'a1b2c3d4-e5f6-4a8b-9c0d-1e2f3a4b5c6d';
@@ -188,4 +189,27 @@ test('runSpawn: delegates to injected runner with the plan (no real process)', (
   const out = runSpawn(plan, { runner: (p) => { got = p; return { ...p, ran: true }; } });
   assert.equal(got, plan);
   assert.equal(out.ran, true);
+});
+
+// personaByHashtag: maps each topic's hashtag → persona so --list can label
+// sessions with the name a human uses ("kill Cú").
+test('personaByHashtag: maps hashtag → persona, skips _meta, ignores topic-less', () => {
+  const convo = '2205483045424020';            // → hashtag e5424020
+  const hashtag = shortConvoHash(convo);
+  const store = {
+    '-100': { [convo]: 124, _is_forum: true, _ts: { [convo]: 1 } },
+    '-200': { '1234': 7 },                       // short convo → hashtag t1234
+  };
+  const map = personaByHashtag(store);
+  assert.deepEqual(map[hashtag], personaForConvo(convo));
+  assert.deepEqual(map['t1234'], personaForConvo('1234'));
+  assert.equal(map._is_forum, undefined);        // meta key never mapped
+  assert.equal(map['tdeadbeef'], undefined);     // a session with no topic → absent
+});
+
+test('personaByHashtag: empty/garbage store → empty map (no throw)', () => {
+  assert.deepEqual(personaByHashtag({}), {});
+  assert.deepEqual(personaByHashtag(null), {});
+  assert.deepEqual(personaByHashtag({ '-1': null }), {});
+  assert.deepEqual(personaByHashtag({ '-1': ['a', 'b'] }), {}); // array entry skipped
 });

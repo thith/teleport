@@ -22,6 +22,8 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { uuidToConvoInt } from './convo-registry.mjs';
 import { shortConvoHash } from './convo-hash.mjs';
+import { readTopicsStore } from './topics-store.mjs';
+import { personaForConvo, formatPersona } from './persona.mjs';
 
 export const SPAWN_PROMPT = 'Telegram me and wait for instructions';
 
@@ -174,6 +176,27 @@ export function listSpawnSessions(exec = execFileSync) {
 }
 
 /**
+ * Build `{ <hashtag>: persona }` from the topics store so `--list` can show the
+ * persona name beside each `tele-<hashtag>` session ("kill Cú" → which hashtag).
+ * The screen name carries only the (lossy) hashtag, so persona — which is
+ * derived from the convoId — must be recovered via the convoId keys in
+ * topics.json: `shortConvoHash(convoId)` is the same hashtag the session is named
+ * after. A session with no topic yet (hasn't sent its first message) won't be in
+ * the map → printed without a persona. `store` injectable for tests.
+ */
+export function personaByHashtag(store = readTopicsStore()) {
+  const map = {};
+  for (const entry of Object.values(store || {})) {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) continue;
+    for (const key of Object.keys(entry)) {
+      if (key.startsWith('_')) continue;
+      map[shortConvoHash(key)] = personaForConvo(key);
+    }
+  }
+  return map;
+}
+
+/**
  * Resolve the `--kill <id>` target from argv. Pure → unit-testable.
  * Returns `{ found, raw }`: `found` = a --kill/--quit flag is present; `raw` = the
  * id token, or null when it's missing or flag-looking (a `-`-prefixed next token
@@ -230,7 +253,13 @@ if (isDirectRun) {
     const sessions = listSpawnSessions();
     if (!sessions.length) { console.log('[spawn] no agent sessions (tele-*) running.'); process.exit(0); }
     console.log(`[spawn] ${sessions.length} agent session(s):`);
-    for (const s of sessions) console.log(`  ${s.name}  (pid ${s.pid})  → topic #${s.name.replace(/^tele-/, '')}`);
+    const pmap = personaByHashtag();
+    for (const s of sessions) {
+      const hashtag = s.name.replace(/^tele-/, '');
+      const persona = pmap[hashtag];
+      const label = persona ? `${formatPersona(persona)}  ` : '';
+      console.log(`  ${label}${s.name}  (pid ${s.pid})  → topic #${hashtag}`);
+    }
     process.exit(0);
   }
 
