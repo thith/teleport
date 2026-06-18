@@ -19,8 +19,9 @@ const OUT_DIR = path.join(ROOT, 'tmp/tele-html');
 
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
-/** HTML: nhúng markdown, render bằng marked qua CDN (fallback raw text nếu CDN bị chặn/offline).
- *  Lưu ý: cần mạng để render đẹp (CDN) — trên điện thoại / Telegram webview luôn có mạng nên OK. */
+/** HTML artifact để gửi qua Telegram. Render markdown bằng marked (CDN); nếu CDN bị chặn/offline
+ *  → hiển thị RAW markdown ngay (luôn đọc được, KHÔNG kẹt "đang tải"). KHÔNG phải self-contained
+ *  tuyệt đối (cần mạng để render đẹp) — trên điện thoại / Telegram webview có mạng nên OK. */
 const tpl = (title, md) => `<!doctype html><html lang="vi"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${esc(title)}</title>
@@ -31,14 +32,14 @@ table{border-collapse:collapse;width:100%;display:block;overflow-x:auto;font-siz
 th,td{border:1px solid #ddd;padding:6px 8px;text-align:left;vertical-align:top}
 th{background:#f5f5f7}code{background:#f0f0f0;padding:1px 4px;border-radius:3px}
 blockquote{border-left:3px solid #c9a9ff;margin:0;padding:4px 12px;background:#faf7ff;color:#555}
+#r{white-space:pre-wrap;word-wrap:break-word;font-family:inherit;margin:0}
 </style></head><body>
-<div id="c">Đang tải…</div>
+<div id="c"><pre id="r"></pre></div>
+<script>const md=${JSON.stringify(md).replace(/</g, '\\u003c')};
+document.getElementById('r').textContent=md;</script>
 <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
-<script>
-const md=${JSON.stringify(md)};
-function render(){try{document.getElementById('c').innerHTML=marked.parse(md)}catch(e){document.getElementById('c').innerText=md}}
-if(window.marked)render();else{var s=document.querySelector('script[src*=marked]');s.onload=render;s.onerror=function(){document.getElementById('c').innerText=md}}
-</script></body></html>`;
+<script>try{if(window.marked)document.getElementById('c').innerHTML=marked.parse(md);}catch(e){}</script>
+</body></html>`;
 
 /** Tiêu đề: H1 đầu tiên trong md, fallback tên file. */
 function titleOf(md, file) {
