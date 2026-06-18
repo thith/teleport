@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import {
   acquireLock as acquireConvoLock,
@@ -504,6 +505,73 @@ export function escapeMarkdownV2(text) {
       return t.value.replace(textEscapeRe, (m) => '\\' + m);
     })
     .join('');
+}
+
+/**
+ * Read the git context of `cwd` for the per-convo header footer: current
+ * branch and a clean/dirty count of the working tree. Returns null when `cwd`
+ * is not inside a git work tree or `git` is unavailable — the caller then omits
+ * the footer. MUST never throw and never block a send (short, local git calls).
+ */
+export function readGitContext(cwd = process.cwd()) {
+  try {
+    const run = (a) =>
+      execFileSync('git', a, {
+        cwd,
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+        // Bound the call so a hung git (stale index.lock, fs stall) can NEVER
+        // block a send: timeout → ETIMEDOUT → caught below → footer omitted.
+        // GIT_OPTIONAL_LOCKS=0 keeps `status` from waiting on the index lock.
+        timeout: 1000,
+        killSignal: 'SIGKILL',
+        maxBuffer: 1 << 20,
+        env: { ...process.env, GIT_OPTIONAL_LOCKS: '0' },
+      }).trim();
+    // Bail if not a work tree (rev-parse exits non-zero → caught below).
+    run(['rev-parse', '--is-inside-work-tree']);
+    const branch = run(['rev-parse', '--abbrev-ref', 'HEAD']);
+    const status = run(['status', '--porcelain']);
+    const dirty = status ? status.split('\n').filter((l) => l.length > 0).length : 0;
+    // Folder NAME only — never the full path (would leak local layout into a
+    // multi-member Telegram group). basename of cwd, not the repo toplevel.
+    return { folder: path.basename(cwd), branch, dirty };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Format the one-time per-convo context footer (folder · branch · clean/dirty).
+ * Appended only to the FIRST message of a convo (see isFirstConvoMessage).
+ * `raw` escapes MdV2 specials because the --raw path sends pre-escaped text;
+ * default mode leaves it literal (escapeMarkdownV2 escapes downstream) and
+ * plain mode also sends it verbatim — so `plain` needs no branch here (literal
+ * == default-unescaped). Returns '' when ctx is null (not a git repo).
+ */
+export function formatGitFooter(ctx, { raw = false } = {}) {
+  if (!ctx) return '';
+  const state = ctx.dirty > 0 ? `dirty (${ctx.dirty})` : 'clean';
+  let footer = `📁 ${ctx.folder} · 🌿 ${ctx.branch} · ${state}`;
+  if (raw) footer = footer.replace(MDV2_ALL_SPECIALS_RE, (m) => '\\' + m);
+  return '\n\n' + footer;
+}
+
+/**
+ * True when no allocation row exists yet for (convoId, botId, chatId) — i.e.
+ * this send is the FIRST message of the convo in this chat. Reads the convo
+ * registry that recordConvoSend writes after each send. On any read error we
+ * return false (skip the footer) rather than risk repeating it on later sends.
+ */
+export function isFirstConvoMessage({ convoId, botId, chatId }, registryFile = CONVO_REGISTRY_FILE) {
+  try {
+    const { rows } = readConvoRows(registryFile);
+    // Coerce convoId to Number to mirror the stored row type (hasAllocationRow
+    // compares with ===); String(chatId) already normalizes the chat side.
+    return !hasAllocationRow(rows, Number(convoId), botId, String(chatId));
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -1223,6 +1291,16 @@ async function main() {
 
   const opts = { raw: args.raw, plain: args.plain, replyTo: args.replyTo };
 
+  // Per-convo context footer (folder · branch · clean/dirty): computed LAZILY —
+  // git only runs when a send is actually the FIRST message of its convo (gated
+  // per-chat below), so --react / --close-topic / follow-up sends never shell
+  // out to git. Memoized so the multi-admin fan-out reads git at most once.
+  let _gitFooter;
+  const gitFooterFor = () => {
+    if (_gitFooter === undefined) _gitFooter = formatGitFooter(readGitContext(), opts);
+    return _gitFooter;
+  };
+
   // GC dead topics (RFC 01 P3): explicit/opt-in. Close topics whose convo has
   // not sent for TELE_TOPIC_TTL_H hours (default 48), then clear their mapping.
   // Reversible (closeForumTopic). Intended for cron.
@@ -1336,7 +1414,10 @@ async function main() {
         // In a DEDICATED group the whole group IS this project, so the `[project]`
         // message prefix is redundant (RFC 02) — drop it (the persona tag still
         // identifies the agent). Shared group keeps `[project]` to disambiguate.
-        const caption = injectConvoHash(rawCaption, dedicatedGroup ? '' : projectCode, convoIdForSend, { pretokensEscaped: opts.raw, persona });
+        const captionBody = isFirstConvoMessage({ convoId: convoIdForSend, botId, chatId })
+          ? rawCaption + gitFooterFor()
+          : rawCaption;
+        const caption = injectConvoHash(captionBody, dedicatedGroup ? '' : projectCode, convoIdForSend, { pretokensEscaped: opts.raw, persona });
         const { topicKey, topicName } = topicTarget({ convoId: convoIdForSend, persona, projectCode, dedicated: dedicatedGroup });
         let threadId = requireTopic(await resolveThreadId({ token, chatId, projectCode, topicKey, topicName, icon: topicIcon }), chatId, convoIdForSend);
         let sendOpts = { ...opts, messageThreadId: threadId };
@@ -1406,7 +1487,10 @@ async function main() {
       const convoIdForSend = resolveConvoIdPreSend({ preResolved, replyTo: args.replyTo, chatId, botId }) ?? fallbackConvoId;
       const persona = personaForConvo(convoIdForSend);
       // Dedicated group → drop the redundant `[project]` prefix (see above).
-      const message = injectConvoHash(rawMessage, dedicatedGroup ? '' : projectCode, convoIdForSend, { pretokensEscaped: opts.raw, persona });
+      const messageBody = isFirstConvoMessage({ convoId: convoIdForSend, botId, chatId })
+        ? rawMessage + gitFooterFor()
+        : rawMessage;
+      const message = injectConvoHash(messageBody, dedicatedGroup ? '' : projectCode, convoIdForSend, { pretokensEscaped: opts.raw, persona });
       const { topicKey, topicName } = topicTarget({ convoId: convoIdForSend, persona, projectCode, dedicated: dedicatedGroup });
       let threadId = requireTopic(await resolveThreadId({ token, chatId, projectCode, topicKey, topicName, icon: topicIcon }), chatId, convoIdForSend);
       let sendOpts = { ...opts, messageThreadId: threadId };
