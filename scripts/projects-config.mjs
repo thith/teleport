@@ -54,12 +54,12 @@ export function readProjectsConfig(file = DEFAULT_PROJECTS_FILE) {
  * Resolve `{ chatId, dedicated, roles, code, topicIcon }` for a project.
  * `lookupKey` is the projects.json key (= `basename(cwd)`); it is NOT shown to
  * users and is also the roster-harvest target — keep it folder-stable.
- * - `dedicated: true`  → chatId came from projects.json (project's OWN group,
- *   in practice often shared by several dedicated projects); topic titles lead
- *   with a `<code> · ` prefix to disambiguate them.
+ * - `dedicated: true`  → chatId came from projects.json (project's OWN group);
+ *   no `[<code>]` message prefix and a persona-only topic title ("Heo 🐷") —
+ *   projects sharing the group are told apart by their per-project `topicIcon`.
  * - `dedicated: false` → chatId is the shared catch-all (`fallbackChatId`, may be
- *   null; typically a DM); topic titles are persona-only and the project is
- *   carried by the per-message `[<code>]` prefix instead.
+ *   null); each message carries a `[<code>]` prefix AND the topic title is
+ *   code-first ("md · 🐉 Rồng") so the catch-all group is scannable by project.
  * - `roles` always comes from the json entry (may be {}).
  * - `code`  → the DISPLAY/canonical project code: entry.code (a short alias, e.g.
  *   "d_be") when set, else `lookupKey`. Lets a repo folder ("digesty-worker")

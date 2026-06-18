@@ -22,11 +22,12 @@ function tmpTopics() {
 
 // ---- topicTarget ---------------------------------------------------------
 
-test('topicTarget: keys by convoId, titles by persona (default catch-all → persona-only)', () => {
+test('topicTarget: dedicated (in projects.json) → persona-only, name-first title', () => {
   const t = topicTarget({
     convoId: '3039138158370420',
     persona: { emoji: '🐷', name: 'Heo' },
     projectCode: 'luni',
+    dedicated: true,
   });
   assert.deepEqual(t, { topicKey: '3039138158370420', topicName: 'Heo 🐷' });
 });
@@ -45,26 +46,32 @@ test('topicTarget: no persona falls back to projectCode', () => {
   );
 });
 
-test('topicTarget: dedicated group → code-first prefix to disambiguate shared group (RFC 02)', () => {
-  const t = topicTarget({ convoId: '99', persona: { emoji: '🐷', name: 'Heo' }, projectCode: 'luni', dedicated: true });
+test('topicTarget: catch-all (not in projects.json) → code-first title "code · emoji name"', () => {
+  const t = topicTarget({ convoId: '99', persona: { emoji: '🐉', name: 'Rồng' }, projectCode: 'md', dedicated: false });
+  assert.deepEqual(t, { topicKey: '99', topicName: 'md · 🐉 Rồng' });
+});
+
+test('topicTarget: dedicated default (false) is catch-all → code-first', () => {
+  // `dedicated` omitted defaults to false (catch-all): code leads the title.
+  const t = topicTarget({ convoId: '99', persona: { emoji: '🐷', name: 'Heo' }, projectCode: 'luni' });
   assert.deepEqual(t, { topicKey: '99', topicName: 'luni · 🐷 Heo' });
 });
 
-test('topicTarget: dedicated but empty projectCode → degrades to persona-only (no orphan " · ")', () => {
-  const t = topicTarget({ convoId: '99', persona: { emoji: '🐷', name: 'Heo' }, projectCode: '', dedicated: true });
+test('topicTarget: catch-all with empty projectCode → name-first persona-only (no orphan " · ")', () => {
+  const t = topicTarget({ convoId: '99', persona: { emoji: '🐷', name: 'Heo' }, projectCode: '', dedicated: false });
   assert.deepEqual(t, { topicKey: '99', topicName: 'Heo 🐷' });
 });
 
-test('topicTarget: catch-all (non-dedicated) → persona-only title', () => {
-  const t = topicTarget({ convoId: '99', persona: { emoji: '🐷', name: 'Heo' }, projectCode: 'luni', dedicated: false });
-  assert.deepEqual(t, { topicKey: '99', topicName: 'Heo 🐷' });
-});
-
-test('topicTarget: dedicated title leads with code text, not an emoji (never adjacent to the leading icon)', () => {
+test('topicTarget: dedicated persona-only title trails the emoji (never adjacent to the leading topicIcon)', () => {
   const t = topicTarget({ convoId: '7', persona: { emoji: '🐷', name: 'Heo' }, projectCode: 'luni', dedicated: true });
-  // leading glyph is the code text, so the persona emoji can't clash with a leading topic icon.
-  assert.ok(t.topicName.startsWith('luni · '), `expected code-first title, got ${t.topicName}`);
-  assert.ok(/🐷 Heo$/u.test(t.topicName), `expected persona unit "🐷 Heo" at the end, got ${t.topicName}`);
+  // dedicated groups carry a leading topicIcon; name-first keeps the persona emoji off the front.
+  assert.ok(/^Heo 🐷$/u.test(t.topicName), `expected name-first persona-only, got ${t.topicName}`);
+});
+
+test('topicTarget: catch-all code-first title leads with code text, not an emoji', () => {
+  const t = topicTarget({ convoId: '7', persona: { emoji: '🐉', name: 'Rồng' }, projectCode: 'md', dedicated: false });
+  assert.ok(t.topicName.startsWith('md · '), `expected code-first title, got ${t.topicName}`);
+  assert.ok(/🐉 Rồng$/u.test(t.topicName), `expected persona unit "🐉 Rồng" at the end, got ${t.topicName}`);
 });
 
 // ---- createForumTopic: icon payload --------------------------------------

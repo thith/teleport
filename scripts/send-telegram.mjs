@@ -834,26 +834,25 @@ export function teamModeForumError(chatId) {
 
 /**
  * Compute `{ topicKey, topicName }` for resolveThreadId — one forum topic per
- * convo, keyed by convoId. A `<project> · ` PREFIX is added ONLY for a project
- * with its own `projects.json` entry (`dedicated: true`): in practice several
- * such projects share one physical forum group (same `chatId`), so the code at
- * the scannable left edge disambiguates them — topics of the same project then
- * cluster together in the topic list ("luni · 🐷 Heo"). The env catch-all
- * (`dedicated: false`) is typically a DM with no forum topics, so the title is
- * persona-only ("Heo 🐷") and the per-message `[<code>]` prefix carries the
- * project instead (RFC 02). Falls back to projectCode only at the edge where
- * convoId/persona can't be resolved.
- *
- * Code-first also keeps the persona emoji away from the topic's leading icon
- * emoji (the per-project `topicIcon` Telegram renders before the title): the
- * leading glyph is the code text, so the two emojis never sit adjacent.
+ * convo, keyed by convoId. Title format depends on `dedicated` (RFC 02):
+ * - `dedicated: true` (project HAS a `projects.json` entry): persona-only,
+ *   name-first ("Heo 🐷"). Projects sharing such a group are told apart by their
+ *   per-project `topicIcon` (Telegram renders it before the title), so the emoji
+ *   trails the name and never sits adjacent to that leading icon; messages carry
+ *   no `[<code>]` body prefix either.
+ * - `dedicated: false` (catch-all — project NOT in `projects.json`): code-first
+ *   ("md · 🐉 Rồng", format `<code> · <emoji> <name>`) so the shared catch-all
+ *   group is scannable by project in the topic list; messages also carry the
+ *   `[<code>]` body prefix (added at the call site).
+ * Catch-all with an empty projectCode degrades to the persona-only form (no
+ * orphan " · "). Falls back to projectCode only at the edge where convoId/persona
+ * can't be resolved.
  */
 export function topicTarget({ convoId, persona, projectCode, dedicated = false }) {
   if (convoId != null && persona) {
-    // Guard `projectCode`: dedicated-but-empty (shouldn't happen in current
-    // wiring, but topicTarget is exported) degrades to the persona-only form
-    // rather than emitting an orphan " · " prefix.
-    const title = dedicated && projectCode ? `${projectCode} · ${persona.emoji} ${persona.name}` : `${persona.name} ${persona.emoji}`;
+    const title = !dedicated && projectCode
+      ? `${projectCode} · ${persona.emoji} ${persona.name}`
+      : `${persona.name} ${persona.emoji}`;
     return { topicKey: String(convoId), topicName: title };
   }
   return { topicKey: projectCode, topicName: projectCode };
@@ -886,7 +885,7 @@ function isPermanentNoTopicError(res) {
 export async function resolveThreadId({ token, chatId, projectCode, topicKey = projectCode, topicName = projectCode, icon = {}, nowFn = Date.now, topicsFile, fetcher = createForumTopic, forceCreate = false, sleepFn = defaultSleep }) {
   // `topicKey` is the topics-store cache key, `topicName` the forum-topic
   // title. Normally topicKey = convoId and topicName = the title from
-  // topicTarget ("luni · 🐷 Heo" dedicated, "Heo 🐷" catch-all), giving each
+  // topicTarget ("Heo 🐷" dedicated, "md · 🐉 Rồng" catch-all), giving each
   // convo its own topic (RFC 01). The
   // projectCode default only applies at the edge where convo/persona can't be
   // resolved (see topicTarget) so a send never crashes.
@@ -1236,7 +1235,8 @@ async function main() {
   const lookupKey = path.basename(process.cwd()) || '';
   // RFC 02: per-project group via projects.json[key].chatId (DEDICATED) →
   // fallback TELEGRAM_ADMIN_CHAT_ID env (SHARED catch-all). `dedicated` drives
-  // the topic-title form (persona-only vs persona·project).
+  // the topic-title form (dedicated persona-only vs catch-all code-first) and
+  // the `[code]` message prefix (catch-all only).
   const fallbackChatId = process.env.TELEGRAM_ADMIN_CHAT_ID || envFromFile.TELEGRAM_ADMIN_CHAT_ID;
   const projCfg = resolveProjectConfig(lookupKey, { config: readProjectsConfig(), fallbackChatId });
   const projectCode = projCfg.code;
