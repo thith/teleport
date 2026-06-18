@@ -666,8 +666,18 @@ async function postSendDocument(token, chatId, filePath, caption, parseMode, rep
  *   CHAT_FORUM_REQUIRED, BOT_DOMAIN_INVALID, or any 403 (permission).
  * Caller wraps the result; non-ok → negative cache + send without thread_id.
  */
-async function createForumTopic(token, chatId, name) {
+export async function createForumTopic(token, chatId, name, icon = {}) {
   const payload = { chat_id: chatId, name: String(name).slice(0, 128) };
+  // Optional per-project topic icon (projects.json `topicIcon`). `icon_color` and
+  // `icon_custom_emoji_id` are independent Telegram fields — pass either or both;
+  // absent → Telegram's default icon. A custom emoji id MUST come from
+  // getForumTopicIconStickers (that set is free for non-premium accounts too).
+  if (icon && typeof icon.iconEmojiId === 'string' && icon.iconEmojiId.trim()) {
+    payload.icon_custom_emoji_id = icon.iconEmojiId.trim();
+  }
+  if (icon && Number.isInteger(icon.iconColor)) {
+    payload.icon_color = icon.iconColor;
+  }
   const res = await fetch(`${TELEGRAM_API}${token}/createForumTopic`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -758,12 +768,16 @@ export function teamModeForumError(chatId) {
  * convo, keyed by convoId. Title = persona; the `· <project>` suffix is added
  * ONLY in a SHARED group (`dedicated: false`) to disambiguate projects that
  * coexist there. In a project's OWN group (`dedicated: true`) the suffix is
- * redundant, so the title is persona-only ("🐷 Heo") (RFC 02). Falls back to
+ * redundant, so the title is persona-only ("Heo 🐷") (RFC 02). Falls back to
  * projectCode only at the edge where convoId/persona can't be resolved.
+ *
+ * The persona emoji goes AFTER the name ("Heo 🐷", not "🐷 Heo") so it never sits
+ * adjacent to the topic's leading icon emoji (the per-project `topicIcon`), which
+ * Telegram renders just before the title — otherwise the two emojis would clash.
  */
 export function topicTarget({ convoId, persona, projectCode, dedicated = false }) {
   if (convoId != null && persona) {
-    const title = dedicated ? `${persona.emoji} ${persona.name}` : `${persona.emoji} ${persona.name} · ${projectCode}`;
+    const title = dedicated ? `${persona.name} ${persona.emoji}` : `${persona.name} ${persona.emoji} · ${projectCode}`;
     return { topicKey: String(convoId), topicName: title };
   }
   return { topicKey: projectCode, topicName: projectCode };
@@ -793,10 +807,10 @@ function isPermanentNoTopicError(res) {
   return /CHAT_FORUM_REQUIRED|TOPICS_FORBIDDEN|FORUM_NOT_ENABLED|NOT_FORUM|TOPIC_CREATE_DISABLED|chat not found|user is deactivated|bot was kicked|not enough rights/i.test(d);
 }
 
-export async function resolveThreadId({ token, chatId, projectCode, topicKey = projectCode, topicName = projectCode, nowFn = Date.now, topicsFile, fetcher = createForumTopic, forceCreate = false, sleepFn = defaultSleep }) {
+export async function resolveThreadId({ token, chatId, projectCode, topicKey = projectCode, topicName = projectCode, icon = {}, nowFn = Date.now, topicsFile, fetcher = createForumTopic, forceCreate = false, sleepFn = defaultSleep }) {
   // `topicKey` is the topics-store cache key, `topicName` the forum-topic
   // title. Normally topicKey = convoId and topicName = persona title
-  // ("🐷 Heo · luni"), giving each convo its own topic (RFC 01). The
+  // ("Heo 🐷 · luni"), giving each convo its own topic (RFC 01). The
   // projectCode default only applies at the edge where convo/persona can't be
   // resolved (see topicTarget) so a send never crashes.
   if (topicKey == null || String(topicKey).startsWith('_')) return null;
@@ -807,6 +821,9 @@ export async function resolveThreadId({ token, chatId, projectCode, topicKey = p
   // 1. Positive cache hit — use immediately (stamp last-use for GC). Skipped on
   // `forceCreate` (topic-gone recovery): we must create a FRESH topic, never
   // reuse a possibly-dead cached thread a sibling may have re-recorded (S2-M2).
+  // NOTE: the topic icon is applied only at CREATION — a cache hit reuses the
+  // existing topic as-is, so changing a project's `topicIcon` does NOT retro-edit
+  // already-created topics (icon is cosmetic; per-convo topics are short-lived).
   if (!forceCreate) {
     const cached = getThreadId(store, chatId, topicKey);
     if (cached != null) { touchTopicUse(chatId, topicKey, nowFn(), topicsFile); return cached; }
@@ -822,7 +839,7 @@ export async function resolveThreadId({ token, chatId, projectCode, topicKey = p
   let res;
   let threw = false;
   try {
-    res = await sendWithRetry(() => fetcher(token, chatId, topicName), {
+    res = await sendWithRetry(() => fetcher(token, chatId, topicName, icon), {
       attempts: TOPIC_CREATE_BACKOFF_MS.length + 1,
       backoff: TOPIC_CREATE_BACKOFF_MS,
       sleepFn,
@@ -830,6 +847,30 @@ export async function resolveThreadId({ token, chatId, projectCode, topicKey = p
   } catch {
     threw = true; // every attempt threw (network) — TRANSIENT, not "forum disabled"
     res = null;
+  }
+  // The per-project topic icon is COSMETIC and best-effort. A bad/stale icon (a
+  // custom-emoji id not in getForumTopicIconStickers, or a color outside
+  // Telegram's allowed set) makes the create 400 — and because topic creation is
+  // mandatory (requireTopic), that would drop the whole report on EVERY send (a
+  // 400 isn't permanent → never negative-cached → retried forever). So if a
+  // create with an icon 400s, retry ONCE without the icon and let Telegram use
+  // its default. Defensive predicate: non-ok 400 + an icon was actually sent (we
+  // don't rely on exact Telegram error strings, which aren't stable/documented).
+  const iconWasSent = !!icon && (
+    (typeof icon.iconEmojiId === 'string' && icon.iconEmojiId.trim() !== '') ||
+    Number.isInteger(icon.iconColor)
+  );
+  if (!threw && res && !res.ok && res.status === 400 && iconWasSent && !isPermanentNoTopicError(res)) {
+    try {
+      res = await sendWithRetry(() => fetcher(token, chatId, topicName, {}), {
+        attempts: TOPIC_CREATE_BACKOFF_MS.length + 1,
+        backoff: TOPIC_CREATE_BACKOFF_MS,
+        sleepFn,
+      });
+    } catch {
+      threw = true;
+      res = null;
+    }
   }
   if (res && res.ok && res.messageThreadId != null) {
     // Locked RMW so we don't clobber a sibling process's positive entry.
@@ -1070,17 +1111,22 @@ async function sendDocumentToAdmin(token, chatId, filePath, caption, opts) {
 async function main() {
   const envFromFile = loadEnvFromFile(ENV_FILE);
   const token = process.env.REPORT_BOT_TOKEN || envFromFile.REPORT_BOT_TOKEN;
-  // Project code: TELE_PROJECT_CODE env override > basename(cwd). No project-local .env reading.
-  const projectCode =
-    process.env.TELE_PROJECT_CODE ||
-    path.basename(process.cwd()) ||
-    '';
-  // RFC 02: per-project group via projects.json[code].chatId (DEDICATED) →
+  // Lookup key = basename(cwd) (= the projects.json key). No env override, no
+  // project-local .env reading. The DISPLAY code is projCfg.code (entry.code
+  // short alias, e.g. "d_be", else the lookup key).
+  const lookupKey = path.basename(process.cwd()) || '';
+  // RFC 02: per-project group via projects.json[key].chatId (DEDICATED) →
   // fallback TELEGRAM_ADMIN_CHAT_ID env (SHARED catch-all). `dedicated` drives
   // the topic-title form (persona-only vs persona·project).
   const fallbackChatId = process.env.TELEGRAM_ADMIN_CHAT_ID || envFromFile.TELEGRAM_ADMIN_CHAT_ID;
-  const projCfg = resolveProjectConfig(projectCode, { config: readProjectsConfig(), fallbackChatId });
+  const projCfg = resolveProjectConfig(lookupKey, { config: readProjectsConfig(), fallbackChatId });
+  const projectCode = projCfg.code;
   const dedicatedGroup = projCfg.dedicated;
+  // Per-project forum-topic icon (projects.json `topicIcon: { emoji?, color? }`).
+  // Mapped to createForumTopic's field names; absent fields are dropped downstream.
+  const topicIcon = projCfg.topicIcon
+    ? { iconEmojiId: projCfg.topicIcon.emoji, iconColor: projCfg.topicIcon.color }
+    : {};
   const adminIds = adminIdsFrom(projCfg, fallbackChatId, parseAdminChatIds);
   // RFC 01: teleport runs ONE mode — team. Every target chat MUST be a forum
   // supergroup; each convo gets its OWN forum topic titled with its persona,
@@ -1091,7 +1137,7 @@ async function main() {
     process.exit(1);
   }
   if (adminIds.length === 0) {
-    console.error(`[send-telegram] project "${projectCode}" chưa cấu hình group: thêm "${projectCode}".chatId vào teleport/projects.json, hoặc đặt TELEGRAM_ADMIN_CHAT_ID (shared catch-all).`);
+    console.error(`[send-telegram] project "${lookupKey}" chưa cấu hình group: thêm "${lookupKey}".chatId vào teleport/projects.json, hoặc đặt TELEGRAM_ADMIN_CHAT_ID (shared catch-all).`);
     process.exit(1);
   }
 
@@ -1217,7 +1263,7 @@ async function main() {
         // identifies the agent). Shared group keeps `[project]` to disambiguate.
         const caption = injectConvoHash(rawCaption, dedicatedGroup ? '' : projectCode, convoIdForSend, { pretokensEscaped: opts.raw, persona });
         const { topicKey, topicName } = topicTarget({ convoId: convoIdForSend, persona, projectCode, dedicated: dedicatedGroup });
-        let threadId = requireTopic(await resolveThreadId({ token, chatId, projectCode, topicKey, topicName }), chatId, convoIdForSend);
+        let threadId = requireTopic(await resolveThreadId({ token, chatId, projectCode, topicKey, topicName, icon: topicIcon }), chatId, convoIdForSend);
         let sendOpts = { ...opts, messageThreadId: threadId };
         let result;
         try {
@@ -1226,7 +1272,7 @@ async function main() {
           if (isTopicGoneError(e instanceof Error ? e.message : String(e))) {
             // Topic vanished → clear cache, RE-CREATE a topic, retry into it.
             dropTopicMapping(chatId, topicKey);
-            threadId = requireTopic(await resolveThreadId({ token, chatId, projectCode, topicKey, topicName, forceCreate: true }), chatId, convoIdForSend);
+            threadId = requireTopic(await resolveThreadId({ token, chatId, projectCode, topicKey, topicName, icon: topicIcon, forceCreate: true }), chatId, convoIdForSend);
             sendOpts = { ...opts, messageThreadId: threadId };
             result = await sendDocumentToAdmin(token, chatId, args.filePath, caption, sendOpts);
           } else { throw e; }
@@ -1287,7 +1333,7 @@ async function main() {
       // Dedicated group → drop the redundant `[project]` prefix (see above).
       const message = injectConvoHash(rawMessage, dedicatedGroup ? '' : projectCode, convoIdForSend, { pretokensEscaped: opts.raw, persona });
       const { topicKey, topicName } = topicTarget({ convoId: convoIdForSend, persona, projectCode, dedicated: dedicatedGroup });
-      let threadId = requireTopic(await resolveThreadId({ token, chatId, projectCode, topicKey, topicName }), chatId, convoIdForSend);
+      let threadId = requireTopic(await resolveThreadId({ token, chatId, projectCode, topicKey, topicName, icon: topicIcon }), chatId, convoIdForSend);
       let sendOpts = { ...opts, messageThreadId: threadId };
       let result;
       try {
@@ -1296,7 +1342,7 @@ async function main() {
         if (isTopicGoneError(e instanceof Error ? e.message : String(e))) {
           // Topic vanished → clear cache, RE-CREATE a topic, retry into it.
           dropTopicMapping(chatId, topicKey);
-          threadId = requireTopic(await resolveThreadId({ token, chatId, projectCode, topicKey, topicName, forceCreate: true }), chatId, convoIdForSend);
+          threadId = requireTopic(await resolveThreadId({ token, chatId, projectCode, topicKey, topicName, icon: topicIcon, forceCreate: true }), chatId, convoIdForSend);
           sendOpts = { ...opts, messageThreadId: threadId };
           result = await sendTextToAdmin(token, chatId, message, sendOpts);
         } else { throw e; }

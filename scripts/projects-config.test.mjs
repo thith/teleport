@@ -57,6 +57,40 @@ test('resolveProjectConfig: no entry + no fallback → chatId null (caller fail-
   assert.equal(r.dedicated, false);
 });
 
+test('resolveProjectConfig: entry.code → display code (short alias); roster lookup stays the key', () => {
+  const cfg = { 'digesty-worker': { code: 'd_be', chatId: '-100', roles: {} } };
+  const r = resolveProjectConfig('digesty-worker', { config: cfg, fallbackChatId: '-999' });
+  assert.equal(r.code, 'd_be');
+});
+
+test('resolveProjectConfig: no entry.code → code falls back to the lookup key', () => {
+  const r = resolveProjectConfig('luni', { config: CONFIG, fallbackChatId: '-999' });
+  assert.equal(r.code, 'luni');
+});
+
+test('resolveProjectConfig: blank/non-string code is ignored → falls back to lookup key', () => {
+  const cfg = { x: { code: '   ', chatId: '-100' }, y: { code: 42, chatId: '-100' } };
+  assert.equal(resolveProjectConfig('x', { config: cfg }).code, 'x');
+  assert.equal(resolveProjectConfig('y', { config: cfg }).code, 'y');
+});
+
+test('resolveProjectConfig: no entry → code is the (unmatched) lookup key', () => {
+  const r = resolveProjectConfig('ghost', { config: CONFIG, fallbackChatId: '-999' });
+  assert.equal(r.code, 'ghost');
+});
+
+test('resolveProjectConfig: topicIcon object passed through when present', () => {
+  const cfg = { p: { chatId: '-100', topicIcon: { emoji: '123', color: 7322096 } } };
+  const r = resolveProjectConfig('p', { config: cfg });
+  assert.deepEqual(r.topicIcon, { emoji: '123', color: 7322096 });
+});
+
+test('resolveProjectConfig: topicIcon null when absent or not an object', () => {
+  assert.equal(resolveProjectConfig('luni', { config: CONFIG }).topicIcon, null);
+  const cfg = { p: { chatId: '-100', topicIcon: 'nope' } };
+  assert.equal(resolveProjectConfig('p', { config: cfg }).topicIcon, null);
+});
+
 test('resolveProjectConfig: empty/falsy code never matches a config[""] key', () => {
   const cfg = { '': { chatId: '-1', roles: { '9': 'admin' } } };
   const r = resolveProjectConfig('', { config: cfg, fallbackChatId: '-999' });

@@ -8,6 +8,7 @@ import {
   teamModeForumError,
   topicTarget,
   resolveThreadId,
+  createForumTopic,
   isForumCached,
   cacheForum,
 } from './send-telegram.mjs';
@@ -27,7 +28,7 @@ test('topicTarget: keys by convoId, titles by persona', () => {
     persona: { emoji: '🐷', name: 'Heo' },
     projectCode: 'luni',
   });
-  assert.deepEqual(t, { topicKey: '3039138158370420', topicName: '🐷 Heo · luni' });
+  assert.deepEqual(t, { topicKey: '3039138158370420', topicName: 'Heo 🐷 · luni' });
 });
 
 test('topicTarget: no convoId falls back to projectCode', () => {
@@ -46,12 +47,64 @@ test('topicTarget: no persona falls back to projectCode', () => {
 
 test('topicTarget: dedicated group → persona-only title (no project suffix, RFC 02)', () => {
   const t = topicTarget({ convoId: '99', persona: { emoji: '🐷', name: 'Heo' }, projectCode: 'luni', dedicated: true });
-  assert.deepEqual(t, { topicKey: '99', topicName: '🐷 Heo' });
+  assert.deepEqual(t, { topicKey: '99', topicName: 'Heo 🐷' });
 });
 
 test('topicTarget: shared group → persona + project suffix', () => {
   const t = topicTarget({ convoId: '99', persona: { emoji: '🐷', name: 'Heo' }, projectCode: 'luni', dedicated: false });
-  assert.deepEqual(t, { topicKey: '99', topicName: '🐷 Heo · luni' });
+  assert.deepEqual(t, { topicKey: '99', topicName: 'Heo 🐷 · luni' });
+});
+
+test('topicTarget: persona emoji trails the name (never adjacent to the leading icon)', () => {
+  const t = topicTarget({ convoId: '7', persona: { emoji: '🐷', name: 'Heo' }, projectCode: 'luni', dedicated: true });
+  // emoji is the LAST char; the name comes first so a leading topic icon can't clash.
+  assert.ok(/Heo\s+🐷$/u.test(t.topicName), `expected name-then-emoji, got ${t.topicName}`);
+});
+
+// ---- createForumTopic: icon payload --------------------------------------
+
+test('createForumTopic: adds icon_* fields only when valid; omits otherwise', async () => {
+  const bodies = [];
+  const orig = global.fetch;
+  global.fetch = async (_url, init) => {
+    bodies.push(JSON.parse(init.body));
+    return { ok: true, json: async () => ({ ok: true, result: { message_thread_id: 1 } }) };
+  };
+  try {
+    await createForumTopic('tok', '-100', 'T', { iconEmojiId: '5312016608254762256', iconColor: 7322096 });
+    await createForumTopic('tok', '-100', 'T', { iconEmojiId: '   ' });   // blank → omit
+    await createForumTopic('tok', '-100', 'T', { iconColor: 7.5 });        // non-integer → omit
+    await createForumTopic('tok', '-100', 'T', {});                        // nothing → default
+  } finally {
+    global.fetch = orig;
+  }
+  assert.equal(bodies[0].icon_custom_emoji_id, '5312016608254762256');
+  assert.equal(bodies[0].icon_color, 7322096);
+  assert.equal('icon_custom_emoji_id' in bodies[1], false);
+  assert.equal('icon_color' in bodies[2], false);
+  assert.equal('icon_custom_emoji_id' in bodies[3], false);
+  assert.equal('icon_color' in bodies[3], false);
+});
+
+test('createForumTopic: emoji-only / color-only are independent; non-string emoji omitted', async () => {
+  const bodies = [];
+  const orig = global.fetch;
+  global.fetch = async (_url, init) => {
+    bodies.push(JSON.parse(init.body));
+    return { ok: true, json: async () => ({ ok: true, result: { message_thread_id: 1 } }) };
+  };
+  try {
+    await createForumTopic('tok', '-100', 'T', { iconEmojiId: '5310039132297242441' }); // emoji only
+    await createForumTopic('tok', '-100', 'T', { iconColor: 7322096 });                  // color only
+    await createForumTopic('tok', '-100', 'T', { iconEmojiId: 123456 });                 // non-string → omit
+  } finally {
+    global.fetch = orig;
+  }
+  assert.equal(bodies[0].icon_custom_emoji_id, '5310039132297242441');
+  assert.equal('icon_color' in bodies[0], false);
+  assert.equal(bodies[1].icon_color, 7322096);
+  assert.equal('icon_custom_emoji_id' in bodies[1], false);
+  assert.equal('icon_custom_emoji_id' in bodies[2], false);
 });
 
 // ---- detectForum ---------------------------------------------------------
@@ -128,16 +181,76 @@ test('resolveThreadId: team keys cache by topicKey, creates with topicName', asy
   const fetcher = async (_t, _c, name) => { createdName = name; return { ok: true, messageThreadId: 777 }; };
   const tid = await resolveThreadId({
     token: 'tok', chatId: '-100', projectCode: 'luni',
-    topicKey: '3039138158370420', topicName: '🐷 Heo · luni',
+    topicKey: '3039138158370420', topicName: 'Heo 🐷 · luni',
     topicsFile: file, fetcher,
   });
   assert.equal(tid, 777);
-  assert.equal(createdName, '🐷 Heo · luni');
+  assert.equal(createdName, 'Heo 🐷 · luni');
   // Cached under the convoId key, not the project name.
   const store = readTopicsStore(file);
   assert.equal(getThreadId(store, '-100', '3039138158370420'), 777);
   assert.equal(getThreadId(store, '-100', 'luni'), null);
   fs.unlinkSync(file);
+});
+
+test('resolveThreadId: forwards the topic icon to the create fetcher', async () => {
+  const file = tmpTopics();
+  let gotIcon = null;
+  const fetcher = async (_t, _c, _name, icon) => { gotIcon = icon; return { ok: true, messageThreadId: 321 }; };
+  const tid = await resolveThreadId({
+    token: 'tok', chatId: '-100', projectCode: 'd_be',
+    topicKey: 'k', topicName: 'n',
+    icon: { iconEmojiId: '5312016608254762256', iconColor: 7322096 },
+    topicsFile: file, fetcher,
+  });
+  assert.equal(tid, 321);
+  assert.deepEqual(gotIcon, { iconEmojiId: '5312016608254762256', iconColor: 7322096 });
+  fs.unlinkSync(file);
+});
+
+test('resolveThreadId: icon defaults to {} when omitted (no crash, fetcher gets {})', async () => {
+  const file = tmpTopics();
+  let gotIcon = 'unset';
+  const fetcher = async (_t, _c, _name, icon) => { gotIcon = icon; return { ok: true, messageThreadId: 1 }; };
+  await resolveThreadId({ token: 't', chatId: '-100', projectCode: 'luni', topicKey: 'k', topicName: 'n', topicsFile: file, fetcher });
+  assert.deepEqual(gotIcon, {});
+  fs.unlinkSync(file);
+});
+
+test('resolveThreadId: icon-rejection 400 retries ONCE without the icon (best-effort icon)', async () => {
+  const file = tmpTopics();
+  const iconsSeen = [];
+  let call = 0;
+  const fetcher = async (_t, _c, _name, icon) => {
+    iconsSeen.push(icon);
+    call++;
+    if (call === 1) return { ok: false, status: 400, description: 'ICON_COLOR_INVALID' };
+    return { ok: true, messageThreadId: 555 };
+  };
+  const tid = await resolveThreadId({
+    token: 'tok', chatId: '-100', projectCode: 'd_be',
+    topicKey: 'k', topicName: 'n',
+    icon: { iconEmojiId: 'bad-id', iconColor: 999 },
+    topicsFile: file, fetcher, sleepFn: noSleep,
+  });
+  assert.equal(tid, 555);                                  // topic still created with default icon
+  assert.equal(call, 2);                                   // exactly one extra attempt
+  assert.deepEqual(iconsSeen[0], { iconEmojiId: 'bad-id', iconColor: 999 });
+  assert.deepEqual(iconsSeen[1], {});                      // retry dropped the icon entirely
+  fs.unlinkSync(file);
+});
+
+test('resolveThreadId: a 400 with NO icon sent does NOT trigger an icon-retry', async () => {
+  const file = tmpTopics();
+  let call = 0;
+  const fetcher = async () => { call++; return { ok: false, status: 400, description: 'something else' }; };
+  const tid = await resolveThreadId({
+    token: 'tok', chatId: '-100', projectCode: 'luni', topicKey: 'k', topicName: 'n',
+    topicsFile: file, fetcher, sleepFn: noSleep,
+  });
+  assert.equal(tid, null);
+  assert.equal(call, 1);                                   // no icon was sent → no retry
+  // failed create writes no topics file → nothing to unlink
 });
 
 test('resolveThreadId: default mode still keys by projectCode', async () => {

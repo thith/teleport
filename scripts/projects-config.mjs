@@ -51,24 +51,34 @@ export function readProjectsConfig(file = DEFAULT_PROJECTS_FILE) {
 }
 
 /**
- * Resolve `{ chatId, dedicated, roles }` for a project code.
+ * Resolve `{ chatId, dedicated, roles, code, topicIcon }` for a project.
+ * `lookupKey` is the projects.json key (= `basename(cwd)`); it is NOT shown to
+ * users and is also the roster-harvest target — keep it folder-stable.
  * - `dedicated: true`  → chatId came from projects.json (project's OWN group);
  *   topic titles omit the project suffix.
  * - `dedicated: false` → chatId is the shared catch-all (`fallbackChatId`, may be
  *   null); topic titles include `· <code>` to disambiguate projects in one group.
- * `roles` always comes from the json entry (may be {}).
+ * - `roles` always comes from the json entry (may be {}).
+ * - `code`  → the DISPLAY/canonical project code: entry.code (a short alias, e.g.
+ *   "d_be") when set, else `lookupKey`. Lets a repo folder ("digesty-worker")
+ *   carry a short code without the old `TELE_PROJECT_CODE` env var. Used only for
+ *   display (topic suffix / message prefix), never for lookup/roster.
+ * - `topicIcon` → optional `{ emoji?, color? }` forum-topic icon (or null);
+ *   passed through to createForumTopic. Absent → Telegram's default icon.
  */
-export function resolveProjectConfig(code, { config = {}, fallbackChatId = null } = {}) {
-  const entry = (code && config[code]) || null; // truthy: '' code never matches a config[''] key
+export function resolveProjectConfig(lookupKey, { config = {}, fallbackChatId = null } = {}) {
+  const entry = (lookupKey && config[lookupKey]) || null; // truthy: '' key never matches a config[''] key
   const roles = (entry && entry.roles && typeof entry.roles === 'object') ? entry.roles : {};
+  const code = (entry && typeof entry.code === 'string' && entry.code.trim()) ? entry.code.trim() : lookupKey;
+  const topicIcon = (entry && entry.topicIcon && typeof entry.topicIcon === 'object' && !Array.isArray(entry.topicIcon)) ? entry.topicIcon : null;
   // Trim so a whitespace-only chatId ("   ") is treated as absent, not as a
   // bogus dedicated target that would bypass the empty-adminIds fail-fast.
   const dedicatedChatId = entry?.chatId == null ? '' : String(entry.chatId).trim();
   if (dedicatedChatId) {
-    return { chatId: dedicatedChatId, dedicated: true, roles };
+    return { chatId: dedicatedChatId, dedicated: true, roles, code, topicIcon };
   }
   const fallback = fallbackChatId == null ? '' : String(fallbackChatId).trim();
-  return { chatId: fallback || null, dedicated: false, roles };
+  return { chatId: fallback || null, dedicated: false, roles, code, topicIcon };
 }
 
 /**

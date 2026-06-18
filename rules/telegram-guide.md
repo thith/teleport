@@ -2,7 +2,7 @@
 
 > **Paths:** `teleport/` is a sibling of every project. Agents normally invoke with `cwd = project root` and refer to `../teleport/...`. Before running any Teleport script, verify the shell working directory: if you are not at the project root, either set `workdir` to the project root first or adjust the relative path to the actual `teleport/scripts/...` location. Do not use absolute paths in reusable instructions.
 
-`node ../teleport/scripts/send-telegram.mjs` sends messages/files to admins in `../teleport/.env`. `[PROJECT]` prefix auto-derived from `basename(cwd)` (override via `TELE_PROJECT_CODE`).
+`node ../teleport/scripts/send-telegram.mjs` sends messages/files to admins in `../teleport/.env`. The project is resolved from `basename(cwd)` (= the `projects.json` key); its display label is that entry's `code` field when set (a short alias, e.g. `d_be`), else the key itself. (No env override — the old `TELE_PROJECT_CODE` was removed; configure `code` in `projects.json` instead.)
 
 ## When to use
 - Finished a task while user is away.
@@ -68,7 +68,7 @@ What admin receives (the script injects the `[<project>]` tag plus the persona i
 ⬜ skipped
 ```
 
-- `<project>` is auto-derived from `basename(process.cwd())` (or `TELE_PROJECT_CODE` env). In a **dedicated per-project group** the `[<project>]` prefix is omitted — from both the topic name and the message — since the whole group is that project. `<emoji> <name>` is the **persona** auto-assigned to this convo (a stable emoji+name pair, e.g. `🦄 Kỳ Lân`); `<hashtag>` is the clickable convo hashtag (see encoding below).
+- `<project>` is the `projects.json` entry's `code` (else its key = `basename(process.cwd())`). In a **dedicated per-project group** the `[<project>]` prefix is omitted — from both the topic name and the message — since the whole group is that project; topics are then told apart by the per-project `topicIcon` (a forum-topic icon set on creation). `<emoji> <name>` is the **persona** auto-assigned to this convo (a stable emoji+name pair, e.g. `🦄 Kỳ Lân`); `<hashtag>` is the clickable convo hashtag (see encoding below). (In the **topic title** the persona renders name-first — `Kỳ Lân 🦄` — so its emoji never sits beside the leading `topicIcon`; the in-message tag above stays emoji-first.)
 - **You do NOT type the `[<project>]` prefix, the persona tag, or the `#<hashtag>`** — `send-telegram.mjs` injects all of them and replaces the leading emoji you typed with the persona's. Just type the emoji + topic line as before.
 - **Why the hashtag:** Telegram makes `#<letter><digits>` clickable; admin taps it to filter every message of one convo across multiple concurrent threads. The leading letter is required — Telegram does NOT render pure-numeric `#1234` as clickable (hashtags must contain at least one letter).
 - **convoId encoding:** scheme keeps the hashtag short while remaining clickable:
