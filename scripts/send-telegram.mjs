@@ -206,7 +206,7 @@ export async function postReaction(token, chatId, messageId, emoji = '👍') {
 }
 
 export function parseArgs(argv) {
-  const result = { filePath: null, positional: [], raw: false, plain: false, replyTo: null, react: null, convo: null, gcTopics: false };
+  const result = { filePath: null, positional: [], raw: false, plain: false, replyTo: null, react: null, convo: null, gcTopics: false, closeTopic: false };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === '--convo') {
@@ -244,6 +244,7 @@ export function parseArgs(argv) {
     if (arg === '--raw' || arg === '--md-raw') { result.raw = true; continue; }
     if (arg === '--plain') { result.plain = true; continue; }
     if (arg === '--gc-topics') { result.gcTopics = true; continue; }
+    if (arg === '--close-topic') { result.closeTopic = true; continue; }
     // (mutual exclusion validated after the loop so order doesn't matter)
     if (arg.startsWith('--')) throw new Error(`Unknown flag: ${arg}`);
     result.positional.push(arg);
@@ -992,6 +993,48 @@ export async function gcDeadTopics({ token, chatId, now = Date.now(), ttlMs, clo
 }
 
 /**
+ * Close ONE convo's topic on demand for a single chat (the `--close-topic` flag).
+ * Mirrors the per-item body of gcDeadTopics — re-validate under the lock, then
+ * clear the mapping AND its `_ts` stamp on success — but targets a specific
+ * convoId regardless of idle time. **Never throws** (a network/API failure is
+ * reported via the return value, not an exception, so the caller can keep going
+ * across chats and still set a non-zero exit). Returns `{ status, description? }`:
+ *   - `'closed'` — a topic existed and was closed (mapping + `_ts` cleared)
+ *   - `'absent'` — no topic mapping for this convo in this chat (idempotent no-op)
+ *   - `'failed'` — a topic existed but the close call errored/threw (`description`
+ *     carries the Telegram reason / thrown message for the operator)
+ * `closer`/`topicsFile` injectable for tests.
+ */
+export async function closeConvoTopic({ token, chatId, convoKey, closer = closeForumTopic, topicsFile }) {
+  let threadId;
+  try {
+    threadId = getThreadId(readTopicsStore(topicsFile), chatId, convoKey);
+  } catch {
+    threadId = null;
+  }
+  if (threadId == null) return { status: 'absent' };
+  try {
+    const r = await closer(token, chatId, threadId);
+    if (!r || !r.ok) return { status: 'failed', description: r?.description };
+    // Re-validate under the lock: only clear if the mapping STILL points at the
+    // topic we just closed (a concurrent send could have re-created one). Drop
+    // the `_ts` stamp too so no orphan timestamp lingers (mirror gcDeadTopics).
+    try {
+      updateTopicsStore((s) => {
+        const k = String(chatId);
+        if (s[k] && s[k][convoKey] === threadId) {
+          delete s[k][convoKey];
+          if (s[k]._ts) delete s[k]._ts[convoKey];
+        }
+      }, topicsFile);
+    } catch {}
+    return { status: 'closed' };
+  } catch (e) {
+    return { status: 'failed', description: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+/**
  * Returns { ok, fallback } — `fallback: true` means Telegram rejected our
  * MarkdownV2 parse and we re-sent the chunk as a temporary `.md` document so
  * the admin still receives the content with its markdown source intact
@@ -1199,6 +1242,38 @@ async function main() {
       console.log(`[send-telegram] gc-topics ${chatId}: closed ${closed}/${considered}`);
     }
     console.log(`[send-telegram] gc-topics done: ${totalClosed} closed`);
+    return;
+  }
+
+  // Close ONE specific topic on demand (the topic of `--convo <N>`). Used by the
+  // "Chào và đóng topic" wind-down: after the agent posts its closing summary and
+  // stops its listeners, it closes its own topic. Reversible (closeForumTopic) —
+  // Telegram keeps history and the topic can be reopened. Requires --convo since
+  // the topic is keyed per convoId (topicKey = convoId, RFC 01).
+  if (args.closeTopic) {
+    if (typeof args.convo !== 'number') {
+      console.error('[send-telegram] --close-topic requires --convo <convoId> (topic is keyed per convo)');
+      process.exit(1);
+    }
+    const convoKey = String(args.convo);
+    let closed = 0;
+    let failed = 0;
+    for (const chatId of effectiveAdminIds) {
+      const r = await closeConvoTopic({ token, chatId, convoKey });
+      if (r.status === 'closed') {
+        closed++;
+        console.log(`[send-telegram] close-topic ${chatId}: closed topic for convo ${convoKey}`);
+      } else if (r.status === 'failed') {
+        failed++;
+        console.error(`[send-telegram] close-topic ${chatId}: FAILED for convo ${convoKey}: ${r.description ?? 'unknown error (bot needs "Manage Topics" admin right?)'}`);
+      } else {
+        console.log(`[send-telegram] close-topic ${chatId}: no topic for convo ${convoKey} (skip)`);
+      }
+    }
+    console.log(`[send-telegram] close-topic done: ${closed} closed, ${failed} failed`);
+    // Fail loud: a caller/agent scripting the wind-down must be able to detect a
+    // close that didn't happen (vs the "absent" idempotent no-op, which is ok).
+    if (failed > 0) process.exit(1);
     return;
   }
 

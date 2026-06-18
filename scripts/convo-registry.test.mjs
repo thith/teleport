@@ -291,6 +291,13 @@ test('parseArgs (send-telegram) — --raw and --plain are mutually exclusive', (
   assert.throws(() => parseSendArgs(['--raw', '--plain', 'hi']));
 });
 
+test('parseArgs (send-telegram) — --close-topic flag parses (default false)', () => {
+  assert.strictEqual(parseSendArgs(['hi']).closeTopic, false);
+  const a = parseSendArgs(['--close-topic', '--convo', '7']);
+  assert.strictEqual(a.closeTopic, true);
+  assert.strictEqual(a.convo, 7);
+});
+
 test('injectConvoHash + escapeMarkdownV2 — hashtag survives escape pipeline', () => {
   // Non-raw mode: injectConvoHash returns unescaped prefix, then upstream
   // escapeMarkdownV2 escapes everything including `#`. Telegram's entity scanner
