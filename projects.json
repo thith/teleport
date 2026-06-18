@@ -81,5 +81,19 @@
       "7574369337": { "role": "member", "username": "doanphlinh", "title": "chị", "name": "Linh", "position": "marketing" },
       "6167404371": { "role": "member", "username": "Duyenngmy", "title": "chị", "name": "Duyên", "position": "PM" }
     }
+  },
+  "digesty-hub": {
+    "code": "d_hub",
+    "chatId": "-1004470275584",
+    "topicIcon": { "emoji": "5350481781306958339" },
+    "roles": {
+      "144242180": { "role": "admin", "username": "mangcut", "title": "anh", "name": "Thi", "position": "founder" },
+      "462349070": { "role": "member", "username": "Millie_Braze", "title": "chị", "name": "Hà", "position": "designer" },
+      "@ultoxtung": { "role": "dev", "username": "ultoxtung", "title": "anh", "name": "TùngBé", "position": "dev" },
+      "@mikeducc": { "role": "dev", "username": "mikeducc", "title": "anh", "name": "Mike", "position": "dev" },
+      "@tungnpt": { "role": "maintainer", "username": "tungnpt", "title": "anh", "name": "TùngTee", "position": "reviewer" },
+      "7574369337": { "role": "member", "username": "doanphlinh", "title": "chị", "name": "Linh", "position": "marketing" },
+      "6167404371": { "role": "member", "username": "Duyenngmy", "title": "chị", "name": "Duyên", "position": "PM" }
+    }
   }
 }

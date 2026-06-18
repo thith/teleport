@@ -10,7 +10,7 @@
 
 **MUST NOT send a local file path/link as text** (e.g. `specs/26-foo.md`, `/Users/.../report.md`, `tmp/foo.html`, a `[file](path)` markdown link) — the recipient cannot open it on their phone. When you want to share the **contents** of a local file (`.md`, `.html`, spec/RFC/doc/report), attach it with `node ../teleport/scripts/send-telegram.mjs --file <path> "<caption>"` so it arrives as a downloadable document. **This applies to `.html` exactly like `.md`: attach the `.html` file, never paste its path/link.** A bare repo-relative path is fine only as a *reference label* inside prose the recipient already has ("updated `specs/26-foo.md`"), never as the delivery mechanism for content they're meant to read.
 
-**Non-technical recipients can't read Markdown — prefer HTML.** When the audience is a non-dev (e.g. marketing/design team), don't attach raw `.md`; render it to a self-contained `.html` first, then attach the `.html`. (In the `luni` project: `pnpm mkt:html` → `tmp/marketing-html/*.html`, then `--file <that.html>`.) Same delivery rule — attach the file, never the path.
+**For file documents, attach `.html` by default — see the canonical rule below** ("Định dạng FILE tài liệu: mặc định HTML"). Render với `node ../teleport/scripts/md-to-html.mjs <file>` → `tmp/tele-html/*.html`, rồi `--file <that.html>`. Áp dụng mọi người nhận & mọi dự án; ai cần `.md` thì yêu cầu explicit.
 
 ## Spawning a new agent instance (RFC 03)
 
@@ -109,7 +109,24 @@ Attachment:
 node ../teleport/scripts/send-telegram.mjs --file <path> "caption"
 ```
 
-**Auto fallbacks:**
+### Định dạng FILE tài liệu: mặc định HTML (mọi dự án, mọi người nhận)
+
+Khi **chủ động gửi một file tài liệu** (spec / RFC / strategy / content có format/bảng…) cho người nhận qua Telegram, **mặc định build sang `.html` và đính kèm bản `.html`** — áp dụng **mọi người nhận (kể cả dev) và mọi dự án**.
+
+- **Vì sao:** trên Telegram, `.md` hiển thị thô (bảng vỡ, khó đọc) với *mọi* người; `.html` self-contained mở đẹp ngay trên điện thoại. Markdown vẫn là **source of truth trong repo** — dev ngồi máy tự lấy `.md` từ repo, không cần nhận `.md` qua Telegram.
+- **Build (chạy ở repo, theo cwd):**
+  ```bash
+  node ../teleport/scripts/md-to-html.mjs <file.md|dir...>   # không tham số: build mọi .md trong repo (cwd), skip tmp/node_modules/.git
+  ```
+  → `tmp/tele-html/<…>.html` (artifact, **gitignore — không commit**). Rồi `send-telegram.mjs --file <…>.html`.
+- **Ngoại lệ:** người nhận muốn `.md` thì phải **yêu cầu rõ ràng**; khi đó mới gửi `.md` (`--file x.md` hoặc dán nội dung `--plain`).
+- **KHÔNG có `docType`/cấu hình per-user.** Mặc định html cho mọi người; ai cần md thì nói explicit trong chat. (Đơn giản, đỡ một lớp config.)
+- **Phạm vi:** quy ước này chỉ cho **FILE tài liệu *có format*** (spec/RFC/strategy/content có heading/bảng). Ba thứ KHÁC, KHÔNG áp html:
+  - Tin nhắn ngắn / report vài dòng inline → text thường như trên.
+  - **Raw log / debug artifact / dump** (text thô không format) → đính kèm nguyên định dạng gốc (`.md`/`.txt`/`.log`), trừ khi người nhận xin html.
+  - **Auto-fallback** bên dưới (text quá dài / parse lỗi) → vẫn `.md` (text/log thô cứu hộ).
+
+**Auto fallbacks** (cơ chế nội bộ send-telegram — giữ `.md`, KHÔNG html-hoá):
 - Message > 4000 chars → sent as one `.md` file (never split into multiple messages).
 - MarkdownV2 parse reject → resent as `.md` attachment with first line as caption.
 
