@@ -54,15 +54,17 @@ export function readProjectsConfig(file = DEFAULT_PROJECTS_FILE) {
  * Resolve `{ chatId, dedicated, roles, code, topicIcon }` for a project.
  * `lookupKey` is the projects.json key (= `basename(cwd)`); it is NOT shown to
  * users and is also the roster-harvest target — keep it folder-stable.
- * - `dedicated: true`  → chatId came from projects.json (project's OWN group);
- *   topic titles omit the project suffix.
+ * - `dedicated: true`  → chatId came from projects.json (project's OWN group,
+ *   in practice often shared by several dedicated projects); topic titles lead
+ *   with a `<code> · ` prefix to disambiguate them.
  * - `dedicated: false` → chatId is the shared catch-all (`fallbackChatId`, may be
- *   null); topic titles include `· <code>` to disambiguate projects in one group.
+ *   null; typically a DM); topic titles are persona-only and the project is
+ *   carried by the per-message `[<code>]` prefix instead.
  * - `roles` always comes from the json entry (may be {}).
  * - `code`  → the DISPLAY/canonical project code: entry.code (a short alias, e.g.
  *   "d_be") when set, else `lookupKey`. Lets a repo folder ("digesty-worker")
  *   carry a short code without the old `TELE_PROJECT_CODE` env var. Used only for
- *   display (topic suffix / message prefix), never for lookup/roster.
+ *   display (topic title prefix / message prefix), never for lookup/roster.
  * - `topicIcon` → optional `{ emoji?, color? }` forum-topic icon (or null);
  *   passed through to createForumTopic. Absent → Telegram's default icon.
  */

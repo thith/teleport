@@ -834,19 +834,26 @@ export function teamModeForumError(chatId) {
 
 /**
  * Compute `{ topicKey, topicName }` for resolveThreadId — one forum topic per
- * convo, keyed by convoId. Title = persona; the `· <project>` suffix is added
- * ONLY in a SHARED group (`dedicated: false`) to disambiguate projects that
- * coexist there. In a project's OWN group (`dedicated: true`) the suffix is
- * redundant, so the title is persona-only ("Heo 🐷") (RFC 02). Falls back to
- * projectCode only at the edge where convoId/persona can't be resolved.
+ * convo, keyed by convoId. A `<project> · ` PREFIX is added ONLY for a project
+ * with its own `projects.json` entry (`dedicated: true`): in practice several
+ * such projects share one physical forum group (same `chatId`), so the code at
+ * the scannable left edge disambiguates them — topics of the same project then
+ * cluster together in the topic list ("luni · 🐷 Heo"). The env catch-all
+ * (`dedicated: false`) is typically a DM with no forum topics, so the title is
+ * persona-only ("Heo 🐷") and the per-message `[<code>]` prefix carries the
+ * project instead (RFC 02). Falls back to projectCode only at the edge where
+ * convoId/persona can't be resolved.
  *
- * The persona emoji goes AFTER the name ("Heo 🐷", not "🐷 Heo") so it never sits
- * adjacent to the topic's leading icon emoji (the per-project `topicIcon`), which
- * Telegram renders just before the title — otherwise the two emojis would clash.
+ * Code-first also keeps the persona emoji away from the topic's leading icon
+ * emoji (the per-project `topicIcon` Telegram renders before the title): the
+ * leading glyph is the code text, so the two emojis never sit adjacent.
  */
 export function topicTarget({ convoId, persona, projectCode, dedicated = false }) {
   if (convoId != null && persona) {
-    const title = dedicated ? `${persona.name} ${persona.emoji}` : `${persona.name} ${persona.emoji} · ${projectCode}`;
+    // Guard `projectCode`: dedicated-but-empty (shouldn't happen in current
+    // wiring, but topicTarget is exported) degrades to the persona-only form
+    // rather than emitting an orphan " · " prefix.
+    const title = dedicated && projectCode ? `${projectCode} · ${persona.emoji} ${persona.name}` : `${persona.name} ${persona.emoji}`;
     return { topicKey: String(convoId), topicName: title };
   }
   return { topicKey: projectCode, topicName: projectCode };
@@ -878,8 +885,9 @@ function isPermanentNoTopicError(res) {
 
 export async function resolveThreadId({ token, chatId, projectCode, topicKey = projectCode, topicName = projectCode, icon = {}, nowFn = Date.now, topicsFile, fetcher = createForumTopic, forceCreate = false, sleepFn = defaultSleep }) {
   // `topicKey` is the topics-store cache key, `topicName` the forum-topic
-  // title. Normally topicKey = convoId and topicName = persona title
-  // ("Heo 🐷 · luni"), giving each convo its own topic (RFC 01). The
+  // title. Normally topicKey = convoId and topicName = the title from
+  // topicTarget ("luni · 🐷 Heo" dedicated, "Heo 🐷" catch-all), giving each
+  // convo its own topic (RFC 01). The
   // projectCode default only applies at the edge where convo/persona can't be
   // resolved (see topicTarget) so a send never crashes.
   if (topicKey == null || String(topicKey).startsWith('_')) return null;

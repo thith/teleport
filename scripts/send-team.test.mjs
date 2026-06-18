@@ -22,13 +22,13 @@ function tmpTopics() {
 
 // ---- topicTarget ---------------------------------------------------------
 
-test('topicTarget: keys by convoId, titles by persona', () => {
+test('topicTarget: keys by convoId, titles by persona (default catch-all → persona-only)', () => {
   const t = topicTarget({
     convoId: '3039138158370420',
     persona: { emoji: '🐷', name: 'Heo' },
     projectCode: 'luni',
   });
-  assert.deepEqual(t, { topicKey: '3039138158370420', topicName: 'Heo 🐷 · luni' });
+  assert.deepEqual(t, { topicKey: '3039138158370420', topicName: 'Heo 🐷' });
 });
 
 test('topicTarget: no convoId falls back to projectCode', () => {
@@ -45,20 +45,26 @@ test('topicTarget: no persona falls back to projectCode', () => {
   );
 });
 
-test('topicTarget: dedicated group → persona-only title (no project suffix, RFC 02)', () => {
+test('topicTarget: dedicated group → code-first prefix to disambiguate shared group (RFC 02)', () => {
   const t = topicTarget({ convoId: '99', persona: { emoji: '🐷', name: 'Heo' }, projectCode: 'luni', dedicated: true });
+  assert.deepEqual(t, { topicKey: '99', topicName: 'luni · 🐷 Heo' });
+});
+
+test('topicTarget: dedicated but empty projectCode → degrades to persona-only (no orphan " · ")', () => {
+  const t = topicTarget({ convoId: '99', persona: { emoji: '🐷', name: 'Heo' }, projectCode: '', dedicated: true });
   assert.deepEqual(t, { topicKey: '99', topicName: 'Heo 🐷' });
 });
 
-test('topicTarget: shared group → persona + project suffix', () => {
+test('topicTarget: catch-all (non-dedicated) → persona-only title', () => {
   const t = topicTarget({ convoId: '99', persona: { emoji: '🐷', name: 'Heo' }, projectCode: 'luni', dedicated: false });
-  assert.deepEqual(t, { topicKey: '99', topicName: 'Heo 🐷 · luni' });
+  assert.deepEqual(t, { topicKey: '99', topicName: 'Heo 🐷' });
 });
 
-test('topicTarget: persona emoji trails the name (never adjacent to the leading icon)', () => {
+test('topicTarget: dedicated title leads with code text, not an emoji (never adjacent to the leading icon)', () => {
   const t = topicTarget({ convoId: '7', persona: { emoji: '🐷', name: 'Heo' }, projectCode: 'luni', dedicated: true });
-  // emoji is the LAST char; the name comes first so a leading topic icon can't clash.
-  assert.ok(/Heo\s+🐷$/u.test(t.topicName), `expected name-then-emoji, got ${t.topicName}`);
+  // leading glyph is the code text, so the persona emoji can't clash with a leading topic icon.
+  assert.ok(t.topicName.startsWith('luni · '), `expected code-first title, got ${t.topicName}`);
+  assert.ok(/🐷 Heo$/u.test(t.topicName), `expected persona unit "🐷 Heo" at the end, got ${t.topicName}`);
 });
 
 // ---- createForumTopic: icon payload --------------------------------------
@@ -181,11 +187,11 @@ test('resolveThreadId: team keys cache by topicKey, creates with topicName', asy
   const fetcher = async (_t, _c, name) => { createdName = name; return { ok: true, messageThreadId: 777 }; };
   const tid = await resolveThreadId({
     token: 'tok', chatId: '-100', projectCode: 'luni',
-    topicKey: '3039138158370420', topicName: 'Heo 🐷 · luni',
+    topicKey: '3039138158370420', topicName: 'luni · 🐷 Heo',
     topicsFile: file, fetcher,
   });
   assert.equal(tid, 777);
-  assert.equal(createdName, 'Heo 🐷 · luni');
+  assert.equal(createdName, 'luni · 🐷 Heo');
   // Cached under the convoId key, not the project name.
   const store = readTopicsStore(file);
   assert.equal(getThreadId(store, '-100', '3039138158370420'), 777);
