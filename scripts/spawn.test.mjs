@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { buildSpawnPlan, genSessionSeed, runSpawn, hasBinary, screenSessionExists, normalizeSessionName, parseScreenSessions, listSpawnSessions, resolveKillId, resolveAttachId, SPAWN_PROMPT, personaByHashtag } from './spawn.mjs';
+import { buildSpawnPlan, genSessionSeed, runSpawn, hasBinary, screenSessionExists, normalizeSessionName, parseScreenSessions, listSpawnSessions, resolveKillId, resolveAttachId, SPAWN_PROMPT, personaByHashtag, gracefulKill, KILL_GRACE_MS } from './spawn.mjs';
 import { uuidToConvoInt } from './convo-registry.mjs';
 import { shortConvoHash } from './convo-hash.mjs';
 import { personaForConvo } from './persona.mjs';
@@ -212,4 +212,63 @@ test('personaByHashtag: empty/garbage store → empty map (no throw)', () => {
   assert.deepEqual(personaByHashtag(null), {});
   assert.deepEqual(personaByHashtag({ '-1': null }), {});
   assert.deepEqual(personaByHashtag({ '-1': ['a', 'b'] }), {}); // array entry skipped
+});
+
+// gracefulKill: /exit first, poll up to graceMs, force-quit if stubborn.
+test('gracefulKill: session exits after /exit → method "exit", no quit sent', async () => {
+  const calls = [];
+  const exec = (bin, args) => { calls.push(args.slice(-2).join(' ')); };
+  let polls = 0;
+  // present for the first poll, gone on the second (claude /exit landed)
+  const sessionExists = () => (++polls < 2);
+  const r = await gracefulKill('tele-x', { exec, sleep: async () => {}, sessionExists, pollMs: 500, graceMs: 10000 });
+  assert.deepEqual(r, { method: 'exit', killed: true });
+  assert.ok(calls.some((c) => c.includes('stuff')));      // /exit was sent
+  assert.ok(!calls.some((c) => c === 'X quit'));          // quit NOT needed
+});
+
+test('gracefulKill: stubborn session → force quit after grace, killed once gone', async () => {
+  const sent = [];
+  const exec = (bin, args) => { sent.push(args.join(' ')); };
+  // Always present during polling; gone only AFTER quit is issued.
+  let quit = false;
+  const sessionExists = () => !quit;
+  const exec2 = (bin, args) => { sent.push(args.join(' ')); if (args.includes('quit')) quit = true; };
+  let sleeps = 0;
+  const r = await gracefulKill('tele-y', { exec: exec2, sleep: async () => { sleeps++; }, sessionExists, pollMs: 500, graceMs: 1000 });
+  assert.equal(r.method, 'quit');
+  assert.equal(r.killed, true);
+  assert.ok(sent.some((c) => c.includes('stuff /exit')));  // tried graceful first
+  assert.ok(sent.some((c) => c.includes('-X quit')));      // then forced
+  assert.ok(sleeps >= 2, 'poll loop must actually run (not skipped) before force-quit');
+});
+
+test('gracefulKill: force quit fails (still listed) → killed:false', async () => {
+  const sessionExists = () => true; // never disappears, even after quit
+  const r = await gracefulKill('tele-z', { exec: () => {}, sleep: async () => {}, sessionExists, pollMs: 500, graceMs: 1000 });
+  assert.deepEqual(r, { method: 'quit', killed: false });
+});
+
+test('gracefulKill: stuff throwing (undeliverable) → SKIP 10s poll, go straight to quit', async () => {
+  let quitCalled = false;
+  let sleeps = 0;
+  const exec = (bin, args) => {
+    if (args.includes('stuff')) throw new Error('screen busy');
+    if (args.includes('quit')) quitCalled = true;
+  };
+  const sessionExists = () => !quitCalled;
+  const r = await gracefulKill('tele-w', { exec, sleep: async () => { sleeps++; }, sessionExists, pollMs: 500, graceMs: 10000 });
+  assert.equal(quitCalled, true);
+  assert.equal(r.method, 'quit');   // undeliverable /exit must NOT be reported as a graceful exit
+  assert.equal(r.killed, true);
+  // Undeliverable /exit must NOT poll the full grace — only the first post-quit
+  // verify sleep should run (not the ~20 poll-loop sleeps).
+  assert.equal(sleeps, 1);
+});
+
+test('gracefulKill: already-gone session returns instantly (no pre-check sleep)', async () => {
+  let sleeps = 0;
+  const r = await gracefulKill('tele-gone', { exec: () => {}, sleep: async () => { sleeps++; }, sessionExists: () => false, pollMs: 500, graceMs: 10000 });
+  assert.deepEqual(r, { method: 'exit', killed: true });
+  assert.equal(sleeps, 0); // checked before sleeping → zero delay
 });

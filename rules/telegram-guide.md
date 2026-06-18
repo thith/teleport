@@ -42,7 +42,12 @@ When the user asks to **spawn / start / launch** a Claude agent — e.g. "spawn 
   the current terminal — don't run it from inside an agent's own automated flow.
 - **"kill / stop agent <id>"** → `node ../teleport/scripts/spawn.mjs --kill <id>` — `<id>` may be the bare hashtag
   (`d1331668`), the Telegram form (`#d1331668`), or the full name (`tele-d1331668`); it's
-  normalized then killed (verifies the session is gone). Headless agents need no teardown.
+  normalized then **gracefully** torn down: the helper types the agent's own `/exit`
+  (clean CLI quit, flushes session — softer than a SIGHUP), waits up to **10s**, and only
+  force-`quit`s if it's still "bướng" (e.g. busy mid-loop so `/exit` never reached an idle
+  prompt). Verifies the session is gone. Headless agents need no teardown. **Lưu ý timing:**
+  `/exit` chỉ ăn khi claude đang ở REPL idle — muốn chắc graceful, bảo agent *"chào và đóng
+  topic"* trước (nó stop listeners → về prompt), rồi mới `--kill`.
 
 The helper takes NO task argument (prompt is hard-coded); the user assigns work via Telegram
 after the new agent greets.

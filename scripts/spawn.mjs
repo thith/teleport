@@ -196,6 +196,59 @@ export function personaByHashtag(store = readTopicsStore()) {
   return map;
 }
 
+export const KILL_GRACE_MS = 10_000;
+
+/**
+ * Graceful teardown of an interactive (screen) agent: first ask claude to quit
+ * cleanly via its own `/exit`, wait up to `graceMs`, and only force-`quit` if it's
+ * still "stubborn".
+ *
+ * The `/exit` is typed via `screen -X stuff`, which injects the keystrokes
+ * wherever claude's input cursor currently is — it is NOT conditionally delivered
+ * only to an idle prompt. If claude is at the REPL it exits cleanly (softer than
+ * the SIGHUP of `screen -X quit`); if it's mid-task the keys buffer (or land in a
+ * sub-prompt) and `/exit` may not take effect — which is exactly why we wait then
+ * force-`quit`. So `/exit` is best-effort, the hard quit is the guarantee.
+ *
+ * Returns `{ method, killed }`:
+ * - `method: 'exit'` — gone on its own within grace (attributed to `/exit`).
+ * - `method: 'quit'` — needed the hard fallback; `killed` = whether it's gone.
+ * `exec`/`sleep`/`sessionExists` injectable for tests (no real screen / clock).
+ */
+export async function gracefulKill(name, {
+  exec = execFileSync,
+  sleep = sleepMs,
+  sessionExists = (n) => screenSessionExists(n, exec),
+  graceMs = KILL_GRACE_MS,
+  pollMs = 500,
+} = {}) {
+  // 1. Polite: type "/exit\r" into the REPL (CR = Enter; passed as one argv
+  //    element via execFileSync, no shell, so the literal CR is safe). If it
+  //    can't even be DELIVERED (screen unreachable), there's nothing to wait for
+  //    → skip the grace poll, go straight to the hard quit (don't hang 10s).
+  let politeSent = false;
+  try { exec('screen', ['-S', name, '-X', 'stuff', '/exit\r'], { stdio: 'ignore' }); politeSent = true; } catch { /* skip poll */ }
+  // 2. Poll for it to disappear on its own, up to graceMs. Check BEFORE sleeping
+  //    (already-gone returns with no delay), and clamp the sleep so a pollMs that
+  //    doesn't divide graceMs can't overshoot the grace window.
+  if (politeSent) {
+    for (let waited = 0; waited < graceMs; waited += pollMs) {
+      if (!sessionExists(name)) return { method: 'exit', killed: true };
+      await sleep(Math.min(pollMs, graceMs - waited));
+    }
+    if (!sessionExists(name)) return { method: 'exit', killed: true }; // final check at t=graceMs
+  }
+  // 3. Still there (or polite undelivered) → hard quit (SIGHUP teardown), then
+  //    re-verify a few times: a loaded box can take >300ms to reap the session,
+  //    and a single check would false-report killed:false.
+  try { exec('screen', ['-S', name, '-X', 'quit'], { stdio: 'ignore' }); } catch { /* re-check decides */ }
+  for (let i = 0; i < 3; i++) {
+    await sleep(300);
+    if (!sessionExists(name)) return { method: 'quit', killed: true };
+  }
+  return { method: 'quit', killed: false };
+}
+
 /**
  * Resolve the `--kill <id>` target from argv. Pure → unit-testable.
  * Returns `{ found, raw }`: `found` = a --kill/--quit flag is present; `raw` = the
@@ -275,15 +328,16 @@ if (isDirectRun) {
       console.error(`[spawn] no screen session "${name}" (try: pnpm spawn:ls).`);
       process.exit(1);
     }
-    // `screen -X quit` can exit non-zero (race, perms) → don't let it throw a stack
-    // trace; the re-check below is the source of truth (kill verified by absence).
-    try { execFileSync('screen', ['-S', name, '-X', 'quit'], { stdio: 'ignore' }); } catch { /* re-check decides */ }
-    await sleepMs(300); // settle, then verify it's gone
-    if (screenSessionExists(name)) {
+    // Graceful: try claude's own /exit first, wait up to 10s, force-quit if stubborn.
+    console.log(`[spawn] sending /exit to "${name}", waiting up to ${KILL_GRACE_MS / 1000}s…`);
+    const r = await gracefulKill(name);
+    if (!r.killed) {
       console.error(`[spawn] FAILED to kill "${name}" (still listed). Try: screen -S ${name} -X quit`);
       process.exit(1);
     }
-    console.log(`[spawn] killed agent session "${name}".`);
+    console.log(r.method === 'exit'
+      ? `[spawn] "${name}" exited gracefully (/exit).`
+      : `[spawn] "${name}" didn't exit in ${KILL_GRACE_MS / 1000}s — force-killed.`);
     process.exit(0);
   }
 
