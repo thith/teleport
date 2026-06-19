@@ -85,6 +85,10 @@ After sending any Telegram message, you **MUST immediately** start the reply-lis
 ## Spawn agent instances
 
 **WHENEVER** the user asks to spawn / start / launch a Claude agent — e.g. "spawn Claude", "start an agent", "launch a Claude", "... headless" — **or any similar phrasing in any language** (Vietnamese e.g. "chạy một Claude", "khởi động một agent", "chạy Claude headless") — you **MUST** read `../teleport/rules/telegram-guide.md` section "Spawning a new agent instance" and follow it. Do **NOT** rely on invocation details from this snippet; the guide is the single source of truth.
+
+## Handover to another topic/agent
+
+**WHENEVER** the user asks to **hand over / hand off** the current work to another topic or agent — e.g. "handover cho Tuộc", "bàn giao cho …", "chuyển việc sang topic khác", "handover sang topic mới" — **or any similar phrasing in any language** — you **MUST** read `../teleport/rules/telegram-guide.md` section "Handover sang convo/topic khác" and follow it. Teleport performs the handover for you via `handover.mjs` — do **NOT** improvise (do **NOT** just write a file and ask the user to send it manually, and do **NOT** spawn a new agent yourself). Use `--to <persona|#hashtag|convoId>` to hand to an **existing** live topic; use `--new` **only** when a brand-new topic is explicitly wanted. The guide is the single source of truth.
 ````
 
 #### Per-project setup for spawn

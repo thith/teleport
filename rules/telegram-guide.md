@@ -12,11 +12,11 @@
 
 **For file documents, attach `.html` by default — see the canonical rule below** ("Định dạng FILE tài liệu: mặc định HTML"). Render với `node ../teleport/scripts/md-to-html.mjs <file>` → `tmp/tele-html/*.html`, rồi `--file <that.html>`. Áp dụng mọi người nhận & mọi dự án; ai cần `.md` thì yêu cầu explicit.
 
-## Spawning a new agent instance (RFC 03)
+## Spawning a new agent instance
 
 When the user asks to **spawn / start / launch** a Claude agent — e.g. "spawn Claude", "start an agent", "launch a Claude", "... headless" — **or any similar phrasing in any language** (Vietnamese e.g. "chạy một Claude", "khởi động một agent", "bật agent mới", "khởi động một agent", "chạy Claude headless") — run the spawn helper from the **project root** so the new instance inherits this project's group. **For a spawn request, when the user just says "agent" without naming a tool (e.g. "bật agent mới", "start an agent"), default to spawning Claude.**
 
-> **Always call `spawn.mjs` directly — run it from the project root.** It resolves the target Telegram group from its **cwd** (RFC 02), so it must run where the project's `package.json` lives; that single command works in **every** project with no per-project setup:
+> **Always call `spawn.mjs` directly — run it from the project root.** It resolves the target Telegram group from its **cwd**, so it must run where the project's `package.json` lives; that single command works in **every** project with no per-project setup:
 > ```bash
 > node ../teleport/scripts/spawn.mjs [--interactive | --list | --attach <id> | --kill <id>]
 > ```
@@ -52,7 +52,7 @@ When the user asks to **spawn / start / launch** a Claude agent — e.g. "spawn 
 The helper takes NO task argument (prompt is hard-coded); the user assigns work via Telegram
 after the new agent greets.
 
-## Handover sang convo/topic khác (RFC 05)
+## Handover sang convo/topic khác
 
 Khi user nói **"handover cho &lt;target&gt;"** (hoặc "bàn giao cho …", "chuyển việc sang …",
 "handover sang topic mới") → bàn giao việc đang làm sang một topic khác qua
@@ -252,7 +252,7 @@ After starting `--wait-once`:
 When the listener writes `prompt ready: <path>`, parse that file as JSON:
 - `text`, `messageId`, `chatId`, `fromUserId`, `fromName`, `fromRole`, `fromMember`, `replyToMessageId`, `replyToText`, `quotedText`, `convoId`, `persona`, `attachments[]`.
 - `persona` is **your own** identity on Telegram: `{ emoji, name, index }` (e.g. `{ emoji: "🐷", name: "Heo", index: 16 }`), derived deterministically from `convoId`. **This is the name you answer to.** Use it to (1) **self-identify** in your prose ("Heo đây — đã xong X"), and (2) **recognize when a human is addressing YOU** by name: a message in which your **full `name` appears as a standalone token** — whitespace/`@`/punctuation-delimited (`"Heo ơi…"`, `"@Heo"`, `"nhờ Heo nhé"`) — is meant for you. A different persona name means it's for another agent (treat like a misrouted reply — see the relevance check below).
-  - **MUST match the FULL name, never a substring.** Names may be one or two words (`"Cá Heo"`, `"Sư Tử"`), and several form substring pairs: `🐬 Cá Heo` ⊃ `🐷 Heo`, `🦝 Mèo Rừng` ⊃ `🐱 Mèo`, `🐢 Rùa` ⊂ `🐞 Bọ Rùa`. So `"Cá Heo ơi…"` is for 🐬 Cá Heo and **NOT** for 🐷 Heo; conversely `"Heo ơi…"` is for 🐷 Heo and **NOT** for 🐬 Cá Heo. When two persona names could both appear, prefer the **longest** full-name match. Routing itself is still structural (by `message_thread_id`, per RFC 01) — this rule only governs whether a name *mentioned inside your own topic* is addressing you.
+  - **MUST match the FULL name, never a substring.** Names may be one or two words (`"Cá Heo"`, `"Sư Tử"`), and several form substring pairs: `🐬 Cá Heo` ⊃ `🐷 Heo`, `🦝 Mèo Rừng` ⊃ `🐱 Mèo`, `🐢 Rùa` ⊂ `🐞 Bọ Rùa`. So `"Cá Heo ơi…"` is for 🐬 Cá Heo and **NOT** for 🐷 Heo; conversely `"Heo ơi…"` is for 🐷 Heo and **NOT** for 🐬 Cá Heo. When two persona names could both appear, prefer the **longest** full-name match. Routing itself is still structural (by `message_thread_id`) — this rule only governs whether a name *mentioned inside your own topic* is addressing you.
   - `persona` is absent only when `convoId` couldn't be resolved.
   - **Persona is a label, not a character.** The emoji+name exist purely to **distinguish and address** agents (so a team can say "Heo" instead of a numeric convoId). It does **NOT** define or influence your personality, tone, or working style — being 🐷 Heo doesn't make you behave "like a pig", and 🦁 Sư Tử isn't more assertive. Self-identify with the name; don't role-play it.
   - **Sibling agents (other personas).** You are usually NOT the only agent running — several agents may work in parallel, each with a **distinct animal persona** from the 40-pair pool (`PERSONA_POOL` in `scripts/persona.mjs`). Humans live in `projects.json` (`[code].roles`); agents are the animals. The two sets are disjoint, so:
