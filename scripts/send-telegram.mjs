@@ -37,7 +37,8 @@ import {
   updatePendingStore,
 } from './pending-store.mjs';
 import { CONVO_HASH_LONG_LEN, shortConvoHash as _shortConvoHash } from './convo-hash.mjs';
-import { personaForConvo, formatPersona } from './persona.mjs';
+import { formatPersona } from './persona.mjs';
+import { resolvePersonaInGroup, peekPersona } from './persona-store.mjs';
 import { readProjectsConfig, resolveProjectConfig, adminIdsFrom } from './projects-config.mjs';
 
 // Re-export so existing imports of `shortConvoHash` from send-telegram keep
@@ -1005,6 +1006,35 @@ export async function closeForumTopic(token, chatId, messageThreadId) {
   return { ok: res.ok && body?.ok === true, description: body?.description };
 }
 
+// Marker prefixed/suffixed onto a topic's title when it is wound down, so a
+// CLOSED topic stays visually distinct from a fresh OPEN one that may reuse the
+// same persona name (RFC 01, ext). 🔒 = "đã đóng".
+export const CLOSED_TOPIC_MARK = '🔒';
+export function closedTopicTitle(persona) {
+  const name = persona?.name ?? 'topic';
+  return `${CLOSED_TOPIC_MARK} ${name} (đã đóng)`;
+}
+
+/**
+ * Rename a forum topic (Telegram editForumTopic). Used by the wind-down to add
+ * the closed marker. `name` ≤ 128 chars (Telegram limit). Returns `{ ok }`;
+ * never throws (caller treats a rename failure as non-fatal — the close still
+ * proceeds). Passing only the name keeps the topic's existing icon.
+ */
+export async function editForumTopic(token, chatId, messageThreadId, name) {
+  try {
+    const res = await fetch(`${TELEGRAM_API}${token}/editForumTopic`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: chatId, message_thread_id: messageThreadId, name: String(name).slice(0, 128) }),
+    });
+    const body = await res.json().catch(() => ({}));
+    return { ok: res.ok && body?.ok === true, description: body?.description };
+  } catch (e) {
+    return { ok: false, description: e instanceof Error ? e.message : String(e) };
+  }
+}
+
 /**
  * Select convo→topic mappings considered dead for GC, using the DURABLE
  * last-use timestamp (`entry._ts[convoKey]`). A topic is dead iff it HAS a
@@ -1033,7 +1063,7 @@ export function selectDeadConvoTopics(store, chatId, now, ttlMs) {
  * an idle convo's topic is never closed mid-task. `closer`/`topicsFile`
  * injectable. Staleness is by durable last-use (`_ts`) vs `now`/`ttlMs`.
  */
-export async function gcDeadTopics({ token, chatId, now = Date.now(), ttlMs, closer = closeForumTopic, topicsFile }) {
+export async function gcDeadTopics({ token, chatId, now = Date.now(), ttlMs, closer = closeForumTopic, renamer = editForumTopic, topicsFile }) {
   const store = readTopicsStore(topicsFile);
   const dead = selectDeadConvoTopics(store, chatId, now, ttlMs);
   let closed = 0;
@@ -1046,6 +1076,13 @@ export async function gcDeadTopics({ token, chatId, now = Date.now(), ttlMs, clo
       const cur = readTopicsStore(topicsFile)[String(chatId)];
       const curTs = cur?._ts?.[convoKey];
       if (cur?.[convoKey] !== threadId || typeof curTs !== 'number' || now - curTs <= ttlMs) continue;
+      // Mark with the closed marker before closing (same rationale as the on-
+      // demand wind-down) so a GC'd topic stays distinct from a future reuse of
+      // its freed persona name. Best-effort — rename failure doesn't block GC.
+      try {
+        const persona = peekPersona(convoKey, undefined);
+        if (persona) await renamer(token, chatId, threadId, closedTopicTitle(persona));
+      } catch { /* non-fatal */ }
       const r = await closer(token, chatId, threadId);
       if (r && r.ok) {
         closed++;
@@ -1080,7 +1117,7 @@ export async function gcDeadTopics({ token, chatId, now = Date.now(), ttlMs, clo
  *     carries the Telegram reason / thrown message for the operator)
  * `closer`/`topicsFile` injectable for tests.
  */
-export async function closeConvoTopic({ token, chatId, convoKey, closer = closeForumTopic, topicsFile }) {
+export async function closeConvoTopic({ token, chatId, convoKey, closer = closeForumTopic, renamer = editForumTopic, topicsFile }) {
   let threadId;
   try {
     threadId = getThreadId(readTopicsStore(topicsFile), chatId, convoKey);
@@ -1089,6 +1126,14 @@ export async function closeConvoTopic({ token, chatId, convoKey, closer = closeF
   }
   if (threadId == null) return { status: 'absent' };
   try {
+    // Retitle with the closed marker FIRST (while the topic is still open), so a
+    // closed "Bò" reads as "🔒 Bò (đã đóng)" and never collides visually with a
+    // future open "Bò" that reuses the freed name. Best-effort: a rename failure
+    // (e.g. missing admin right) must NOT block the close — we still proceed.
+    try {
+      const persona = peekPersona(convoKey, undefined);
+      if (persona) await renamer(token, chatId, threadId, closedTopicTitle(persona));
+    } catch { /* non-fatal: continue to close */ }
     const r = await closer(token, chatId, threadId);
     if (!r || !r.ok) return { status: 'failed', description: r?.description };
     // Re-validate under the lock: only clear if the mapping STILL points at the
@@ -1418,7 +1463,11 @@ async function main() {
     for (const chatId of effectiveAdminIds) {
       try {
         const convoIdForSend = resolveConvoIdPreSend({ preResolved, replyTo: args.replyTo, chatId, botId }) ?? fallbackConvoId;
-        const persona = personaForConvo(convoIdForSend);
+        // Group-aware: on first touch, pick a persona NOT used by another live
+        // topic in THIS chat (collision avoidance within the group); once pinned
+        // it's stable. `chatId` scopes the group; the topics-store snapshot lists
+        // its live topics.
+        const persona = resolvePersonaInGroup(convoIdForSend, { chatId, topicsStore: readTopicsStore() });
         // In a DEDICATED group the whole group IS this project, so the `[project]`
         // message prefix is redundant (RFC 02) — drop it (the persona tag still
         // identifies the agent). Shared group keeps `[project]` to disambiguate.
@@ -1493,7 +1542,8 @@ async function main() {
   for (const chatId of effectiveAdminIds) {
     try {
       const convoIdForSend = resolveConvoIdPreSend({ preResolved, replyTo: args.replyTo, chatId, botId }) ?? fallbackConvoId;
-      const persona = personaForConvo(convoIdForSend);
+      // Group-aware first-touch assignment (see the document-send path above).
+      const persona = resolvePersonaInGroup(convoIdForSend, { chatId, topicsStore: readTopicsStore() });
       // Dedicated group → drop the redundant `[project]` prefix (see above).
       const messageBody = isFirstConvoMessage({ convoId: convoIdForSend, botId, chatId })
         ? rawMessage + gitFooterFor()
@@ -1615,8 +1665,9 @@ function emitConvoLine({ convoId, messageId }) {
   console.log(`[send-telegram] convo: ${convoId} messageId: ${messageId} pid: ${process.pid}`);
   // RFC 04: echo this convo's persona so the agent reading stdout learns the
   // name it answers to (e.g. "🐷 Heo") and can self-identify in its prose —
-  // fulfilling the RFC 01 §5 intent. Derived, not stored.
-  const persona = personaForConvo(convoId);
+  // fulfilling the RFC 01 §5 intent. Read-only peek: the send path above already
+  // pinned this convo, so this just echoes that pin (no second assignment).
+  const persona = peekPersona(convoId);
   if (persona != null) console.log(`[send-telegram] persona: ${formatPersona(persona)}`);
 }
 

@@ -6,6 +6,11 @@ import path from 'node:path';
 import { selectDeadConvoTopics, gcDeadTopics, closeConvoTopic } from './send-telegram.mjs';
 import { readTopicsStore, writeTopicsStore } from './topics-store.mjs';
 
+// Mock renamer so the close paths never hit the real editForumTopic (network).
+// Records the titles it was asked to set, for the marker assertions below.
+const renamedTitles = [];
+const noopRenamer = async (_t, _c, _thread, name) => { renamedTitles.push(name); return { ok: true }; };
+
 function tmpTopics() {
   return path.join(os.tmpdir(), `gc-topics-${process.pid}-${Math.floor(performance.now() * 1000)}.json`);
 }
@@ -50,7 +55,7 @@ test('gcDeadTopics: closes idle topic, clears mapping AND its _ts', async () => 
   writeTopicsStore({ '-100': { '111': 10, '222': 20, _ts: { '111': OLD, '222': FRESH } } }, file);
   const closedThreads = [];
   const closer = async (_t, _c, threadId) => { closedThreads.push(threadId); return { ok: true }; };
-  const res = await gcDeadTopics({ token: 't', chatId: '-100', now: NOW, ttlMs: TTL, closer, topicsFile: file });
+  const res = await gcDeadTopics({ token: 't', chatId: '-100', now: NOW, ttlMs: TTL, closer, renamer: noopRenamer, topicsFile: file });
   assert.deepEqual(res, { closed: 1, considered: 1 });
   assert.deepEqual(closedThreads, [10]);
   const store = readTopicsStore(file);
@@ -64,7 +69,7 @@ test('gcDeadTopics: failed close keeps mapping for next run', async () => {
   const file = tmpTopics();
   writeTopicsStore({ '-100': { '111': 10, _ts: { '111': OLD } } }, file);
   const closer = async () => ({ ok: false, description: 'rate limited' });
-  const res = await gcDeadTopics({ token: 't', chatId: '-100', now: NOW, ttlMs: TTL, closer, topicsFile: file });
+  const res = await gcDeadTopics({ token: 't', chatId: '-100', now: NOW, ttlMs: TTL, closer, renamer: noopRenamer, topicsFile: file });
   assert.deepEqual(res, { closed: 0, considered: 1 });
   assert.equal(readTopicsStore(file)['-100']['111'], 10); // retained
   fs.unlinkSync(file);
@@ -75,7 +80,7 @@ test('gcDeadTopics: brand-new topic (no _ts) is NOT closed even if GC runs', asy
   writeTopicsStore({ '-100': { '111': 10 } }, file); // no _ts at all
   let calls = 0;
   const closer = async () => { calls++; return { ok: true }; };
-  const res = await gcDeadTopics({ token: 't', chatId: '-100', now: NOW, ttlMs: TTL, closer, topicsFile: file });
+  const res = await gcDeadTopics({ token: 't', chatId: '-100', now: NOW, ttlMs: TTL, closer, renamer: noopRenamer, topicsFile: file });
   assert.deepEqual(res, { closed: 0, considered: 0 });
   assert.equal(calls, 0);
   assert.equal(readTopicsStore(file)['-100']['111'], 10);
@@ -87,7 +92,7 @@ test('closeConvoTopic: closes the convo topic, clears mapping AND its _ts', asyn
   writeTopicsStore({ '-100': { '111': 10, '222': 20, _ts: { '111': FRESH, '222': FRESH } } }, file);
   const closedThreads = [];
   const closer = async (_t, _c, threadId) => { closedThreads.push(threadId); return { ok: true }; };
-  const r = await closeConvoTopic({ token: 't', chatId: '-100', convoKey: '111', closer, topicsFile: file });
+  const r = await closeConvoTopic({ token: 't', chatId: '-100', convoKey: '111', closer, renamer: noopRenamer, topicsFile: file });
   assert.deepEqual(r, { status: 'closed' });
   assert.deepEqual(closedThreads, [10]);          // closed regardless of idle time (fresh _ts)
   const store = readTopicsStore(file);
@@ -97,12 +102,28 @@ test('closeConvoTopic: closes the convo topic, clears mapping AND its _ts', asyn
   fs.unlinkSync(file);
 });
 
+test('closeConvoTopic: retitles the topic with the 🔒 closed marker before closing', async () => {
+  const file = tmpTopics();
+  writeTopicsStore({ '-100': { '111': 10, _ts: { '111': FRESH } } }, file);
+  renamedTitles.length = 0;
+  let order = [];
+  const closer = async () => { order.push('close'); return { ok: true }; };
+  const renamer = async (_t, _c, _thread, name) => { order.push('rename'); renamedTitles.push(name); return { ok: true }; };
+  const r = await closeConvoTopic({ token: 't', chatId: '-100', convoKey: '111', closer, renamer, topicsFile: file });
+  assert.equal(r.status, 'closed');
+  assert.equal(renamedTitles.length, 1);
+  assert.ok(renamedTitles[0].startsWith('🔒 '), `expected lock marker, got "${renamedTitles[0]}"`);
+  assert.ok(renamedTitles[0].includes('(đã đóng)'));
+  assert.deepEqual(order, ['rename', 'close']); // rename happens while topic still open
+  fs.unlinkSync(file);
+});
+
 test('closeConvoTopic: absent mapping → status absent, closer NOT called', async () => {
   const file = tmpTopics();
   writeTopicsStore({ '-100': { '111': 10, _ts: { '111': FRESH } } }, file);
   let calls = 0;
   const closer = async () => { calls++; return { ok: true }; };
-  const r = await closeConvoTopic({ token: 't', chatId: '-100', convoKey: '999', closer, topicsFile: file });
+  const r = await closeConvoTopic({ token: 't', chatId: '-100', convoKey: '999', closer, renamer: noopRenamer, topicsFile: file });
   assert.deepEqual(r, { status: 'absent' });
   assert.equal(calls, 0);
   assert.equal(readTopicsStore(file)['-100']['111'], 10); // untouched
@@ -113,7 +134,7 @@ test('closeConvoTopic: failed close (ok:false) → status failed + description, 
   const file = tmpTopics();
   writeTopicsStore({ '-100': { '111': 10, _ts: { '111': FRESH } } }, file);
   const closer = async () => ({ ok: false, description: 'not enough rights' });
-  const r = await closeConvoTopic({ token: 't', chatId: '-100', convoKey: '111', closer, topicsFile: file });
+  const r = await closeConvoTopic({ token: 't', chatId: '-100', convoKey: '111', closer, renamer: noopRenamer, topicsFile: file });
   assert.deepEqual(r, { status: 'failed', description: 'not enough rights' });
   assert.equal(readTopicsStore(file)['-100']['111'], 10);     // preserved on failure
   assert.equal(readTopicsStore(file)['-100']._ts['111'], FRESH);
@@ -124,7 +145,7 @@ test('closeConvoTopic: closer throws → status failed (never throws), mapping k
   const file = tmpTopics();
   writeTopicsStore({ '-100': { '111': 10, _ts: { '111': FRESH } } }, file);
   const closer = async () => { throw new Error('socket hang up'); };
-  const r = await closeConvoTopic({ token: 't', chatId: '-100', convoKey: '111', closer, topicsFile: file });
+  const r = await closeConvoTopic({ token: 't', chatId: '-100', convoKey: '111', closer, renamer: noopRenamer, topicsFile: file });
   assert.equal(r.status, 'failed');
   assert.match(r.description, /socket hang up/);
   assert.equal(readTopicsStore(file)['-100']['111'], 10);     // preserved

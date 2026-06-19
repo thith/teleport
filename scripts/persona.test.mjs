@@ -12,8 +12,8 @@ import { uuidToConvoInt } from './convo-registry.mjs';
 
 const PERSONA_SCRIPT = fileURLToPath(new URL('./persona.mjs', import.meta.url));
 
-test('pool has exactly 40 entries', () => {
-  assert.equal(PERSONA_POOL.length, 40);
+test('pool has exactly 110 entries', () => {
+  assert.equal(PERSONA_POOL.length, 110);
 });
 
 test('every emoji is unique', () => {
@@ -74,9 +74,9 @@ test('personaForConvo is null when no convoId', () => {
 
 test('assignment spreads across the pool (not all one persona)', () => {
   const seen = new Set();
-  for (let i = 0; i < 4000; i++) seen.add(convoPersonaIndex(`${i}`));
-  // With 4000 distinct ids over 40 buckets, expect near-full coverage.
-  assert.ok(seen.size >= 35, `poor spread: only ${seen.size}/40 buckets hit`);
+  for (let i = 0; i < 8000; i++) seen.add(convoPersonaIndex(`${i}`));
+  // With 8000 distinct ids over 110 buckets, expect near-full coverage.
+  assert.ok(seen.size >= 100, `poor spread: only ${seen.size}/110 buckets hit`);
 });
 
 test('formatPersona renders "emoji name"', () => {
@@ -91,7 +91,10 @@ test('CLI whoami prints persona from CLAUDE_CODE_SESSION_ID', () => {
   // personaForConvo so the test tracks the registry instead of hard-coding it.
   const sessionId = 'd0f29b89-3400-4ecf-8d92-0e49f466db4f';
   const out = execFileSync(process.execPath, [PERSONA_SCRIPT], {
-    env: { ...process.env, CLAUDE_CODE_SESSION_ID: sessionId, CODEX_THREAD_ID: '' },
+    // Isolate from the real pin store: an empty/absent path makes the read-only
+    // whoami derive the persona (mod current pool) deterministically, matching
+    // personaForConvo below regardless of what's pinned on this machine.
+    env: { ...process.env, CLAUDE_CODE_SESSION_ID: sessionId, CODEX_THREAD_ID: '', TELE_PERSONA_STORE: '/nonexistent/persona-store-test.jsonl' },
     encoding: 'utf8',
   }).trim();
   // Cross-check against PRODUCTION derivation (uuidToConvoInt), not a re-impl,

@@ -1,5 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import os from 'node:os';
+import path from 'node:path';
+// Isolate the persona pin store (resolved at call-time from TELE_PERSONA_STORE)
+// so these tests DERIVE personas instead of reading machine-local pins.
+process.env.TELE_PERSONA_STORE = path.join(os.tmpdir(), `teleport-persona-store-attribution-${process.pid}.jsonl`);
 import { formatFromName, buildPromptData, buildCombinedPromptData } from './tele-listen.mjs';
 import { personaForConvo } from './persona.mjs';
 
@@ -74,11 +79,11 @@ test('buildCombinedPromptData: phantom suppressed, real reply kept (from last ms
 // self-identify and recognize when a human addresses it by name.
 test('buildCombinedPromptData: injects own persona when convoId is known', () => {
   const mk = (id) => ({ msg: { message_id: id, chat: { id: -100 }, from: { id, first_name: 'Thi' }, text: `m${id}` } });
-  const convoId = 2120524005926900; // → 🐷 Heo (index 16)
+  const convoId = 2120524005926900; // → 🐧 Cánh Cụt (index 26) on the 110-pool
   const out = buildCombinedPromptData([mk(1)], null, convoId);
   assert.deepEqual(out.persona, personaForConvo(convoId));
-  assert.equal(out.persona.name, 'Heo');
-  assert.equal(out.persona.emoji, '🐷');
+  assert.equal(out.persona.name, 'Cánh Cụt');
+  assert.equal(out.persona.emoji, '🐧');
 });
 
 test('buildCombinedPromptData: no persona field when convoId absent', () => {

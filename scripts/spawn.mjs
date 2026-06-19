@@ -23,7 +23,8 @@ import { fileURLToPath } from 'node:url';
 import { uuidToConvoInt } from './convo-registry.mjs';
 import { shortConvoHash } from './convo-hash.mjs';
 import { readTopicsStore } from './topics-store.mjs';
-import { personaForConvo, formatPersona } from './persona.mjs';
+import { formatPersona } from './persona.mjs';
+import { peekPersona } from './persona-store.mjs';
 
 export const SPAWN_PROMPT = 'Telegram me and wait for instructions';
 
@@ -190,7 +191,7 @@ export function personaByHashtag(store = readTopicsStore()) {
     if (!entry || typeof entry !== 'object' || Array.isArray(entry)) continue;
     for (const key of Object.keys(entry)) {
       if (key.startsWith('_')) continue;
-      map[shortConvoHash(key)] = personaForConvo(key);
+      map[shortConvoHash(key)] = peekPersona(key);
     }
   }
   return map;

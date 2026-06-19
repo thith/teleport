@@ -34,6 +34,11 @@ import {
 import { personaForConvo, formatPersona } from './persona.mjs';
 import { shortConvoHash } from './convo-hash.mjs';
 
+// Isolate the persona pin store so handover (and the CLI subprocesses it
+// spawns, which inherit this env) DERIVE personas instead of reading the real
+// machine-local pins. Resolved at call-time from TELE_PERSONA_STORE.
+process.env.TELE_PERSONA_STORE = path.join(os.tmpdir(), `teleport-persona-store-handover-${process.pid}.jsonl`);
+
 // Real convoId examples (long → letter-prefixed hashtag).
 const TARGET_CONVO = '2205483045424020';            // → #e5424020
 const TARGET_HASH = shortConvoHash(TARGET_CONVO);    // 'e5424020'

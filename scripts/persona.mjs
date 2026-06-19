@@ -7,10 +7,13 @@
 // never has to "remember" or pick one (which historically biased every agent
 // to 🦊 because LLMs have no real RNG).
 //
-// Leaf module re: INTERNAL deps — it imports no other teleport script, so any
-// script (send/listen/registry) can pull it in without circular-dependency
-// risk. The two node: built-ins below are stdlib (used only by the direct-run
-// CLI guard at the bottom), not internal deps, so they don't break that.
+// Leaf module re: INTERNAL deps AT LOAD TIME — it imports no other teleport
+// script eagerly, so any script (send/listen/registry) can pull it in without
+// circular-dependency risk. The two node: built-ins below are stdlib. The ONE
+// teleport import (persona-store, which imports back into us) is LAZY — done
+// inside the direct-run CLI guard only — so the cycle materialises after both
+// modules are fully initialised, never at load. Do NOT add an eager teleport
+// import here or you reintroduce the cycle.
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
@@ -59,6 +62,85 @@ export const PERSONA_POOL = [
   { emoji: '🐝', name: 'Ong' },
   { emoji: '🐞', name: 'Bọ Rùa' },
   { emoji: '🦄', name: 'Kỳ Lân' },
+  // ── Mở rộng pool 40 → 110 (RFC 01, ext). Vẫn append-only, nhưng vì
+  // `mod = PERSONA_POOL.length` nên việc đổi length cũng đổi persona của các
+  // convo ĐANG sống (h%40 ≠ h%110) — chấp nhận theo quyết định của PO.
+  // Thú
+  { emoji: '🐨', name: 'Gấu Túi' },
+  { emoji: '🐭', name: 'Chuột' },
+  { emoji: '🐹', name: 'Chuột Lang' },
+  { emoji: '🦘', name: 'Chuột Túi' },
+  { emoji: '🦥', name: 'Lười' },
+  { emoji: '🦡', name: 'Lửng' },
+  { emoji: '🦫', name: 'Hải Ly' },
+  { emoji: '🦓', name: 'Ngựa Vằn' },
+  { emoji: '🐃', name: 'Trâu' },
+  { emoji: '🐫', name: 'Lạc Đà' },
+  { emoji: '🐆', name: 'Báo' },
+  { emoji: '🦧', name: 'Đười Ươi' },
+  { emoji: '🦔', name: 'Nhím' },
+  { emoji: '🦨', name: 'Chồn' },
+  // Chim
+  { emoji: '🦆', name: 'Vịt' },
+  { emoji: '🦢', name: 'Thiên Nga' },
+  { emoji: '🦜', name: 'Vẹt' },
+  { emoji: '🦚', name: 'Công' },
+  { emoji: '🦩', name: 'Hồng Hạc' },
+  { emoji: '🕊️', name: 'Bồ Câu' },
+  { emoji: '🦇', name: 'Dơi' },
+  { emoji: '🦃', name: 'Gà Tây' },
+  { emoji: '🪿', name: 'Ngỗng' },
+  // Biển & bò sát
+  { emoji: '🐠', name: 'Cá Vàng' },
+  { emoji: '🐡', name: 'Cá Nóc' },
+  { emoji: '🐳', name: 'Cá Voi' },
+  { emoji: '🦭', name: 'Hải Cẩu' },
+  { emoji: '🦐', name: 'Tôm' },
+  { emoji: '🦞', name: 'Tôm Hùm' },
+  { emoji: '🦀', name: 'Cua' },
+  { emoji: '🦑', name: 'Mực' },
+  { emoji: '🐌', name: 'Ốc Sên' },
+  { emoji: '🪼', name: 'Sứa' },
+  { emoji: '🐊', name: 'Cá Sấu' },
+  { emoji: '🦎', name: 'Thằn Lằn' },
+  // Côn trùng
+  { emoji: '🐜', name: 'Kiến' },
+  { emoji: '🦗', name: 'Châu Chấu' },
+  { emoji: '🕷️', name: 'Nhện' },
+  { emoji: '🦂', name: 'Bọ Cạp' },
+  { emoji: '🦟', name: 'Muỗi' },
+  { emoji: '🪳', name: 'Gián' },
+  { emoji: '🪱', name: 'Giun' },
+  // Cây & hoa
+  { emoji: '🌳', name: 'Cổ Thụ' },
+  { emoji: '🌲', name: 'Thông' },
+  { emoji: '🌴', name: 'Dừa' },
+  { emoji: '🌵', name: 'Xương Rồng' },
+  { emoji: '🎋', name: 'Tre' },
+  { emoji: '🌷', name: 'Tulip' },
+  { emoji: '🌹', name: 'Hồng' },
+  { emoji: '🌻', name: 'Hướng Dương' },
+  { emoji: '🌼', name: 'Cúc' },
+  { emoji: '🪷', name: 'Sen' },
+  { emoji: '🍄', name: 'Nấm' },
+  { emoji: '🌾', name: 'Lúa' },
+  // Nhân hoá & huyền thoại
+  { emoji: '🦖', name: 'Khủng Long' },
+  { emoji: '🦕', name: 'Cổ Dài' },
+  { emoji: '🧜', name: 'Tiên Cá' },
+  { emoji: '🧚', name: 'Tiên' },
+  { emoji: '🧞', name: 'Thần Đèn' },
+  { emoji: '🧙', name: 'Phù Thủy' },
+  { emoji: '🤖', name: 'Robot' },
+  { emoji: '👽', name: 'Alien' },
+  { emoji: '🧟', name: 'Thây Ma' },
+  { emoji: '🦸', name: 'Siêu Nhân' },
+  { emoji: '🦹', name: 'Ác Nhân' },
+  { emoji: '🧛', name: 'Cà Rồng' },
+  { emoji: '🧌', name: 'Quỷ Lùn' },
+  { emoji: '🗿', name: 'Tượng Đá' },
+  { emoji: '☃️', name: 'Người Tuyết' },
+  { emoji: '🎃', name: 'Bí Ngô' },
 ];
 
 /**
@@ -103,12 +185,18 @@ export function formatPersona(persona) {
 // imports (leaf-module invariant — avoids the send/listen ↔ persona cycle).
 async function runCli() {
   const { resolveConvoIdFromEnv } = await import('./convo-registry.mjs');
+  // Lazy import keeps persona.mjs a leaf at LOAD time (persona-store imports us);
+  // the cycle only resolves here, on direct CLI run. peekPersona is READ-ONLY —
+  // whoami reports the pinned persona (or the derived one) WITHOUT creating a
+  // pin, so a mere "who am I?" never mutates the store. The authoritative pin is
+  // written by the send/listen paths.
+  const { peekPersona } = await import('./persona-store.mjs');
   const { convoId, source } = resolveConvoIdFromEnv();
   if (convoId == null) {
     console.error('[persona] no native session env (CLAUDE_CODE_SESSION_ID / CODEX_THREAD_ID) — cannot resolve a persona for this agent.');
     process.exit(1);
   }
-  const persona = personaForConvo(convoId);
+  const persona = peekPersona(convoId);
   console.log(formatPersona(persona)); // stdout: just "🐷 Heo" — easy to capture
   console.error(`[persona] convoId ${convoId} (via ${source}) → ${formatPersona(persona)} (index ${persona.index})`);
 }

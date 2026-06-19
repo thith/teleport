@@ -24,7 +24,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { personaForConvo, formatPersona, PERSONA_POOL } from './persona.mjs';
+import { formatPersona, PERSONA_POOL } from './persona.mjs';
+import { peekPersona } from './persona-store.mjs';
 import { shortConvoHash } from './convo-hash.mjs';
 import { readTopicsStore } from './topics-store.mjs';
 import { readProjectsConfig, resolveProjectConfig, adminIdsFrom } from './projects-config.mjs';
@@ -146,7 +147,7 @@ export function listLiveTopics(store, chatIds) {
         convoId: key,
         threadId,
         ts,                       // last-use epoch_ms (RFC 01 topics-store _ts), 0 if unknown
-        persona: personaForConvo(key),
+        persona: peekPersona(key),
         hashtag: shortConvoHash(key),
       });
     }
@@ -217,8 +218,8 @@ export function handoverHeader(sourcePersona, sourceConvoId, targetPersona) {
  * - `handover.from` attribution so the receiver recognizes a legitimate baton-pass
  */
 export function buildHandoverPrompt({ targetConvoId, targetChatId, sourceConvoId, notes, nowSec }) {
-  const sourcePersona = personaForConvo(sourceConvoId);
-  const targetPersona = personaForConvo(targetConvoId);
+  const sourcePersona = peekPersona(sourceConvoId);
+  const targetPersona = peekPersona(targetConvoId);
   const text = `${handoverHeader(sourcePersona, sourceConvoId, targetPersona)}\n\n${notes.trim()}`;
   const synthMsg = {
     message_id: null,
@@ -264,7 +265,7 @@ export function writePromptExclusive(promptObj, promptFile, deps = {}) {
 /** Seed prompt for a freshly-spawned agent (--new). It must open its own
  * Telegram channel so the user can follow up, then await instructions. */
 export function buildSeedPrompt({ sourceConvoId, notes }) {
-  const sourcePersona = personaForConvo(sourceConvoId);
+  const sourcePersona = peekPersona(sourceConvoId);
   const from = sourcePersona ? formatPersona(sourcePersona) : 'một agent khác';
   return [
     `Bạn vừa được bàn giao việc từ ${from} (handover).`,

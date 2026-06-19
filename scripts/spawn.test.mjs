@@ -1,5 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import os from 'node:os';
+import path from 'node:path';
+// Isolate the persona pin store so `--list` persona mapping DERIVES instead of
+// reading machine-local pins (resolved at call-time from TELE_PERSONA_STORE).
+process.env.TELE_PERSONA_STORE = path.join(os.tmpdir(), `teleport-persona-store-spawn-${process.pid}.jsonl`);
 import { buildSpawnPlan, genSessionSeed, runSpawn, hasBinary, screenSessionExists, normalizeSessionName, parseScreenSessions, listSpawnSessions, resolveKillId, resolveAttachId, SPAWN_PROMPT, personaByHashtag, gracefulKill, KILL_GRACE_MS } from './spawn.mjs';
 import { uuidToConvoInt } from './convo-registry.mjs';
 import { shortConvoHash } from './convo-hash.mjs';
