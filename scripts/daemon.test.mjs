@@ -93,6 +93,28 @@ test('dispatchCommand: needsProject → folder is the positional first token, dr
   fs.rmSync(parent, { recursive: true, force: true });
 });
 
+test('dispatchCommand: strips teleport secrets from the child env, keeps identity', async () => {
+  const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'ws-'));
+  fs.mkdirSync(path.join(parent, 'app'));
+  process.env.SNEAKY_SECRET = 'topsecret'; // a stand-in teleport .env key
+  let childEnv;
+  try {
+    await dispatchCommand({ cmd: 'run', rest: 'app build' }, { id: '7' }, {
+      daemonChatId: '1', projectsConfig: { _default: { roles: { '7': { role: 'admin' } } } }, registry: REG,
+      parentDir: parent, scriptsDir: '/scripts', secretEnvKeys: ['SNEAKY_SECRET', 'REPORT_BOT_TOKEN'],
+      sendText: async () => {},
+      runner: async (bin, argv, opts) => { childEnv = opts.env; return { stdout: 'ok', stderr: '' }; },
+    });
+    assert.equal(childEnv.SNEAKY_SECRET, undefined);     // secret stripped — can't leak to a project's npm script
+    assert.equal(childEnv.REPORT_BOT_TOKEN, undefined);  // always stripped
+    assert.equal(childEnv.TELE_FROM_ID, '7');            // identity still injected
+    assert.equal(childEnv.TELE_FROM_ROLE, 'admin');
+  } finally {
+    delete process.env.SNEAKY_SECRET;
+    fs.rmSync(parent, { recursive: true, force: true });
+  }
+});
+
 test('dispatchCommand: quoted args survive as one token (not split on inner spaces)', async () => {
   const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'ws-'));
   fs.mkdirSync(path.join(parent, 'app'));

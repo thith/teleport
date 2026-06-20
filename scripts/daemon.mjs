@@ -186,6 +186,12 @@ async function main() {
   const env = loadEnvFromFile(ENV_FILE);
   const token = process.env.REPORT_BOT_TOKEN || env.REPORT_BOT_TOKEN;
   if (!token) { console.error('[daemon] Missing REPORT_BOT_TOKEN in .env or env.'); process.exit(1); }
+  // The secret boundary: every key teleport loads from `.env` is a secret and
+  // MUST NOT leak into a dispatched child (esp. `/run`, which executes a sibling
+  // project's npm script — a hostile package.json could otherwise exfiltrate
+  // REPORT_BOT_TOKEN). Scripts that genuinely need a secret read it from the
+  // `.env` FILE themselves (e.g. send-telegram), so stripping is always safe.
+  const secretEnvKeys = [...new Set([...Object.keys(env), 'REPORT_BOT_TOKEN'])];
   const botId = extractBotId(token);
   const projectsConfig = readProjectsConfig(PROJECTS_FILE);
   const registry = loadCommands({ projectsConfig });
@@ -253,7 +259,7 @@ async function main() {
       const updates = readCacheSinceOffset(loopOffset, cacheFile);
       const mine = updates.filter((u) => u.message && String(u.message.chat?.id) === daemonChatId);
       if (mine.length) {
-        handleControlMessages(mine, { token, daemonChatId, projectsConfig, registry, sendText });
+        handleControlMessages(mine, { token, daemonChatId, projectsConfig, registry, sendText, secretEnvKeys });
       }
       if (updates.length) writeOffset(Math.max(...updates.map((u) => u.update_id)), daemonOffsetFile);
 
@@ -300,7 +306,7 @@ export function handleControlMessages(mine, ctx) {
 // REMOTE CODE EXECUTION: the registry's minRole + resolveSpawnCwd containment are
 // the gate; `runner`/`scriptsDir`/`parentDir` are injectable for tests.
 export async function dispatchCommand(parsed, from, {
-  daemonChatId, projectsConfig, registry, sendText,
+  daemonChatId, projectsConfig, registry, sendText, secretEnvKeys = [],
   runner = execFileP, scriptsDir = __dirname, parentDir = PARENT_DIR,
 }) {
   const spec = resolveCommand(parsed.cmd, registry);
@@ -320,13 +326,14 @@ export async function dispatchCommand(parsed, from, {
     rest = parts.slice(1); // drop the folder token
   }
   const argv = [path.join(scriptsDir, spec.run), ...spec.args, ...rest];
-  const env = {
-    ...process.env,
+  const env = { ...process.env };
+  for (const k of secretEnvKeys) delete env[k]; // strip teleport secrets (see secret boundary in main)
+  Object.assign(env, {
     TELE_FROM_ID: from && from.id != null ? String(from.id) : '',
     TELE_FROM_ROLE: role,
     TELE_FROM_NAME: (from && (from.first_name || from.username)) || 'admin',
     TELE_FROM_USERNAME: (from && from.username) || '',
-  };
+  });
   try {
     const { stdout, stderr } = await runner(process.execPath, argv, {
       cwd, env, timeout: COMMAND_TIMEOUT_MS, maxBuffer: COMMAND_MAX_BUFFER,
