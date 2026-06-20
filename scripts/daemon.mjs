@@ -28,8 +28,8 @@ import {
   loadEnvFromFile, parseAdminChatIds, extractBotId, sendTextChunk, shortConvoHash,
 } from './send-telegram.mjs';
 import {
-  readProjectsConfig, roleFor, assertChatIdKind, projectEntries,
-  resolveDefaultChatId, resolveDaemonChatId,
+  readProjectsConfig, roleFor, assertChatIdKind, projectEntries, readDefaultGroup,
+  resolveDefaultChatId, resolveDaemonChatId, resolveQuietHours,
 } from './projects-config.mjs';
 import {
   DEFAULT_TMP_DIR, botScopedFiles, fetchUpdates, appendToCache, readCacheSinceOffset,
@@ -119,14 +119,26 @@ export function buildWhisperPrompt({ targetConvoId, targetChatId, fromUserId, fr
   };
 }
 
-// The whisperer's advisory role, looked up across all configured projects'
-// roles (the owner of the control DM is typically `admin`). Highest privilege
-// wins; unmapped → 'member' (least privilege, so the target still gates).
+// The whisperer's advisory role, looked up across the catch-all roster
+// (`_default.roles`) AND every dedicated project's roles. The control-DM owner is
+// typically admin in the catch-all, so `_default.roles` MUST be consulted (it's
+// skipped by projectEntries). Highest privilege wins; unmapped → 'member' (least
+// privilege, so the target still gates).
 const ROLE_RANK = { admin: 3, maintainer: 2, dev: 1, member: 0 };
 export function resolveSenderRole(projectsConfig, userId) {
   let best = 'member';
-  for (const [, proj] of projectEntries(projectsConfig)) {
-    const r = roleFor(proj && proj.roles, userId);
+  // Consult ONLY the rosters that are actually authoritative: `_default.roles`
+  // (the catch-all group) + each DEDICATED project's own roles. A SHARED project's
+  // `roles` block is dead config (resolveProjectConfig ignores it, using
+  // `_default.roles` instead), so it must NOT grant privilege here either.
+  const rosters = [
+    readDefaultGroup(projectsConfig).roles,
+    ...projectEntries(projectsConfig)
+      .filter(([, p]) => p && p.chatId != null && String(p.chatId).trim() !== '')
+      .map(([, p]) => p.roles),
+  ];
+  for (const roles of rosters) {
+    const r = roleFor(roles, userId);
     if (r && (ROLE_RANK[r] ?? -1) > (ROLE_RANK[best] ?? -1)) best = r;
   }
   return best;
@@ -138,9 +150,12 @@ export function resolveSenderRole(projectsConfig, userId) {
 export function validateDaemonConfig({ projectsConfig, catchAllIds, daemonChatId }) {
   if (!daemonChatId) throw new Error('Missing daemonChatId — set projects.json `_config.daemonChatId` (a private chat id).');
   assertChatIdKind(daemonChatId, 'private', 'projects.json `_config.daemonChatId`');
-  for (const id of catchAllIds) assertChatIdKind(id, 'group', 'projects.json `_config.defaultChatId`');
+  for (const id of catchAllIds) assertChatIdKind(id, 'group', 'projects.json `_default.chatId`');
   for (const [key, proj] of projectEntries(projectsConfig)) {
-    if (proj && proj.chatId != null) assertChatIdKind(proj.chatId, 'group', `project '${key}' chatId`);
+    // Trim first: an empty/whitespace chatId means "shared" (no own group) — same
+    // as resolveProjectConfig — so don't validate (or reject startup on) it.
+    const chatId = proj?.chatId == null ? '' : String(proj.chatId).trim();
+    if (chatId) assertChatIdKind(chatId, 'group', `project '${key}' chatId`);
   }
 }
 
@@ -256,7 +271,10 @@ async function main() {
       // 3) Heartbeat reminders (moved here from tele-listen) — throttled.
       if (Date.now() - lastHeartbeat > HEARTBEAT_EVERY_MS) {
         lastHeartbeat = Date.now();
-        try { await runHeartbeatReminders(token, groupAdminIds); } catch (e) { console.error(`[daemon] heartbeat: ${e?.message ?? e}`); }
+        try {
+          const quietHours = resolveQuietHours(readProjectsConfig(PROJECTS_FILE), { env: process.env, envFile: env });
+          await runHeartbeatReminders(token, groupAdminIds, { quietHours });
+        } catch (e) { console.error(`[daemon] heartbeat: ${e?.message ?? e}`); }
       }
     } catch (e) {
       console.error(`[daemon] loop error: ${e instanceof Error ? e.message : e}`);

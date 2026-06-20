@@ -1,7 +1,13 @@
 {
   "_config": {
-    "defaultChatId": "-1003456789012",
-    "daemonChatId": "100000001"
+    "daemonChatId": "100000001",
+    "quietHours": { "start": 22, "end": 8 }
+  },
+  "_default": {
+    "chatId": "-1003456789012",
+    "roles": {
+      "100000001": { "role": "admin", "username": "alice", "title": "anh", "name": "An", "position": "founder" }
+    }
   },
   "my-project": {
     "code": "myproj",

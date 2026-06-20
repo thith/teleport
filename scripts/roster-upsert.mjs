@@ -90,10 +90,17 @@ export function upsertMember(roles, from) {
 
 /**
  * Best-effort: harvest a batch of `from` objects into projects.json under
- * `[projectCode].roles`. Only writes into an EXISTING project entry (a
- * dedicated group); a shared/absent entry is left untouched so we never create
- * a chatless project stub. Atomic write (tmp + rename). Returns the number of
- * rows changed. Swallows all I/O errors — harvest must never block the listener.
+ * `[projectCode].roles`. Dedicated project → its own existing entry; the
+ * catch-all `_default` → auto-created if absent. A normal absent project is left
+ * untouched (no chatless stub). Atomic write (tmp + rename). Returns the number
+ * of rows changed. Swallows all I/O errors — harvest must never block the listener.
+ *
+ * Concurrency: read-modify-write is NOT locked, so two listeners harvesting the
+ * SAME entry concurrently (more likely now that all shared projects share
+ * `_default`) can lose one row. This is acceptable — harvest is best-effort and
+ * EVENTUALLY CONSISTENT: the dropped member is re-harvested the next time they
+ * speak. A lock is deliberately avoided (projects.json is also hand-edited by the
+ * PO; a write lock there would be surprising).
  */
 export function harvestMembers(froms, { projectCode, file = DEFAULT_PROJECTS_FILE } = {}) {
   if (!projectCode || !Array.isArray(froms) || froms.length === 0) return 0;
@@ -104,8 +111,15 @@ export function harvestMembers(froms, { projectCode, file = DEFAULT_PROJECTS_FIL
     return 0;
   }
   if (!config || typeof config !== 'object') return 0;
-  const entry = config[projectCode];
-  if (!entry || typeof entry !== 'object') return 0; // only harvest into a real (dedicated) entry
+  let entry = config[projectCode];
+  if (!entry || typeof entry !== 'object') {
+    // The catch-all roster `_default` is auto-created (roles-only) so harvesting
+    // works even before the PO has set up `_default` — otherwise shared-group
+    // members would be silently dropped. A normal (dedicated) project is NOT
+    // stubbed: we don't want a chatless project entry materialising.
+    if (projectCode === '_default') { entry = {}; config[projectCode] = entry; }
+    else return 0;
+  }
 
   let roles = entry.roles && typeof entry.roles === 'object' ? entry.roles : {};
   let changed = 0;

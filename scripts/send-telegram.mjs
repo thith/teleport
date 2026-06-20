@@ -829,7 +829,7 @@ export function teamModeForumError(chatId) {
     '  1. Tạo group, bật Topics (Group → Edit → Topics).',
     '  2. Add bot vào group, đặt làm admin + bật quyền "Manage Topics".',
     '  3. BotFather → Bot Settings → Group Privacy → Turn OFF (để bot nhận mọi message trong topic).',
-    '  4. Lấy group id (negative) và đặt _config.defaultChatId = id đó trong projects.json.',
+    '  4. Lấy group id (negative) và đặt _default.chatId = id đó trong projects.json.',
   ].join('\n');
 }
 
@@ -1279,7 +1279,7 @@ async function main() {
   // short alias, e.g. "d_be", else the lookup key).
   const lookupKey = path.basename(process.cwd()) || '';
   // RFC 02: per-project group via projects.json[key].chatId (DEDICATED) →
-  // fallback to the catch-all default group (projects.json `_config.defaultChatId`,
+  // fallback to the catch-all default group (projects.json `_default.chatId`,
   // or the deprecated TELEGRAM_ADMIN_CHAT_ID env). `dedicated` drives the
   // topic-title form (dedicated persona-only vs catch-all code-first) and the
   // `[code]` message prefix (catch-all only).
@@ -1303,7 +1303,7 @@ async function main() {
     process.exit(1);
   }
   if (adminIds.length === 0) {
-    console.error(`[send-telegram] project "${lookupKey}" chưa cấu hình group: thêm "${lookupKey}".chatId vào teleport/projects.json, hoặc đặt _config.defaultChatId trong projects.json (shared catch-all).`);
+    console.error(`[send-telegram] project "${lookupKey}" chưa cấu hình group: thêm "${lookupKey}".chatId vào teleport/projects.json, hoặc đặt _default.chatId trong projects.json (shared catch-all).`);
     process.exit(1);
   }
 

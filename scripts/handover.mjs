@@ -342,7 +342,7 @@ async function main() {
   // (i) existing topic → resolve + inject.
   const { chatIds } = resolveChatIds({ envFile, chatIdOverride: args.chatId });
   if (!chatIds.length) {
-    err('[handover] no admin chat configured (set projects.json[<cwd>].chatId or _config.defaultChatId)');
+    err('[handover] no admin chat configured (set projects.json[<cwd>].chatId or _default.chatId)');
     process.exit(EXIT.USAGE);
   }
   const store = readTopicsStore();

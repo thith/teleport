@@ -3,24 +3,46 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { readProjectsConfig, resolveProjectConfig, roleFor, memberFor, adminIdsFrom, isGroupChatId, isPrivateChatId, assertChatIdKind, readGlobalConfig, projectEntries, resolveDefaultChatId, resolveDaemonChatId } from './projects-config.mjs';
+import { readProjectsConfig, resolveProjectConfig, roleFor, memberFor, adminIdsFrom, isGroupChatId, isPrivateChatId, assertChatIdKind, readGlobalConfig, readDefaultGroup, projectEntries, resolveDefaultChatId, resolveDaemonChatId, resolveQuietHours } from './projects-config.mjs';
 
-test('readGlobalConfig + projectEntries: _config separated from projects', () => {
-  const cfg = { _config: { defaultChatId: '-100', daemonChatId: '42' }, luni: { chatId: '-1' }, md: { chatId: '-2' } };
-  assert.deepEqual(readGlobalConfig(cfg), { defaultChatId: '-100', daemonChatId: '42' });
-  assert.deepEqual(projectEntries(cfg).map(([k]) => k), ['luni', 'md']); // _config skipped
+test('readGlobalConfig/readDefaultGroup + projectEntries: reserved keys separated from projects', () => {
+  const cfg = { _config: { daemonChatId: '42' }, _default: { chatId: '-100', roles: { '1': 'admin' } }, luni: { chatId: '-1' }, md: { chatId: '-2' } };
+  assert.deepEqual(readGlobalConfig(cfg), { daemonChatId: '42' });
+  assert.deepEqual(readDefaultGroup(cfg), { chatId: '-100', roles: { '1': 'admin' } });
+  assert.deepEqual(projectEntries(cfg).map(([k]) => k), ['luni', 'md']); // _config + _default skipped
   assert.deepEqual(readGlobalConfig({}), {});
 });
 
-test('resolveDefaultChatId/resolveDaemonChatId: projects.json _config wins; env is deprecated fallback', () => {
-  const cfg = { _config: { defaultChatId: '-100', daemonChatId: '42' } };
+test('resolveDefaultChatId (from _default.chatId) / resolveDaemonChatId (from _config); env deprecated fallback', () => {
+  const cfg = { _default: { chatId: '-100' }, _config: { daemonChatId: '42' } };
   assert.equal(resolveDefaultChatId(cfg, { env: { TELEGRAM_ADMIN_CHAT_ID: '-999' }, envFile: {} }), '-100'); // json wins
   assert.equal(resolveDaemonChatId(cfg, { env: {}, envFile: {} }), '42');
-  // fallback to env when _config absent
+  // fallback to env when reserved blocks absent
   assert.equal(resolveDefaultChatId({}, { env: { TELEGRAM_ADMIN_CHAT_ID: '-7' }, envFile: {} }), '-7');
   assert.equal(resolveDaemonChatId({}, { env: { DAEMON_CHAT_ID: '8' }, envFile: {} }), '8');
-  // nothing anywhere → null
   assert.equal(resolveDefaultChatId({}, { env: {}, envFile: {} }), null);
+});
+
+test('resolveQuietHours: _config.quietHours wins; env fallback; invalid → null', () => {
+  assert.deepEqual(resolveQuietHours({ _config: { quietHours: { start: 22, end: 8 } } }, { env: {}, envFile: {} }), { start: 22, end: 8 });
+  assert.deepEqual(resolveQuietHours({}, { env: { QUIET_HOURS_START: '21', QUIET_HOURS_END: '7' }, envFile: {} }), { start: 21, end: 7 });
+  assert.deepEqual(resolveQuietHours({ _config: { quietHours: { start: 99, end: 'x' } } }, { env: {}, envFile: {} }), { start: null, end: null });
+  assert.deepEqual(resolveQuietHours({}, { env: {}, envFile: {} }), { start: null, end: null });
+  // empty quietHours object must NOT shadow the env fallback
+  assert.deepEqual(resolveQuietHours({ _config: { quietHours: {} } }, { env: { QUIET_HOURS_START: '22', QUIET_HOURS_END: '8' }, envFile: {} }), { start: 22, end: 8 });
+});
+
+test('resolveProjectConfig: shared project inherits _default.roles', () => {
+  const cfg = { _default: { chatId: '-100', roles: { '144242180': { role: 'admin' } } }, ded: { chatId: '-200', roles: { '999': { role: 'dev' } } } };
+  const shared = resolveProjectConfig('some-shared-proj', { config: cfg, fallbackChatId: '-100' });
+  assert.equal(shared.dedicated, false);
+  assert.deepEqual(shared.roles, { '144242180': { role: 'admin' } }); // from _default
+  const dedicated = resolveProjectConfig('ded', { config: cfg, fallbackChatId: '-100' });
+  assert.equal(dedicated.dedicated, true);
+  assert.deepEqual(dedicated.roles, { '999': { role: 'dev' } }); // own entry
+  // A shared project's OWN roles are dead config: no `_default.roles` → {} (NOT entryRoles)
+  const noDefault = resolveProjectConfig('sharedproj', { config: { sharedproj: { roles: { '5': { role: 'admin' } } } }, fallbackChatId: '-100' });
+  assert.deepEqual(noDefault.roles, {}); // never inherits a shared project's own roles
 });
 
 test('isGroupChatId / isPrivateChatId: sign convention', () => {
@@ -82,11 +104,13 @@ test('resolveProjectConfig: no entry → fallback chatId, NOT dedicated, empty r
   assert.deepEqual(r.roles, {});
 });
 
-test('resolveProjectConfig: entry with roles but no chatId → fallback chatId, NOT dedicated, roles kept', () => {
+test('resolveProjectConfig: entry with roles but no chatId → shared, roles from _default (NOT own)', () => {
   const r = resolveProjectConfig('noChat', { config: CONFIG, fallbackChatId: '-999' });
   assert.equal(r.chatId, '-999');
   assert.equal(r.dedicated, false);
-  assert.equal(r.roles['7'], 'maintainer'); // roles still come from the entry
+  // A shared project's OWN roles are dead config — roles come from `_default.roles`
+  // (here absent in CONFIG) → {}, never the entry's own `7: maintainer`.
+  assert.deepEqual(r.roles, {});
 });
 
 test('resolveProjectConfig: no entry + no fallback → chatId null (caller fail-fasts)', () => {

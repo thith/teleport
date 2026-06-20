@@ -47,14 +47,32 @@ test('buildWhisperPrompt: injected shape with whisper flag + real fromRole', () 
   assert.deepEqual(p.attachments, []);
 });
 
-test('resolveSenderRole: highest privilege across projects, default member', () => {
+test('resolveSenderRole: highest privilege across DEDICATED projects, default member', () => {
   const cfg = {
-    a: { roles: { '1': { role: 'member' }, '9': 'admin' } },
-    b: { roles: { '1': { role: 'maintainer' } } },
+    a: { chatId: '-1', roles: { '1': { role: 'member' }, '9': 'admin' } },
+    b: { chatId: '-2', roles: { '1': { role: 'maintainer' } } },
   };
   assert.equal(resolveSenderRole(cfg, '1'), 'maintainer'); // member in a, maintainer in b → maintainer
   assert.equal(resolveSenderRole(cfg, '9'), 'admin');
   assert.equal(resolveSenderRole(cfg, '404'), 'member');   // unmapped → least privilege
+});
+
+test('resolveSenderRole: ignores a SHARED project\'s dead roles block (no chatId)', () => {
+  // A shared project's own roles are ignored by resolveProjectConfig, so they
+  // must NOT grant privilege here either — only `_default.roles` + dedicated.
+  const cfg = { shared: { roles: { '5': { role: 'admin' } } }, ded: { chatId: '-9', roles: { '6': { role: 'maintainer' } } } };
+  assert.equal(resolveSenderRole(cfg, '5'), 'member'); // dead config → not honored
+  assert.equal(resolveSenderRole(cfg, '6'), 'maintainer');
+});
+
+test('resolveSenderRole: consults _default.roles (catch-all owner not in any project)', () => {
+  // The control-DM owner is typically admin ONLY in the catch-all roster
+  // (_default.roles). projectEntries skips _default, so this would regress to
+  // member unless _default.roles is explicitly consulted.
+  const cfg = { _default: { roles: { '7': { role: 'admin' } } }, proj: { chatId: '-1', roles: { '8': { role: 'dev' } } } };
+  assert.equal(resolveSenderRole(cfg, '7'), 'admin'); // only in _default → still admin
+  assert.equal(resolveSenderRole(cfg, '8'), 'dev');
+  assert.equal(resolveSenderRole(cfg, '404'), 'member');
 });
 
 test('validateDaemonConfig: enforces group/private split', () => {
@@ -70,9 +88,9 @@ test('validateDaemonConfig: enforces group/private split', () => {
   // a project chat that is private → error
   assert.throws(() => validateDaemonConfig({ projectsConfig: { bad: { chatId: '144242180' } }, catchAllIds: ['-100'], daemonChatId: '1' }), /project 'bad' chatId must be a GROUP/);
   // catch-all private → error
-  assert.throws(() => validateDaemonConfig({ projectsConfig: {}, catchAllIds: ['144242180'], daemonChatId: '1' }), /defaultChatId.* must be a GROUP/);
-  // _config key is skipped during project iteration (not treated as a project)
-  assert.doesNotThrow(() => validateDaemonConfig({ projectsConfig: { _config: { defaultChatId: '-100' }, ok: { chatId: '-101' } }, catchAllIds: ['-100'], daemonChatId: '1' }));
+  assert.throws(() => validateDaemonConfig({ projectsConfig: {}, catchAllIds: ['144242180'], daemonChatId: '1' }), /_default.chatId.* must be a GROUP/);
+  // reserved _config / _default keys are skipped during project iteration
+  assert.doesNotThrow(() => validateDaemonConfig({ projectsConfig: { _config: { daemonChatId: '1' }, _default: { chatId: '-100' }, ok: { chatId: '-101' } }, catchAllIds: ['-100'], daemonChatId: '1' }));
 });
 
 test('singleton: acquire writes pid, second acquire fails while alive, status reflects it, release clears', () => {

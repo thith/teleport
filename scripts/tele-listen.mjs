@@ -1082,8 +1082,15 @@ function maybePruneAlive(now) {
   try { pruneAliveStale({ now }); } catch {}
 }
 
-export async function runHeartbeatReminders(token, adminIds, { sendText, now = Date.now(), storeFile, getLastAliveMs: getLastAliveMsArg = getLastAliveMs, aliveFreshMs = ALIVE_FRESH_MS, recordSystemMsgId = appendSystemMsgId } = {}) {
-  if (isQuietHour(new Date(now))) return 0;
+export async function runHeartbeatReminders(token, adminIds, { sendText, now = Date.now(), storeFile, quietHours, getLastAliveMs: getLastAliveMsArg = getLastAliveMs, aliveFreshMs = ALIVE_FRESH_MS, recordSystemMsgId = appendSystemMsgId } = {}) {
+  // Quiet-hours: the caller (daemon) passes the resolved `{start,end}` window
+  // (from projects.json `_config.quietHours`). When omitted, fall back to the
+  // process.env QUIET_HOURS_* (legacy / direct-test path). Either way the pure
+  // isQuietHour does the wrap-midnight + range validation.
+  const qhEnv = quietHours
+    ? { QUIET_HOURS_START: quietHours.start == null ? '' : String(quietHours.start), QUIET_HOURS_END: quietHours.end == null ? '' : String(quietHours.end) }
+    : process.env;
+  if (isQuietHour(new Date(now), qhEnv)) return 0;
   const sendImpl = sendText ?? (async (chatId, text, convoId) => {
     try {
       // Team mode: a reminder belongs in the convo's OWN topic, never General
@@ -1647,7 +1654,7 @@ async function main() {
   // the listener would accept messages from ANY chat. Fail-fast like the send
   // side (review G-Critical RFC 02).
   if (adminIds.length === 0) {
-    console.error(`[tele-listen] project "${lookupKey}" chưa cấu hình group: thêm "${lookupKey}".chatId vào teleport/projects.json, hoặc đặt _config.defaultChatId trong projects.json (shared catch-all).`);
+    console.error(`[tele-listen] project "${lookupKey}" chưa cấu hình group: thêm "${lookupKey}".chatId vào teleport/projects.json, hoặc đặt _default.chatId trong projects.json (shared catch-all).`);
     process.exit(1);
   }
 
@@ -1914,9 +1921,11 @@ async function main() {
   // into projects.json so the PO can fill title/name/position by hand. Never
   // elevates privilege (new rows default to `member`). See roster-upsert.mjs.
   try {
+    // Dedicated project → harvest into its own entry; shared (catch-all) → into
+    // the `_default` group's roster (all shared projects share that group).
     harvestMembers(
       toProcess.map((m) => m.msg.from),
-      { projectCode: lookupKey },
+      { projectCode: projCfg.dedicated ? lookupKey : '_default' },
     );
   } catch {}
 
@@ -2124,7 +2133,7 @@ function requireProjectAdminIdsOrExit(logPrefix = '[tele-listen]') {
   const projCfg = resolveProjectConfig(lookupKey, { config: projectsConfig, fallbackChatId });
   const adminIds = adminIdsFrom(projCfg, fallbackChatId, parseAdminChatIds);
   if (adminIds.length === 0) {
-    console.error(`${logPrefix} project "${lookupKey}" chưa cấu hình group: thêm "${lookupKey}".chatId vào teleport/projects.json, hoặc đặt _config.defaultChatId trong projects.json (shared catch-all).`);
+    console.error(`${logPrefix} project "${lookupKey}" chưa cấu hình group: thêm "${lookupKey}".chatId vào teleport/projects.json, hoặc đặt _default.chatId trong projects.json (shared catch-all).`);
     process.exit(1);
   }
   return { envFromFile, lookupKey, projCfg, adminIds, roles: projCfg.roles };

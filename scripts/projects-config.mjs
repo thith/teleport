@@ -50,19 +50,26 @@ export function readProjectsConfig(file = DEFAULT_PROJECTS_FILE) {
   }
 }
 
-// Reserved top-level key in projects.json holding NON-project, non-secret global
-// config (the catch-all default group + the daemon control DM). Underscore-
-// prefixed so it is never mistaken for a project entry. Secrets (bot token, API
-// keys) stay in .env; everything else lives here so config is in ONE place.
+// Two reserved top-level keys in projects.json (underscore-prefixed so they are
+// never mistaken for a project entry). Config lives here; .env holds secrets only.
+//   `_default` — the catch-all GROUP, shaped like a project: `{ chatId, roles }`.
+//                Projects without their own group fall back to it (chat + roster).
+//   `_config`  — pure global CONFIG (not a group): `{ daemonChatId, quietHours }`.
 export const GLOBAL_CONFIG_KEY = '_config';
+export const DEFAULT_GROUP_KEY = '_default';
 
-// The `_config` block, or {}. `{ defaultChatId?, daemonChatId?, ... }`.
+// The `_config` block, or {}. `{ daemonChatId?, quietHours?, ... }`.
 export function readGlobalConfig(config = {}) {
   const g = config && config[GLOBAL_CONFIG_KEY];
   return (g && typeof g === 'object') ? g : {};
 }
+// The `_default` catch-all group block, or {}. `{ chatId?, roles? }`.
+export function readDefaultGroup(config = {}) {
+  const d = config && config[DEFAULT_GROUP_KEY];
+  return (d && typeof d === 'object') ? d : {};
+}
 
-// Project entries only — skips the `_config` block and any other reserved
+// Project entries only — skips `_config`, `_default`, and any other reserved
 // underscore-prefixed key. Use this everywhere code iterates "all projects".
 export function projectEntries(config = {}) {
   return Object.entries(config || {}).filter(([k]) => !k.startsWith('_'));
@@ -70,15 +77,15 @@ export function projectEntries(config = {}) {
 
 let _warnedDefaultEnv = false;
 let _warnedDaemonEnv = false;
-// Catch-all default GROUP chat id: projects.json `_config.defaultChatId` is the
-// source of truth; falls back to the DEPRECATED env `TELEGRAM_ADMIN_CHAT_ID`
-// (warned once) so existing .env setups keep working during migration.
+// Catch-all default GROUP chat id: projects.json `_default.chatId` is the source
+// of truth; falls back to the DEPRECATED env `TELEGRAM_ADMIN_CHAT_ID` (warned
+// once) so existing .env setups keep working during migration.
 export function resolveDefaultChatId(config, { env = process.env, envFile = {} } = {}) {
-  const fromJson = readGlobalConfig(config).defaultChatId;
+  const fromJson = readDefaultGroup(config).chatId;
   if (fromJson != null && String(fromJson).trim() !== '') return String(fromJson).trim();
   const fromEnv = env.TELEGRAM_ADMIN_CHAT_ID || envFile.TELEGRAM_ADMIN_CHAT_ID;
   if (fromEnv) {
-    if (!_warnedDefaultEnv) { _warnedDefaultEnv = true; console.error('[config] DEPRECATED: TELEGRAM_ADMIN_CHAT_ID in .env — move it to projects.json `_config.defaultChatId`.'); }
+    if (!_warnedDefaultEnv) { _warnedDefaultEnv = true; console.error('[config] DEPRECATED: TELEGRAM_ADMIN_CHAT_ID in .env — move it to projects.json `_default.chatId`.'); }
     return String(fromEnv).trim();
   }
   return null;
@@ -97,6 +104,24 @@ export function resolveDaemonChatId(config, { env = process.env, envFile = {} } 
   return null;
 }
 
+// Quiet-hours window for auto-reminders: projects.json `_config.quietHours`
+// `{ start, end }` (0–23), falling back to the DEPRECATED env QUIET_HOURS_*.
+// Returns `{ start, end }` with null when unset/invalid (caller treats as 24/7).
+export function resolveQuietHours(config, { env = process.env, envFile = {} } = {}) {
+  const parseHr = (v) => {
+    if (v == null || v === '') return null;
+    const n = Number(v);
+    return Number.isInteger(n) && n >= 0 && n <= 23 ? n : null;
+  };
+  const qh = readGlobalConfig(config).quietHours;
+  // Only treat `_config.quietHours` as set when it actually has a bound — an
+  // empty `{}` must fall through to the env fallback, not silently disable it.
+  if (qh && typeof qh === 'object' && (qh.start != null || qh.end != null)) {
+    return { start: parseHr(qh.start), end: parseHr(qh.end) };
+  }
+  return { start: parseHr(env.QUIET_HOURS_START ?? envFile.QUIET_HOURS_START), end: parseHr(env.QUIET_HOURS_END ?? envFile.QUIET_HOURS_END) };
+}
+
 /**
  * Resolve `{ chatId, dedicated, roles, code, topicIcon }` for a project.
  * `lookupKey` is the projects.json key (= `basename(cwd)`); it is NOT shown to
@@ -107,7 +132,9 @@ export function resolveDaemonChatId(config, { env = process.env, envFile = {} } 
  * - `dedicated: false` → chatId is the shared catch-all (`fallbackChatId`, may be
  *   null); each message carries a `[<code>]` prefix AND the topic title is
  *   code-first ("md · 🐉 Rồng") so the catch-all group is scannable by project.
- * - `roles` always comes from the json entry (may be {}).
+ * - `roles` → a DEDICATED project's own entry roles; a SHARED project inherits
+ *   the catch-all group's roster from `_default.roles` (all shared projects live
+ *   in the same group, so they share its members).
  * - `code`  → the DISPLAY/canonical project code: entry.code (a short alias, e.g.
  *   "d_be") when set, else `lookupKey`. Lets a repo folder ("digesty-worker")
  *   carry a short code without the old `TELE_PROJECT_CODE` env var. Used only for
@@ -116,16 +143,24 @@ export function resolveDaemonChatId(config, { env = process.env, envFile = {} } 
  *   passed through to createForumTopic. Absent → Telegram's default icon.
  */
 export function resolveProjectConfig(lookupKey, { config = {}, fallbackChatId = null } = {}) {
-  const entry = (lookupKey && config[lookupKey]) || null; // truthy: '' key never matches a config[''] key
-  const roles = (entry && entry.roles && typeof entry.roles === 'object') ? entry.roles : {};
+  // Never resolve a reserved `_`-key (`_default`/`_config`) as a project — a repo
+  // folder named `_default` must NOT hijack the catch-all/global config.
+  const entry = (lookupKey && !String(lookupKey).startsWith('_') && config[lookupKey]) || null;
+  const entryRoles = (entry && entry.roles && typeof entry.roles === 'object') ? entry.roles : {};
   const code = (entry && typeof entry.code === 'string' && entry.code.trim()) ? entry.code.trim() : lookupKey;
   const topicIcon = (entry && entry.topicIcon && typeof entry.topicIcon === 'object' && !Array.isArray(entry.topicIcon)) ? entry.topicIcon : null;
   // Trim so a whitespace-only chatId ("   ") is treated as absent, not as a
   // bogus dedicated target that would bypass the empty-adminIds fail-fast.
   const dedicatedChatId = entry?.chatId == null ? '' : String(entry.chatId).trim();
   if (dedicatedChatId) {
-    return { chatId: dedicatedChatId, dedicated: true, roles, code, topicIcon };
+    return { chatId: dedicatedChatId, dedicated: true, roles: entryRoles, code, topicIcon };
   }
+  // Shared → inherit the catch-all group's roster (`_default.roles`) ONLY. A
+  // shared project's OWN `roles` block is dead config and must NEVER grant
+  // privilege (it would contradict resolveSenderRole's dedicated-only scan), so
+  // when `_default.roles` is absent/malformed we fall to `{}`, not `entryRoles`.
+  const defaultRoles = readDefaultGroup(config).roles;
+  const roles = (defaultRoles && typeof defaultRoles === 'object') ? defaultRoles : {};
   const fallback = fallbackChatId == null ? '' : String(fallbackChatId).trim();
   return { chatId: fallback || null, dedicated: false, roles, code, topicIcon };
 }

@@ -113,6 +113,27 @@ test('harvestMembers: writes new rows into [code].roles atomically', () => {
   fs.unlinkSync(f);
 });
 
+test('harvestMembers: catch-all members harvest into the _default roster', () => {
+  const f = tmpJson({ _default: { chatId: '-100', roles: {} }, luni: { chatId: '-200' } });
+  const n = harvestMembers([{ id: 5, username: 'mai', first_name: 'Mai' }], { projectCode: '_default', file: f });
+  assert.equal(n, 1);
+  const after = JSON.parse(fs.readFileSync(f, 'utf8'));
+  assert.equal(after._default.roles['5'].username, 'mai'); // went into _default, not luni
+  fs.unlinkSync(f);
+});
+
+test('harvestMembers: auto-creates the _default block when absent (but NOT a normal project)', () => {
+  const f = tmpJson({ luni: { chatId: '-200' } }); // no _default yet
+  const n = harvestMembers([{ id: 6, username: 'tan', first_name: 'Tan' }], { projectCode: '_default', file: f });
+  assert.equal(n, 1);
+  assert.equal(JSON.parse(fs.readFileSync(f, 'utf8'))._default.roles['6'].username, 'tan'); // _default stubbed
+  // a normal (non-_default) absent project is NOT stubbed
+  const n2 = harvestMembers([{ id: 7, username: 'x', first_name: 'X' }], { projectCode: 'nope', file: f });
+  assert.equal(n2, 0);
+  assert.equal(JSON.parse(fs.readFileSync(f, 'utf8')).nope, undefined);
+  fs.unlinkSync(f);
+});
+
 test('harvestMembers: de-dupes batch + skips bots & known ids → may write 0', () => {
   const f = tmpJson({ luni: { chatId: '-100', roles: { '1': 'admin' } } });
   const n = harvestMembers(

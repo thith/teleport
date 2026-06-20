@@ -141,7 +141,7 @@ nên **khi daemon KHÔNG chạy thì sẽ không có reminder/`/pending`**).
   `admin/maintainer` được authorize. Chạy detached giúp user nếu được yêu cầu:
   `screen -dmS teleport-daemon node ../teleport/scripts/daemon.mjs`.
 - **Cấu hình:** đặt `_config.daemonChatId` (private chat id, dương) trong `../teleport/projects.json`
-  (env chỉ giữ secrets). Mọi project/`_config.defaultChatId` phải là **group (id âm)**; daemon
+  (env chỉ giữ secrets). Mọi project/`_default.chatId` phải là **group (id âm)**; daemon
   chat phải là **private (id dương)** — daemon tự validate và báo lỗi nếu sai.
 
 ## Content format
@@ -312,7 +312,7 @@ Anyone in the group can talk to you (membership is the real trust boundary), but
 
 Unknown / typo'd role strings are treated as non-privileged (least privilege) — they will NOT pass the `admin`/`maintainer` check. This complements (does not replace) each project's own admin-whitelist rules. When in doubt, confirm with an `admin`.
 
-**Roster auto-fill (FYI).** Telegram has no API to list a group's members, so the listener harvests them lazily: the first time someone speaks, their `{ id, username, name }` is appended to `projects.json` under `[code].roles` with `role: member` and empty `title`/`position` for the PO to fill by hand. Harvest never elevates privilege — a freshly-harvested member is always `member` until the PO edits the file. PO may also pre-create a row keyed by `@username`; harvest fills its id on first sight.
+**Roster auto-fill (FYI).** Telegram has no API to list a group's members, so the listener harvests them lazily: the first time someone speaks, their `{ id, username, name }` is appended with `role: member` and empty `title`/`position` for the PO to fill by hand. A **dedicated** project harvests into its own `[code].roles`; a **shared/catch-all** project harvests into the `_default.roles` roster (the catch-all group's shared members). Harvest never elevates privilege — a freshly-harvested member is always `member` until the PO edits the file. PO may also pre-create a row keyed by `@username`; harvest fills its id on first sight.
 
 **MUST: validate prompt relevance before acting (the "misrouted reply" check).** Multiple agents share one admin chat, and admins occasionally tap "reply" on the wrong message. Before treating a prompt as a directive, cross-check `replyToText` against the most recent message *you* sent in this turn. The strongest positive signal is: `replyToText` starts with your identity tag — your persona `[<emoji> <name> #<convo-hashtag>]` (and the `[<project>]` prefix too, in a SHARED group; a DEDICATED per-project group omits the `[<project>]` prefix since the whole group is that project).
 

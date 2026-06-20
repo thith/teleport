@@ -46,13 +46,17 @@ teleport posts every conversation in its own **forum topic**, so the chat **must
 REPORT_BOT_TOKEN=<bot token from BotFather>
 ```
 
-Non-secret config lives in `projects.json` (copy `projects.sample.json` → `projects.json`; it's gitignored). The catch-all default group and the daemon's control DM go in its `_config` block:
+Non-secret config lives in `projects.json` (copy `projects.sample.json` → `projects.json`; it's gitignored). Two reserved blocks: `_default` is the catch-all group (chatId + its member roster), `_config` is global config (daemon DM, quiet hours):
 
 ```json
 {
+  "_default": {
+    "chatId": "<forum supergroup ID — a negative number>",
+    "roles": { "<your telegram user id>": { "role": "admin", "name": "You" } }
+  },
   "_config": {
-    "defaultChatId": "<forum supergroup ID — a negative number>",
-    "daemonChatId": "<your private chat id — only if you run the daemon>"
+    "daemonChatId": "<your private chat id — only if you run the daemon>",
+    "quietHours": { "start": 22, "end": 8 }
   }
 }
 ```
@@ -139,7 +143,7 @@ Per-project `package.json` scripts (optional convenience):
 "daemon:stop": "node ../teleport/scripts/daemon.mjs --stop"
 ```
 
-**Config:** set `_config.daemonChatId` (your private chat id) in `projects.json`. Chat-id rule (validated at startup): every project / `_config.defaultChatId` chat must be a **group** (negative id); `daemonChatId` must be a **private** chat (positive id). `/spawn <project>` resolves `<workspace-parent>/<project>` as the new agent's cwd (which is how it joins that project's group). **Whisper** injects a discreet steer into a topic with `whisper:true` — invisible in the group; the receiving agent acts on it without announcing it (see `rules/telegram-guide.md`).
+**Config:** set `_config.daemonChatId` (your private chat id) in `projects.json`. Chat-id rule (validated at startup): every project / `_default.chatId` chat must be a **group** (negative id); `daemonChatId` must be a **private** chat (positive id). `/spawn <project>` resolves `<workspace-parent>/<project>` as the new agent's cwd (which is how it joins that project's group). **Whisper** injects a discreet steer into a topic with `whisper:true` — invisible in the group; the receiving agent acts on it without announcing it (see `rules/telegram-guide.md`).
 
 ## How to use
 
