@@ -124,7 +124,7 @@ The spawn helper lives at `teleport/scripts/spawn.mjs`. Add these scripts to eac
 
 A small, **non-AI**, **manually-started** process (`scripts/daemon.mjs`) that gives you remote control even when **every agent has died** (quota / network / API) — the one case the normal "an agent runs the command" model can't recover from, because a dead agent can't receive "spawn a new one". It's best-effort: start it before you step away (or have a live agent start it); forget to, and teleport behaves exactly as before.
 
-It listens to **one private DM** (`DAEMON_CHAT_ID`) and handles known commands — `/spawn <project>`, `/whisper topic:#<hash> <text>`, `/pending`, `/start` — plus the heartbeat auto-reminder (which now lives **only** here, moved out of the agent listeners). It never calls an LLM. It "harvests" Telegram updates into the *same* shared cache the agent listeners use (cooperative, no offset war); only its own private-DM lane is processed by the daemon.
+It listens to **one private DM** (`DAEMON_CHAT_ID`) and handles known commands — `/spawn <project>`, `/run <project> <script> [args]` (auto-detects npm/pnpm/yarn, validates the script in package.json, then runs `<pm> run <script>`; admin/maintainer only — remote exec), `/whisper topic:#<hash> <text>`, `/pending`, `/start` — plus the heartbeat auto-reminder (which now lives **only** here, moved out of the agent listeners). It never calls an LLM. It "harvests" Telegram updates into the *same* shared cache the agent listeners use (cooperative, no offset war); only its own private-DM lane is processed by the daemon.
 
 ```bash
 node ../teleport/scripts/daemon.mjs            # run (keep a terminal/screen open)

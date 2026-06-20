@@ -23,9 +23,12 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+const execFileP = promisify(execFile);
 
 import {
-  loadEnvFromFile, parseAdminChatIds, extractBotId, sendTextChunk, shortConvoHash,
+  loadEnvFromFile, parseAdminChatIds, extractBotId, sendTextToAdmin, shortConvoHash,
 } from './send-telegram.mjs';
 import {
   readProjectsConfig, roleFor, assertChatIdKind, projectEntries, readDefaultGroup,
@@ -79,10 +82,64 @@ export function parseWhisperArgs(rest) {
   return { target, message };
 }
 
+// `/run` config. Only npm/pnpm/yarn are ever invoked (the PM is auto-detected,
+// never user-supplied — it's remote code execution, keep it bounded). Hard
+// timeout; output is sent as-is and teleport auto-attaches it as a file when long
+// (we only tail-cap at a generous safety ceiling to avoid pathological sends).
+export const RUN_TIMEOUT_MS = 5 * 60 * 1000;
+export const RUN_MAX_BUFFER = 8 * 1024 * 1024;
+export const RUN_OUTPUT_CAP = 100_000;
+
+// Parse `/run <project> <script> [args...]` (NO package manager — auto-detected).
+// Returns {project, script, args} or {error}.
+export function parseRunArgs(rest) {
+  const parts = (rest || '').trim().split(/\s+/).filter(Boolean);
+  if (parts.length < 2) return { error: 'usage: /run <project> <script> [args...]' };
+  const [project, script, ...args] = parts;
+  // A script starting with '-' would be parsed by the PM as a flag (e.g. a way
+  // to slip `--prefix`); the script name must be a plain identifier.
+  if (script.startsWith('-')) return { error: `invalid script name: ${JSON.stringify(script)}` };
+  return { project, script, args };
+}
+
+// Detect the package manager a project uses: package.json `packageManager` field
+// first, then lockfiles (pnpm > yarn > npm), default npm. Pure (deps injected).
+export function detectPackageManager(cwd, { existsSync = fs.existsSync, readFileSync = fs.readFileSync } = {}) {
+  try {
+    const pkg = JSON.parse(readFileSync(path.join(cwd, 'package.json'), 'utf8'));
+    const pm = typeof pkg.packageManager === 'string' ? pkg.packageManager.split('@')[0].trim() : '';
+    if (pm === 'pnpm' || pm === 'yarn' || pm === 'npm') return pm;
+  } catch { /* fall through to lockfiles */ }
+  if (existsSync(path.join(cwd, 'pnpm-lock.yaml'))) return 'pnpm';
+  if (existsSync(path.join(cwd, 'yarn.lock'))) return 'yarn';
+  if (existsSync(path.join(cwd, 'package-lock.json'))) return 'npm';
+  return 'npm';
+}
+
+// Read a project's package.json scripts. Returns {scripts} or {error} (missing
+// file / parse error). Pure (readFileSync injectable).
+export function readPackageScripts(cwd, { readFileSync = fs.readFileSync } = {}) {
+  let raw;
+  try { raw = readFileSync(path.join(cwd, 'package.json'), 'utf8'); }
+  catch { return { error: `no package.json in ${cwd}` }; }
+  let pkg;
+  try { pkg = JSON.parse(raw); } catch { return { error: `package.json is not valid JSON` }; }
+  const scripts = (pkg && pkg.scripts && typeof pkg.scripts === 'object' && !Array.isArray(pkg.scripts)) ? pkg.scripts : {};
+  return { scripts };
+}
+
+// Tail-cap a string at a generous ceiling (safety net only — normal output is
+// sent whole and teleport files it if long). Pure.
+export function tailOutput(s, max = RUN_OUTPUT_CAP) {
+  s = s == null ? '' : String(s);
+  if (s.length <= max) return s;
+  return `…(truncated; showing last ${max} chars)\n` + s.slice(s.length - max);
+}
+
 // Resolve `/spawn <project>` to a sibling directory under PARENT_DIR. Returns
 // { cwd } or { error }. Validates the project token (no path traversal) and that
 // the directory exists with a package.json (teleport's project convention).
-export function resolveSpawnCwd(project, { parentDir = PARENT_DIR, statSync = fs.statSync } = {}) {
+export function resolveSpawnCwd(project, { parentDir = PARENT_DIR, statSync = fs.statSync, realpathSync = fs.realpathSync } = {}) {
   if (!project) return { error: 'usage: /spawn <project>' };
   if (!/^[A-Za-z0-9._-]+$/.test(project) || project === '.' || project === '..') {
     return { error: `invalid project name: ${JSON.stringify(project)}` };
@@ -92,6 +149,17 @@ export function resolveSpawnCwd(project, { parentDir = PARENT_DIR, statSync = fs
     if (!statSync(cwd).isDirectory()) return { error: `not a directory: ${cwd}` };
   } catch {
     return { error: `project folder not found: ${cwd}` };
+  }
+  // Containment after following symlinks: a project dir that's a symlink to
+  // OUTSIDE the workspace parent must not let /spawn or /run execute elsewhere.
+  try {
+    const realParent = realpathSync(parentDir);
+    const realCwd = realpathSync(cwd);
+    if (realCwd !== realParent && !realCwd.startsWith(realParent + path.sep)) {
+      return { error: `project resolves outside the workspace: ${project}` };
+    }
+  } catch {
+    return { error: `cannot resolve project path: ${cwd}` };
   }
   return { cwd };
 }
@@ -238,7 +306,9 @@ async function main() {
 
   console.error(`[daemon] up. pid=${process.pid} bot=${botId} control-DM=${daemonChatId} parent=${PARENT_DIR}`);
   const sendText = async (chatId, text) => {
-    try { await sendTextChunk(token, chatId, text, { raw: false, plain: true }); } catch (e) { console.error(`[daemon] send failed: ${e?.message ?? e}`); }
+    // sendTextToAdmin (not sendTextChunk) so LONG output — e.g. a /run build log —
+    // auto-falls-back to a .md document instead of throwing on the 4096 limit.
+    try { await sendTextToAdmin(token, chatId, text, { raw: false, plain: true }); } catch (e) { console.error(`[daemon] send failed: ${e?.message ?? e}`); }
   };
 
   let lastHeartbeat = 0;
@@ -303,10 +373,52 @@ async function handleControlMessages(mine, { token, daemonChatId, projectsConfig
     try {
       if (parsed.cmd === 'spawn') await cmdSpawn(parsed.rest, ctx);
       else if (parsed.cmd === 'whisper') await cmdWhisper(parsed.rest, ctx);
+      else if (parsed.cmd === 'run') await cmdRun(parsed.rest, ctx);
       // /pending, /start handled above; unknown commands ignored silently.
     } catch (e) {
       await sendText(daemonChatId, `❌ /${parsed.cmd} failed: ${e instanceof Error ? e.message : e}`);
     }
+  }
+}
+
+// `/run <project> <npm|pnpm|yarn> <args>` — cd into a sibling project and run a
+// package-manager command, sending the result back to the control DM. REMOTE
+// EXEC → gated to admin/maintainer (resolveSenderRole), binary whitelisted, hard
+// timeout. `runner` injectable for tests.
+export async function cmdRun(rest, { daemonChatId, from, projectsConfig, sendText, runner = execFileP, parentDir = PARENT_DIR }) {
+  const role = resolveSenderRole(projectsConfig, from && from.id);
+  if (role !== 'admin' && role !== 'maintainer') {
+    await sendText(daemonChatId, `❌ /run cần quyền admin/maintainer (bạn: ${role}).`);
+    return;
+  }
+  const a = parseRunArgs(rest);
+  if (a.error) { await sendText(daemonChatId, `❌ ${a.error}`); return; }
+  const r = resolveSpawnCwd(a.project, { parentDir });
+  if (r.error) { await sendText(daemonChatId, `❌ ${r.error}`); return; }
+  // package.json must exist and define the requested script.
+  const pkg = readPackageScripts(r.cwd);
+  if (pkg.error) { await sendText(daemonChatId, `❌ ${pkg.error}`); return; }
+  if (!Object.prototype.hasOwnProperty.call(pkg.scripts, a.script)) {
+    const avail = Object.keys(pkg.scripts);
+    await sendText(daemonChatId, `❌ script "${a.script}" không có trong ${a.project}/package.json. Có: ${avail.length ? avail.join(', ') : '(không có script nào)'}`);
+    return;
+  }
+  const pm = detectPackageManager(r.cwd);
+  // argv: `<pm> run <script> -- <args>`. The `--` makes everything after it go to
+  // the SCRIPT, not the package manager — so a trailing `--prefix /elsewhere` (npm)
+  // / `--dir` (pnpm) / `--cwd` (yarn) can't redirect the PM out of the project cwd.
+  // No `hasBinary(pm)` pre-check (it shells out): a missing PM surfaces as the
+  // execFile ENOENT below, caught and reported.
+  const args = a.args.length ? ['run', a.script, '--', ...a.args] : ['run', a.script];
+  const label = `${a.project}: ${pm} run ${a.script}${a.args.length ? ' ' + a.args.join(' ') : ''}`;
+  await sendText(daemonChatId, `▶️ ${label} …`);
+  try {
+    const { stdout, stderr } = await runner(pm, args, { cwd: r.cwd, timeout: RUN_TIMEOUT_MS, maxBuffer: RUN_MAX_BUFFER });
+    const out = tailOutput((stdout || '') + (stderr ? `\n[stderr]\n${stderr}` : ''));
+    await sendText(daemonChatId, `✅ ${label} — exit 0\n\n${out || '(no output)'}`);
+  } catch (e) {
+    const body = (e.stdout || '') + (e.stderr ? `\n[stderr]\n${e.stderr}` : '') + (e.killed ? '\n[killed: timeout]' : '');
+    await sendText(daemonChatId, `❌ ${label} — exit ${e.code ?? e.signal ?? '?'}\n\n${tailOutput(body) || (e.message || 'failed')}`);
   }
 }
 

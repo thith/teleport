@@ -1199,7 +1199,7 @@ export async function sendTextChunk(token, chatId, rawChunk, { raw, plain, reply
   throw new Error(desc);
 }
 
-async function sendTextToAdmin(token, chatId, text, opts) {
+export async function sendTextToAdmin(token, chatId, text, opts) {
   // Long-message policy: if text exceeds the single-message limit, send as a
   // single .md file attachment instead of splitting into multiple Telegram
   // messages. Rationale: chunked sends give each chunk its own messageId, so

@@ -131,9 +131,11 @@ Khi prompt có `whisper: true` → **MUST**:
 
 `daemon.mjs` là một process **không-phải-AI**, bật tay (best-effort), để điều khiển/cứu hộ
 từ xa **kể cả khi mọi agent đã chết** (quota/network). Nó nghe một **private DM**
-(`DAEMON_CHAT_ID`) và xử lý lệnh: `/spawn <project>`, `/whisper topic:#<hash> <text>`,
-`/pending`, `/start`, cùng **heartbeat auto-reminder** (đã chuyển từ tele-listen sang đây —
-nên **khi daemon KHÔNG chạy thì sẽ không có reminder/`/pending`**).
+(`DAEMON_CHAT_ID`) và xử lý lệnh: `/spawn <project>`, `/run <project> <script> [args]`,
+`/whisper topic:#<hash> <text>`, `/pending`, `/start`, cùng **heartbeat auto-reminder** (đã
+chuyển từ tele-listen sang đây — nên **khi daemon KHÔNG chạy thì sẽ không có reminder/`/pending`**).
+`/run` tự detect npm/pnpm/yarn của project, validate script trong package.json, rồi chạy
+`<pm> run <script>` (chỉ admin/maintainer — remote exec).
 
 - **Bật:** từ project root chạy `node ../teleport/scripts/daemon.mjs` (giữ terminal/screen
   mở để nó sống). Trạng thái: `--status`; dừng: `--stop`. Single-instance (pidfile).

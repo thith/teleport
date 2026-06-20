@@ -6,7 +6,149 @@ import path from 'node:path';
 import {
   parseDaemonCommand, parseWhisperArgs, resolveSpawnCwd, buildWhisperPrompt,
   validateDaemonConfig, resolveSenderRole, acquireSingleton, releaseSingleton, daemonStatus,
+  parseRunArgs, tailOutput, cmdRun, detectPackageManager, readPackageScripts,
 } from './daemon.mjs';
+
+// Build a fake project dir with a package.json (scripts) + optional lockfile.
+function fakeProject(scripts = {}, { lock, packageManager } = {}) {
+  const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'run-parent-'));
+  const proj = path.join(parent, 'proj');
+  fs.mkdirSync(proj);
+  const pkg = { name: 'proj', scripts };
+  if (packageManager) pkg.packageManager = packageManager;
+  fs.writeFileSync(path.join(proj, 'package.json'), JSON.stringify(pkg));
+  if (lock) fs.writeFileSync(path.join(proj, lock), '');
+  return { parent, proj, cleanup: () => fs.rmSync(parent, { recursive: true, force: true }) };
+}
+
+test('parseRunArgs: project + script + args (no package manager)', () => {
+  assert.deepEqual(parseRunArgs('luni dev'), { project: 'luni', script: 'dev', args: [] });
+  assert.deepEqual(parseRunArgs('d_be build --prod'), { project: 'd_be', script: 'build', args: ['--prod'] });
+  assert.ok(parseRunArgs('luni').error); // no script
+  assert.ok(parseRunArgs('').error);
+});
+
+test('detectPackageManager: packageManager field > lockfile > npm default', () => {
+  const { proj, cleanup } = fakeProject({}, { packageManager: 'pnpm@9.0.0' });
+  assert.equal(detectPackageManager(proj), 'pnpm'); cleanup();
+  const a = fakeProject({}, { lock: 'yarn.lock' }); assert.equal(detectPackageManager(a.proj), 'yarn'); a.cleanup();
+  const b = fakeProject({}, { lock: 'pnpm-lock.yaml' }); assert.equal(detectPackageManager(b.proj), 'pnpm'); b.cleanup();
+  const c = fakeProject({}, { lock: 'package-lock.json' }); assert.equal(detectPackageManager(c.proj), 'npm'); c.cleanup();
+  const d = fakeProject({}); assert.equal(detectPackageManager(d.proj), 'npm'); d.cleanup(); // default
+});
+
+test('readPackageScripts: returns scripts, or error when missing/invalid', () => {
+  const { proj, cleanup } = fakeProject({ dev: 'vite', test: 'vitest' });
+  assert.deepEqual(readPackageScripts(proj).scripts, { dev: 'vite', test: 'vitest' });
+  cleanup();
+  assert.ok(readPackageScripts('/no/such/dir').error); // missing package.json
+});
+
+test('tailOutput: keeps tail with marker when over limit', () => {
+  assert.equal(tailOutput('short', 100), 'short');
+  const t = tailOutput('x'.repeat(50), 10);
+  assert.ok(t.startsWith('…(truncated'));
+  assert.ok(t.endsWith('xxxxxxxxxx'));
+});
+
+test('cmdRun: refuses non-admin/maintainer (remote exec gate)', async () => {
+  const sent = []; let ran = false;
+  await cmdRun('proj dev', {
+    daemonChatId: '1', from: { id: '999' }, projectsConfig: { _default: { roles: { '999': { role: 'member' } } } },
+    sendText: async (_c, t) => sent.push(t), runner: async () => { ran = true; return { stdout: '', stderr: '' }; },
+  });
+  assert.equal(ran, false);
+  assert.match(sent[0], /admin\/maintainer/);
+});
+
+test('cmdRun: missing script → error listing available, never runs', async () => {
+  const { parent, cleanup } = fakeProject({ dev: 'vite', build: 'vite build' });
+  const sent = []; let ran = false;
+  await cmdRun('proj nope', {
+    daemonChatId: '1', from: { id: '7' }, projectsConfig: { _default: { roles: { '7': { role: 'admin' } } } },
+    parentDir: parent, sendText: async (_c, t) => sent.push(t), runner: async () => { ran = true; return {}; },
+  });
+  assert.equal(ran, false);
+  assert.match(sent[0], /script "nope" không có/);
+  assert.match(sent[0], /dev, build/);
+  cleanup();
+});
+
+test('cmdRun: admin runs <pm> run <script> in the project cwd + reports output', async () => {
+  const { parent, proj, cleanup } = fakeProject({ dev: 'vite' }, { lock: 'pnpm-lock.yaml' });
+  const calls = []; const sent = [];
+  await cmdRun('proj dev --port 3000', {
+    daemonChatId: '1', from: { id: '7' }, projectsConfig: { _default: { roles: { '7': { role: 'admin' } } } },
+    parentDir: parent, sendText: async (_c, t) => sent.push(t),
+    runner: async (bin, args, opts) => { calls.push({ bin, args, cwd: opts.cwd }); return { stdout: 'served', stderr: '' }; },
+  });
+  assert.equal(calls[0].bin, 'pnpm'); // detected from lockfile
+  // `--` delimits: the `--port 3000` go to the SCRIPT, not the package manager,
+  // so a hostile `--prefix /elsewhere` can't redirect the PM out of cwd.
+  assert.deepEqual(calls[0].args, ['run', 'dev', '--', '--port', '3000']);
+  assert.equal(calls[0].cwd, proj);
+  assert.ok(sent.some((t) => /exit 0/.test(t) && /served/.test(t)));
+  cleanup();
+});
+
+test('parseRunArgs: rejects a script name starting with "-" (PM-flag injection)', () => {
+  assert.ok(parseRunArgs('luni --prefix').error);
+  assert.ok(parseRunArgs('luni -x build').error);
+});
+
+test('cmdRun: a --prefix arg is delimited after -- (cannot redirect the PM cwd)', async () => {
+  const { parent, proj, cleanup } = fakeProject({ dev: 'vite' });
+  const calls = [];
+  await cmdRun('proj dev --prefix /etc', {
+    daemonChatId: '1', from: { id: '7' }, projectsConfig: { _default: { roles: { '7': { role: 'admin' } } } },
+    parentDir: parent, sendText: async () => {}, runner: async (bin, args, opts) => { calls.push({ args, cwd: opts.cwd }); return { stdout: '', stderr: '' }; },
+  });
+  assert.deepEqual(calls[0].args, ['run', 'dev', '--', '--prefix', '/etc']); // after the delimiter
+  assert.equal(calls[0].cwd, proj);
+  cleanup();
+});
+
+test('resolveSpawnCwd: rejects a project dir that symlinks OUTSIDE the workspace', () => {
+  const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'ws-'));
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'outside-'));
+  fs.symlinkSync(outside, path.join(parent, 'evil'));
+  const r = resolveSpawnCwd('evil', { parentDir: parent });
+  assert.ok(r.error && /outside the workspace/.test(r.error));
+  fs.rmSync(parent, { recursive: true, force: true }); fs.rmSync(outside, { recursive: true, force: true });
+});
+
+test('cmdRun: prototype-chain "scripts" (toString/constructor) are NOT runnable', async () => {
+  const { parent, cleanup } = fakeProject({ dev: 'vite' });
+  const sent = []; let ran = false;
+  await cmdRun('proj toString', {
+    daemonChatId: '1', from: { id: '7' }, projectsConfig: { _default: { roles: { '7': { role: 'admin' } } } },
+    parentDir: parent, sendText: async (_c, t) => sent.push(t), runner: async () => { ran = true; return {}; },
+  });
+  assert.equal(ran, false); // hasOwnProperty guard → not treated as an existing script
+  assert.match(sent[0], /script "toString" không có/);
+  cleanup();
+});
+
+test('readPackageScripts: an array "scripts" is treated as no scripts', () => {
+  const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'run-parent-'));
+  const proj = path.join(parent, 'p'); fs.mkdirSync(proj);
+  fs.writeFileSync(path.join(proj, 'package.json'), JSON.stringify({ scripts: ['a', 'b'] }));
+  assert.deepEqual(readPackageScripts(proj).scripts, {}); // array → {}
+  fs.rmSync(parent, { recursive: true, force: true });
+});
+
+test('cmdRun: no package.json → error', async () => {
+  const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'run-parent-'));
+  fs.mkdirSync(path.join(parent, 'proj')); // dir but no package.json
+  const sent = []; let ran = false;
+  await cmdRun('proj dev', {
+    daemonChatId: '1', from: { id: '7' }, projectsConfig: { _default: { roles: { '7': { role: 'admin' } } } },
+    parentDir: parent, sendText: async (_c, t) => sent.push(t), runner: async () => { ran = true; return {}; },
+  });
+  assert.equal(ran, false);
+  assert.match(sent[0], /no package.json/);
+  fs.rmSync(parent, { recursive: true, force: true });
+});
 
 test('parseDaemonCommand: extracts command + rest, strips @botname, lowercases', () => {
   assert.deepEqual(parseDaemonCommand('/spawn d_be'), { cmd: 'spawn', rest: 'd_be' });
