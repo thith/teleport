@@ -64,13 +64,15 @@ test('validateDaemonConfig: enforces group/private split', () => {
     catchAllIds: ['-100999'], daemonChatId: '144242180',
   }));
   // daemon chat must be private
-  assert.throws(() => validateDaemonConfig({ projectsConfig: {}, catchAllIds: ['-100'], daemonChatId: '-100' }), /DAEMON_CHAT_ID must be a PRIVATE/);
+  assert.throws(() => validateDaemonConfig({ projectsConfig: {}, catchAllIds: ['-100'], daemonChatId: '-100' }), /daemonChatId.* must be a PRIVATE/);
   // missing daemon chat
-  assert.throws(() => validateDaemonConfig({ projectsConfig: {}, catchAllIds: ['-100'], daemonChatId: '' }), /Missing DAEMON_CHAT_ID/);
+  assert.throws(() => validateDaemonConfig({ projectsConfig: {}, catchAllIds: ['-100'], daemonChatId: '' }), /Missing daemonChatId/);
   // a project chat that is private → error
   assert.throws(() => validateDaemonConfig({ projectsConfig: { bad: { chatId: '144242180' } }, catchAllIds: ['-100'], daemonChatId: '1' }), /project 'bad' chatId must be a GROUP/);
   // catch-all private → error
-  assert.throws(() => validateDaemonConfig({ projectsConfig: {}, catchAllIds: ['144242180'], daemonChatId: '1' }), /catch-all .* must be a GROUP/);
+  assert.throws(() => validateDaemonConfig({ projectsConfig: {}, catchAllIds: ['144242180'], daemonChatId: '1' }), /defaultChatId.* must be a GROUP/);
+  // _config key is skipped during project iteration (not treated as a project)
+  assert.doesNotThrow(() => validateDaemonConfig({ projectsConfig: { _config: { defaultChatId: '-100' }, ok: { chatId: '-101' } }, catchAllIds: ['-100'], daemonChatId: '1' }));
 });
 
 test('singleton: acquire writes pid, second acquire fails while alive, status reflects it, release clears', () => {

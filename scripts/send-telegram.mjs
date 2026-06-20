@@ -39,7 +39,7 @@ import {
 import { CONVO_HASH_LONG_LEN, shortConvoHash as _shortConvoHash } from './convo-hash.mjs';
 import { formatPersona } from './persona.mjs';
 import { resolvePersonaInGroup, peekPersona } from './persona-store.mjs';
-import { readProjectsConfig, resolveProjectConfig, adminIdsFrom } from './projects-config.mjs';
+import { readProjectsConfig, resolveProjectConfig, adminIdsFrom, resolveDefaultChatId } from './projects-config.mjs';
 
 // Re-export so existing imports of `shortConvoHash` from send-telegram keep
 // working. Logic now lives in convo-hash.mjs (leaf, no circular deps).
@@ -829,7 +829,7 @@ export function teamModeForumError(chatId) {
     '  1. Tạo group, bật Topics (Group → Edit → Topics).',
     '  2. Add bot vào group, đặt làm admin + bật quyền "Manage Topics".',
     '  3. BotFather → Bot Settings → Group Privacy → Turn OFF (để bot nhận mọi message trong topic).',
-    '  4. Lấy group id (negative) và đặt TELEGRAM_ADMIN_CHAT_ID = id đó.',
+    '  4. Lấy group id (negative) và đặt _config.defaultChatId = id đó trong projects.json.',
   ].join('\n');
 }
 
@@ -1279,11 +1279,13 @@ async function main() {
   // short alias, e.g. "d_be", else the lookup key).
   const lookupKey = path.basename(process.cwd()) || '';
   // RFC 02: per-project group via projects.json[key].chatId (DEDICATED) →
-  // fallback TELEGRAM_ADMIN_CHAT_ID env (SHARED catch-all). `dedicated` drives
-  // the topic-title form (dedicated persona-only vs catch-all code-first) and
-  // the `[code]` message prefix (catch-all only).
-  const fallbackChatId = process.env.TELEGRAM_ADMIN_CHAT_ID || envFromFile.TELEGRAM_ADMIN_CHAT_ID;
-  const projCfg = resolveProjectConfig(lookupKey, { config: readProjectsConfig(), fallbackChatId });
+  // fallback to the catch-all default group (projects.json `_config.defaultChatId`,
+  // or the deprecated TELEGRAM_ADMIN_CHAT_ID env). `dedicated` drives the
+  // topic-title form (dedicated persona-only vs catch-all code-first) and the
+  // `[code]` message prefix (catch-all only).
+  const projectsConfig = readProjectsConfig();
+  const fallbackChatId = resolveDefaultChatId(projectsConfig, { env: process.env, envFile: envFromFile });
+  const projCfg = resolveProjectConfig(lookupKey, { config: projectsConfig, fallbackChatId });
   const projectCode = projCfg.code;
   const dedicatedGroup = projCfg.dedicated;
   // Per-project forum-topic icon (projects.json `topicIcon: { emoji?, color? }`).
@@ -1301,7 +1303,7 @@ async function main() {
     process.exit(1);
   }
   if (adminIds.length === 0) {
-    console.error(`[send-telegram] project "${lookupKey}" chưa cấu hình group: thêm "${lookupKey}".chatId vào teleport/projects.json, hoặc đặt TELEGRAM_ADMIN_CHAT_ID (shared catch-all).`);
+    console.error(`[send-telegram] project "${lookupKey}" chưa cấu hình group: thêm "${lookupKey}".chatId vào teleport/projects.json, hoặc đặt _config.defaultChatId trong projects.json (shared catch-all).`);
     process.exit(1);
   }
 

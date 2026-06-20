@@ -38,11 +38,23 @@ teleport posts every conversation in its own **forum topic**, so the chat **must
 - **Turn Group Privacy OFF (required):** [@BotFather](https://t.me/BotFather) → `/mybots` → your bot → `Bot Settings` → `Group Privacy` → *Turn off* — so the bot receives your replies inside topics (otherwise the listener never sees them).
 - **Group ID:** add [@RawDataBot](https://t.me/RawDataBot) to the group → it instantly prints the group ID (a negative number) → remove RawDataBot when done.
 
-### 3. Fill `.env`
+### 3. Fill `.env` (secrets) and `projects.json` (config)
+
+`.env` holds **secrets only**:
 
 ```ini
 REPORT_BOT_TOKEN=<bot token from BotFather>
-TELEGRAM_ADMIN_CHAT_ID=<forum supergroup ID — a negative number>
+```
+
+Non-secret config lives in `projects.json` (copy `projects.sample.json` → `projects.json`; it's gitignored). The catch-all default group and the daemon's control DM go in its `_config` block:
+
+```json
+{
+  "_config": {
+    "defaultChatId": "<forum supergroup ID — a negative number>",
+    "daemonChatId": "<your private chat id — only if you run the daemon>"
+  }
+}
 ```
 
 Then verify it works:
@@ -127,7 +139,7 @@ Per-project `package.json` scripts (optional convenience):
 "daemon:stop": "node ../teleport/scripts/daemon.mjs --stop"
 ```
 
-**Config:** add `DAEMON_CHAT_ID=<your private chat id>` to `teleport/.env`. Chat-id rule (validated at startup): every project / catch-all chat must be a **group** (negative id); `DAEMON_CHAT_ID` must be a **private** chat (positive id). `/spawn <project>` resolves `<workspace-parent>/<project>` as the new agent's cwd (which is how it joins that project's group). **Whisper** injects a discreet steer into a topic with `whisper:true` — invisible in the group; the receiving agent acts on it without announcing it (see `rules/telegram-guide.md`).
+**Config:** set `_config.daemonChatId` (your private chat id) in `projects.json`. Chat-id rule (validated at startup): every project / `_config.defaultChatId` chat must be a **group** (negative id); `daemonChatId` must be a **private** chat (positive id). `/spawn <project>` resolves `<workspace-parent>/<project>` as the new agent's cwd (which is how it joins that project's group). **Whisper** injects a discreet steer into a topic with `whisper:true` — invisible in the group; the receiving agent acts on it without announcing it (see `rules/telegram-guide.md`).
 
 ## How to use
 

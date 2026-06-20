@@ -140,9 +140,9 @@ nên **khi daemon KHÔNG chạy thì sẽ không có reminder/`/pending`**).
 - **Khi user bảo "bật/chạy daemon"** → đây là hành động **sensitive** (như spawn): chỉ
   `admin/maintainer` được authorize. Chạy detached giúp user nếu được yêu cầu:
   `screen -dmS teleport-daemon node ../teleport/scripts/daemon.mjs`.
-- **Cấu hình:** thêm `DAEMON_CHAT_ID=<private chat id, dương>` vào `../teleport/.env`. Mọi
-  project/catch-all chat phải là **group (id âm)**; daemon chat phải là **private (id dương)** —
-  daemon tự validate và báo lỗi nếu sai.
+- **Cấu hình:** đặt `_config.daemonChatId` (private chat id, dương) trong `../teleport/projects.json`
+  (env chỉ giữ secrets). Mọi project/`_config.defaultChatId` phải là **group (id âm)**; daemon
+  chat phải là **private (id dương)** — daemon tự validate và báo lỗi nếu sai.
 
 ## Content format
 

@@ -27,7 +27,10 @@ import { fileURLToPath } from 'node:url';
 import {
   loadEnvFromFile, parseAdminChatIds, extractBotId, sendTextChunk, shortConvoHash,
 } from './send-telegram.mjs';
-import { readProjectsConfig, roleFor, assertChatIdKind } from './projects-config.mjs';
+import {
+  readProjectsConfig, roleFor, assertChatIdKind, projectEntries,
+  resolveDefaultChatId, resolveDaemonChatId,
+} from './projects-config.mjs';
 import {
   DEFAULT_TMP_DIR, botScopedFiles, fetchUpdates, appendToCache, readCacheSinceOffset,
   readOffset, writeOffset, resolveStartOffset, acquirePollLock, releasePollLock,
@@ -122,7 +125,7 @@ export function buildWhisperPrompt({ targetConvoId, targetChatId, fromUserId, fr
 const ROLE_RANK = { admin: 3, maintainer: 2, dev: 1, member: 0 };
 export function resolveSenderRole(projectsConfig, userId) {
   let best = 'member';
-  for (const proj of Object.values(projectsConfig || {})) {
+  for (const [, proj] of projectEntries(projectsConfig)) {
     const r = roleFor(proj && proj.roles, userId);
     if (r && (ROLE_RANK[r] ?? -1) > (ROLE_RANK[best] ?? -1)) best = r;
   }
@@ -133,10 +136,10 @@ export function resolveSenderRole(projectsConfig, userId) {
 // chat must be a GROUP, and DAEMON_CHAT_ID must be a PRIVATE DM. Throws with a
 // clear message on the first violation. Pure (config + env passed in).
 export function validateDaemonConfig({ projectsConfig, catchAllIds, daemonChatId }) {
-  if (!daemonChatId) throw new Error('Missing DAEMON_CHAT_ID (a private chat id) in .env or process env.');
-  assertChatIdKind(daemonChatId, 'private', 'DAEMON_CHAT_ID');
-  for (const id of catchAllIds) assertChatIdKind(id, 'group', 'the catch-all TELEGRAM_ADMIN_CHAT_ID');
-  for (const [key, proj] of Object.entries(projectsConfig || {})) {
+  if (!daemonChatId) throw new Error('Missing daemonChatId — set projects.json `_config.daemonChatId` (a private chat id).');
+  assertChatIdKind(daemonChatId, 'private', 'projects.json `_config.daemonChatId`');
+  for (const id of catchAllIds) assertChatIdKind(id, 'group', 'projects.json `_config.defaultChatId`');
+  for (const [key, proj] of projectEntries(projectsConfig)) {
     if (proj && proj.chatId != null) assertChatIdKind(proj.chatId, 'group', `project '${key}' chatId`);
   }
 }
@@ -183,10 +186,11 @@ async function main() {
   const token = process.env.REPORT_BOT_TOKEN || env.REPORT_BOT_TOKEN;
   if (!token) { console.error('[daemon] Missing REPORT_BOT_TOKEN in .env or env.'); process.exit(1); }
   const botId = extractBotId(token);
-  const daemonChatId = String(process.env.DAEMON_CHAT_ID || env.DAEMON_CHAT_ID || '').trim();
-  const catchAllRaw = process.env.TELEGRAM_ADMIN_CHAT_ID || env.TELEGRAM_ADMIN_CHAT_ID || '';
-  const catchAllIds = parseAdminChatIds(catchAllRaw);
   const projectsConfig = readProjectsConfig(PROJECTS_FILE);
+  // Config lives in projects.json `_config` (env only for secrets); env names
+  // remain a deprecated fallback during migration.
+  const daemonChatId = resolveDaemonChatId(projectsConfig, { env: process.env, envFile: env }) || '';
+  const catchAllIds = parseAdminChatIds(resolveDefaultChatId(projectsConfig, { env: process.env, envFile: env }) || '');
 
   try {
     validateDaemonConfig({ projectsConfig, catchAllIds, daemonChatId });
@@ -214,7 +218,7 @@ async function main() {
   }
   // Group admin ids for heartbeat reminders (where agent topics live).
   const groupAdminIds = [...new Set(catchAllIds.concat(
-    Object.values(projectsConfig || {}).map((p) => p && p.chatId).filter(Boolean).map(String),
+    projectEntries(projectsConfig).map(([, p]) => p && p.chatId).filter(Boolean).map(String),
   ))];
 
   console.error(`[daemon] up. pid=${process.pid} bot=${botId} control-DM=${daemonChatId} parent=${PARENT_DIR}`);
@@ -305,7 +309,7 @@ async function cmdWhisper(rest, { daemonChatId, from, projectsConfig, catchAllId
   // Resolve #hashtag/convoId/persona → a live topic across all group chats.
   const store = readTopicsStore();
   const groupChatIds = [...new Set(catchAllIds.concat(
-    Object.values(projectsConfig || {}).map((p) => p && p.chatId).filter(Boolean).map(String),
+    projectEntries(projectsConfig).map(([, p]) => p && p.chatId).filter(Boolean).map(String),
   ))];
   const matched = matchTarget(normalizeTarget(args.target), listLiveTopics(store, groupChatIds));
   if (matched.status !== 'found') {

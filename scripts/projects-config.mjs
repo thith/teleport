@@ -50,6 +50,53 @@ export function readProjectsConfig(file = DEFAULT_PROJECTS_FILE) {
   }
 }
 
+// Reserved top-level key in projects.json holding NON-project, non-secret global
+// config (the catch-all default group + the daemon control DM). Underscore-
+// prefixed so it is never mistaken for a project entry. Secrets (bot token, API
+// keys) stay in .env; everything else lives here so config is in ONE place.
+export const GLOBAL_CONFIG_KEY = '_config';
+
+// The `_config` block, or {}. `{ defaultChatId?, daemonChatId?, ... }`.
+export function readGlobalConfig(config = {}) {
+  const g = config && config[GLOBAL_CONFIG_KEY];
+  return (g && typeof g === 'object') ? g : {};
+}
+
+// Project entries only — skips the `_config` block and any other reserved
+// underscore-prefixed key. Use this everywhere code iterates "all projects".
+export function projectEntries(config = {}) {
+  return Object.entries(config || {}).filter(([k]) => !k.startsWith('_'));
+}
+
+let _warnedDefaultEnv = false;
+let _warnedDaemonEnv = false;
+// Catch-all default GROUP chat id: projects.json `_config.defaultChatId` is the
+// source of truth; falls back to the DEPRECATED env `TELEGRAM_ADMIN_CHAT_ID`
+// (warned once) so existing .env setups keep working during migration.
+export function resolveDefaultChatId(config, { env = process.env, envFile = {} } = {}) {
+  const fromJson = readGlobalConfig(config).defaultChatId;
+  if (fromJson != null && String(fromJson).trim() !== '') return String(fromJson).trim();
+  const fromEnv = env.TELEGRAM_ADMIN_CHAT_ID || envFile.TELEGRAM_ADMIN_CHAT_ID;
+  if (fromEnv) {
+    if (!_warnedDefaultEnv) { _warnedDefaultEnv = true; console.error('[config] DEPRECATED: TELEGRAM_ADMIN_CHAT_ID in .env — move it to projects.json `_config.defaultChatId`.'); }
+    return String(fromEnv).trim();
+  }
+  return null;
+}
+
+// Daemon control-DM chat id: projects.json `_config.daemonChatId`, falling back
+// to the DEPRECATED env `DAEMON_CHAT_ID`.
+export function resolveDaemonChatId(config, { env = process.env, envFile = {} } = {}) {
+  const fromJson = readGlobalConfig(config).daemonChatId;
+  if (fromJson != null && String(fromJson).trim() !== '') return String(fromJson).trim();
+  const fromEnv = env.DAEMON_CHAT_ID || envFile.DAEMON_CHAT_ID;
+  if (fromEnv) {
+    if (!_warnedDaemonEnv) { _warnedDaemonEnv = true; console.error('[config] DEPRECATED: DAEMON_CHAT_ID in .env — move it to projects.json `_config.daemonChatId`.'); }
+    return String(fromEnv).trim();
+  }
+  return null;
+}
+
 /**
  * Resolve `{ chatId, dedicated, roles, code, topicIcon }` for a project.
  * `lookupKey` is the projects.json key (= `basename(cwd)`); it is NOT shown to

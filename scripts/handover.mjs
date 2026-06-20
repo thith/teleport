@@ -28,7 +28,7 @@ import { formatPersona, PERSONA_POOL } from './persona.mjs';
 import { peekPersona } from './persona-store.mjs';
 import { shortConvoHash } from './convo-hash.mjs';
 import { readTopicsStore } from './topics-store.mjs';
-import { readProjectsConfig, resolveProjectConfig, adminIdsFrom } from './projects-config.mjs';
+import { readProjectsConfig, resolveProjectConfig, adminIdsFrom, resolveDefaultChatId } from './projects-config.mjs';
 import { resolveConvoIdFromEnv, validateConvoIdString } from './convo-registry.mjs';
 
 /** True iff `s` is a convoId the listener can actually watch (positive,
@@ -282,8 +282,9 @@ export function buildSeedPrompt({ sourceConvoId, notes }) {
 export function resolveChatIds({ cwd = process.cwd(), env = process.env, envFile = {}, chatIdOverride = null } = {}) {
   if (chatIdOverride) return { chatIds: [String(chatIdOverride)], roles: {} };
   const lookupKey = path.basename(cwd) || '';
-  const fallbackChatId = env.TELEGRAM_ADMIN_CHAT_ID || envFile.TELEGRAM_ADMIN_CHAT_ID || null;
-  const projCfg = resolveProjectConfig(lookupKey, { config: readProjectsConfig(), fallbackChatId });
+  const projectsConfig = readProjectsConfig();
+  const fallbackChatId = resolveDefaultChatId(projectsConfig, { env, envFile });
+  const projCfg = resolveProjectConfig(lookupKey, { config: projectsConfig, fallbackChatId });
   const chatIds = adminIdsFrom(projCfg, fallbackChatId, parseAdminChatIds).filter(Boolean);
   return { chatIds, roles: projCfg.roles };
 }
@@ -341,7 +342,7 @@ async function main() {
   // (i) existing topic → resolve + inject.
   const { chatIds } = resolveChatIds({ envFile, chatIdOverride: args.chatId });
   if (!chatIds.length) {
-    err('[handover] no admin chat configured (set projects.json[<cwd>].chatId or TELEGRAM_ADMIN_CHAT_ID)');
+    err('[handover] no admin chat configured (set projects.json[<cwd>].chatId or _config.defaultChatId)');
     process.exit(EXIT.USAGE);
   }
   const store = readTopicsStore();

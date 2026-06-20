@@ -1,4 +1,8 @@
 {
+  "_config": {
+    "defaultChatId": "-1003456789012",
+    "daemonChatId": "100000001"
+  },
   "my-project": {
     "code": "myproj",
     "chatId": "-1001234567890",

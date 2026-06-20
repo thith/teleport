@@ -3,7 +3,25 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { readProjectsConfig, resolveProjectConfig, roleFor, memberFor, adminIdsFrom, isGroupChatId, isPrivateChatId, assertChatIdKind } from './projects-config.mjs';
+import { readProjectsConfig, resolveProjectConfig, roleFor, memberFor, adminIdsFrom, isGroupChatId, isPrivateChatId, assertChatIdKind, readGlobalConfig, projectEntries, resolveDefaultChatId, resolveDaemonChatId } from './projects-config.mjs';
+
+test('readGlobalConfig + projectEntries: _config separated from projects', () => {
+  const cfg = { _config: { defaultChatId: '-100', daemonChatId: '42' }, luni: { chatId: '-1' }, md: { chatId: '-2' } };
+  assert.deepEqual(readGlobalConfig(cfg), { defaultChatId: '-100', daemonChatId: '42' });
+  assert.deepEqual(projectEntries(cfg).map(([k]) => k), ['luni', 'md']); // _config skipped
+  assert.deepEqual(readGlobalConfig({}), {});
+});
+
+test('resolveDefaultChatId/resolveDaemonChatId: projects.json _config wins; env is deprecated fallback', () => {
+  const cfg = { _config: { defaultChatId: '-100', daemonChatId: '42' } };
+  assert.equal(resolveDefaultChatId(cfg, { env: { TELEGRAM_ADMIN_CHAT_ID: '-999' }, envFile: {} }), '-100'); // json wins
+  assert.equal(resolveDaemonChatId(cfg, { env: {}, envFile: {} }), '42');
+  // fallback to env when _config absent
+  assert.equal(resolveDefaultChatId({}, { env: { TELEGRAM_ADMIN_CHAT_ID: '-7' }, envFile: {} }), '-7');
+  assert.equal(resolveDaemonChatId({}, { env: { DAEMON_CHAT_ID: '8' }, envFile: {} }), '8');
+  // nothing anywhere → null
+  assert.equal(resolveDefaultChatId({}, { env: {}, envFile: {} }), null);
+});
 
 test('isGroupChatId / isPrivateChatId: sign convention', () => {
   assert.equal(isGroupChatId('-1001234567890'), true);

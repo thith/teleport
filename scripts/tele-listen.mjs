@@ -18,7 +18,7 @@ import {
 import { recordAlive, isAlive, getLastAliveMs, pruneStale as pruneAliveStale, DEFAULT_FRESH_MS as ALIVE_FRESH_MS } from './listener-alive.mjs';
 import { readTopicsStore, getThreadId, DEFAULT_TOPICS_FILE } from './topics-store.mjs';
 import { peekPersona } from './persona-store.mjs';
-import { readProjectsConfig, resolveProjectConfig, roleFor, memberFor, adminIdsFrom } from './projects-config.mjs';
+import { readProjectsConfig, resolveProjectConfig, roleFor, memberFor, adminIdsFrom, resolveDefaultChatId } from './projects-config.mjs';
 import { harvestMembers } from './roster-upsert.mjs';
 import {
   acquireLock as acquireConvoLock,
@@ -1630,8 +1630,9 @@ async function main() {
   // (keyed by basename(cwd) = the projects.json key — also the roster-harvest
   // target), falling back to TELEGRAM_ADMIN_CHAT_ID env (shared catch-all).
   const lookupKey = path.basename(process.cwd()) || '';
-  const fallbackChatId = process.env.TELEGRAM_ADMIN_CHAT_ID || envFromFile.TELEGRAM_ADMIN_CHAT_ID;
-  const projCfg = resolveProjectConfig(lookupKey, { config: readProjectsConfig(), fallbackChatId });
+  const projectsConfig = readProjectsConfig();
+  const fallbackChatId = resolveDefaultChatId(projectsConfig, { env: process.env, envFile: envFromFile });
+  const projCfg = resolveProjectConfig(lookupKey, { config: projectsConfig, fallbackChatId });
   const adminIds = adminIdsFrom(projCfg, fallbackChatId, parseAdminChatIds);
   // Roles (RFC 02): from projects.json[key].roles ONLY (advisory; agent-side
   // enforcement). Unmapped sender → 'member' (see roleFor).
@@ -1646,7 +1647,7 @@ async function main() {
   // the listener would accept messages from ANY chat. Fail-fast like the send
   // side (review G-Critical RFC 02).
   if (adminIds.length === 0) {
-    console.error(`[tele-listen] project "${lookupKey}" chưa cấu hình group: thêm "${lookupKey}".chatId vào teleport/projects.json, hoặc đặt TELEGRAM_ADMIN_CHAT_ID (shared catch-all).`);
+    console.error(`[tele-listen] project "${lookupKey}" chưa cấu hình group: thêm "${lookupKey}".chatId vào teleport/projects.json, hoặc đặt _config.defaultChatId trong projects.json (shared catch-all).`);
     process.exit(1);
   }
 
@@ -2118,11 +2119,12 @@ async function readOurLockBody(lockFile) {
 function requireProjectAdminIdsOrExit(logPrefix = '[tele-listen]') {
   const envFromFile = loadEnvFromFile(ENV_FILE);
   const lookupKey = path.basename(process.cwd()) || '';
-  const fallbackChatId = process.env.TELEGRAM_ADMIN_CHAT_ID || envFromFile.TELEGRAM_ADMIN_CHAT_ID;
-  const projCfg = resolveProjectConfig(lookupKey, { config: readProjectsConfig(), fallbackChatId });
+  const projectsConfig = readProjectsConfig();
+  const fallbackChatId = resolveDefaultChatId(projectsConfig, { env: process.env, envFile: envFromFile });
+  const projCfg = resolveProjectConfig(lookupKey, { config: projectsConfig, fallbackChatId });
   const adminIds = adminIdsFrom(projCfg, fallbackChatId, parseAdminChatIds);
   if (adminIds.length === 0) {
-    console.error(`${logPrefix} project "${lookupKey}" chưa cấu hình group: thêm "${lookupKey}".chatId vào teleport/projects.json, hoặc đặt TELEGRAM_ADMIN_CHAT_ID (shared catch-all).`);
+    console.error(`${logPrefix} project "${lookupKey}" chưa cấu hình group: thêm "${lookupKey}".chatId vào teleport/projects.json, hoặc đặt _config.defaultChatId trong projects.json (shared catch-all).`);
     process.exit(1);
   }
   return { envFromFile, lookupKey, projCfg, adminIds, roles: projCfg.roles };
