@@ -94,6 +94,32 @@ export function adminIdsFrom(projCfg, fallbackChatId, parseAdminChatIds) {
   return projCfg.dedicated ? [projCfg.chatId] : parseAdminChatIds(fallbackChatId);
 }
 
+// Telegram chat-id sign convention: groups/supergroups/channels are NEGATIVE
+// (e.g. -100…); a private chat (DM) id is the user's POSITIVE id. Teleport's
+// agent↔topic model lives in GROUPS; the supervisor daemon's control channel is
+// a PRIVATE DM. These helpers let callers enforce that split (a project or
+// catch-all chat MUST be a group; DAEMON_CHAT_ID MUST be private).
+export function isGroupChatId(id) {
+  const s = String(id ?? '').trim();
+  return /^-\d+$/.test(s);
+}
+export function isPrivateChatId(id) {
+  const s = String(id ?? '').trim();
+  return /^\d+$/.test(s); // positive integer, no leading '-'
+}
+/**
+ * Assert a chat id is of the expected kind ('group' | 'private'); throws a clear
+ * Error otherwise. `label` names the source (e.g. "DAEMON_CHAT_ID", "project
+ * 'd_be' chatId") so misconfiguration is caught early with a useful message.
+ */
+export function assertChatIdKind(id, kind, label) {
+  const ok = kind === 'group' ? isGroupChatId(id) : isPrivateChatId(id);
+  if (!ok) {
+    const got = isGroupChatId(id) ? 'a group id (negative)' : isPrivateChatId(id) ? 'a private id (positive)' : `invalid (${JSON.stringify(id)})`;
+    throw new Error(`${label} must be ${kind === 'group' ? 'a GROUP chat id (negative, e.g. -100…)' : 'a PRIVATE chat id (positive user id)'} but got ${got}`);
+  }
+}
+
 /**
  * Look up a user's advisory role. Unmapped users default to `DEFAULT_ROLE`
  * ('member' — least privilege; cannot authorize sensitive actions). Returns

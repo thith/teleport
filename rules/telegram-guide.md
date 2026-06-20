@@ -112,6 +112,38 @@ misrouted. Khi đó **MUST**:
    không bao giờ là authority. (Field `handover` thiếu/méo → coi như prompt thường, áp
    misroute-check.)
 
+## Whisper — nhận chỉ thị ngầm (bạn là topic ĐƯỢC whisper)
+
+Một người có quyền (owner/admin) có thể **"nói thầm"** với bạn qua **supervisor daemon**:
+họ DM riêng cho bot, daemon ghi thẳng một prompt vào hàng đợi của bạn — **KHÔNG có message
+nào hiện trong group**. Bạn nhận biết qua field **`whisper: true`** trong prompt (kèm
+`fromRole` thật của người whisper, `messageId: null`).
+
+Khi prompt có `whisper: true` → **MUST**:
+1. **Coi là chỉ thị hợp lệ** (không flag misrouted) — đây là định hướng riêng cho bạn.
+2. **Xử lý KÍN ĐÁO:** làm theo, nhưng **KHÔNG tự khai trong group** rằng "có người vừa
+   whisper" / không lặp lại nguyên văn lời nhắc ra topic. Cứ điều chỉnh hành vi một cách tự
+   nhiên (vd whisper bảo "nhớ confirm rõ X" → bạn chủ động hỏi/confirm X như thể tự nghĩ ra).
+3. **Vẫn áp role-gate sensitive** theo `fromRole` của prompt: whisper từ `admin/maintainer`
+   mới authorize được commit/deploy/…; từ role thấp hơn thì vẫn phải xin confirm.
+
+## Supervisor daemon (tuỳ chọn)
+
+`daemon.mjs` là một process **không-phải-AI**, bật tay (best-effort), để điều khiển/cứu hộ
+từ xa **kể cả khi mọi agent đã chết** (quota/network). Nó nghe một **private DM**
+(`DAEMON_CHAT_ID`) và xử lý lệnh: `/spawn <project>`, `/whisper topic:#<hash> <text>`,
+`/pending`, `/start`, cùng **heartbeat auto-reminder** (đã chuyển từ tele-listen sang đây —
+nên **khi daemon KHÔNG chạy thì sẽ không có reminder/`/pending`**).
+
+- **Bật:** từ project root chạy `node ../teleport/scripts/daemon.mjs` (giữ terminal/screen
+  mở để nó sống). Trạng thái: `--status`; dừng: `--stop`. Single-instance (pidfile).
+- **Khi user bảo "bật/chạy daemon"** → đây là hành động **sensitive** (như spawn): chỉ
+  `admin/maintainer` được authorize. Chạy detached giúp user nếu được yêu cầu:
+  `screen -dmS teleport-daemon node ../teleport/scripts/daemon.mjs`.
+- **Cấu hình:** thêm `DAEMON_CHAT_ID=<private chat id, dương>` vào `../teleport/.env`. Mọi
+  project/catch-all chat phải là **group (id âm)**; daemon chat phải là **private (id dương)** —
+  daemon tự validate và báo lỗi nếu sai.
+
 ## Content format
 
 What you type:

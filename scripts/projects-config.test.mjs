@@ -3,7 +3,27 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { readProjectsConfig, resolveProjectConfig, roleFor, memberFor, adminIdsFrom } from './projects-config.mjs';
+import { readProjectsConfig, resolveProjectConfig, roleFor, memberFor, adminIdsFrom, isGroupChatId, isPrivateChatId, assertChatIdKind } from './projects-config.mjs';
+
+test('isGroupChatId / isPrivateChatId: sign convention', () => {
+  assert.equal(isGroupChatId('-1001234567890'), true);
+  assert.equal(isGroupChatId('-100'), true);
+  assert.equal(isGroupChatId('144242180'), false);  // private user id
+  assert.equal(isGroupChatId('abc'), false);
+  assert.equal(isPrivateChatId('144242180'), true);
+  assert.equal(isPrivateChatId('-1001234567890'), false);
+  assert.equal(isPrivateChatId(''), false);
+  assert.equal(isGroupChatId(-100), true);          // number input too
+  assert.equal(isPrivateChatId(144242180), true);
+});
+
+test('assertChatIdKind: passes the right kind, throws on the wrong one', () => {
+  assert.doesNotThrow(() => assertChatIdKind('-100', 'group', 'project chatId'));
+  assert.doesNotThrow(() => assertChatIdKind('144242180', 'private', 'DAEMON_CHAT_ID'));
+  assert.throws(() => assertChatIdKind('144242180', 'group', "project 'd_be' chatId"), /must be a GROUP/);
+  assert.throws(() => assertChatIdKind('-100', 'private', 'DAEMON_CHAT_ID'), /must be a PRIVATE/);
+  assert.throws(() => assertChatIdKind('xyz', 'group', 'catch-all'), /must be a GROUP/);
+});
 
 function tmpJson(obj) {
   const f = path.join(os.tmpdir(), `projects-${process.pid}-${Math.floor(performance.now() * 1000)}.json`);

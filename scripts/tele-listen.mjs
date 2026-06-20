@@ -802,10 +802,25 @@ export function readCache(cacheFile = UPDATES_CACHE_FILE) {
   } catch {
     return [];
   }
+  // Telegram update_ids are globally unique, so any repeat is a DUPLICATE APPEND
+  // — the cache is a shared "co-op" file that several listeners (and the daemon)
+  // append to, with no per-write dedup, so the same update can land more than
+  // once (e.g. two pollers fetch the same batch before either advances the
+  // offset). Dedup by update_id on read (keep first seen, preserve order) so a
+  // consumer never sees an update twice — otherwise buildCombinedPromptData
+  // would aggregate the repeats into a prompt that says the same thing N times.
+  const seen = new Set();
   const results = [];
   for (const line of raw.trim().split('\n')) {
     if (!line) continue;
-    try { results.push(JSON.parse(line)); } catch {}
+    let u;
+    try { u = JSON.parse(line); } catch { continue; }
+    const id = u && u.update_id;
+    if (id != null) {
+      if (seen.has(id)) continue;
+      seen.add(id);
+    }
+    results.push(u);
   }
   return results;
 }
@@ -1775,7 +1790,6 @@ async function main() {
   let fetchFailed = false;
   let pendingOrphans = [];
   let systemMsgIdsSnapshot = new Set();
-  let pendingResponses = [];
   // Captured before fetch so this poll uses one stable Telegram getUpdates
   // offset even if another listener advances the global offset concurrently.
   let preFetchGlobalOffset = readOffset(botGlobalOffsetFile);
@@ -1784,38 +1798,11 @@ async function main() {
     try {
       const globalOffset = preFetchGlobalOffset;
       const fetched = await fetchUpdates(token, globalOffset);
-      // Capture the original batch's max update_id BEFORE we splice handled
-      // /pending updates out — otherwise a /pending-only batch would never
-      // advance the Telegram offset, looping the same command forever.
-      const originalMaxUpdateId = fetched.length > 0
-        ? Math.max(...fetched.map((u) => u.update_id))
-        : 0;
-      // /pending command — detect inside lock, dispatch AFTER releasing lock
-      // (HTTP sends should not block other listeners on pollLock).
-      if (fetched.length > 0) {
-        const { handledIds, responses } = detectPendingCommands(fetched, adminIds);
-        if (handledIds.size > 0) {
-          for (let i = fetched.length - 1; i >= 0; i--) {
-            if (handledIds.has(fetched[i].update_id)) fetched.splice(i, 1);
-          }
-          pendingResponses = responses;
-        }
-      }
-      // /start command — public onboarding guide. Same detect/dispatch split.
-      if (fetched.length > 0) {
-        const { handledIds, responses } = detectStartCommands(fetched);
-        if (handledIds.size > 0) {
-          for (let i = fetched.length - 1; i >= 0; i--) {
-            if (handledIds.has(fetched[i].update_id)) fetched.splice(i, 1);
-          }
-          pendingResponses = pendingResponses.concat(responses);
-        }
-      }
-      // Both handlers may have consumed every fetched update; still advance
-      // the Telegram offset past them, else we loop the same command forever.
-      if (fetched.length === 0 && pendingResponses.length > 0 && originalMaxUpdateId > 0) {
-        writeOffset(originalMaxUpdateId, botGlobalOffsetFile);
-      }
+      // NOTE: cross-cutting, non-AI control handling (/pending, /start, and the
+      // heartbeat auto-reminder) was MOVED to the supervisor daemon (daemon.mjs).
+      // Agent listeners no longer answer those — they only route replies to their
+      // own topic. The handler functions remain exported here for the daemon to
+      // import. (No daemon running ⇒ no reminders/pending; accepted trade-off.)
       if (fetched.length > 0) {
         systemMsgIdsSnapshot = readSystemMsgIds();
         const { orphans, nonOrphan } = partitionOrphans(fetched, adminIds, systemMsgIdsSnapshot);
@@ -1857,12 +1844,8 @@ async function main() {
         } catch (e) {
           console.error(`[tele-listen] audit log write failed: ${e instanceof Error ? e.message : String(e)}`);
         }
-        // Advance the global offset past the WHOLE fetched batch — including any
-        // /pending or /start updates we spliced out above. Recomputing from the
-        // (spliced) `fetched` would regress the offset when the handled command
-        // was the newest update, re-fetching & re-handling it next poll (G2-M).
-        // Non-command updates are already cached, so advancing past them is safe.
-        const maxUpdateId = Math.max(originalMaxUpdateId, ...fetched.map((u) => u.update_id));
+        // Advance the global offset past the whole fetched batch.
+        const maxUpdateId = Math.max(...fetched.map((u) => u.update_id));
         writeOffset(maxUpdateId, botGlobalOffsetFile);
       }
       pruneCache(undefined, botCacheFile);
@@ -1882,11 +1865,7 @@ async function main() {
     await reactToOrphans(token, pendingOrphans, systemMsgIdsSnapshot);
   }
 
-  // Dispatch /pending responses prepared inside the lock. Network call lives
-  // here so pollLock release latency is unaffected by Telegram round-trip.
-  if (pendingResponses.length > 0) {
-    await dispatchPendingResponses(token, pendingResponses);
-  }
+  // (/pending dispatch moved to daemon.mjs — see note in the fetch block above.)
 
   // Resolve per-loop offset AFTER fetch+prune so a new loop's min(cache)
   // initialization reflects what is actually still buffered. Calling it before
@@ -1926,9 +1905,7 @@ async function main() {
       console.error('[tele-listen] topics.json unreadable/corrupt — convo routing disabled until fixed; advancing offset');
     }
     advanceLoopOffset();
-    // Heartbeat: even when nothing to process, scan for due reminders.
-    // Best-effort; failures are logged inside `runHeartbeatReminders`.
-    await runHeartbeatReminders(token, adminIds);
+    // (Heartbeat auto-reminders moved to daemon.mjs.)
     process.exit(2);
   }
 
@@ -1996,10 +1973,7 @@ async function main() {
   console.log(
     `[tele-listen] prompt written to ${promptFile}: "${preview}${data.text.length > 60 ? '…' : ''}" (messageId: ${data.messageId})`,
   );
-  // Heartbeat after successful prompt write too. Same poll cycle owns the
-  // chance to remind — running it here ensures reminders fire even on busy
-  // convos that always have a fresh admin reply to process.
-  await runHeartbeatReminders(token, adminIds);
+  // (Heartbeat auto-reminders moved to daemon.mjs.)
   process.exit(0);
 }
 

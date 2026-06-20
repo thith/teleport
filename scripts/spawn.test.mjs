@@ -19,6 +19,28 @@ test('SPAWN_PROMPT is the hard-coded greeting (no task passed)', () => {
   assert.equal(SPAWN_PROMPT, 'Telegram me and wait for instructions');
 });
 
+test('runSpawn: passes cwd through to the spawn call (sibling-project targeting)', () => {
+  const calls = [];
+  const fakeSpawn = (cmd, args, opts) => { calls.push({ cmd, args, opts }); return { unref() {}, pid: 4242 }; };
+  // headless plan
+  const planH = buildSpawnPlan();
+  const rH = runSpawn(planH, { cwd: '/work/d_be', spawnFn: fakeSpawn });
+  assert.equal(calls[0].opts.cwd, '/work/d_be');
+  assert.equal(calls[0].opts.detached, true);
+  assert.equal(rH.pid, 4242);
+  // interactive plan
+  const planI = buildSpawnPlan({ interactive: true, seed: genSessionSeed(() => FIXED_UUID) });
+  runSpawn(planI, { cwd: '/work/luni', spawnFn: fakeSpawn });
+  assert.equal(calls[1].opts.cwd, '/work/luni');
+});
+
+test('runSpawn: no cwd → no cwd option (inherit)', () => {
+  const calls = [];
+  const fakeSpawn = (cmd, args, opts) => { calls.push(opts); return { unref() {} }; };
+  runSpawn(buildSpawnPlan(), { spawnFn: fakeSpawn });
+  assert.equal('cwd' in calls[0], false);
+});
+
 test('buildSpawnPlan headless (default): claude -p <prompt>, no session/teardown', () => {
   const p = buildSpawnPlan();
   assert.equal(p.mode, 'headless');

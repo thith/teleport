@@ -191,3 +191,16 @@ test('self-heal is deferred on a torn cache tail (no spurious rollback)', () => 
   // Torn tail → do NOT heal this poll; preserve the offset and retry next poll.
   assert.strictEqual(start, 667901271);
 });
+
+test('readCacheSinceOffset dedups duplicate appends by update_id (co-op cache safety)', () => {
+  const cacheFile = tmp('dedup-cache.jsonl');
+  // Simulate several pollers re-appending the SAME batch (the bug that made a
+  // prompt repeat "Admin follow-up:" N times): update 100 appended 5×, 101 3×.
+  appendToCache([upd(100), upd(101)], cacheFile);
+  appendToCache([upd(100), upd(101)], cacheFile);
+  appendToCache([upd(100)], cacheFile);
+  appendToCache([upd(100)], cacheFile);
+  appendToCache([upd(100), upd(101), upd(102)], cacheFile);
+  const out = readCacheSinceOffset(0, cacheFile);
+  assert.deepStrictEqual(out.map((u) => u.update_id), [100, 101, 102]); // unique, file order
+});

@@ -282,17 +282,22 @@ const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
  * - interactive: `screen -dm` self-detaches; we invoke and return.
  * - headless: detached + unref so it survives this process exiting.
  */
-export function runSpawn(plan, { runner } = {}) {
+export function runSpawn(plan, { runner, cwd, spawnFn = cpSpawn } = {}) {
   if (runner) return runner(plan);
+  // `cwd` sets the spawned agent's working directory — which is how it later
+  // resolves its Telegram group (RFC 02: group derived from basename(cwd)). The
+  // supervisor daemon passes a sibling project dir here so `/spawn <project>`
+  // lands the new agent in that project's group. Undefined → inherit our cwd.
+  const opts = cwd ? { cwd } : {};
   if (plan.mode === 'interactive') {
     // No `detached: true` needed: `screen -dm` self-daemonizes, so the front-end
     // `screen` process exits immediately and the claude session lives on inside
     // screen. unref() releases our handle to that short-lived front-end.
-    const r = cpSpawn(plan.command[0], plan.command.slice(1), { stdio: 'ignore' });
+    const r = spawnFn(plan.command[0], plan.command.slice(1), { stdio: 'ignore', ...opts });
     r.unref?.();
     return { ...plan };
   }
-  const child = cpSpawn(plan.command[0], plan.command.slice(1), { detached: true, stdio: 'ignore' });
+  const child = spawnFn(plan.command[0], plan.command.slice(1), { detached: true, stdio: 'ignore', ...opts });
   child.unref();
   return { ...plan, pid: child.pid };
 }

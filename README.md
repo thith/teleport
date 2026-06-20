@@ -104,6 +104,31 @@ The spawn helper lives at `teleport/scripts/spawn.mjs`. Add these scripts to eac
 
 `spawn:i` (interactive, subscription billing) / `spawn:headless` (`claude -p`, SDK pool) launch an agent; `spawn:ls` lists running agents; `spawn:kill <id>` stops one (id = the topic hashtag). Interactive mode needs `screen` (preinstalled on macOS) or `tmux` on the host. (Command/billing specifics live in `rules/telegram-guide.md` — the single source of truth — so this README and the wiring snippet never drift.)
 
+## Supervisor daemon (optional)
+
+A small, **non-AI**, **manually-started** process (`scripts/daemon.mjs`) that gives you remote control even when **every agent has died** (quota / network / API) — the one case the normal "an agent runs the command" model can't recover from, because a dead agent can't receive "spawn a new one". It's best-effort: start it before you step away (or have a live agent start it); forget to, and teleport behaves exactly as before.
+
+It listens to **one private DM** (`DAEMON_CHAT_ID`) and handles known commands — `/spawn <project>`, `/whisper topic:#<hash> <text>`, `/pending`, `/start` — plus the heartbeat auto-reminder (which now lives **only** here, moved out of the agent listeners). It never calls an LLM. It "harvests" Telegram updates into the *same* shared cache the agent listeners use (cooperative, no offset war); only its own private-DM lane is processed by the daemon.
+
+```bash
+node ../teleport/scripts/daemon.mjs            # run (keep a terminal/screen open)
+node ../teleport/scripts/daemon.mjs --status   # is it running?
+node ../teleport/scripts/daemon.mjs --stop      # stop it (pidfile)
+# detached (survives the terminal):
+screen -dmS teleport-daemon node ../teleport/scripts/daemon.mjs
+```
+
+Per-project `package.json` scripts (optional convenience):
+
+```json
+"daemon": "node ../teleport/scripts/daemon.mjs",
+"daemon:bg": "screen -dmS teleport-daemon node ../teleport/scripts/daemon.mjs",
+"daemon:status": "node ../teleport/scripts/daemon.mjs --status",
+"daemon:stop": "node ../teleport/scripts/daemon.mjs --stop"
+```
+
+**Config:** add `DAEMON_CHAT_ID=<your private chat id>` to `teleport/.env`. Chat-id rule (validated at startup): every project / catch-all chat must be a **group** (negative id); `DAEMON_CHAT_ID` must be a **private** chat (positive id). `/spawn <project>` resolves `<workspace-parent>/<project>` as the new agent's cwd (which is how it joins that project's group). **Whisper** injects a discreet steer into a topic with `whisper:true` — invisible in the group; the receiving agent acts on it without announcing it (see `rules/telegram-guide.md`).
+
 ## How to use
 
 Say *"tele me"* (or similar) **before** you leave the desk. Examples:
