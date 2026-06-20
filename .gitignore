@@ -1,3 +1,4 @@
 .env
 tmp/
 scripts/tmp/
+projects.json

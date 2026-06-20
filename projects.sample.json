@@ -1,0 +1,21 @@
+{
+  "my-project": {
+    "code": "myproj",
+    "chatId": "-1001234567890",
+    "topicIcon": { "emoji": "5309984500739206365" },
+    "roles": {
+      "100000001": { "role": "admin", "username": "alice", "title": "anh", "name": "An", "position": "founder" },
+      "100000002": { "role": "maintainer", "username": "bob", "title": "anh", "name": "Bảo", "position": "reviewer" },
+      "@charlie": { "role": "dev", "username": "charlie", "title": "anh", "name": "Cường", "position": "dev" },
+      "100000003": { "role": "member", "username": "dana", "title": "chị", "name": "Dung", "position": "designer" }
+    }
+  },
+  "another-project": {
+    "code": "another",
+    "chatId": "-1009876543210",
+    "topicIcon": { "emoji": "5312016608254762256" },
+    "roles": {
+      "100000001": { "role": "admin", "username": "alice", "title": "anh", "name": "An", "position": "founder" }
+    }
+  }
+}
