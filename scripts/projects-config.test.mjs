@@ -204,6 +204,22 @@ test('roleFor: object profile → reads .role; missing .role → member', () => 
   assert.equal(roleFor(roles, 2), 'member'); // object lacking role → least privilege
 });
 
+test('roleFor/memberFor: a polluted prototype never grants privilege (own-property guard)', () => {
+  // Pollute Object.prototype with a role-shaped value at a key a lookup could hit,
+  // then assert the guard ignores it. Without the own-property guard this FAILS
+  // (roleFor would return 'admin'); with it, the default holds. try/finally so the
+  // pollution never leaks to other tests.
+  try {
+    // eslint-disable-next-line no-extend-native
+    Object.prototype['1337'] = { role: 'admin' };
+    assert.equal(roleFor({}, '1337'), 'member');   // inherited → ignored
+    assert.equal(memberFor({}, '1337'), null);
+    assert.equal(roleFor({ '1337': 'dev' }, '1337'), 'dev'); // own property still works
+  } finally {
+    delete Object.prototype['1337'];
+  }
+});
+
 test('memberFor: object → profile; string shorthand/unmapped/no-userId → null', () => {
   const profile = { role: 'admin', title: 'anh', name: 'Thi', position: 'founder / dev' };
   const roles = { '1': profile, '2': 'dev' };

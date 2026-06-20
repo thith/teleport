@@ -124,7 +124,20 @@ The spawn helper lives at `teleport/scripts/spawn.mjs`. Add these scripts to eac
 
 A small, **non-AI**, **manually-started** process (`scripts/daemon.mjs`) that gives you remote control even when **every agent has died** (quota / network / API) — the one case the normal "an agent runs the command" model can't recover from, because a dead agent can't receive "spawn a new one". It's best-effort: start it before you step away (or have a live agent start it); forget to, and teleport behaves exactly as before.
 
-It listens to **one private DM** (`DAEMON_CHAT_ID`) and handles known commands — `/spawn <project>`, `/run <project> <script> [args]` (auto-detects npm/pnpm/yarn, validates the script in package.json, then runs `<pm> run <script>`; admin/maintainer only — remote exec), `/whisper topic:#<hash> <text>`, `/pending`, `/start` — plus the heartbeat auto-reminder (which now lives **only** here, moved out of the agent listeners). It never calls an LLM. It "harvests" Telegram updates into the *same* shared cache the agent listeners use (cooperative, no offset war); only its own private-DM lane is processed by the daemon.
+It listens to **one private DM** (`DAEMON_CHAT_ID`) and is a thin, **registry-driven dispatcher**: every command is declared in `commands.json` (teleport's committed, self-sufficient built-ins) and may be extended per-deployment via `projects.json._commands`. The daemon parses `/<cmd> [folder] [args]`, gates by the command's `minRole`, and runs the mapped teleport script — it never calls an LLM, and adding a command is a JSON entry + a script, not daemon code. Built-ins:
+
+| Command | Role | What |
+|---|---|---|
+| `/spawn <project>` | maintainer | launch an interactive agent in `<project>` |
+| `/headless <project>` | maintainer | launch a headless agent in `<project>` |
+| `/kill <id>` | maintainer | kill an agent by id/hashtag |
+| `/ls` | member | list running agents |
+| `/run <project> <script> [args]` | maintainer | run a `package.json` script — auto-detects npm/pnpm/yarn, validates the script, runs `<pm> run <script> -- <args>` (remote exec) |
+| `/whisper #<hash> <text>` | admin | discreet steer into a topic (also accepts a persona name or convoId as the target) |
+| `/pending` | member | convos waiting on an admin reply |
+| `/start` | public | onboarding help |
+
+When `needsProject` is set (spawn/headless/run), the **first positional token is the folder**; remaining tokens are the script's args (quote-aware, so `--grep "a b"` is one arg). Plus the heartbeat auto-reminder (which now lives **only** here, moved out of the agent listeners). It "harvests" Telegram updates into the *same* shared cache the agent listeners use (cooperative, no offset war); only its own private-DM lane is processed by the daemon.
 
 ```bash
 node ../teleport/scripts/daemon.mjs            # run (keep a terminal/screen open)
@@ -143,7 +156,7 @@ Per-project `package.json` scripts (optional convenience):
 "daemon:stop": "node ../teleport/scripts/daemon.mjs --stop"
 ```
 
-**Config:** set `_config.daemonChatId` (your private chat id) in `projects.json`. Chat-id rule (validated at startup): every project / `_default.chatId` chat must be a **group** (negative id); `daemonChatId` must be a **private** chat (positive id). `/spawn <project>` resolves `<workspace-parent>/<project>` as the new agent's cwd (which is how it joins that project's group). **Whisper** injects a discreet steer into a topic with `whisper:true` — invisible in the group; the receiving agent acts on it without announcing it (see `rules/telegram-guide.md`).
+**Config:** set `_config.daemonChatId` (your private chat id) in `projects.json`. Chat-id rule (validated at startup): every project / `_default.chatId` chat must be a **group** (negative id); `daemonChatId` must be a **private** chat (positive id). a `needsProject` command resolves `<workspace-parent>/<folder>` as the script's cwd (which, for spawn, is how the new agent joins that project's group), with realpath containment so a symlinked folder can't escape the workspace. **Whisper** injects a discreet steer into a topic with `whisper:true` — invisible in the group; the receiving agent acts on it without announcing it (see `rules/telegram-guide.md`).
 
 ## How to use
 

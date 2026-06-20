@@ -4,108 +4,33 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {
-  parseDaemonCommand, parseWhisperArgs, resolveSpawnCwd, buildWhisperPrompt,
+  parseDaemonCommand, resolveSpawnCwd, dispatchCommand, handleControlMessages,
   validateDaemonConfig, resolveSenderRole, acquireSingleton, releaseSingleton, daemonStatus,
-  parseRunArgs, tailOutput, cmdRun, detectPackageManager, readPackageScripts,
 } from './daemon.mjs';
 
-// Build a fake project dir with a package.json (scripts) + optional lockfile.
-function fakeProject(scripts = {}, { lock, packageManager } = {}) {
-  const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'run-parent-'));
-  const proj = path.join(parent, 'proj');
-  fs.mkdirSync(proj);
-  const pkg = { name: 'proj', scripts };
-  if (packageManager) pkg.packageManager = packageManager;
-  fs.writeFileSync(path.join(proj, 'package.json'), JSON.stringify(pkg));
-  if (lock) fs.writeFileSync(path.join(proj, lock), '');
-  return { parent, proj, cleanup: () => fs.rmSync(parent, { recursive: true, force: true }) };
-}
-
-test('parseRunArgs: project + script + args (no package manager)', () => {
-  assert.deepEqual(parseRunArgs('luni dev'), { project: 'luni', script: 'dev', args: [] });
-  assert.deepEqual(parseRunArgs('d_be build --prod'), { project: 'd_be', script: 'build', args: ['--prod'] });
-  assert.ok(parseRunArgs('luni').error); // no script
-  assert.ok(parseRunArgs('').error);
+test('parseDaemonCommand: extracts command + rest, strips @botname, lowercases', () => {
+  assert.deepEqual(parseDaemonCommand('/spawn d_be'), { cmd: 'spawn', rest: 'd_be' });
+  assert.deepEqual(parseDaemonCommand('/Whisper@my_bot topic:#e5424020 hi there'), { cmd: 'whisper', rest: 'topic:#e5424020 hi there' });
+  assert.deepEqual(parseDaemonCommand('/pending'), { cmd: 'pending', rest: '' });
+  assert.equal(parseDaemonCommand('not a command'), null);
+  assert.equal(parseDaemonCommand('  '), null);
+  assert.equal(parseDaemonCommand(undefined), null);
 });
 
-test('detectPackageManager: packageManager field > lockfile > npm default', () => {
-  const { proj, cleanup } = fakeProject({}, { packageManager: 'pnpm@9.0.0' });
-  assert.equal(detectPackageManager(proj), 'pnpm'); cleanup();
-  const a = fakeProject({}, { lock: 'yarn.lock' }); assert.equal(detectPackageManager(a.proj), 'yarn'); a.cleanup();
-  const b = fakeProject({}, { lock: 'pnpm-lock.yaml' }); assert.equal(detectPackageManager(b.proj), 'pnpm'); b.cleanup();
-  const c = fakeProject({}, { lock: 'package-lock.json' }); assert.equal(detectPackageManager(c.proj), 'npm'); c.cleanup();
-  const d = fakeProject({}); assert.equal(detectPackageManager(d.proj), 'npm'); d.cleanup(); // default
-});
-
-test('readPackageScripts: returns scripts, or error when missing/invalid', () => {
-  const { proj, cleanup } = fakeProject({ dev: 'vite', test: 'vitest' });
-  assert.deepEqual(readPackageScripts(proj).scripts, { dev: 'vite', test: 'vitest' });
-  cleanup();
-  assert.ok(readPackageScripts('/no/such/dir').error); // missing package.json
-});
-
-test('tailOutput: keeps tail with marker when over limit', () => {
-  assert.equal(tailOutput('short', 100), 'short');
-  const t = tailOutput('x'.repeat(50), 10);
-  assert.ok(t.startsWith('…(truncated'));
-  assert.ok(t.endsWith('xxxxxxxxxx'));
-});
-
-test('cmdRun: refuses non-admin/maintainer (remote exec gate)', async () => {
-  const sent = []; let ran = false;
-  await cmdRun('proj dev', {
-    daemonChatId: '1', from: { id: '999' }, projectsConfig: { _default: { roles: { '999': { role: 'member' } } } },
-    sendText: async (_c, t) => sent.push(t), runner: async () => { ran = true; return { stdout: '', stderr: '' }; },
-  });
-  assert.equal(ran, false);
-  assert.match(sent[0], /admin\/maintainer/);
-});
-
-test('cmdRun: missing script → error listing available, never runs', async () => {
-  const { parent, cleanup } = fakeProject({ dev: 'vite', build: 'vite build' });
-  const sent = []; let ran = false;
-  await cmdRun('proj nope', {
-    daemonChatId: '1', from: { id: '7' }, projectsConfig: { _default: { roles: { '7': { role: 'admin' } } } },
-    parentDir: parent, sendText: async (_c, t) => sent.push(t), runner: async () => { ran = true; return {}; },
-  });
-  assert.equal(ran, false);
-  assert.match(sent[0], /script "nope" không có/);
-  assert.match(sent[0], /dev, build/);
-  cleanup();
-});
-
-test('cmdRun: admin runs <pm> run <script> in the project cwd + reports output', async () => {
-  const { parent, proj, cleanup } = fakeProject({ dev: 'vite' }, { lock: 'pnpm-lock.yaml' });
-  const calls = []; const sent = [];
-  await cmdRun('proj dev --port 3000', {
-    daemonChatId: '1', from: { id: '7' }, projectsConfig: { _default: { roles: { '7': { role: 'admin' } } } },
-    parentDir: parent, sendText: async (_c, t) => sent.push(t),
-    runner: async (bin, args, opts) => { calls.push({ bin, args, cwd: opts.cwd }); return { stdout: 'served', stderr: '' }; },
-  });
-  assert.equal(calls[0].bin, 'pnpm'); // detected from lockfile
-  // `--` delimits: the `--port 3000` go to the SCRIPT, not the package manager,
-  // so a hostile `--prefix /elsewhere` can't redirect the PM out of cwd.
-  assert.deepEqual(calls[0].args, ['run', 'dev', '--', '--port', '3000']);
-  assert.equal(calls[0].cwd, proj);
-  assert.ok(sent.some((t) => /exit 0/.test(t) && /served/.test(t)));
-  cleanup();
-});
-
-test('parseRunArgs: rejects a script name starting with "-" (PM-flag injection)', () => {
-  assert.ok(parseRunArgs('luni --prefix').error);
-  assert.ok(parseRunArgs('luni -x build').error);
-});
-
-test('cmdRun: a --prefix arg is delimited after -- (cannot redirect the PM cwd)', async () => {
-  const { parent, proj, cleanup } = fakeProject({ dev: 'vite' });
-  const calls = [];
-  await cmdRun('proj dev --prefix /etc', {
-    daemonChatId: '1', from: { id: '7' }, projectsConfig: { _default: { roles: { '7': { role: 'admin' } } } },
-    parentDir: parent, sendText: async () => {}, runner: async (bin, args, opts) => { calls.push({ args, cwd: opts.cwd }); return { stdout: '', stderr: '' }; },
-  });
-  assert.deepEqual(calls[0].args, ['run', 'dev', '--', '--prefix', '/etc']); // after the delimiter
-  assert.equal(calls[0].cwd, proj);
-  cleanup();
+test('resolveSpawnCwd: maps project → sibling dir, rejects traversal/missing', () => {
+  const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'tele-parent-'));
+  fs.mkdirSync(path.join(parent, 'd_be'));
+  assert.deepEqual(resolveSpawnCwd('d_be', { parentDir: parent }), { cwd: path.join(parent, 'd_be') });
+  assert.ok(resolveSpawnCwd('../etc', { parentDir: parent }).error);   // traversal blocked by charset
+  // `.` and `..` PASS the charset (dots are allowed) → they are caught ONLY by
+  // the explicit `=== '.'/'..'` guard. `.` is especially load-bearing: it would
+  // otherwise resolve to the workspace root itself and pass containment. Assert
+  // the specific error so removing that guard fails this test.
+  assert.match(resolveSpawnCwd('.', { parentDir: parent }).error, /invalid project name/);
+  assert.match(resolveSpawnCwd('..', { parentDir: parent }).error, /invalid project name/);
+  assert.ok(resolveSpawnCwd('nope', { parentDir: parent }).error);     // not found
+  assert.ok(resolveSpawnCwd('', { parentDir: parent }).error);        // empty
+  fs.rmSync(parent, { recursive: true, force: true });
 });
 
 test('resolveSpawnCwd: rejects a project dir that symlinks OUTSIDE the workspace', () => {
@@ -117,76 +42,128 @@ test('resolveSpawnCwd: rejects a project dir that symlinks OUTSIDE the workspace
   fs.rmSync(parent, { recursive: true, force: true }); fs.rmSync(outside, { recursive: true, force: true });
 });
 
-test('cmdRun: prototype-chain "scripts" (toString/constructor) are NOT runnable', async () => {
-  const { parent, cleanup } = fakeProject({ dev: 'vite' });
+// ── dispatchCommand: the generic registry dispatcher ──────────────────────────
+
+// A registry mirroring commands.json shape. resolveCommand normalises entries, so
+// a bare entry without args/needsProject still dispatches.
+const REG = {
+  ls:      { run: 'spawn.mjs',   args: ['--list'], needsProject: false, minRole: 'member' },
+  spawn:   { run: 'spawn.mjs',   args: ['--interactive'], needsProject: true, minRole: 'maintainer' },
+  run:     { run: 'run.mjs',     args: [], needsProject: true, minRole: 'maintainer' },
+  whisper: { run: 'whisper.mjs', args: [], needsProject: false, minRole: 'admin' },
+};
+
+test('dispatchCommand: unknown command → stays silent (no send)', async () => {
   const sent = []; let ran = false;
-  await cmdRun('proj toString', {
-    daemonChatId: '1', from: { id: '7' }, projectsConfig: { _default: { roles: { '7': { role: 'admin' } } } },
-    parentDir: parent, sendText: async (_c, t) => sent.push(t), runner: async () => { ran = true; return {}; },
+  await dispatchCommand({ cmd: 'nope', rest: '' }, { id: '7' }, {
+    daemonChatId: '1', projectsConfig: { _default: { roles: { '7': { role: 'admin' } } } }, registry: REG,
+    sendText: async (_c, t) => sent.push(t), runner: async () => { ran = true; return { stdout: '', stderr: '' }; },
   });
-  assert.equal(ran, false); // hasOwnProperty guard → not treated as an existing script
-  assert.match(sent[0], /script "toString" không có/);
-  cleanup();
+  assert.equal(ran, false);
+  assert.equal(sent.length, 0);
 });
 
-test('readPackageScripts: an array "scripts" is treated as no scripts', () => {
-  const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'run-parent-'));
-  const proj = path.join(parent, 'p'); fs.mkdirSync(proj);
-  fs.writeFileSync(path.join(proj, 'package.json'), JSON.stringify({ scripts: ['a', 'b'] }));
-  assert.deepEqual(readPackageScripts(proj).scripts, {}); // array → {}
+test('dispatchCommand: gates by minRole (member cannot run a maintainer command)', async () => {
+  const sent = []; let ran = false;
+  await dispatchCommand({ cmd: 'run', rest: 'proj dev' }, { id: '9' }, {
+    daemonChatId: '1', projectsConfig: { _default: { roles: { '9': { role: 'member' } } } }, registry: REG,
+    sendText: async (_c, t) => sent.push(t), runner: async () => { ran = true; return {}; },
+  });
+  assert.equal(ran, false);
+  assert.match(sent[0], /cần quyền maintainer/);
+});
+
+test('dispatchCommand: needsProject → folder is the positional first token, dropped from argv; cwd=project; identity in env', async () => {
+  const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'ws-'));
+  fs.mkdirSync(path.join(parent, 'luni'));
+  const calls = []; const sent = [];
+  await dispatchCommand({ cmd: 'run', rest: 'luni dev --port 3000' }, { id: '7', first_name: 'Thi', username: 'thi' }, {
+    daemonChatId: '1', projectsConfig: { _default: { roles: { '7': { role: 'admin' } } } }, registry: REG,
+    parentDir: parent, scriptsDir: '/scripts',
+    sendText: async (_c, t) => sent.push(t),
+    runner: async (bin, argv, opts) => { calls.push({ bin, argv, cwd: opts.cwd, env: opts.env }); return { stdout: 'served', stderr: '' }; },
+  });
+  assert.equal(calls[0].bin, process.execPath);            // runs `node <script>`
+  assert.deepEqual(calls[0].argv, ['/scripts/run.mjs', 'dev', '--port', '3000']); // folder dropped, args passed
+  assert.equal(calls[0].cwd, path.join(parent, 'luni'));   // cwd = the project
+  assert.equal(calls[0].env.TELE_FROM_ID, '7');
+  assert.equal(calls[0].env.TELE_FROM_ROLE, 'admin');
+  assert.equal(calls[0].env.TELE_FROM_NAME, 'Thi');
+  assert.equal(sent[0], 'served');                         // stdout relayed verbatim
   fs.rmSync(parent, { recursive: true, force: true });
 });
 
-test('cmdRun: no package.json → error', async () => {
-  const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'run-parent-'));
-  fs.mkdirSync(path.join(parent, 'proj')); // dir but no package.json
+test('dispatchCommand: quoted args survive as one token (not split on inner spaces)', async () => {
+  const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'ws-'));
+  fs.mkdirSync(path.join(parent, 'app'));
+  const calls = [];
+  await dispatchCommand({ cmd: 'run', rest: 'app test --grep "a b c"' }, { id: '7' }, {
+    daemonChatId: '1', projectsConfig: { _default: { roles: { '7': { role: 'admin' } } } }, registry: REG,
+    parentDir: parent, scriptsDir: '/scripts',
+    sendText: async () => {},
+    runner: async (bin, argv) => { calls.push(argv); return { stdout: 'ok', stderr: '' }; },
+  });
+  assert.deepEqual(calls[0], ['/scripts/run.mjs', 'test', '--grep', 'a b c']); // 'a b c' is ONE arg
+  fs.rmSync(parent, { recursive: true, force: true });
+});
+
+test('dispatchCommand: !needsProject → cwd=workspace root, no token dropped', async () => {
+  const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'ws-'));
+  const calls = [];
+  await dispatchCommand({ cmd: 'whisper', rest: '#abc12345 nhắc nhẹ' }, { id: '7' }, {
+    daemonChatId: '1', projectsConfig: { _default: { roles: { '7': { role: 'admin' } } } }, registry: REG,
+    parentDir: parent, scriptsDir: '/scripts',
+    sendText: async () => {},
+    runner: async (bin, argv, opts) => { calls.push({ argv, cwd: opts.cwd }); return { stdout: 'ok', stderr: '' }; },
+  });
+  assert.deepEqual(calls[0].argv, ['/scripts/whisper.mjs', '#abc12345', 'nhắc', 'nhẹ']); // nothing dropped
+  assert.equal(calls[0].cwd, parent);                      // workspace root
+  fs.rmSync(parent, { recursive: true, force: true });
+});
+
+test('dispatchCommand: needsProject with a bad folder → error, never runs', async () => {
+  const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'ws-'));
   const sent = []; let ran = false;
-  await cmdRun('proj dev', {
-    daemonChatId: '1', from: { id: '7' }, projectsConfig: { _default: { roles: { '7': { role: 'admin' } } } },
+  await dispatchCommand({ cmd: 'spawn', rest: '../etc' }, { id: '7' }, {
+    daemonChatId: '1', projectsConfig: { _default: { roles: { '7': { role: 'maintainer' } } } }, registry: REG,
     parentDir: parent, sendText: async (_c, t) => sent.push(t), runner: async () => { ran = true; return {}; },
   });
   assert.equal(ran, false);
-  assert.match(sent[0], /no package.json/);
+  assert.ok(sent[0].startsWith('❌'));
   fs.rmSync(parent, { recursive: true, force: true });
 });
 
-test('parseDaemonCommand: extracts command + rest, strips @botname, lowercases', () => {
-  assert.deepEqual(parseDaemonCommand('/spawn d_be'), { cmd: 'spawn', rest: 'd_be' });
-  assert.deepEqual(parseDaemonCommand('/Whisper@my_bot topic:#e5424020 hi there'), { cmd: 'whisper', rest: 'topic:#e5424020 hi there' });
-  assert.deepEqual(parseDaemonCommand('/pending'), { cmd: 'pending', rest: '' });
-  assert.equal(parseDaemonCommand('not a command'), null);
-  assert.equal(parseDaemonCommand('  '), null);
-  assert.equal(parseDaemonCommand(undefined), null);
+test('dispatchCommand: a failing child relays its own stdout/stderr', async () => {
+  const sent = [];
+  await dispatchCommand({ cmd: 'ls', rest: '' }, { id: '7' }, {
+    daemonChatId: '1', projectsConfig: { _default: { roles: { '7': { role: 'admin' } } } }, registry: REG,
+    sendText: async (_c, t) => sent.push(t),
+    runner: async () => { const e = new Error('exit 1'); e.stdout = 'partial'; e.stderr = 'boom'; throw e; },
+  });
+  assert.match(sent[0], /partial/);
+  assert.match(sent[0], /boom/);
 });
 
-test('parseWhisperArgs: topic prefix optional, splits target + message', () => {
-  assert.deepEqual(parseWhisperArgs('topic:#e5424020 confirm rõ với X'), { target: '#e5424020', message: 'confirm rõ với X' });
-  assert.deepEqual(parseWhisperArgs('#e5424020 hello'), { target: '#e5424020', message: 'hello' });
-  assert.deepEqual(parseWhisperArgs('Cú nhắc nhở nhẹ'), { target: 'Cú', message: 'nhắc nhở nhẹ' });
-  assert.ok(parseWhisperArgs('#e5424020').error);   // no message
-  assert.ok(parseWhisperArgs('').error);            // empty
-});
-
-test('resolveSpawnCwd: maps project → sibling dir, rejects traversal/missing', () => {
-  const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'tele-parent-'));
-  fs.mkdirSync(path.join(parent, 'd_be'));
-  assert.deepEqual(resolveSpawnCwd('d_be', { parentDir: parent }), { cwd: path.join(parent, 'd_be') });
-  assert.ok(resolveSpawnCwd('../etc', { parentDir: parent }).error);   // traversal blocked by charset
-  assert.ok(resolveSpawnCwd('nope', { parentDir: parent }).error);     // not found
-  assert.ok(resolveSpawnCwd('', { parentDir: parent }).error);        // empty
-  fs.rmSync(parent, { recursive: true, force: true });
-});
-
-test('buildWhisperPrompt: injected shape with whisper flag + real fromRole', () => {
-  const p = buildWhisperPrompt({ targetConvoId: '2205483045424020', targetChatId: '-100', fromUserId: '144242180', fromName: 'Thi', fromRole: 'admin', text: 'hãy confirm' });
-  assert.equal(p.whisper, true);
-  assert.equal(p.messageId, null);       // injected, not a real message
-  assert.equal(p.convoId, 2205483045424020);
-  assert.equal(p.chatId, '-100');
-  assert.equal(p.fromRole, 'admin');
-  assert.equal(p.fromUserId, '144242180');
-  assert.equal(p.text, 'hãy confirm');
-  assert.deepEqual(p.attachments, []);
+test('handleControlMessages: fire-and-forget — returns synchronously, relays only after the child settles', async () => {
+  let release;
+  const gate = new Promise((res) => { release = res; });
+  const sent = [];
+  const ctx = {
+    daemonChatId: '1', projectsConfig: { _default: { roles: { '7': { role: 'admin' } } } }, registry: REG,
+    parentDir: '/tmp', scriptsDir: '/scripts',
+    sendText: async (_c, t) => sent.push(t),
+    runner: () => gate.then(() => ({ stdout: 'late', stderr: '' })), // pending until released
+  };
+  const ret = handleControlMessages([{ message: { text: '/ls', from: { id: '7' } } }], ctx);
+  // Sync, non-blocking: a reverted `async … await dispatchCommand` would return a
+  // Promise here (and would not have relayed yet anyway) — `undefined` proves the
+  // loop is not awaiting the child.
+  assert.equal(ret, undefined);
+  assert.equal(sent.length, 0);            // child still in flight → nothing relayed
+  release();
+  await new Promise((r) => setImmediate(r));
+  await new Promise((r) => setImmediate(r));
+  assert.deepEqual(sent, ['late']);        // relayed once the child finished
 });
 
 test('resolveSenderRole: highest privilege across DEDICATED projects, default member', () => {

@@ -17,8 +17,14 @@
 // Domain split (validated at startup): agents/topics live in GROUPS (chatId < 0);
 // the daemon's control channel is a PRIVATE DM (DAEMON_CHAT_ID > 0).
 //
-// Phase 1 commands: /spawn <project>, /whisper topic:#<hash> <text>, /pending,
-// /start — plus the heartbeat auto-reminder pass (moved here from tele-listen).
+// Commands are REGISTRY-DRIVEN (commands.json + projects.json `_commands`, loaded
+// via commands.mjs): the daemon is a thin dispatcher. It parses `/cmd [folder]
+// [args]`, gates by the command's minRole, and runs `node scripts/<run>` (cwd =
+// the project when needsProject, else the workspace root), passing the sender's
+// identity via env (TELE_FROM_*) and relaying the script's stdout back to the DM.
+// Built-ins (spawn/headless/kill/ls/run/whisper/pending/start) live in teleport's
+// own commands.json so it stays self-sufficient. Plus the heartbeat auto-reminder
+// pass (moved here from tele-listen).
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -28,7 +34,7 @@ import { promisify } from 'node:util';
 const execFileP = promisify(execFile);
 
 import {
-  loadEnvFromFile, parseAdminChatIds, extractBotId, sendTextToAdmin, shortConvoHash,
+  loadEnvFromFile, parseAdminChatIds, extractBotId, sendTextToAdmin,
 } from './send-telegram.mjs';
 import {
   readProjectsConfig, roleFor, assertChatIdKind, projectEntries, readDefaultGroup,
@@ -37,12 +43,9 @@ import {
 import {
   DEFAULT_TMP_DIR, botScopedFiles, fetchUpdates, appendToCache, readCacheSinceOffset,
   readOffset, writeOffset, resolveStartOffset, acquirePollLock, releasePollLock,
-  partitionOrphans, pruneCache, detectPendingCommands, dispatchPendingResponses,
-  detectStartCommands, runHeartbeatReminders,
+  partitionOrphans, pruneCache, runHeartbeatReminders,
 } from './tele-listen.mjs';
-import { readTopicsStore } from './topics-store.mjs';
-import { listLiveTopics, normalizeTarget, matchTarget, writePromptExclusive } from './handover.mjs';
-import { buildSpawnPlan, genSessionSeed, runSpawn, hasBinary } from './spawn.mjs';
+import { loadCommands, resolveCommand, roleMeets, tokenizeArgs } from './commands.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ENV_FILE = path.join(__dirname, '..', '.env');
@@ -67,76 +70,14 @@ export function parseDaemonCommand(text) {
   return { cmd: m[1].toLowerCase(), rest: (m[2] ?? '').trim() };
 }
 
-// Parse `/whisper` arguments: `topic:#<hash|convoId> <message>`. The `topic:`
-// prefix is optional; the first token is the target, the remainder the message.
-// Returns { target, message } or { error }.
-export function parseWhisperArgs(rest) {
-  if (!rest) return { error: 'usage: /whisper topic:#<hashtag> <message>' };
-  const cleaned = rest.replace(/^topic:\s*/i, '').trim();
-  const sp = cleaned.search(/\s/);
-  if (sp < 0) return { error: 'whisper needs a message after the topic' };
-  const target = cleaned.slice(0, sp).trim();
-  const message = cleaned.slice(sp + 1).trim();
-  if (!target) return { error: 'missing topic target' };
-  if (!message) return { error: 'missing message' };
-  return { target, message };
-}
+// Hard bound on a dispatched command (remote code execution); output beyond the
+// buffer cap aborts the child. Output is relayed whole — teleport's send layer
+// auto-attaches a .md document when it's too long for one Telegram message.
+export const COMMAND_TIMEOUT_MS = 5 * 60 * 1000;
+export const COMMAND_MAX_BUFFER = 8 * 1024 * 1024;
 
-// `/run` config. Only npm/pnpm/yarn are ever invoked (the PM is auto-detected,
-// never user-supplied — it's remote code execution, keep it bounded). Hard
-// timeout; output is sent as-is and teleport auto-attaches it as a file when long
-// (we only tail-cap at a generous safety ceiling to avoid pathological sends).
-export const RUN_TIMEOUT_MS = 5 * 60 * 1000;
-export const RUN_MAX_BUFFER = 8 * 1024 * 1024;
-export const RUN_OUTPUT_CAP = 100_000;
-
-// Parse `/run <project> <script> [args...]` (NO package manager — auto-detected).
-// Returns {project, script, args} or {error}.
-export function parseRunArgs(rest) {
-  const parts = (rest || '').trim().split(/\s+/).filter(Boolean);
-  if (parts.length < 2) return { error: 'usage: /run <project> <script> [args...]' };
-  const [project, script, ...args] = parts;
-  // A script starting with '-' would be parsed by the PM as a flag (e.g. a way
-  // to slip `--prefix`); the script name must be a plain identifier.
-  if (script.startsWith('-')) return { error: `invalid script name: ${JSON.stringify(script)}` };
-  return { project, script, args };
-}
-
-// Detect the package manager a project uses: package.json `packageManager` field
-// first, then lockfiles (pnpm > yarn > npm), default npm. Pure (deps injected).
-export function detectPackageManager(cwd, { existsSync = fs.existsSync, readFileSync = fs.readFileSync } = {}) {
-  try {
-    const pkg = JSON.parse(readFileSync(path.join(cwd, 'package.json'), 'utf8'));
-    const pm = typeof pkg.packageManager === 'string' ? pkg.packageManager.split('@')[0].trim() : '';
-    if (pm === 'pnpm' || pm === 'yarn' || pm === 'npm') return pm;
-  } catch { /* fall through to lockfiles */ }
-  if (existsSync(path.join(cwd, 'pnpm-lock.yaml'))) return 'pnpm';
-  if (existsSync(path.join(cwd, 'yarn.lock'))) return 'yarn';
-  if (existsSync(path.join(cwd, 'package-lock.json'))) return 'npm';
-  return 'npm';
-}
-
-// Read a project's package.json scripts. Returns {scripts} or {error} (missing
-// file / parse error). Pure (readFileSync injectable).
-export function readPackageScripts(cwd, { readFileSync = fs.readFileSync } = {}) {
-  let raw;
-  try { raw = readFileSync(path.join(cwd, 'package.json'), 'utf8'); }
-  catch { return { error: `no package.json in ${cwd}` }; }
-  let pkg;
-  try { pkg = JSON.parse(raw); } catch { return { error: `package.json is not valid JSON` }; }
-  const scripts = (pkg && pkg.scripts && typeof pkg.scripts === 'object' && !Array.isArray(pkg.scripts)) ? pkg.scripts : {};
-  return { scripts };
-}
-
-// Tail-cap a string at a generous ceiling (safety net only — normal output is
-// sent whole and teleport files it if long). Pure.
-export function tailOutput(s, max = RUN_OUTPUT_CAP) {
-  s = s == null ? '' : String(s);
-  if (s.length <= max) return s;
-  return `…(truncated; showing last ${max} chars)\n` + s.slice(s.length - max);
-}
-
-// Resolve `/spawn <project>` to a sibling directory under PARENT_DIR. Returns
+// Resolve `<folder>` (positional first token when needsProject) to a sibling
+// directory under PARENT_DIR. Returns
 // { cwd } or { error }. Validates the project token (no path traversal) and that
 // the directory exists with a package.json (teleport's project convention).
 export function resolveSpawnCwd(project, { parentDir = PARENT_DIR, statSync = fs.statSync, realpathSync = fs.realpathSync } = {}) {
@@ -162,29 +103,6 @@ export function resolveSpawnCwd(project, { parentDir = PARENT_DIR, statSync = fs
     return { error: `cannot resolve project path: ${cwd}` };
   }
   return { cwd };
-}
-
-// Build the prompt object injected into a target convo by /whisper. Mirrors the
-// handover prompt shape but carries `whisper:true` (discreet steer) and the
-// REAL fromRole of the whisperer so the target's sensitive-action gate still
-// applies. `messageId:null` marks it as injected (not a real Telegram message).
-export function buildWhisperPrompt({ targetConvoId, targetChatId, fromUserId, fromName, fromRole, text }) {
-  return {
-    text,
-    messageId: null,
-    chatId: targetChatId == null ? null : String(targetChatId),
-    fromUserId: fromUserId == null ? null : String(fromUserId),
-    fromName: fromName ?? 'admin',
-    fromRole: fromRole ?? 'member',
-    fromMember: null,
-    replyToMessageId: null,
-    replyToText: null,
-    quotedText: null,
-    timestamp: Math.floor(Date.now() / 1000),
-    attachments: [],
-    convoId: Number(targetConvoId),
-    whisper: true,
-  };
 }
 
 // The whisperer's advisory role, looked up across the catch-all roster
@@ -270,6 +188,7 @@ async function main() {
   if (!token) { console.error('[daemon] Missing REPORT_BOT_TOKEN in .env or env.'); process.exit(1); }
   const botId = extractBotId(token);
   const projectsConfig = readProjectsConfig(PROJECTS_FILE);
+  const registry = loadCommands({ projectsConfig });
   // Config lives in projects.json `_config` (env only for secrets); env names
   // remain a deprecated fallback during migration.
   const daemonChatId = resolveDaemonChatId(projectsConfig, { env: process.env, envFile: env }) || '';
@@ -334,7 +253,7 @@ async function main() {
       const updates = readCacheSinceOffset(loopOffset, cacheFile);
       const mine = updates.filter((u) => u.message && String(u.message.chat?.id) === daemonChatId);
       if (mine.length) {
-        await handleControlMessages(mine, { token, daemonChatId, projectsConfig, catchAllIds, sendText });
+        handleControlMessages(mine, { token, daemonChatId, projectsConfig, registry, sendText });
       }
       if (updates.length) writeOffset(Math.max(...updates.map((u) => u.update_id)), daemonOffsetFile);
 
@@ -353,119 +272,73 @@ async function main() {
   }
 }
 
-// Dispatch the control-DM messages. Reuses tele-listen's /pending + /start
-// handlers; implements /spawn and /whisper directly (non-AI).
-async function handleControlMessages(mine, { token, daemonChatId, projectsConfig, catchAllIds, sendText }) {
-  // /pending + /start: reuse the existing detect/dispatch (scoped to the DM).
-  try {
-    const { responses: pend } = detectPendingCommands(mine, [daemonChatId]);
-    const { responses: start } = detectStartCommands(mine);
-    const responses = [...pend, ...start];
-    if (responses.length) await dispatchPendingResponses(token, responses);
-  } catch (e) { console.error(`/pending|/start: ${e?.message ?? e}`); }
-
+// Dispatch the control-DM messages: each `/command` is resolved against the
+// registry and run as a teleport script (non-AI). Dispatch is FIRE-AND-FORGET:
+// a command runs a child process that can take seconds-to-minutes (a build, a
+// graceful kill), and awaiting it here would freeze the daemon's poll + heartbeat
+// for that whole time. We launch each and attach a `.catch` so a thrown dispatch
+// still reports instead of becoming an unhandled rejection. (Offset is advanced
+// by the caller regardless, so a slow command is never re-processed.)
+export function handleControlMessages(mine, ctx) {
   for (const u of mine) {
     const msg = u.message;
     const parsed = parseDaemonCommand(msg.text);
     if (!parsed) continue;
-    const from = msg.from || {};
-    const ctx = { token, daemonChatId, msg, from, projectsConfig, catchAllIds, sendText };
-    try {
-      if (parsed.cmd === 'spawn') await cmdSpawn(parsed.rest, ctx);
-      else if (parsed.cmd === 'whisper') await cmdWhisper(parsed.rest, ctx);
-      else if (parsed.cmd === 'run') await cmdRun(parsed.rest, ctx);
-      // /pending, /start handled above; unknown commands ignored silently.
-    } catch (e) {
-      await sendText(daemonChatId, `❌ /${parsed.cmd} failed: ${e instanceof Error ? e.message : e}`);
-    }
+    dispatchCommand(parsed, msg.from || {}, ctx).catch((e) =>
+      ctx.sendText(ctx.daemonChatId, `❌ /${parsed.cmd} failed: ${e instanceof Error ? e.message : e}`));
   }
 }
 
-// `/run <project> <npm|pnpm|yarn> <args>` — cd into a sibling project and run a
-// package-manager command, sending the result back to the control DM. REMOTE
-// EXEC → gated to admin/maintainer (resolveSenderRole), binary whitelisted, hard
-// timeout. `runner` injectable for tests.
-export async function cmdRun(rest, { daemonChatId, from, projectsConfig, sendText, runner = execFileP, parentDir = PARENT_DIR }) {
+// Generic registry dispatcher. Resolves `/cmd` to a command spec, gates by
+// minRole, then runs `node scripts/<run> [...spec.args] [...rest]` with:
+//   • cwd     = the project folder (positional first token) when needsProject,
+//               else the workspace root;
+//   • env     = the sender's identity (TELE_FROM_*), so the script can apply the
+//               whisperer's real role to a target's sensitive-action gate, etc.;
+//   • stdout  = relayed verbatim to the control DM (teleport files it if long).
+// Unknown commands are ignored silently (the DM may carry non-command chatter).
+// REMOTE CODE EXECUTION: the registry's minRole + resolveSpawnCwd containment are
+// the gate; `runner`/`scriptsDir`/`parentDir` are injectable for tests.
+export async function dispatchCommand(parsed, from, {
+  daemonChatId, projectsConfig, registry, sendText,
+  runner = execFileP, scriptsDir = __dirname, parentDir = PARENT_DIR,
+}) {
+  const spec = resolveCommand(parsed.cmd, registry);
+  if (!spec) return; // not a known command → stay quiet
   const role = resolveSenderRole(projectsConfig, from && from.id);
-  if (role !== 'admin' && role !== 'maintainer') {
-    await sendText(daemonChatId, `❌ /run cần quyền admin/maintainer (bạn: ${role}).`);
+  if (!roleMeets(role, spec.minRole)) {
+    await sendText(daemonChatId, `❌ /${parsed.cmd} cần quyền ${spec.minRole} (bạn: ${role}).`);
     return;
   }
-  const a = parseRunArgs(rest);
-  if (a.error) { await sendText(daemonChatId, `❌ ${a.error}`); return; }
-  const r = resolveSpawnCwd(a.project, { parentDir });
-  if (r.error) { await sendText(daemonChatId, `❌ ${r.error}`); return; }
-  // package.json must exist and define the requested script.
-  const pkg = readPackageScripts(r.cwd);
-  if (pkg.error) { await sendText(daemonChatId, `❌ ${pkg.error}`); return; }
-  if (!Object.prototype.hasOwnProperty.call(pkg.scripts, a.script)) {
-    const avail = Object.keys(pkg.scripts);
-    await sendText(daemonChatId, `❌ script "${a.script}" không có trong ${a.project}/package.json. Có: ${avail.length ? avail.join(', ') : '(không có script nào)'}`);
-    return;
+  const parts = tokenizeArgs(parsed.rest); // quote-aware (`--grep "a b"` → one arg)
+  let cwd = parentDir;
+  let rest = parts;
+  if (spec.needsProject) {
+    const r = resolveSpawnCwd(parts[0], { parentDir });
+    if (r.error) { await sendText(daemonChatId, `❌ ${r.error}`); return; }
+    cwd = r.cwd;
+    rest = parts.slice(1); // drop the folder token
   }
-  const pm = detectPackageManager(r.cwd);
-  // argv: `<pm> run <script> -- <args>`. The `--` makes everything after it go to
-  // the SCRIPT, not the package manager — so a trailing `--prefix /elsewhere` (npm)
-  // / `--dir` (pnpm) / `--cwd` (yarn) can't redirect the PM out of the project cwd.
-  // No `hasBinary(pm)` pre-check (it shells out): a missing PM surfaces as the
-  // execFile ENOENT below, caught and reported.
-  const args = a.args.length ? ['run', a.script, '--', ...a.args] : ['run', a.script];
-  const label = `${a.project}: ${pm} run ${a.script}${a.args.length ? ' ' + a.args.join(' ') : ''}`;
-  await sendText(daemonChatId, `▶️ ${label} …`);
+  const argv = [path.join(scriptsDir, spec.run), ...spec.args, ...rest];
+  const env = {
+    ...process.env,
+    TELE_FROM_ID: from && from.id != null ? String(from.id) : '',
+    TELE_FROM_ROLE: role,
+    TELE_FROM_NAME: (from && (from.first_name || from.username)) || 'admin',
+    TELE_FROM_USERNAME: (from && from.username) || '',
+  };
   try {
-    const { stdout, stderr } = await runner(pm, args, { cwd: r.cwd, timeout: RUN_TIMEOUT_MS, maxBuffer: RUN_MAX_BUFFER });
-    const out = tailOutput((stdout || '') + (stderr ? `\n[stderr]\n${stderr}` : ''));
-    await sendText(daemonChatId, `✅ ${label} — exit 0\n\n${out || '(no output)'}`);
+    const { stdout, stderr } = await runner(process.execPath, argv, {
+      cwd, env, timeout: COMMAND_TIMEOUT_MS, maxBuffer: COMMAND_MAX_BUFFER,
+    });
+    const out = ((stdout || '') + (stderr ? `\n[stderr]\n${stderr}` : '')).trim();
+    await sendText(daemonChatId, out || '✅ (no output)');
   } catch (e) {
-    const body = (e.stdout || '') + (e.stderr ? `\n[stderr]\n${e.stderr}` : '') + (e.killed ? '\n[killed: timeout]' : '');
-    await sendText(daemonChatId, `❌ ${label} — exit ${e.code ?? e.signal ?? '?'}\n\n${tailOutput(body) || (e.message || 'failed')}`);
+    // execFile rejects on non-zero exit / timeout / ENOENT — surface the child's
+    // own output (scripts print their own ❌ messages) before falling back.
+    const body = ((e.stdout || '') + (e.stderr ? `\n[stderr]\n${e.stderr}` : '') + (e.killed ? '\n[killed: timeout]' : '')).trim();
+    await sendText(daemonChatId, body || `❌ /${parsed.cmd} failed: ${e.message || e}`);
   }
-}
-
-async function cmdSpawn(rest, { daemonChatId, sendText }) {
-  const project = rest.split(/\s+/)[0];
-  const r = resolveSpawnCwd(project);
-  if (r.error) { await sendText(daemonChatId, `❌ ${r.error}`); return; }
-  if (!hasBinary('claude')) { await sendText(daemonChatId, '❌ `claude` not found on PATH.'); return; }
-  if (!hasBinary('screen')) { await sendText(daemonChatId, '❌ `screen` not found (needed for interactive spawn).'); return; }
-  const seed = genSessionSeed();
-  runSpawn(buildSpawnPlan({ interactive: true, sessionName: seed.sessionName, sessionId: seed.sessionId, seed }), { cwd: r.cwd });
-  await sendText(daemonChatId, `✅ spawned agent in ${project} (${seed.sessionName}) — it will greet in its topic shortly.`);
-}
-
-async function cmdWhisper(rest, { daemonChatId, from, projectsConfig, catchAllIds, sendText }) {
-  const args = parseWhisperArgs(rest);
-  if (args.error) { await sendText(daemonChatId, `❌ ${args.error}`); return; }
-  // Resolve #hashtag/convoId/persona → a live topic across all group chats.
-  const store = readTopicsStore();
-  const groupChatIds = [...new Set(catchAllIds.concat(
-    projectEntries(projectsConfig).map(([, p]) => p && p.chatId).filter(Boolean).map(String),
-  ))];
-  const matched = matchTarget(normalizeTarget(args.target), listLiveTopics(store, groupChatIds));
-  if (matched.status !== 'found') {
-    await sendText(daemonChatId, `❌ target ${args.target} ${matched.status === 'ambiguous' ? 'is ambiguous' : 'not found among live topics'}.`);
-    return;
-  }
-  const { convoId, chatId } = matched.match;
-  // fromRole = the whisperer's advisory role so the target agent's sensitive-
-  // action gate still applies (owner of the control DM is normally admin).
-  const fromRole = resolveSenderRole(projectsConfig, from.id);
-  const prompt = buildWhisperPrompt({
-    targetConvoId: convoId, targetChatId: chatId,
-    fromUserId: from.id, fromName: from.first_name || from.username || 'admin', fromRole,
-    text: args.message,
-  });
-  const promptFile = path.join(DEFAULT_TMP_DIR, `prompt-convo-${convoId}.json`);
-  try {
-    writePromptExclusive(prompt, promptFile);
-  } catch (e) {
-    if (e && e.code === 'EEXIST') {
-      await sendText(daemonChatId, `⚠️ #${shortConvoHash(convoId)} đang bận (prompt trước chưa xử lý) — thử lại sau.`);
-      return;
-    }
-    throw e;
-  }
-  await sendText(daemonChatId, `🤫 whispered to #${shortConvoHash(convoId)} (kín, không hiện trong group).`);
 }
 
 // CLI: `node daemon.mjs` (run) | `--status` | `--stop`.

@@ -210,9 +210,17 @@ export function assertChatIdKind(id, kind, label) {
  * (`{ role, username, ... }`); only `.role` drives privilege.
  */
 export const DEFAULT_ROLE = 'member';
+// `ownProp` reads a key only if it's the object's OWN property — so a roles map
+// can never grant privilege via an inherited prototype member (e.g. a user id
+// that collides with `toString`/`constructor`). Defense-in-depth: Telegram ids
+// are numeric so this can't trigger today, but the role gate must not depend on
+// that staying true.
+function ownProp(obj, key) {
+  return obj && Object.prototype.hasOwnProperty.call(obj, key) ? obj[key] : undefined;
+}
 export function roleFor(roles, userId) {
   if (userId == null) return null;
-  const v = roles && roles[String(userId)];
+  const v = ownProp(roles, String(userId));
   if (v == null) return DEFAULT_ROLE;
   if (typeof v === 'string') return v;
   return v.role ?? DEFAULT_ROLE;
@@ -226,7 +234,7 @@ export function roleFor(roles, userId) {
  */
 export function memberFor(roles, userId) {
   if (userId == null) return null;
-  const v = roles && roles[String(userId)];
+  const v = ownProp(roles, String(userId));
   if (v == null || typeof v === 'string') return null;
   return v;
 }
