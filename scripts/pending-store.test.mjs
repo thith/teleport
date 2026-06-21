@@ -16,7 +16,7 @@ import {
   updatePendingStore,
   writePendingStore,
 } from './pending-store.mjs';
-import { handlePendingCommand, runHeartbeatReminders, isQuietHour, detectStartCommands } from './tele-listen.mjs';
+import { runHeartbeatReminders, isQuietHour } from './tele-listen.mjs';
 
 function tmp() {
   return path.join(os.tmpdir(), `pending-${Date.now()}-${Math.random().toString(36).slice(2)}.json`);
@@ -149,51 +149,6 @@ test('pending-store — updatePendingStore round-trip', () => {
   fs.unlinkSync(file);
 });
 
-test('handlePendingCommand — admin /pending message triggers response', async () => {
-  const updates = [{
-    update_id: 1,
-    message: {
-      message_id: 100,
-      chat: { id: 144242180, type: 'private' },
-      text: '/pending',
-    },
-  }];
-  let sentBody = null;
-  const sendText = async (chatId, text) => { sentBody = text; return true; };
-  const handled = await handlePendingCommand('TOKEN', updates, ['144242180'], { sendText });
-  assert.strictEqual(handled.size, 1);
-  assert.ok(sentBody);
-});
-
-test('handlePendingCommand — ignores non-admin chat', async () => {
-  const updates = [{
-    update_id: 1,
-    message: {
-      message_id: 100,
-      chat: { id: 999999, type: 'private' },
-      text: '/pending',
-    },
-  }];
-  let sentBody = null;
-  const sendText = async (chatId, text) => { sentBody = text; return true; };
-  const handled = await handlePendingCommand('TOKEN', updates, ['144242180'], { sendText });
-  assert.strictEqual(handled.size, 0);
-  assert.strictEqual(sentBody, null);
-});
-
-test('handlePendingCommand — ignores non-/pending text', async () => {
-  const updates = [{
-    update_id: 1,
-    message: {
-      message_id: 100,
-      chat: { id: 144242180, type: 'private' },
-      text: 'hello world',
-    },
-  }];
-  const handled = await handlePendingCommand('TOKEN', updates, ['144242180'], { sendText: async () => true });
-  assert.strictEqual(handled.size, 0);
-});
-
 function atHour(h) {
   const d = new Date(2026, 4, 23, h, 30, 0);
   return d;
@@ -286,26 +241,6 @@ test('formatPendingList — caps at PENDING_LIST_CAP entries + "…and N more"',
   assert.match(out, /…and 10 more/);
   // Header should still say total count, not the capped count.
   assert.match(out, /30 pending convos/);
-});
-
-test('handlePendingCommand — strict regex rejects /pendingabc', async () => {
-  const updates = [{
-    update_id: 1,
-    message: { message_id: 100, chat: { id: 144242180, type: 'private' }, text: '/pendingabc' },
-  }];
-  const handled = await handlePendingCommand('TOKEN', updates, ['144242180'], { sendText: async () => true });
-  assert.strictEqual(handled.size, 0);
-});
-
-test('handlePendingCommand — strict regex accepts /pending@bot_name', async () => {
-  const updates = [{
-    update_id: 1,
-    message: { message_id: 100, chat: { id: 144242180, type: 'private' }, text: '/pending@my_bot' },
-  }];
-  let sent = false;
-  const handled = await handlePendingCommand('TOKEN', updates, ['144242180'], { sendText: async () => { sent = true; return true; } });
-  assert.strictEqual(handled.size, 1);
-  assert.strictEqual(sent, true);
 });
 
 test('runHeartbeatReminders — fans out to ALL admins, throttled between sends', async () => {
@@ -415,103 +350,12 @@ test('formatPendingList — renders 🟢/💀/⚪ markers + last-alive', () => {
 
 
 // ---------------------------------------------------------------------------
-// /start command
+// Replies to a heartbeat-reminder output must be classified as orphans (admin
+// replied to the bot's reminder message, not to a real bot message from an
+// agent thread). Verifies the systemMsgId recording → findOrphanMessages path.
 // ---------------------------------------------------------------------------
 
-test('detectStartCommands — bare /start triggers response with guide + footer', () => {
-  const updates = [{
-    update_id: 1,
-    message: { message_id: 50, chat: { id: 99, type: 'private' }, text: '/start' },
-  }];
-  const { handledIds, responses } = detectStartCommands(updates);
-  assert.strictEqual(handledIds.size, 1);
-  assert.strictEqual(responses.length, 1);
-  assert.match(responses[0].body, /Teleport bot/);
-  assert.match(responses[0].body, /github\.com\/thith\/teleport/);
-  assert.match(responses[0].body, /digesty\.vn/);
-});
-
-test('detectStartCommands — /start@botname accepted', () => {
-  const updates = [{
-    update_id: 2,
-    message: { message_id: 51, chat: { id: 99, type: 'private' }, text: '/start@teleport_bot' },
-  }];
-  const { handledIds } = detectStartCommands(updates);
-  assert.strictEqual(handledIds.size, 1);
-});
-
-test('detectStartCommands — /starting (longer prefix) NOT matched', () => {
-  const updates = [{
-    update_id: 3,
-    message: { message_id: 52, chat: { id: 99, type: 'private' }, text: '/starting' },
-  }];
-  const { handledIds } = detectStartCommands(updates);
-  assert.strictEqual(handledIds.size, 0);
-});
-
-test('detectStartCommands — preserves message_thread_id for forum topics', () => {
-  const updates = [{
-    update_id: 4,
-    message: {
-      message_id: 53,
-      chat: { id: 99, type: 'supergroup' },
-      message_thread_id: 777,
-      text: '/start',
-    },
-  }];
-  const { responses } = detectStartCommands(updates);
-  assert.strictEqual(responses[0].threadId, 777);
-  assert.strictEqual(responses[0].replyToMessageId, 53);
-});
-
-test('detectStartCommands — no fetched updates returns empty', () => {
-  const { handledIds, responses } = detectStartCommands([]);
-  assert.strictEqual(handledIds.size, 0);
-  assert.strictEqual(responses.length, 0);
-});
-
-// ---------------------------------------------------------------------------
-// Replies to /pending or /start outputs must be classified as orphans
-// (admin replied to the bot's command response, not to a real bot message
-// from an agent thread). Verifies the dispatchPendingResponses → systemMsgId
-// recording path.
-// ---------------------------------------------------------------------------
-
-import { dispatchPendingResponses, findOrphanMessages } from './tele-listen.mjs';
-
-test('dispatchPendingResponses — records system-msg-id on plain success', async () => {
-  const recorded = [];
-  const sendText = async (chatId, text, threadId, replyToMessageId) => ({
-    ok: true,
-    fallback: false,
-    messageId: 9001,
-  });
-  const recordSystemMsgId = async (chatId, mid) => { recorded.push([chatId, mid]); };
-  await dispatchPendingResponses('TOKEN', [
-    { chatId: 144, threadId: null, replyToMessageId: 1, body: 'hi' },
-  ], { sendText, recordSystemMsgId });
-  assert.deepStrictEqual(recorded, [[144, 9001]]);
-});
-
-test('dispatchPendingResponses — skips recording when sent as .md fallback', async () => {
-  const recorded = [];
-  const sendText = async () => ({ ok: true, fallback: 'auto-file', messageId: 9002 });
-  const recordSystemMsgId = async (chatId, mid) => { recorded.push([chatId, mid]); };
-  await dispatchPendingResponses('TOKEN', [
-    { chatId: 144, threadId: null, replyToMessageId: 1, body: 'hi' },
-  ], { sendText, recordSystemMsgId });
-  assert.strictEqual(recorded.length, 0);
-});
-
-test('dispatchPendingResponses — back-compat: sendText returning `true` does not crash recorder', async () => {
-  // Existing tests injected `async () => true`. Verify the new tracker logic
-  // tolerates a non-object truthy return without throwing or recording.
-  let called = false;
-  await dispatchPendingResponses('TOKEN', [
-    { chatId: 1, threadId: null, replyToMessageId: 2, body: 'x' },
-  ], { sendText: async () => true, recordSystemMsgId: async () => { called = true; } });
-  assert.strictEqual(called, false);
-});
+import { findOrphanMessages } from './tele-listen.mjs';
 
 test('findOrphanMessages — reply to recorded command-response is orphan (with 💔 reply)', () => {
   const systemMsgIds = new Set(['144:9001']);
@@ -542,28 +386,6 @@ test('findOrphanMessages — reply to a NON-recorded message is NOT orphan (real
   }];
   const orphans = findOrphanMessages(updates, ['144'], systemMsgIds);
   assert.strictEqual(orphans.length, 0);
-});
-
-test('integration — /start → dispatch → recordSystemMsgId end-to-end', async () => {
-  // Pipe an admin /start update through the full chain. Verifies that the
-  // detect helper emits a response shape the dispatcher accepts, and that
-  // a successful send registers the bot's reply messageId for orphan-path
-  // routing on a future admin reply to the same message.
-  const updates = [{
-    update_id: 99,
-    message: { message_id: 7, chat: { id: 42, type: 'private' }, text: '/start' },
-  }];
-  const { handledIds, responses } = detectStartCommands(updates);
-  assert.strictEqual(handledIds.size, 1);
-  assert.strictEqual(responses.length, 1);
-
-  const recorded = [];
-  const sendText = async (chatId, text, threadId, replyToMessageId) => ({
-    ok: true, fallback: false, messageId: 12345,
-  });
-  const recordSystemMsgId = async (chatId, mid) => { recorded.push([chatId, mid]); };
-  await dispatchPendingResponses('TOKEN', responses, { sendText, recordSystemMsgId });
-  assert.deepStrictEqual(recorded, [[42, 12345]]);
 });
 
 test('runHeartbeatReminders — registers reminder message ID for orphan-path routing', async () => {
