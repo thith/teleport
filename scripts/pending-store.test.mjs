@@ -16,7 +16,7 @@ import {
   updatePendingStore,
   writePendingStore,
 } from './pending-store.mjs';
-import { runHeartbeatReminders, isQuietHour } from './tele-listen.mjs';
+import { runHeartbeatReminders, isQuietHour, maybeRecordSystemMsg } from './tele-listen.mjs';
 
 function tmp() {
   return path.join(os.tmpdir(), `pending-${Date.now()}-${Math.random().toString(36).slice(2)}.json`);
@@ -412,9 +412,39 @@ test('runHeartbeatReminders — registers reminder message ID for orphan-path ro
   });
   assert.strictEqual(sendCalls.length, 1);
   // The injected `sendText` short-circuits the default sendImpl that does the
-  // registration. So we instead verify the *default* path by using the real
-  // sendImpl with a stubbed sendTextChunk: skip this branch via the explicit
-  // injection covered in the dispatch tests above. The presence of the call
-  // here proves the send still happens after the recordSystemMsgId fix.
+  // registration; the presence of the call here only proves the send still
+  // happens. The registration DECISION itself is covered directly by the
+  // `maybeRecordSystemMsg` tests below (extracted so it is unit-testable without
+  // stubbing the whole topic-lookup + sendTextChunk chain).
   fs.unlinkSync(file);
+});
+
+// The system-msg-id registration decision used by the default reminder sendImpl
+// (and formerly by the now-removed /pending+/start dispatch). A real admin reply
+// to such output must be classified as an orphan, so a successful non-fallback
+// send MUST register its messageId; a fallback or a non-object return must NOT.
+test('maybeRecordSystemMsg — registers on {messageId, fallback:false}', async () => {
+  const rec = [];
+  await maybeRecordSystemMsg({ messageId: 9001, fallback: false }, 144, async (c, m) => rec.push([c, m]));
+  assert.deepStrictEqual(rec, [[144, 9001]]);
+});
+
+test('maybeRecordSystemMsg — skips a .md-fallback send (not a [SYSTEM] message)', async () => {
+  const rec = [];
+  await maybeRecordSystemMsg({ messageId: 9002, fallback: 'auto-file' }, 144, async (c, m) => rec.push([c, m]));
+  assert.strictEqual(rec.length, 0);
+});
+
+test('maybeRecordSystemMsg — skips non-object / no-messageId returns (e.g. sendText → true)', async () => {
+  const rec = [];
+  await maybeRecordSystemMsg(true, 1, async (c, m) => rec.push([c, m]));   // injected sendText returning true
+  await maybeRecordSystemMsg(null, 1, async (c, m) => rec.push([c, m]));
+  await maybeRecordSystemMsg({ ok: true }, 1, async (c, m) => rec.push([c, m])); // object but no messageId
+  assert.strictEqual(rec.length, 0);
+});
+
+test('maybeRecordSystemMsg — a throwing recorder is swallowed (best-effort, never crashes the send)', async () => {
+  await assert.doesNotReject(
+    maybeRecordSystemMsg({ messageId: 5, fallback: false }, 1, async () => { throw new Error('disk full'); }),
+  );
 });

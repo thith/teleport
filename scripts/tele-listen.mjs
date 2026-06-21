@@ -13,7 +13,7 @@ import {
   recordAdminReply,
   updatePendingStore,
 } from './pending-store.mjs';
-import { recordAlive, isAlive, getLastAliveMs, pruneStale as pruneAliveStale, DEFAULT_FRESH_MS as ALIVE_FRESH_MS } from './listener-alive.mjs';
+import { recordAlive, getLastAliveMs, pruneStale as pruneAliveStale, DEFAULT_FRESH_MS as ALIVE_FRESH_MS } from './listener-alive.mjs';
 import { readTopicsStore, getThreadId, DEFAULT_TOPICS_FILE } from './topics-store.mjs';
 import { peekPersona } from './persona-store.mjs';
 import { readProjectsConfig, resolveProjectConfig, roleFor, memberFor, adminIdsFrom, resolveDefaultChatId } from './projects-config.mjs';
@@ -934,6 +934,19 @@ function maybePruneAlive(now) {
   try { pruneAliveStale({ now }); } catch {}
 }
 
+// Register a successfully-sent system message (a command/reminder output the bot
+// itself produced) so that a later admin reply to it is classified as an orphan
+// (💔 + "reply to a regular message" hint) rather than routed to an agent as a
+// prompt. Skips: a .md-fallback send (not a [SYSTEM]-class message), and any
+// non-object / no-messageId return (e.g. an injected sendText returning `true`).
+// Exported so the registration decision is unit-tested directly.
+export async function maybeRecordSystemMsg(res, chatId, recordSystemMsgId) {
+  if (res && res.messageId && !res.fallback) {
+    try { await recordSystemMsgId(chatId, res.messageId); }
+    catch (e) { console.error(`[tele-listen] system-msg-id register failed: ${e instanceof Error ? e.message : String(e)}`); }
+  }
+}
+
 export async function runHeartbeatReminders(token, adminIds, { sendText, now = Date.now(), storeFile, quietHours, getLastAliveMs: getLastAliveMsArg = getLastAliveMs, aliveFreshMs = ALIVE_FRESH_MS, recordSystemMsgId = appendSystemMsgId } = {}) {
   // Quiet-hours: the caller (daemon) passes the resolved `{start,end}` window
   // (from projects.json `_config.quietHours`). When omitted, fall back to the
@@ -954,14 +967,10 @@ export async function runHeartbeatReminders(token, adminIds, { sendText, now = D
         return false;
       }
       const res = await sendTextChunk(token, chatId, text, { raw: false, plain: true, messageThreadId: threadId });
-      // Register the reminder message as a system message, same reason as
-      // /pending and /start responses: replying to a "⏰ Pending reminder"
-      // is a natural admin action, and that reply has no agent thread to
-      // belong to — orphan path is the correct routing.
-      if (res && res.messageId && !res.fallback) {
-        try { await recordSystemMsgId(chatId, res.messageId); }
-        catch (e) { console.error(`[tele-listen] reminder system-msg-id register failed: ${e instanceof Error ? e.message : String(e)}`); }
-      }
+      // Register the reminder message as a system message: replying to a
+      // "⏰ Pending reminder" is a natural admin action, and that reply has no
+      // agent thread to belong to — the orphan path is the correct routing.
+      await maybeRecordSystemMsg(res, chatId, recordSystemMsgId);
       return true;
     } catch (e) {
       console.error(`[tele-listen] reminder send failed to ${chatId}: ${scrubToken(e instanceof Error ? e.message : String(e), token)}`);
