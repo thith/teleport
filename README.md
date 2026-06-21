@@ -105,6 +105,10 @@ After sending any Telegram message, you **MUST immediately** start the reply-lis
 ## Handover to another topic/agent
 
 **WHENEVER** the user asks to **hand over / hand off** the current work to another topic or agent — e.g. "handover cho Tuộc", "bàn giao cho …", "chuyển việc sang topic khác", "handover sang topic mới" — **or any similar phrasing in any language** — you **MUST** read `../teleport/rules/telegram-guide.md` section "Handover sang convo/topic khác" and follow it. Teleport performs the handover for you via `handover.mjs` — do **NOT** improvise (do **NOT** just write a file and ask the user to send it manually, and do **NOT** spawn a new agent yourself). Use `--to <persona|#hashtag|convoId>` to hand to an **existing** live topic; use `--new` **only** when a brand-new topic is explicitly wanted. The guide is the single source of truth.
+
+## Start the supervisor daemon
+
+**WHENEVER** the user asks to start / launch / run the teleport **daemon** (the supervisor / control plane that lets you steer & recover from Telegram even when every agent has died) — e.g. "start the daemon", "launch the daemon", "run the daemon", "chạy daemon", "bật daemon", "khởi động daemon" — **or any similar phrasing in any language** — you **MUST** read `../teleport/rules/telegram-guide.md` section "Supervisor daemon" and follow it (run it from a project root). The trigger word is **"daemon"** specifically — "start an agent" *without* "daemon" is a spawn (above), not this. Starting the daemon is a **sensitive admin/maintainer action** (like spawning). Do **NOT** rely on invocation details from this snippet; the guide is the single source of truth.
 ````
 
 #### Per-project setup for spawn
@@ -147,14 +151,7 @@ node ../teleport/scripts/daemon.mjs --stop      # stop it (pidfile)
 screen -dmS teleport-daemon node ../teleport/scripts/daemon.mjs
 ```
 
-Per-project `package.json` scripts (optional convenience):
-
-```json
-"daemon": "node ../teleport/scripts/daemon.mjs",
-"daemon:bg": "screen -dmS teleport-daemon node ../teleport/scripts/daemon.mjs",
-"daemon:status": "node ../teleport/scripts/daemon.mjs --status",
-"daemon:stop": "node ../teleport/scripts/daemon.mjs --stop"
-```
+teleport has no `package.json` of its own — always invoke the daemon as `node ../teleport/scripts/daemon.mjs` (a sibling project may of course wrap that in its own `package.json` script if it likes). Agents recognise *"start/launch/chạy daemon"* via the wiring snippet above and run it for you (admin/maintainer only).
 
 **Config:** set `_config.daemonChatId` (your private chat id) in `projects.json`. Chat-id rule (validated at startup): every project / `_default.chatId` chat must be a **group** (negative id); `daemonChatId` must be a **private** chat (positive id). a `needsProject` command resolves `<workspace-parent>/<folder>` as the script's cwd (which, for spawn, is how the new agent joins that project's group), with realpath containment so a symlinked folder can't escape the workspace. **Whisper** injects a discreet steer into a topic with `whisper:true` — invisible in the group; the receiving agent acts on it without announcing it (see `rules/telegram-guide.md`).
 

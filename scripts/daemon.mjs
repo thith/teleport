@@ -2,7 +2,7 @@
 //
 // A best-effort, manually-started, NON-AI control plane. It is the always-on
 // piece that lets you steer/recover from afar even when every agent has died
-// (quota/network/API). You start it before stepping away (`pnpm daemon`), or ask
+// (quota/network/API). You start it before stepping away (`node daemon.mjs`), or ask
 // a live agent to start it; forget to, and teleport just behaves as before.
 //
 // Architecture ("hợp tác xã" — cooperative harvest): the daemon polls Telegram
