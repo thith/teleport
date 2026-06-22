@@ -12,7 +12,7 @@ import {
   isForumCached,
   cacheForum,
 } from './send-telegram.mjs';
-import { readTopicsStore, getThreadId, writeTopicsStore, isNoTopicSupportFresh } from './topics-store.mjs';
+import { readTopicsStore, getThreadId, writeTopicsStore } from './topics-store.mjs';
 
 const noSleep = async () => {};
 
@@ -349,14 +349,14 @@ test('resolveThreadId: persistent 504 → null, no negative cache (next send ret
   });
   assert.equal(tid, null);
   assert.equal(calls, 2); // 2 attempts (one retry), then give up
-  // Transient must NOT poison the cache — a later send re-attempts creation.
-  // (Nothing was written at all: no positive thread, no negative marker — so the
-  // store file may not even exist. force:true tolerates that.)
-  assert.equal(isNoTopicSupportFresh(readTopicsStore(file), '-100'), false);
+  // Nothing is ever poisoned — there is no negative cache. A later send
+  // re-attempts creation. (Nothing was written: no positive thread, no marker —
+  // so the store file may not even exist. force:true tolerates that.)
+  assert.equal(readTopicsStore(file)['-100']?._no_topic_support, undefined);
   fs.rmSync(file, { force: true });
 });
 
-test('resolveThreadId: permanent 403 → null + negative cache, single call (no retry)', async () => {
+test('resolveThreadId: permanent 403 → null, single call (no retry), no negative cache', async () => {
   const file = tmpTopics();
   let calls = 0;
   const sleeps = [];
@@ -368,6 +368,8 @@ test('resolveThreadId: permanent 403 → null + negative cache, single call (no 
   assert.equal(tid, null);
   assert.equal(calls, 1); // permanent error is NOT transient → no wasted retry
   assert.deepEqual(sleeps, []); // and no wasted backoff sleep on the permanent path
-  assert.equal(isNoTopicSupportFresh(readTopicsStore(file), '-100'), true);
-  fs.unlinkSync(file);
+  // No negative cache: the next send re-attempts, so a fixed mis-config (admin
+  // grants the right) self-heals immediately instead of being suppressed 1h.
+  assert.equal(readTopicsStore(file)['-100']?._no_topic_support, undefined);
+  try { fs.unlinkSync(file); } catch {}
 });

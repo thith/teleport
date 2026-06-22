@@ -6,10 +6,7 @@ import path from 'node:path';
 import {
   clearThreadId,
   getThreadId,
-  isNoTopicSupportFresh,
-  NO_SUPPORT_TTL_MS,
   readTopicsStore,
-  recordNoTopicSupport,
   recordThreadId,
   writeTopicsStore,
 } from './topics-store.mjs';
@@ -48,37 +45,20 @@ test('topics-store — getThreadId ignores reserved (underscore-prefixed) keys',
   assert.strictEqual(getThreadId(store, 1234, '_no_topic_support'), null);
 });
 
-test('topics-store — recordNoTopicSupport sets flag + timestamp', () => {
-  const store = {};
-  recordNoTopicSupport(store, 1234, Date.parse('2026-05-22T10:00:00Z'));
-  assert.strictEqual(store['1234']._no_topic_support, true);
-  assert.strictEqual(store['1234']._checked_at, '2026-05-22T10:00:00.000Z');
-});
-
-test('topics-store — isNoTopicSupportFresh respects TTL', () => {
-  const t0 = Date.parse('2026-05-22T10:00:00Z');
-  const store = {};
-  recordNoTopicSupport(store, 1234, t0);
-  // 30 minutes later → still fresh
-  assert.strictEqual(isNoTopicSupportFresh(store, 1234, t0 + 30 * 60_000), true);
-  // 61 minutes later → expired
-  assert.strictEqual(isNoTopicSupportFresh(store, 1234, t0 + 61 * 60_000), false);
-});
-
-test('topics-store — recordThreadId clears negative flag (self-heal)', () => {
+test('topics-store — recordThreadId persists mapping over a legacy negative entry', () => {
+  // No negative cache exists anymore; a stale `_no_topic_support` left by an
+  // older build is just inert metadata — recordThreadId neither reads nor
+  // clears it, and the positive mapping lands as normal.
   const store = { '1234': { _no_topic_support: true, _checked_at: '2026-05-22T09:00:00.000Z' } };
   recordThreadId(store, 1234, 'tea_game', 7);
-  assert.strictEqual(store['1234']._no_topic_support, false);
-  assert.strictEqual(store['1234']._checked_at, undefined);
   assert.strictEqual(store['1234'].tea_game, 7);
 });
 
 test('topics-store — clearThreadId removes only specified project, keeps others', () => {
-  const store = { '1234': { tea_game: 12, teleport: 15, _no_topic_support: false } };
+  const store = { '1234': { tea_game: 12, teleport: 15 } };
   clearThreadId(store, 1234, 'tea_game');
   assert.strictEqual(getThreadId(store, 1234, 'tea_game'), null);
   assert.strictEqual(getThreadId(store, 1234, 'teleport'), 15);
-  assert.strictEqual(store['1234']._no_topic_support, false);
 });
 
 test('topics-store — readTopicsStore returns {} on missing file', () => {
@@ -109,10 +89,6 @@ test('isTopicGoneError — detects the three known errors', () => {
   assert.strictEqual(isTopicGoneError(undefined), false);
 });
 
-test('NO_SUPPORT_TTL_MS — exposed constant is 1 hour', () => {
-  assert.strictEqual(NO_SUPPORT_TTL_MS, 60 * 60 * 1000);
-});
-
 test('resolveThreadId — positive cache hit returns thread_id without API call', async () => {
   const file = tmp();
   let store = {};
@@ -126,68 +102,59 @@ test('resolveThreadId — positive cache hit returns thread_id without API call'
   fs.unlinkSync(file);
 });
 
-test('resolveThreadId — fresh negative cache skips API call', async () => {
+test('resolveThreadId — legacy negative entry is ignored, create is re-attempted', async () => {
+  // A stale `_no_topic_support` from an older build must NOT suppress creation:
+  // the negative cache is gone, so every send re-attempts and self-heals.
   const file = tmp();
   const now = Date.parse('2026-05-22T10:00:00Z');
-  let store = {};
-  recordNoTopicSupport(store, 1234, now);
-  writeTopicsStore(store, file);
+  writeTopicsStore({ '1234': { _no_topic_support: true, _checked_at: new Date(now).toISOString() } }, file);
   let fetcherCalls = 0;
-  const fetcher = () => { fetcherCalls++; return { ok: true, messageThreadId: 99 }; };
+  const fetcher = async () => { fetcherCalls++; return { ok: true, messageThreadId: 99, status: 200 }; };
   const got = await resolveThreadId({ token: 'X', chatId: 1234, projectCode: 'p', topicsFile: file, nowFn: () => now + 30 * 60_000, fetcher });
-  assert.strictEqual(got, null);
-  assert.strictEqual(fetcherCalls, 0);
+  assert.strictEqual(got, 99);
+  assert.strictEqual(fetcherCalls, 1); // create WAS attempted despite the legacy flag
   fs.unlinkSync(file);
 });
 
-test('resolveThreadId — successful create persists mapping + clears negative flag', async () => {
+test('resolveThreadId — successful create persists mapping', async () => {
   const file = tmp();
-  // Pre-seed an expired negative cache to verify self-heal
-  const old = Date.parse('2026-05-22T08:00:00Z');
-  let store = {};
-  recordNoTopicSupport(store, 1234, old);
-  writeTopicsStore(store, file);
   const fetcher = async () => ({ ok: true, messageThreadId: 77, status: 200 });
   const got = await resolveThreadId({ token: 'X', chatId: 1234, projectCode: 'tea_game', topicsFile: file, nowFn: () => Date.parse('2026-05-22T10:00:00Z'), fetcher });
   assert.strictEqual(got, 77);
   const after = readTopicsStore(file);
   assert.strictEqual(after['1234'].tea_game, 77);
-  assert.strictEqual(after['1234']._no_topic_support, false);
   fs.unlinkSync(file);
 });
 
-test('resolveThreadId — permanent error (403) sets negative cache', async () => {
+test('resolveThreadId — permanent error (403) returns null, writes no negative cache', async () => {
   const file = tmp();
   const fetcher = async () => ({ ok: false, status: 403, description: 'Forbidden: bot lacks permission' });
   const got = await resolveThreadId({ token: 'X', chatId: 1234, projectCode: 'p', topicsFile: file, fetcher });
   assert.strictEqual(got, null);
+  // No negative cache anymore → the next send re-attempts, so a fixed mis-config
+  // self-heals immediately instead of staying dropped for an hour.
   const after = readTopicsStore(file);
-  assert.strictEqual(after['1234']._no_topic_support, true);
-  fs.unlinkSync(file);
+  assert.strictEqual(after['1234']?._no_topic_support, undefined);
+  try { fs.unlinkSync(file); } catch {}
 });
 
-test('resolveThreadId — transient error (429) does NOT set negative cache', async () => {
+test('resolveThreadId — transient error (429) returns null, no store poisoning', async () => {
   const file = tmp();
   const fetcher = async () => ({ ok: false, status: 429, description: 'Too Many Requests' });
   const got = await resolveThreadId({ token: 'X', chatId: 1234, projectCode: 'p', topicsFile: file, fetcher, sleepFn: noSleep });
   assert.strictEqual(got, null);
   const after = readTopicsStore(file);
-  // No entry at all → next call will retry, not poisoned. File may not exist.
   assert.strictEqual(after['1234']?._no_topic_support, undefined);
   try { fs.unlinkSync(file); } catch {}
 });
 
-test('resolveThreadId — fetcher throws → null, NOT negative-cached (transient)', async () => {
+test('resolveThreadId — fetcher throws → null, no store poisoning', async () => {
   const file = tmp();
   const fetcher = async () => { throw new Error('network down'); };
   const got = await resolveThreadId({ token: 'X', chatId: 1234, projectCode: 'p', topicsFile: file, fetcher, sleepFn: noSleep });
   assert.strictEqual(got, null);
-  // A thrown fetch is TRANSIENT (review C-Maj2): must NOT set the negative cache,
-  // so the next send retries topic creation instead of being suppressed for 1h.
   const after = readTopicsStore(file);
-  assert.notStrictEqual(after['1234']?._no_topic_support, true);
-  // No store write happened (transient throw → no negative cache), so the file
-  // may not exist — clean up tolerantly.
+  assert.strictEqual(after['1234']?._no_topic_support, undefined);
   fs.rmSync(file, { force: true });
 });
 
@@ -200,12 +167,4 @@ test('resolveThreadId — projectCode starting with `_` returns null immediately
   assert.strictEqual(fetcherCalls, 0);
   // No store write — file shouldn't exist.
   assert.strictEqual(fs.existsSync(file), false);
-});
-
-test('isNoTopicSupportFresh — backward clock skew treated as stale', () => {
-  const t0 = Date.parse('2026-05-22T10:00:00Z');
-  const store = {};
-  recordNoTopicSupport(store, 1234, t0);
-  // Clock moved BACKWARD by 1 hour → age is negative → stale → re-check.
-  assert.strictEqual(isNoTopicSupportFresh(store, 1234, t0 - 60 * 60_000), false);
 });

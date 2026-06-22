@@ -7,8 +7,6 @@
 //       "<convoId>": <message_thread_id>,   // one entry per convo (key = convoId)
 //       "_is_forum": true,                  // positive forum-detection cache
 //       "_ts": { "<convoId>": <epoch_ms> }, // durable last-use, for GC
-//       "_no_topic_support": true | false,  // negative topic-create cache
-//       "_checked_at": "2026-05-22T10:00:00.000Z",
 //       ...
 //     },
 //     ...
@@ -22,9 +20,12 @@
 // - Positive cache (`<convoId>: <thread_id>`) is sticky. Cleared by the consumer
 //   on `MESSAGE_THREAD_NOT_FOUND` / `TOPIC_DELETED`, or by GC when the convo's
 //   `_ts` is older than the topic TTL.
-// - Negative cache (`_no_topic_support: true`) has a TTL: if more than
-//   `NO_SUPPORT_TTL_MS` since `_checked_at`, the caller may retry topic
-//   creation. Self-heals within an hour after an admin enables Topics.
+// - There is NO negative topic-create cache: every send re-attempts topic
+//   creation on a cache miss. A previous `_no_topic_support` TTL cache would
+//   keep dropping reports for up to an hour AFTER an admin fixed the mis-config
+//   (enabled Topics / granted the right) — no retry. Re-attempting each time
+//   costs one extra createForumTopic call while genuinely misconfigured, but
+//   self-heals the instant config is fixed.
 // - Underscore-prefixed keys are reserved for store metadata; topic keys
 //   starting with `_` are not supported (convoIds/cwd basenames never do).
 
@@ -34,7 +35,6 @@ import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 export const DEFAULT_TOPICS_FILE = path.join(__dirname, 'tmp', 'topics.json');
-export const NO_SUPPORT_TTL_MS = 60 * 60 * 1000; // 1 hour
 
 function atomicWriteFileSync(file, content) {
   const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
@@ -116,33 +116,11 @@ export function getThreadId(store, chatId, projectCode) {
   return typeof v === 'number' && v > 0 ? v : null;
 }
 
-export function isNoTopicSupportFresh(store, chatId, now = Date.now()) {
-  const entry = store[String(chatId)];
-  if (!entry || entry._no_topic_support !== true) return false;
-  const t = Date.parse(entry._checked_at ?? '');
-  if (!Number.isFinite(t)) return false;
-  const age = now - t;
-  // Negative age = system clock moved backward since the mark. Treat as
-  // stale so we re-check, rather than extending the cache indefinitely.
-  return age >= 0 && age < NO_SUPPORT_TTL_MS;
-}
-
 export function recordThreadId(store, chatId, projectCode, threadId) {
   if (!projectCode || projectCode.startsWith('_')) return store;
   const key = String(chatId);
   const entry = store[key] ?? {};
   entry[projectCode] = threadId;
-  entry._no_topic_support = false;
-  delete entry._checked_at;
-  store[key] = entry;
-  return store;
-}
-
-export function recordNoTopicSupport(store, chatId, now = Date.now()) {
-  const key = String(chatId);
-  const entry = store[key] ?? {};
-  entry._no_topic_support = true;
-  entry._checked_at = new Date(now).toISOString();
   store[key] = entry;
   return store;
 }

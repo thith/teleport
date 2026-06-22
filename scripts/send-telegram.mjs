@@ -25,9 +25,7 @@ import {
 import {
   clearThreadId,
   getThreadId,
-  isNoTopicSupportFresh,
   readTopicsStore,
-  recordNoTopicSupport,
   recordThreadId,
   updateTopicsStore,
   writeTopicsStore,
@@ -862,18 +860,18 @@ export function topicTarget({ convoId, persona, projectCode, dedicated = false }
 /**
  * Resolve the `message_thread_id` to use for a (chatId, topicKey) pair.
  *
- * Returns `null` if no topic should be used — either silently because the
- * chat doesn't support topics (negative cache active), or because the API
- * call to create one failed. All paths are silent: this function never
- * throws, never logs warnings to user-visible stdout. Topic discovery is
- * opportunistic; sends always proceed.
+ * Returns `null` if no topic should be used because the API call to create
+ * one failed. All paths are silent: this function never throws, never logs
+ * warnings to user-visible stdout. Topic discovery is opportunistic; sends
+ * always proceed. There is no negative cache — every send re-attempts creation
+ * so a fixed mis-config self-heals immediately.
  *
  * `nowFn` and `topicsFile` are injectable for tests.
  */
 // Telegram error descriptions / statuses that imply "this chat can never host
-// topics from this bot" (vs. transient errors like 429 / network glitch).
-// Only these set the negative cache; transient errors silently fall back
-// without caching, so the next send retries.
+// topics from this bot" (vs. transient errors like 429 / network glitch). Used
+// to gate the icon-less create retry: a permanent error won't be fixed by
+// dropping the icon, so don't bother retrying.
 function isPermanentNoTopicError(res) {
   if (!res) return true; // fetch itself threw
   if (res.status === 403) return true; // bot lacks permission
@@ -905,9 +903,7 @@ export async function resolveThreadId({ token, chatId, projectCode, topicKey = p
     const cached = getThreadId(store, chatId, topicKey);
     if (cached != null) { touchTopicUse(chatId, topicKey, nowFn(), topicsFile); return cached; }
   }
-  // 2. Negative cache still fresh — skip API call.
-  if (isNoTopicSupportFresh(store, chatId, nowFn())) return null;
-  // 3. Try create — retry once on transient (504/502/503/429 + network throw).
+  // 2. Try create — retry once on transient (504/502/503/429 + network throw).
   // A brand-new convo MUST create a topic on its first send, so an un-retried
   // gateway blip here drops the whole report (existing-topic sends already
   // survive via sendWithRetry). Permanent errors (403 / forum-disabled) are NOT
@@ -955,12 +951,11 @@ export async function resolveThreadId({ token, chatId, projectCode, topicKey = p
     touchTopicUse(chatId, topicKey, nowFn(), topicsFile);
     return res.messageThreadId;
   }
-  // Transient errors (thrown fetch / rate-limit / network) — DON'T poison the
-  // cache; the next send retries creation (review C-Maj2). Only a DEFINITIVE
-  // permanent error (no permission / forum disabled) negative-caches for 1h.
-  if (!threw && isPermanentNoTopicError(res)) {
-    try { updateTopicsStore((s) => recordNoTopicSupport(s, chatId, nowFn()), topicsFile); } catch {}
-  }
+  // Create failed (transient OR permanent). We do NOT negative-cache: every
+  // send re-attempts creation so a fixed mis-config (admin enables Topics /
+  // grants the right) self-heals on the very next send instead of staying
+  // dropped for up to an hour. Cost is one extra createForumTopic call per send
+  // while genuinely misconfigured — an acceptable trade for instant recovery.
   return null;
 }
 
