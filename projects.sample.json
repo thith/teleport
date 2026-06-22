@@ -12,10 +12,11 @@
   "my-project": {
     "code": "myproj",
     "chatId": "-1001234567890",
+    "description": "Backend API + worker cho My Project (Node/Postgres).",
     "topicIcon": { "emoji": "5309984500739206365" },
     "roles": {
       "100000001": { "role": "admin", "username": "alice", "title": "anh", "name": "An", "position": "founder" },
-      "100000002": { "role": "maintainer", "username": "bob", "title": "anh", "name": "Bảo", "position": "reviewer" },
+      "100000002": { "role": "maintainer", "username": "bob", "title": "anh", "name": "Bảo", "position": "reviewer", "note": "review kỹ phần migration" },
       "@charlie": { "role": "dev", "username": "charlie", "title": "anh", "name": "Cường", "position": "dev" },
       "100000003": { "role": "member", "username": "dana", "title": "chị", "name": "Dung", "position": "designer" }
     }

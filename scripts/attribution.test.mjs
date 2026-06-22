@@ -92,3 +92,38 @@ test('buildCombinedPromptData: no persona field when convoId absent', () => {
   assert.equal(out.convoId, undefined);
   assert.equal('persona' in out, false);
 });
+
+// RFC 02: a project's `description` reaches the agent as prompt `projectDescription`.
+test('buildCombinedPromptData: includes projectDescription when provided (trimmed)', () => {
+  const mk = (id) => ({ msg: { message_id: id, chat: { id: -100 }, from: { id, first_name: 'Thi' }, text: `m${id}` } });
+  assert.equal(buildCombinedPromptData([mk(1)], null, null, null, 'Backend API + worker').projectDescription, 'Backend API + worker');
+  assert.equal(buildCombinedPromptData([mk(1)], null, null, null, '  padded  ').projectDescription, 'padded'); // boundary trim
+});
+
+test('buildCombinedPromptData: no projectDescription field when null/absent/blank/non-string', () => {
+  const mk = (id) => ({ msg: { message_id: id, chat: { id: -100 }, from: { id, first_name: 'Thi' }, text: `m${id}` } });
+  assert.equal('projectDescription' in buildCombinedPromptData([mk(1)]), false); // arg omitted
+  assert.equal('projectDescription' in buildCombinedPromptData([mk(1)], null, null, null, null), false); // explicit null
+  assert.equal('projectDescription' in buildCombinedPromptData([mk(1)], null, null, null, '   '), false); // whitespace-only → dropped
+  assert.equal('projectDescription' in buildCombinedPromptData([mk(1)], null, null, null, 123), false); // non-string → dropped
+});
+
+// RFC 02: member `note` rides fromMember; the builder normalizes it at the boundary
+// (keep only a non-empty string) WITHOUT mutating the shared roles config.
+test('buildCombinedPromptData: fromMember.note passthrough + boundary sanitization', () => {
+  const mk = (id) => ({ msg: { message_id: id, chat: { id: -100 }, from: { id, first_name: 'Thi' }, text: `m${id}` } });
+  const roles = { 1: { role: 'maintainer', name: 'Bảo', note: '  review kỹ  ' } };
+  assert.equal(buildCombinedPromptData([mk(1)], null, null, roles).fromMember.note, 'review kỹ'); // trimmed passthrough
+
+  // Blank / non-string note → field dropped, and the SHARED roles config is untouched.
+  const blankRoles = { 1: { role: 'dev', name: 'X', note: '   ' } };
+  assert.equal('note' in buildCombinedPromptData([mk(1)], null, null, blankRoles).fromMember, false);
+  assert.equal(blankRoles[1].note, '   '); // source object NOT mutated
+
+  const typedRoles = { 1: { role: 'dev', name: 'Y', note: { a: 1 } } };
+  assert.equal('note' in buildCombinedPromptData([mk(1)], null, null, typedRoles).fromMember, false);
+
+  // No note key at all → fromMember passes through untouched.
+  const noNote = { 1: { role: 'dev', name: 'Z' } };
+  assert.equal('note' in buildCombinedPromptData([mk(1)], null, null, noNote).fromMember, false);
+});

@@ -231,6 +231,11 @@ export function buildHandoverPrompt({ targetConvoId, targetChatId, sourceConvoId
   // roles intentionally NOT threaded: §2.2 forbids handover authority deriving
   // from project roles, and from:null makes roleFor/memberFor inert anyway — we
   // override fromRole/fromMember below regardless.
+  // projectDescription (5th arg) also intentionally omitted: the target agent is
+  // already operating inside its project (so it has that context), the handover
+  // notes carry the task context, and threading the SOURCE project's description
+  // here would mislabel a cross-group `--chat-id` handover. Descriptive-only, so
+  // dropping it changes nothing about authority.
   const base = buildCombinedPromptData([{ msg: synthMsg, update: { update_id: null } }], null, targetConvoId, null);
   base.messageId = null;
   base.fromRole = 'handover';

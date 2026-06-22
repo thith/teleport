@@ -6,6 +6,8 @@
 //   {
 //     "<code>": {
 //       "chatId": "-1001234567890",        // dedicated forum group for this project
+//       "description": "Backend của Luni",  // optional: what this project IS — surfaced
+//                                            //   to the agent as prompt `projectDescription`
 //       "roles":  {                         // advisory member profiles (enforcement agent-side)
 //         "<userId>": "admin",              //   string shorthand: role only
 //         "<userId>": {                     //   OR full profile object:
@@ -13,14 +15,17 @@
 //           "username": "thi_truong",       //     Telegram @username (no @)
 //           "title":    "anh",              //     xưng hô: anh|chị|em
 //           "name":     "Thi",              //     tên thường gọi
-//           "position": "founder / dev"     //     vai trò trong dự án (mô tả, KHÔNG phải quyền)
+//           "position": "founder / dev",    //     vai trò trong dự án (mô tả, KHÔNG phải quyền)
+//           "note":     "hay vội, cần rõ"   //     optional free-form note about this member —
+//                                            //       reaches the agent via `fromMember.note`
 //         }
 //       }
 //     },
 //     ...
 //   }
-// `title`/`name`/`position`/`username` are descriptive only — they never widen
-// privilege. The sensitive-action gate keys on `role` exclusively.
+// `title`/`name`/`position`/`username`/`note` (member) and `description`
+// (project) are descriptive only — they never widen privilege. The
+// sensitive-action gate keys on `role` exclusively.
 //
 // A row may be PRE-CREATED keyed by `@username` (or `username`) before the
 // numeric id is known; the listener's passive harvest (roster-upsert.mjs)
@@ -123,7 +128,7 @@ export function resolveQuietHours(config, { env = process.env, envFile = {} } = 
 }
 
 /**
- * Resolve `{ chatId, dedicated, roles, code, topicIcon }` for a project.
+ * Resolve `{ chatId, dedicated, roles, code, topicIcon, description }` for a project.
  * `lookupKey` is the projects.json key (= `basename(cwd)`); it is NOT shown to
  * users and is also the roster-harvest target — keep it folder-stable.
  * - `dedicated: true`  → chatId came from projects.json (project's OWN group);
@@ -141,6 +146,10 @@ export function resolveQuietHours(config, { env = process.env, envFile = {} } = 
  *   display (topic title prefix / message prefix), never for lookup/roster.
  * - `topicIcon` → optional `{ emoji?, color? }` forum-topic icon (or null);
  *   passed through to createForumTopic. Absent → Telegram's default icon.
+ * - `description` → optional human description of what the project IS (string),
+ *   or null. Descriptive only (never affects routing/privilege); the listener
+ *   forwards it to the agent as the prompt's `projectDescription` so a fresh
+ *   agent has project context. A SHARED project (no own entry) has none.
  */
 export function resolveProjectConfig(lookupKey, { config = {}, fallbackChatId = null } = {}) {
   // Never resolve a reserved `_`-key (`_default`/`_config`) as a project — a repo
@@ -149,11 +158,14 @@ export function resolveProjectConfig(lookupKey, { config = {}, fallbackChatId = 
   const entryRoles = (entry && entry.roles && typeof entry.roles === 'object') ? entry.roles : {};
   const code = (entry && typeof entry.code === 'string' && entry.code.trim()) ? entry.code.trim() : lookupKey;
   const topicIcon = (entry && entry.topicIcon && typeof entry.topicIcon === 'object' && !Array.isArray(entry.topicIcon)) ? entry.topicIcon : null;
+  // Trim so a whitespace-only description is treated as absent (null), not an
+  // empty string the agent would see as a meaningless blank field.
+  const description = (entry && typeof entry.description === 'string' && entry.description.trim()) ? entry.description.trim() : null;
   // Trim so a whitespace-only chatId ("   ") is treated as absent, not as a
   // bogus dedicated target that would bypass the empty-adminIds fail-fast.
   const dedicatedChatId = entry?.chatId == null ? '' : String(entry.chatId).trim();
   if (dedicatedChatId) {
-    return { chatId: dedicatedChatId, dedicated: true, roles: entryRoles, code, topicIcon };
+    return { chatId: dedicatedChatId, dedicated: true, roles: entryRoles, code, topicIcon, description };
   }
   // Shared → inherit the catch-all group's roster (`_default.roles`) ONLY. A
   // shared project's OWN `roles` block is dead config and must NEVER grant
@@ -162,7 +174,9 @@ export function resolveProjectConfig(lookupKey, { config = {}, fallbackChatId = 
   const defaultRoles = readDefaultGroup(config).roles;
   const roles = (defaultRoles && typeof defaultRoles === 'object') ? defaultRoles : {};
   const fallback = fallbackChatId == null ? '' : String(fallbackChatId).trim();
-  return { chatId: fallback || null, dedicated: false, roles, code, topicIcon };
+  // `description` carries through if the entry set one (harmless descriptive
+  // context); a truly unmapped shared project has no entry → null.
+  return { chatId: fallback || null, dedicated: false, roles, code, topicIcon, description };
 }
 
 /**
@@ -229,8 +243,10 @@ export function roleFor(roles, userId) {
 /**
  * Look up a user's full member profile object. Returns null when the user is
  * unmapped OR mapped via the string shorthand (no descriptive fields to expose).
- * Descriptive only — `title`/`name`/`position`/`username` never widen privilege;
- * the sensitive-action gate keys on `roleFor()` alone.
+ * The whole object is returned verbatim, so any descriptive field set on it —
+ * `title`/`name`/`position`/`username` and the free-form `note` — reaches the
+ * agent as-is via `fromMember`. Descriptive only: none widen privilege; the
+ * sensitive-action gate keys on `roleFor()` alone.
  */
 export function memberFor(roles, userId) {
   if (userId == null) return null;

@@ -550,6 +550,20 @@ export function formatFromName(from) {
 // resolution + 'member' default live in projects-config.roleFor. (The old
 // TELE_ROLES env Map parser was removed.)
 
+// Agent-facing member profile. `memberFor` returns the roles-config object by
+// reference and verbatim; this normalizes the NEW descriptive field `note` (keep
+// only a non-empty trimmed string) on a CLONE so the shared in-memory roles
+// config is never mutated. Pre-existing fields pass through unchanged. Shared by
+// both prompt builders so neither can leak a blank/typed `note` to the agent.
+function agentMemberFrom(roles, userId) {
+  const m = memberFor(roles, userId);
+  if (!m || typeof m !== 'object' || !('note' in m)) return m;
+  const note = typeof m.note === 'string' ? m.note.trim() : '';
+  if (note) return { ...m, note };
+  const { note: _drop, ...rest } = m;
+  return rest;
+}
+
 export function buildPromptData(msg, updateId = null, botId = null, roles = null) {
   const replyTo = realReplyTo(msg);
   return {
@@ -559,7 +573,7 @@ export function buildPromptData(msg, updateId = null, botId = null, roles = null
     fromUserId: String(msg.from?.id ?? msg.chat.id),
     fromName: formatFromName(msg.from),
     fromRole: roleFor(roles, msg.from?.id),
-    fromMember: memberFor(roles, msg.from?.id),
+    fromMember: agentMemberFrom(roles, msg.from?.id),
     replyToMessageId: replyTo?.message_id ?? null,
     // Media-only messages have `.caption` instead of `.text`; fall back so the
     // agent still sees the human-readable context.
@@ -577,7 +591,7 @@ export function buildPromptData(msg, updateId = null, botId = null, roles = null
  * LAST message (newest) so the AI replies to the right thread. Reply/quote
  * metadata from earlier messages in the batch is intentionally dropped.
  */
-export function buildCombinedPromptData(messages, botId = null, convoId = null, roles = null) {
+export function buildCombinedPromptData(messages, botId = null, convoId = null, roles = null, projectDescription = null) {
   if (!messages.length) throw new Error('messages must not be empty');
   const [first, ...rest] = messages;
   const getText = (m) => m.text ?? m.caption ?? '';
@@ -600,7 +614,7 @@ export function buildCombinedPromptData(messages, botId = null, convoId = null, 
     fromUserId: String(last.from?.id ?? last.chat.id),
     fromName: formatFromName(last.from),
     fromRole: roleFor(roles, last.from?.id),
-    fromMember: memberFor(roles, last.from?.id),
+    fromMember: agentMemberFrom(roles, last.from?.id),
     replyToMessageId: replyTo?.message_id ?? null,
     replyToText: replyTo?.text ?? replyTo?.caption ?? (replyTo ? summarizeMediaReplyTarget(replyTo) : null),
     quotedText: last.quote?.text ?? null,
@@ -619,6 +633,15 @@ export function buildCombinedPromptData(messages, botId = null, convoId = null, 
     const persona = peekPersona(convoId);
     if (persona != null) out.persona = persona;
   }
+  // Project context (RFC 02 `description`): tell a fresh agent what this project
+  // IS, so it doesn't have to infer it from the repo. Descriptive only — never a
+  // directive or a privilege signal. Sanitize at this agent-facing boundary (not
+  // just at the caller) so a whitespace-only / non-string value never reaches the
+  // agent as a blank/typed field — the field is simply absent when there's no
+  // meaningful description.
+  const desc = typeof projectDescription === 'string' ? projectDescription.trim() : '';
+  if (desc) out.projectDescription = desc;
+  // (member `note` is normalized at source via agentMemberFrom above.)
   return out;
 }
 
@@ -1790,7 +1813,7 @@ async function main() {
     );
   } catch {}
 
-  const data = buildCombinedPromptData(toProcess, extractBotId(token), convo, roles);
+  const data = buildCombinedPromptData(toProcess, extractBotId(token), convo, roles, projCfg.description);
   if (data.attachments.length) {
     const baseDir = path.join(path.dirname(promptFile), 'attachments');
     await downloadAttachments(token, data.attachments, baseDir);

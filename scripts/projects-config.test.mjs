@@ -153,6 +153,27 @@ test('resolveProjectConfig: topicIcon null when absent or not an object', () => 
   assert.equal(resolveProjectConfig('p', { config: cfg }).topicIcon, null);
 });
 
+test('resolveProjectConfig: description passed through (trimmed) for dedicated + shared', () => {
+  const ded = resolveProjectConfig('p', { config: { p: { chatId: '-100', description: '  Backend API  ' } } });
+  assert.equal(ded.description, 'Backend API'); // surrounding whitespace trimmed
+  // A shared entry (no chatId) may still carry a description — it's harmless context.
+  const shared = resolveProjectConfig('s', { config: { s: { description: 'Shared svc' }, _default: { roles: {} } }, fallbackChatId: '-999' });
+  assert.equal(shared.dedicated, false);
+  assert.equal(shared.description, 'Shared svc');
+});
+
+test('resolveProjectConfig: description null when absent, blank, or non-string', () => {
+  assert.equal(resolveProjectConfig('luni', { config: CONFIG }).description, null); // absent
+  assert.equal(resolveProjectConfig('p', { config: { p: { chatId: '-100', description: '   ' } } }).description, null); // blank → null
+  assert.equal(resolveProjectConfig('p', { config: { p: { chatId: '-100', description: 123 } } }).description, null); // non-string → null
+  assert.equal(resolveProjectConfig('ghost', { config: CONFIG, fallbackChatId: '-999' }).description, null); // no entry
+});
+
+test('memberFor: free-form `note` field is exposed verbatim on the profile', () => {
+  const roles = { 1: { role: 'maintainer', name: 'Bảo', note: 'review kỹ migration' } };
+  assert.equal(memberFor(roles, 1).note, 'review kỹ migration');
+});
+
 test('resolveProjectConfig: empty/falsy code never matches a config[""] key', () => {
   const cfg = { '': { chatId: '-1', roles: { '9': 'admin' } } };
   const r = resolveProjectConfig('', { config: cfg, fallbackChatId: '-999' });
