@@ -5,7 +5,7 @@ import path from 'node:path';
 // Isolate the persona pin store so `--list` persona mapping DERIVES instead of
 // reading machine-local pins (resolved at call-time from TELE_PERSONA_STORE).
 process.env.TELE_PERSONA_STORE = path.join(os.tmpdir(), `teleport-persona-store-spawn-${process.pid}.jsonl`);
-import { buildSpawnPlan, genSessionSeed, runSpawn, hasBinary, screenSessionExists, normalizeSessionName, parseScreenSessions, listSpawnSessions, resolveKillId, resolveAttachId, SPAWN_PROMPT, personaByHashtag, gracefulKill, KILL_GRACE_MS } from './spawn.mjs';
+import { buildSpawnPlan, genSessionSeed, runSpawn, hasBinary, screenSessionExists, normalizeSessionName, parseScreenSessions, listSpawnSessions, resolveKillId, resolveAttachId, resolveMode, SPAWN_PROMPT, PERMISSION_MODES, DEFAULT_PERMISSION_MODE, personaByHashtag, gracefulKill, KILL_GRACE_MS } from './spawn.mjs';
 import { uuidToConvoInt } from './convo-registry.mjs';
 import { shortConvoHash } from './convo-hash.mjs';
 import { personaForConvo } from './persona.mjs';
@@ -44,7 +44,7 @@ test('runSpawn: no cwd → no cwd option (inherit)', () => {
 test('buildSpawnPlan headless (default): claude -p <prompt>, no session/teardown', () => {
   const p = buildSpawnPlan();
   assert.equal(p.mode, 'headless');
-  assert.deepEqual(p.command, ['claude', '-p', SPAWN_PROMPT]);
+  assert.deepEqual(p.command, ['claude', '--permission-mode', 'auto', '-p', SPAWN_PROMPT]);
   assert.equal(p.sessionName, null);
   assert.equal(p.teardown, null);
 });
@@ -52,7 +52,7 @@ test('buildSpawnPlan headless (default): claude -p <prompt>, no session/teardown
 test('buildSpawnPlan interactive: explicit name (no seed) → screen -dmS <name> claude <prompt>, no -p, no --session-id', () => {
   const p = buildSpawnPlan({ interactive: true, sessionName: 'tele-abc123' });
   assert.equal(p.mode, 'interactive');
-  assert.deepEqual(p.command, ['screen', '-U', '-dmS', 'tele-abc123', 'claude', SPAWN_PROMPT]);
+  assert.deepEqual(p.command, ['screen', '-U', '-dmS', 'tele-abc123', 'claude', '--permission-mode', 'auto', SPAWN_PROMPT]);
   assert.equal(p.teardown, 'screen -S tele-abc123 -X quit');
   assert.equal(p.sessionId, null);
   // CRUCIAL: interactive must NOT use -p (that would bill as SDK pool, not subscription).
@@ -65,7 +65,7 @@ test('buildSpawnPlan interactive auto (seed): forces --session-id and names scre
   // Screen name == tele-<hashtag>, matching the #tag the agent shows on Telegram.
   assert.equal(p.sessionName, FIXED_NAME);
   assert.equal(p.sessionId, FIXED_UUID);
-  assert.deepEqual(p.command, ['screen', '-U', '-dmS', FIXED_NAME, 'claude', '--session-id', FIXED_UUID, SPAWN_PROMPT]);
+  assert.deepEqual(p.command, ['screen', '-U', '-dmS', FIXED_NAME, 'claude', '--permission-mode', 'auto', '--session-id', FIXED_UUID, SPAWN_PROMPT]);
   assert.equal(p.teardown, `screen -S ${FIXED_NAME} -X quit`);
   assert.ok(!p.command.includes('-p')); // still subscription billing
 });
@@ -87,7 +87,7 @@ test('buildSpawnPlan interactive: explicit name + seed → name wins, seed id DR
   assert.equal(p.sessionName, 'tele-custom'); // explicit name wins
   assert.equal(p.sessionId, null);            // seed UUID dropped — NOT forced
   assert.ok(!p.command.includes('--session-id'));
-  assert.deepEqual(p.command, ['screen', '-U', '-dmS', 'tele-custom', 'claude', SPAWN_PROMPT]);
+  assert.deepEqual(p.command, ['screen', '-U', '-dmS', 'tele-custom', 'claude', '--permission-mode', 'auto', SPAWN_PROMPT]);
 });
 
 test('buildSpawnPlan interactive: explicit name + explicit valid sessionId → forced (deliberate advanced override)', () => {
@@ -107,6 +107,53 @@ test('buildSpawnPlan interactive: rejects an unsafe session name (shell-safety)'
   assert.throws(() => buildSpawnPlan({ interactive: true, sessionName: '$(whoami)' }), /unsafe session name/);
   // Safe names pass.
   assert.ok(buildSpawnPlan({ interactive: true, sessionName: 'tele-abc_1.2' }));
+});
+
+// --- permission mode (always set on spawn; default auto) ------------------
+
+test('buildSpawnPlan: default permission mode is auto on BOTH headless and interactive', () => {
+  assert.equal(DEFAULT_PERMISSION_MODE, 'auto');
+  const h = buildSpawnPlan().command;
+  assert.equal(h[h.indexOf('--permission-mode') + 1], 'auto');
+  const i = buildSpawnPlan({ interactive: true, sessionName: 'tele-x' }).command;
+  assert.equal(i[i.indexOf('--permission-mode') + 1], 'auto');
+});
+
+test('buildSpawnPlan: a custom permissionMode is threaded into the command', () => {
+  const h = buildSpawnPlan({ permissionMode: 'plan' }).command;
+  assert.deepEqual(h, ['claude', '--permission-mode', 'plan', '-p', SPAWN_PROMPT]);
+  const i = buildSpawnPlan({ interactive: true, sessionName: 'tele-x', permissionMode: 'default' }).command;
+  assert.deepEqual(i, ['screen', '-U', '-dmS', 'tele-x', 'claude', '--permission-mode', 'default', SPAWN_PROMPT]);
+});
+
+test('buildSpawnPlan: rejects an unknown permission mode', () => {
+  assert.throws(() => buildSpawnPlan({ permissionMode: 'yolo' }), /invalid permission mode/);
+});
+
+test('resolveMode: absent → auto; valid value passes through; missing/flag value → null', () => {
+  assert.equal(resolveMode([]), DEFAULT_PERMISSION_MODE);
+  assert.equal(resolveMode(['-i', '--mode', 'plan']), 'plan');
+  assert.equal(resolveMode(['--mode', 'bypassPermissions']), 'bypassPermissions');
+  assert.equal(resolveMode(['--mode']), null);            // flag present, value missing
+  assert.equal(resolveMode(['--mode', '--interactive']), null); // next token is a flag
+  // Assignment form `--mode=<value>` is honored too (so it never silently falls
+  // back to the auto default — that would over-grant autonomy).
+  assert.equal(resolveMode(['--mode=plan']), 'plan');
+  assert.equal(resolveMode(['-i', '--mode=bypassPermissions']), 'bypassPermissions');
+  assert.equal(resolveMode(['--mode=']), null);           // assignment with empty value
+  // Ambiguous: repeated/conflicting --mode → null (refuse to silently pick one,
+  // which could over-grant autonomy). Caller turns null into a usage error.
+  assert.equal(resolveMode(['--mode', 'plan', '--mode=auto']), null);
+  assert.equal(resolveMode(['--mode=plan', '--mode=plan']), null); // even same value twice
+  assert.equal(resolveMode(['--mode', '--mode=plan']), null);
+  // Every CLI choice is recognized by buildSpawnPlan's validation.
+  for (const m of PERMISSION_MODES) assert.ok(buildSpawnPlan({ permissionMode: m }));
+  // resolveMode passes an unknown mode through VERBATIM (it doesn't validate) —
+  // so the main() guard's `!PERMISSION_MODES.includes(...)` clause is load-bearing:
+  // it's what turns `--mode yolo` into a clean usage error instead of an uncaught
+  // buildSpawnPlan throw. This test documents that division of responsibility.
+  assert.equal(resolveMode(['--mode', 'yolo']), 'yolo');
+  assert.equal(PERMISSION_MODES.includes('yolo'), false);
 });
 
 test('genSessionSeed: name = tele-<hashtag of uuidToConvoInt(uuid)>, injectable uuid', () => {

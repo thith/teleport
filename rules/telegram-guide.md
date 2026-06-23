@@ -30,6 +30,10 @@ When the user asks to **spawn / start / launch** a Claude agent — e.g. "spawn 
 - **"spawn Claude headless"** (true automation / fire-and-forget) → `node ../teleport/scripts/spawn.mjs`
   (runs `claude -p` detached). Auto-exits when done; bills against the **Agent SDK pool** —
   use only for genuine non-interactive workflows.
+- **Permission mode (both forms):** every spawn passes an explicit `--permission-mode` to claude,
+  defaulting to **`auto`** (the new autonomous mode). Override with
+  `--mode <default|auto|acceptEdits|bypassPermissions|dontAsk|plan>` (also `--mode=<value>`),
+  e.g. `node ../teleport/scripts/spawn.mjs --interactive --mode plan`.
 
 **List / attach / kill running agents:**
 - **"list agents / which agents are running"** → `node ../teleport/scripts/spawn.mjs --list` (prints each `tele-<hashtag>`

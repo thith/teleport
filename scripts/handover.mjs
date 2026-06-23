@@ -337,6 +337,9 @@ async function main() {
     if (!hasBinary('claude')) { err('[handover] `claude` not found on PATH — cannot spawn'); process.exit(EXIT.ERROR); }
     if (!hasBinary('screen')) { err('[handover] interactive spawn needs `screen` on PATH — not found'); process.exit(EXIT.ERROR); }
     const seed = buildSeedPrompt({ sourceConvoId, notes });
+    // No `permissionMode` passed → inherits buildSpawnPlan's `auto` default
+    // (intentional: a handover spawn is interactive, so a human watches the screen
+    // session). handover exposes no `--mode` passthrough by design.
     const plan = buildSpawnPlan({ interactive: true, seed: genSessionSeed(), prompt: seed });
     runSpawn(plan);
     const hashtag = plan.sessionName.replace(/^tele-/, '');

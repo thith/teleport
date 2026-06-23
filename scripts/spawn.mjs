@@ -13,6 +13,11 @@
 // you give it work over Telegram (it gets its own persona topic via RFC 01/02,
 // and resolves its group from the cwd it's spawned in via RFC 02).
 //
+// Permission mode: every spawn passes an EXPLICIT `--permission-mode` to claude,
+// default `auto` (the new autonomous mode). Override with
+//   --mode <default|auto|acceptEdits|bypassPermissions|dontAsk|plan>
+// (also accepts `--mode=<value>`).
+//
 // Verbal convention (telegram-guide): "spawn Claude" → pnpm spawn:i (interactive);
 // "spawn Claude headless" → pnpm spawn:headless.
 
@@ -27,6 +32,13 @@ import { formatPersona } from './persona.mjs';
 import { peekPersona } from './persona-store.mjs';
 
 export const SPAWN_PROMPT = 'Telegram me and wait for instructions';
+
+// Claude CLI `--permission-mode` choices (verified on claude 2.1.186). A spawn
+// ALWAYS sets one — defaulting to `auto`, the new autonomous mode (NOT the old
+// blanket auto-accept `acceptEdits`/`bypassPermissions`), so a Telegram-driven
+// agent can act without prompting for every permission. Override via `--mode`.
+export const PERMISSION_MODES = ['default', 'auto', 'acceptEdits', 'bypassPermissions', 'dontAsk', 'plan'];
+export const DEFAULT_PERMISSION_MODE = 'auto';
 
 // Session names must be shell/argv-safe — they're interpolated into the printed
 // teardown command and passed to `screen`. Reject anything else (review C-Minor).
@@ -56,7 +68,12 @@ export function genSessionSeed(genUuid = () => crypto.randomUUID()) {
  * Pure: compute the launch plan. No side effects, so it's unit-testable.
  * Returns `{ mode, sessionName, command: [...], teardown }`.
  */
-export function buildSpawnPlan({ interactive = false, sessionName, sessionId, seed, prompt = SPAWN_PROMPT } = {}) {
+export function buildSpawnPlan({ interactive = false, sessionName, sessionId, seed, prompt = SPAWN_PROMPT, permissionMode = DEFAULT_PERMISSION_MODE } = {}) {
+  // Every spawn is launched with an EXPLICIT `--permission-mode` (never left to
+  // the CLI default) so the agent's autonomy is deliberate, not incidental.
+  if (!PERMISSION_MODES.includes(permissionMode)) {
+    throw new Error(`spawn: invalid permission mode ${JSON.stringify(permissionMode)} (allowed: ${PERMISSION_MODES.join(', ')})`);
+  }
   if (interactive) {
     // Auto path: derive name + forced session-id from a seed so the screen name
     // matches the Telegram hashtag. Explicit `sessionName` (power-user override)
@@ -83,7 +100,10 @@ export function buildSpawnPlan({ interactive = false, sessionName, sessionId, se
     // seeded with the positional prompt → interactive (subscription) billing.
     // `--session-id` forces the session UUID so the child's convoId/persona/topic
     // are predictable from the parent (and the screen name matches the hashtag).
-    const claudeArgs = sid != null ? ['claude', '--session-id', sid, prompt] : ['claude', prompt];
+    // `--permission-mode` is always present (works alongside the positional prompt).
+    const claudeArgs = sid != null
+      ? ['claude', '--permission-mode', permissionMode, '--session-id', sid, prompt]
+      : ['claude', '--permission-mode', permissionMode, prompt];
     return {
       mode: 'interactive',
       sessionName: name,
@@ -98,7 +118,12 @@ export function buildSpawnPlan({ interactive = false, sessionName, sessionId, se
   return {
     mode: 'headless',
     sessionName: null,
-    command: ['claude', '-p', prompt], // launched detached below; auto-exits (SDK pool)
+    // `--permission-mode` also set on the headless (`-p`, SDK-pool) path. NB:
+    // `auto` lets a headless agent run tools autonomously with no human watching a
+    // screen session — that's the point of fire-and-forget automation, but it also
+    // means a runaway loop bills the SDK pool unattended. Override with `--mode` for
+    // a more conservative posture (e.g. `plan`) when that risk isn't wanted.
+    command: ['claude', '--permission-mode', permissionMode, '-p', prompt], // launched detached below; auto-exits
     teardown: null,
   };
 }
@@ -274,6 +299,33 @@ export function resolveAttachId(argv) {
   return { found: true, raw: !raw || raw.startsWith('-') ? null : raw };
 }
 
+/**
+ * Resolve the `--mode <permissionMode>` override from argv. Pure → testable.
+ * - Absent → `DEFAULT_PERMISSION_MODE` ('auto').
+ * - Present with a missing/flag-looking value → `null` (caller errors out).
+ * - Present with a value → that string verbatim (caller validates against
+ *   PERMISSION_MODES so an unknown mode gets a clear message, not a deep throw).
+ */
+export function resolveMode(argv) {
+  // Accept BOTH `--mode <value>` and `--mode=<value>`. The whole point is to never
+  // SILENTLY fall back to the `auto` default when the user tried to set a mode —
+  // that would over-grant autonomy (a quiet footgun). So:
+  //  - 0 occurrences → the `auto` default.
+  //  - exactly 1 → parse it (`--mode=` with empty value → null so caller errors).
+  //  - >1 (e.g. `--mode plan --mode=auto`) → ambiguous → null; refuse to arbitrarily
+  //    pick one rather than risk choosing the more-autonomous mode by accident.
+  const hits = argv.filter((a) => a === '--mode' || a.startsWith('--mode='));
+  if (hits.length === 0) return DEFAULT_PERMISSION_MODE;
+  if (hits.length > 1) return null;
+  const h = hits[0];
+  if (h.startsWith('--mode=')) {
+    const v = h.slice('--mode='.length);
+    return v === '' ? null : v;
+  }
+  const raw = argv[argv.indexOf('--mode') + 1];
+  return (!raw || raw.startsWith('-')) ? null : raw;
+}
+
 /** Non-blocking delay (avoids spawning the `sleep` binary + its fractional-second assumption). */
 const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -374,6 +426,12 @@ if (isDirectRun) {
   }
 
   const interactive = argv.includes('--interactive') || argv.includes('-i');
+  // Permission mode: always explicit (default `auto`), overridable via `--mode`.
+  const permissionMode = resolveMode(argv);
+  if (permissionMode === null || !PERMISSION_MODES.includes(permissionMode)) {
+    console.error(`[spawn] --mode needs one of: ${PERMISSION_MODES.join(', ')} (default ${DEFAULT_PERMISSION_MODE}).`);
+    process.exit(1);
+  }
   // Preflight: the binaries we need must exist.
   if (!hasBinary('claude')) {
     console.error('[spawn] `claude` not found on PATH.');
@@ -383,7 +441,7 @@ if (isDirectRun) {
     console.error('[spawn] interactive mode needs `screen` (or install tmux + switch backend). Not found on PATH.');
     process.exit(1);
   }
-  const plan = buildSpawnPlan({ interactive });
+  const plan = buildSpawnPlan({ interactive, permissionMode });
   const result = runSpawn(plan);
   if (plan.mode === 'interactive') {
     // Verify the screen session actually came up — `screen -dmS` returns 0 even
