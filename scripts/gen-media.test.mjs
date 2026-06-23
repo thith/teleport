@@ -49,17 +49,26 @@ test('gen-music: clip kind, --wav only on pro, --model override', () => {
 });
 
 // ---- gen-video ----
-test('gen-video: defaults (16:9, 720p, max-wait 300) + predictLongRunning shape', () => {
+test('gen-video: default request is MINIMAL (no aspectRatio/resolution — veo-3.1 rejects them)', () => {
   const a = parseVideoArgs(['a dog running']);
-  assert.equal(a.aspectRatio, '16:9');
-  assert.equal(a.resolution, '720p');
+  assert.equal(a.aspectRatio, null);   // opt-in, not defaulted
+  assert.equal(a.resolution, null);
   assert.equal(a.maxWaitSec, 300);
   assert.deepEqual(a.errors, []);
   const { url, body } = buildVideoRequest(a);
   assert.match(url, /:predictLongRunning$/);
   assert.equal(body.instances[0].prompt, 'a dog running');
-  assert.equal(body.instances[0].aspectRatio, '16:9');
-  assert.equal(body.parameters.resolution, '720p');
+  assert.equal('aspectRatio' in body.instances[0], false);   // NOT sent by default → no 400
+  assert.deepEqual(body.parameters, {});                     // empty params by default
+});
+
+test('gen-video: aspectRatio/resolution included ONLY when explicitly passed', () => {
+  const a = parseVideoArgs(['a dog', '--aspect-ratio', '9:16', '--resolution', '1080p']);
+  assert.deepEqual(a.errors, []);
+  const { body } = buildVideoRequest(a);
+  assert.equal(body.instances[0].aspectRatio, '9:16');
+  assert.equal(body.parameters.aspectRatio, '9:16');
+  assert.equal(body.parameters.resolution, '1080p');
 });
 
 test('gen-video: validates aspect/resolution/max-wait', () => {

@@ -29,8 +29,12 @@ export function parseVideoArgs(argv) {
   const maxWaitRaw = flags['max-wait'] ?? '300';
   const out = {
     prompt,
-    aspectRatio: flags['aspect-ratio'] || '16:9',
-    resolution: flags.resolution || '720p',
+    // OPT-IN, not defaulted: veo-3.1-generate-preview rejects `aspectRatio` with a
+    // 400 ("aspectRatio isn't supported by this model"), and a picky preview model
+    // may reject `resolution` too. So omit both unless the user explicitly passes
+    // them — the default request carries only the prompt. (Validated only if set.)
+    aspectRatio: flags['aspect-ratio'] || null,
+    resolution: flags.resolution || null,
     model: flags.model || DEFAULT_VIDEO_MODEL,
     maxWaitSec: Number(maxWaitRaw),
     outPath: flags.out || null,
@@ -41,8 +45,8 @@ export function parseVideoArgs(argv) {
     errors: [...errors],
   };
   if (!prompt) out.errors.push('missing <prompt>');
-  if (!VIDEO_ASPECT_RATIOS.includes(out.aspectRatio)) out.errors.push(`--aspect-ratio must be one of ${VIDEO_ASPECT_RATIOS.join(', ')}`);
-  if (!VIDEO_RESOLUTIONS.includes(out.resolution)) out.errors.push(`--resolution must be one of ${VIDEO_RESOLUTIONS.join(', ')}`);
+  if (out.aspectRatio && !VIDEO_ASPECT_RATIOS.includes(out.aspectRatio)) out.errors.push(`--aspect-ratio must be one of ${VIDEO_ASPECT_RATIOS.join(', ')}`);
+  if (out.resolution && !VIDEO_RESOLUTIONS.includes(out.resolution)) out.errors.push(`--resolution must be one of ${VIDEO_RESOLUTIONS.join(', ')}`);
   if (!Number.isFinite(out.maxWaitSec) || out.maxWaitSec <= 0) out.errors.push('--max-wait must be a positive number of seconds');
   const sendErr = validateSend({ send: out.send, convo: out.convo });
   if (sendErr) out.errors.push(sendErr);
@@ -50,9 +54,15 @@ export function parseVideoArgs(argv) {
 }
 
 export function buildVideoRequest({ prompt, aspectRatio, resolution, model }) {
+  // Only include aspectRatio/resolution when explicitly set — see parseVideoArgs.
+  // Default request is minimal: { instances:[{prompt}], parameters:{} }.
+  const instance = { prompt };
+  const parameters = {};
+  if (aspectRatio) { instance.aspectRatio = aspectRatio; parameters.aspectRatio = aspectRatio; }
+  if (resolution) parameters.resolution = resolution;
   return {
     url: `${GEMINI_BASE}/models/${model}:predictLongRunning`,
-    body: { instances: [{ prompt, aspectRatio }], parameters: { aspectRatio, resolution } },
+    body: { instances: [instance], parameters },
   };
 }
 
