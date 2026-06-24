@@ -50,7 +50,7 @@ const REG = {
   ls:      { run: 'spawn.mjs',   args: ['--list'], needsProject: false, minRole: 'member' },
   spawn:   { run: 'spawn.mjs',   args: ['--interactive'], needsProject: true, minRole: 'maintainer' },
   run:     { run: 'run.mjs',     args: [], needsProject: true, minRole: 'maintainer' },
-  whisper: { run: 'whisper.mjs', args: [], needsProject: false, minRole: 'admin' },
+  whisper: { run: 'whisper.mjs', args: [], needsProject: false, minRole: 'admin', wantsReplyText: true },
 };
 
 test('dispatchCommand: unknown command → stays silent (no send)', async () => {
@@ -91,6 +91,52 @@ test('dispatchCommand: needsProject → folder is the positional first token, dr
   assert.equal(calls[0].env.TELE_FROM_NAME, 'Thi');
   assert.equal(sent[0], 'served');                         // stdout relayed verbatim
   fs.rmSync(parent, { recursive: true, force: true });
+});
+
+// RFC 07: the replied-to DM text reaches /whisper (capped) but NOT other commands.
+test('dispatchCommand: TELE_REPLY_TEXT goes to /whisper (capped), absent for /run, /ls', async () => {
+  const cap = 'x'.repeat(400); // > 256 → must be truncated
+  const grab = async () => { let env; await dispatchCommand({ cmd: 'whisper', rest: 'hi' }, { id: '7' }, {
+    daemonChatId: '1', projectsConfig: { _default: { roles: { '7': { role: 'admin' } } } }, registry: REG, scriptsDir: '/s',
+    sendText: async () => {}, runner: async (_b, _a, o) => { env = o.env; return { stdout: '', stderr: '' }; },
+  }, cap); return env; };
+  const wenv = await grab();
+  assert.equal(wenv.TELE_REPLY_TEXT.length, 256);          // capped
+  assert.equal(wenv.TELE_REPLY_TEXT, 'x'.repeat(256));
+
+  // /ls (no wantsReplyText) → reply text must NOT leak into its child env.
+  let lenv;
+  await dispatchCommand({ cmd: 'ls', rest: '' }, { id: '7' }, {
+    daemonChatId: '1', projectsConfig: { _default: { roles: { '7': { role: 'admin' } } } }, registry: REG, scriptsDir: '/s',
+    sendText: async () => {}, runner: async (_b, _a, o) => { lenv = o.env; return { stdout: '', stderr: '' }; },
+  }, cap);
+  assert.equal(lenv.TELE_REPLY_TEXT, '');                  // gated off — no leak to non-whisper children
+
+  // Strongest guard: a STALE/inherited process.env.TELE_REPLY_TEXT must be OVERWRITTEN
+  // to '' for a gated command (the ternary always writes the key), never passed through.
+  const prev = process.env.TELE_REPLY_TEXT;
+  process.env.TELE_REPLY_TEXT = 'inherited-leak #abc';
+  try {
+    let renv;
+    await dispatchCommand({ cmd: 'ls', rest: '' }, { id: '7' }, {
+      daemonChatId: '1', projectsConfig: { _default: { roles: { '7': { role: 'admin' } } } }, registry: REG, scriptsDir: '/s',
+      sendText: async () => {}, runner: async (_b, _a, o) => { renv = o.env; return { stdout: '', stderr: '' }; },
+    }, null);
+    assert.equal(renv.TELE_REPLY_TEXT, ''); // inherited value did NOT pass through
+  } finally {
+    if (prev === undefined) delete process.env.TELE_REPLY_TEXT; else process.env.TELE_REPLY_TEXT = prev;
+  }
+});
+
+// handleControlMessages forwards reply_to_message.text down to the dispatcher.
+test('handleControlMessages: bridges msg.reply_to_message.text into the whisper child env', async () => {
+  let env;
+  handleControlMessages([{ message: { text: '/whisper hi', from: { id: '7' }, reply_to_message: { text: 'ack #abc123' } } }], {
+    daemonChatId: '1', projectsConfig: { _default: { roles: { '7': { role: 'admin' } } } }, registry: REG, scriptsDir: '/s',
+    sendText: async () => {}, runner: async (_b, _a, o) => { env = o.env; return { stdout: '', stderr: '' }; },
+  });
+  await new Promise((r) => setTimeout(r, 10)); // dispatch is fire-and-forget
+  assert.equal(env.TELE_REPLY_TEXT, 'ack #abc123');
 });
 
 test('dispatchCommand: strips teleport secrets from the child env, keeps identity', async () => {

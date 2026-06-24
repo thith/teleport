@@ -32,9 +32,11 @@ test('loadCommands: merges base file with projects.json._commands (custom wins)'
 
 test('resolveCommand: normalises defaults (args/needsProject/minRole)', () => {
   const c = resolveCommand('x', { x: { run: 'run.mjs' } });
-  assert.deepEqual(c, { run: 'run.mjs', args: [], needsProject: false, minRole: 'public', desc: '' });
+  assert.deepEqual(c, { run: 'run.mjs', args: [], needsProject: false, minRole: 'public', wantsReplyText: false, desc: '' });
   const d = resolveCommand('y', { y: { run: 'spawn.mjs', args: ['--list'], needsProject: true, minRole: 'admin', desc: 'hi' } });
-  assert.deepEqual(d, { run: 'spawn.mjs', args: ['--list'], needsProject: true, minRole: 'admin', desc: 'hi' });
+  assert.deepEqual(d, { run: 'spawn.mjs', args: ['--list'], needsProject: true, minRole: 'admin', wantsReplyText: false, desc: 'hi' });
+  // opt-in capability surfaces on the normalised spec
+  assert.equal(resolveCommand('w', { w: { run: 'whisper.mjs', wantsReplyText: true } }).wantsReplyText, true);
 });
 
 test('resolveCommand: rejects non-.mjs, path separators, traversal, unknown', () => {

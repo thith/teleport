@@ -290,7 +290,9 @@ export function handleControlMessages(mine, ctx) {
     const msg = u.message;
     const parsed = parseDaemonCommand(msg.text);
     if (!parsed) continue;
-    dispatchCommand(parsed, msg.from || {}, ctx).catch((e) =>
+    // Pass the replied-to message text (if this DM is a Telegram reply) so /whisper
+    // can pick the target from a previous whisper/ack instead of retyping it (RFC 07).
+    dispatchCommand(parsed, msg.from || {}, ctx, msg.reply_to_message?.text).catch((e) =>
       ctx.sendText(ctx.daemonChatId, `❌ /${parsed.cmd} failed: ${e instanceof Error ? e.message : e}`));
   }
 }
@@ -308,7 +310,7 @@ export function handleControlMessages(mine, ctx) {
 export async function dispatchCommand(parsed, from, {
   daemonChatId, projectsConfig, registry, sendText, secretEnvKeys = [],
   runner = execFileP, scriptsDir = __dirname, parentDir = PARENT_DIR,
-}) {
+}, replyText = null) {
   const spec = resolveCommand(parsed.cmd, registry);
   if (!spec) return; // not a known command → stay quiet
   const role = resolveSenderRole(projectsConfig, from && from.id);
@@ -333,6 +335,10 @@ export async function dispatchCommand(parsed, from, {
     TELE_FROM_ROLE: role,
     TELE_FROM_NAME: (from && (from.first_name || from.username)) || 'admin',
     TELE_FROM_USERNAME: (from && from.username) || '',
+    // Replied-to text (capped) — ONLY for commands that opt in (`wantsReplyText`,
+    // i.e. /whisper). Arbitrary DM reply content must NOT leak to other children
+    // (esp. /run, which executes project scripts). NEVER a privilege input.
+    TELE_REPLY_TEXT: (spec.wantsReplyText && replyText) ? String(replyText).slice(0, 256) : '',
   });
   try {
     const { stdout, stderr } = await runner(process.execPath, argv, {

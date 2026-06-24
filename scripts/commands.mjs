@@ -50,6 +50,9 @@ export function resolveCommand(name, registry) {
     args: Array.isArray(c.args) ? c.args.map(String) : [],
     needsProject: c.needsProject === true,
     minRole: typeof c.minRole === 'string' ? c.minRole : 'public',
+    // Only commands that opt in receive the replied-to DM text (TELE_REPLY_TEXT).
+    // Default false so arbitrary reply content never leaks to e.g. /run children.
+    wantsReplyText: c.wantsReplyText === true,
     desc: typeof c.desc === 'string' ? c.desc : '',
   };
 }
