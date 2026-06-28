@@ -10,12 +10,15 @@
 // loops use, under the SAME poll lock — so daemon and agents never fight the
 // global offset; whoever is awake harvests into the common cache. Each consumer
 // then picks up only its own lane: agents read their topic (by message_thread_id),
-// the daemon reads its PRIVATE control DM (DAEMON_CHAT_ID). Up to retrieval it is
-// identical to an agent; only the *processing* differs — the daemon runs known,
-// deterministic, non-AI commands (it never calls an LLM).
+// the daemon reads the OWNER's messages (by from.id === daemonUserId) — both the
+// owner's private control DM and any `/dm <cmd>` typed in a group topic (RFC 08).
+// Up to retrieval it is identical to an agent; only the *processing* differs — the
+// daemon runs known, deterministic, non-AI commands (it never calls an LLM).
 //
 // Domain split (validated at startup): agents/topics live in GROUPS (chatId < 0);
-// the daemon's control channel is a PRIVATE DM (DAEMON_CHAT_ID > 0).
+// the daemon owner is a single PRIVATE user id (daemonUserId > 0). Authorization
+// is by from.id (Telegram-set), not by chat — so the owner can drive the daemon
+// from a group topic, while everyone else is silently ignored.
 //
 // Commands are REGISTRY-DRIVEN (commands.json + projects.json `_commands`, loaded
 // via commands.mjs): the daemon is a thin dispatcher. It parses `/cmd [folder]
@@ -38,12 +41,13 @@ import {
 } from './send-telegram.mjs';
 import {
   readProjectsConfig, roleFor, assertChatIdKind, projectEntries, readDefaultGroup,
-  resolveDefaultChatId, resolveDaemonChatId, resolveQuietHours,
+  resolveDefaultChatId, resolveDaemonUserId, resolveQuietHours,
 } from './projects-config.mjs';
 import {
   DEFAULT_TMP_DIR, botScopedFiles, fetchUpdates, appendToCache, readCacheSinceOffset,
   readOffset, writeOffset, resolveStartOffset, acquirePollLock, releasePollLock,
   partitionOrphans, pruneCache, runHeartbeatReminders,
+  isDmControlMessage, stripDmControlPrefix,
 } from './tele-listen.mjs';
 import { loadCommands, resolveCommand, roleMeets, tokenizeArgs } from './commands.mjs';
 
@@ -131,11 +135,12 @@ export function resolveSenderRole(projectsConfig, userId) {
 }
 
 // Validate the whole teleport config for the daemon: every project/catch-all
-// chat must be a GROUP, and DAEMON_CHAT_ID must be a PRIVATE DM. Throws with a
-// clear message on the first violation. Pure (config + env passed in).
-export function validateDaemonConfig({ projectsConfig, catchAllIds, daemonChatId }) {
-  if (!daemonChatId) throw new Error('Missing daemonChatId — set projects.json `_config.daemonChatId` (a private chat id).');
-  assertChatIdKind(daemonChatId, 'private', 'projects.json `_config.daemonChatId`');
+// chat must be a GROUP, and the daemon owner id must be a PRIVATE (positive) user
+// id. Throws with a clear message on the first violation. Pure (config + env
+// passed in).
+export function validateDaemonConfig({ projectsConfig, catchAllIds, daemonUserId }) {
+  if (!daemonUserId) throw new Error('Missing daemonUserId — set projects.json `_config.daemonUserId` (a positive user id).');
+  assertChatIdKind(daemonUserId, 'private', 'projects.json `_config.daemonUserId`');
   for (const id of catchAllIds) assertChatIdKind(id, 'group', 'projects.json `_default.chatId`');
   for (const [key, proj] of projectEntries(projectsConfig)) {
     // Trim first: an empty/whitespace chatId means "shared" (no own group) — same
@@ -197,11 +202,11 @@ async function main() {
   const registry = loadCommands({ projectsConfig });
   // Config lives in projects.json `_config` (env only for secrets); env names
   // remain a deprecated fallback during migration.
-  const daemonChatId = resolveDaemonChatId(projectsConfig, { env: process.env, envFile: env }) || '';
+  const daemonUserId = resolveDaemonUserId(projectsConfig, { env: process.env, envFile: env }) || '';
   const catchAllIds = parseAdminChatIds(resolveDefaultChatId(projectsConfig, { env: process.env, envFile: env }) || '');
 
   try {
-    validateDaemonConfig({ projectsConfig, catchAllIds, daemonChatId });
+    validateDaemonConfig({ projectsConfig, catchAllIds, daemonUserId });
   } catch (e) {
     console.error(`[daemon] config error: ${e instanceof Error ? e.message : e}`);
     process.exit(1);
@@ -229,7 +234,7 @@ async function main() {
     projectEntries(projectsConfig).map(([, p]) => p && p.chatId).filter(Boolean).map(String),
   ))];
 
-  console.error(`[daemon] up. pid=${process.pid} bot=${botId} control-DM=${daemonChatId} parent=${PARENT_DIR}`);
+  console.error(`[daemon] up. pid=${process.pid} bot=${botId} owner=${daemonUserId} parent=${PARENT_DIR}`);
   const sendText = async (chatId, text) => {
     // sendTextToAdmin (not sendTextChunk) so LONG output — e.g. a /run build log —
     // auto-falls-back to a .md document instead of throwing on the 4096 limit.
@@ -254,12 +259,24 @@ async function main() {
         } finally { releasePollLock(); }
       }
 
-      // 2) Pick up the daemon's own lane (control DM) from the shared cache.
+      // 2) Pick up the daemon owner's lane from the shared cache. Two entry
+      //    points, both gated on from.id === daemonUserId (Telegram-set, so
+      //    trustworthy; an unauthorized sender is a SILENT DROP — never dispatched,
+      //    never answered):
+      //      • the owner's PRIVATE DM — any /command (legacy behavior; in a DM the
+      //        chat id equals the user id, so this matches as before);
+      //      • a GROUP topic — only `/dm <cmd>` control messages, so ordinary
+      //        topic chatter from the owner is ignored (RFC 08).
       const loopOffset = resolveStartOffset(daemonOffsetFile, globalOffsetFile, cacheFile);
       const updates = readCacheSinceOffset(loopOffset, cacheFile);
-      const mine = updates.filter((u) => u.message && String(u.message.chat?.id) === daemonChatId);
+      const mine = updates.filter((u) => {
+        const msg = u.message;
+        if (!msg || String(msg.from?.id) !== daemonUserId) return false;
+        if (msg.chat?.type === 'private') return true;
+        return isDmControlMessage(msg.text);
+      });
       if (mine.length) {
-        handleControlMessages(mine, { token, daemonChatId, projectsConfig, registry, sendText, secretEnvKeys });
+        handleControlMessages(mine, { token, daemonUserId, projectsConfig, registry, sendText, secretEnvKeys });
       }
       if (updates.length) writeOffset(Math.max(...updates.map((u) => u.update_id)), daemonOffsetFile);
 
@@ -288,12 +305,16 @@ async function main() {
 export function handleControlMessages(mine, ctx) {
   for (const u of mine) {
     const msg = u.message;
-    const parsed = parseDaemonCommand(msg.text);
+    // A `/dm <cmd>` sent from a group topic is rewritten to `/<cmd>` before
+    // dispatch (RFC 08); a bare `/dm` strips to null and is ignored. DM messages
+    // carry no /dm prefix and pass through verbatim.
+    const dispatchText = isDmControlMessage(msg.text) ? stripDmControlPrefix(msg.text) : msg.text;
+    const parsed = parseDaemonCommand(dispatchText);
     if (!parsed) continue;
     // Pass the replied-to message text (if this DM is a Telegram reply) so /whisper
     // can pick the target from a previous whisper/ack instead of retyping it (RFC 07).
     dispatchCommand(parsed, msg.from || {}, ctx, msg.reply_to_message?.text).catch((e) =>
-      ctx.sendText(ctx.daemonChatId, `❌ /${parsed.cmd} failed: ${e instanceof Error ? e.message : e}`));
+      ctx.sendText(ctx.daemonUserId, `❌ /${parsed.cmd} failed: ${e instanceof Error ? e.message : e}`));
   }
 }
 
@@ -308,14 +329,14 @@ export function handleControlMessages(mine, ctx) {
 // REMOTE CODE EXECUTION: the registry's minRole + resolveSpawnCwd containment are
 // the gate; `runner`/`scriptsDir`/`parentDir` are injectable for tests.
 export async function dispatchCommand(parsed, from, {
-  daemonChatId, projectsConfig, registry, sendText, secretEnvKeys = [],
+  daemonUserId, projectsConfig, registry, sendText, secretEnvKeys = [],
   runner = execFileP, scriptsDir = __dirname, parentDir = PARENT_DIR,
 }, replyText = null) {
   const spec = resolveCommand(parsed.cmd, registry);
   if (!spec) return; // not a known command → stay quiet
   const role = resolveSenderRole(projectsConfig, from && from.id);
   if (!roleMeets(role, spec.minRole)) {
-    await sendText(daemonChatId, `❌ /${parsed.cmd} cần quyền ${spec.minRole} (bạn: ${role}).`);
+    await sendText(daemonUserId, `❌ /${parsed.cmd} cần quyền ${spec.minRole} (bạn: ${role}).`);
     return;
   }
   const parts = tokenizeArgs(parsed.rest); // quote-aware (`--grep "a b"` → one arg)
@@ -323,7 +344,7 @@ export async function dispatchCommand(parsed, from, {
   let rest = parts;
   if (spec.needsProject) {
     const r = resolveSpawnCwd(parts[0], { parentDir });
-    if (r.error) { await sendText(daemonChatId, `❌ ${r.error}`); return; }
+    if (r.error) { await sendText(daemonUserId, `❌ ${r.error}`); return; }
     cwd = r.cwd;
     rest = parts.slice(1); // drop the folder token
   }
@@ -345,12 +366,12 @@ export async function dispatchCommand(parsed, from, {
       cwd, env, timeout: COMMAND_TIMEOUT_MS, maxBuffer: COMMAND_MAX_BUFFER,
     });
     const out = ((stdout || '') + (stderr ? `\n[stderr]\n${stderr}` : '')).trim();
-    await sendText(daemonChatId, out || '✅ (no output)');
+    await sendText(daemonUserId, out || '✅ (no output)');
   } catch (e) {
     // execFile rejects on non-zero exit / timeout / ENOENT — surface the child's
     // own output (scripts print their own ❌ messages) before falling back.
     const body = ((e.stdout || '') + (e.stderr ? `\n[stderr]\n${e.stderr}` : '') + (e.killed ? '\n[killed: timeout]' : '')).trim();
-    await sendText(daemonChatId, body || `❌ /${parsed.cmd} failed: ${e.message || e}`);
+    await sendText(daemonUserId, body || `❌ /${parsed.cmd} failed: ${e.message || e}`);
   }
 }
 

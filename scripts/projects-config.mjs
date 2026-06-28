@@ -59,11 +59,11 @@ export function readProjectsConfig(file = DEFAULT_PROJECTS_FILE) {
 // never mistaken for a project entry). Config lives here; .env holds secrets only.
 //   `_default` — the catch-all GROUP, shaped like a project: `{ chatId, roles }`.
 //                Projects without their own group fall back to it (chat + roster).
-//   `_config`  — pure global CONFIG (not a group): `{ daemonChatId, quietHours }`.
+//   `_config`  — pure global CONFIG (not a group): `{ daemonUserId, quietHours }`.
 export const GLOBAL_CONFIG_KEY = '_config';
 export const DEFAULT_GROUP_KEY = '_default';
 
-// The `_config` block, or {}. `{ daemonChatId?, quietHours?, ... }`.
+// The `_config` block, or {}. `{ daemonUserId?, quietHours?, ... }`.
 export function readGlobalConfig(config = {}) {
   const g = config && config[GLOBAL_CONFIG_KEY];
   return (g && typeof g === 'object') ? g : {};
@@ -96,17 +96,27 @@ export function resolveDefaultChatId(config, { env = process.env, envFile = {} }
   return null;
 }
 
-// Daemon control-DM chat id: projects.json `_config.daemonChatId`, falling back
-// to the DEPRECATED env `DAEMON_CHAT_ID`.
-export function resolveDaemonChatId(config, { env = process.env, envFile = {} } = {}) {
-  const fromJson = readGlobalConfig(config).daemonChatId;
+// Daemon owner USER id: projects.json `_config.daemonUserId` — the single user
+// authorized to drive the supervisor daemon, whether by private DM or by
+// `/dm <cmd>` typed in a group topic (RFC 08). Falls back to the older
+// `_config.daemonChatId` and the DEPRECATED env `DAEMON_CHAT_ID`: in a private DM
+// the chat id IS the user id, so the legacy value migrates verbatim.
+export function resolveDaemonUserId(config, { env = process.env, envFile = {} } = {}) {
+  const cfg = readGlobalConfig(config);
+  const fromJson = cfg.daemonUserId ?? cfg.daemonChatId;
   if (fromJson != null && String(fromJson).trim() !== '') return String(fromJson).trim();
   const fromEnv = env.DAEMON_CHAT_ID || envFile.DAEMON_CHAT_ID;
   if (fromEnv) {
-    if (!_warnedDaemonEnv) { _warnedDaemonEnv = true; console.error('[config] DEPRECATED: DAEMON_CHAT_ID in .env — move it to projects.json `_config.daemonChatId`.'); }
+    if (!_warnedDaemonEnv) { _warnedDaemonEnv = true; console.error('[config] DEPRECATED: DAEMON_CHAT_ID in .env — move it to projects.json `_config.daemonUserId`.'); }
     return String(fromEnv).trim();
   }
   return null;
+}
+
+// Deprecated alias (pre-RFC-08 name). The daemon's control-DM chat id and the
+// owner user id are identical in a private DM, so this returns the same value.
+export function resolveDaemonChatId(config, opts) {
+  return resolveDaemonUserId(config, opts);
 }
 
 // Quiet-hours window for auto-reminders: projects.json `_config.quietHours`

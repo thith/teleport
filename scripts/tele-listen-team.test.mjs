@@ -56,3 +56,40 @@ test('empty/null thread map: falls back to legacy reply-to matching', () => {
   assert.equal(out.length, 1);
   assert.equal(out[0].msg.message_id, 9);
 });
+
+// ── RFC 08: daemon-control prefix `/dm <cmd>` ─────────────────────────────────
+import {
+  isDmControlMessage, stripDmControlPrefix, collectMessagesToProcess, DM_CONTROL_PREFIX,
+} from './tele-listen.mjs';
+
+test('isDmControlMessage: matches /dm forms (case-insensitive, @botname, bare), rejects others', () => {
+  assert.equal(DM_CONTROL_PREFIX, 'dm');
+  assert.ok(isDmControlMessage('/dm setup -100'));
+  assert.ok(isDmControlMessage('/DM spawn luni'));
+  assert.ok(isDmControlMessage('  /dm@TeleBot ls  '));
+  assert.ok(isDmControlMessage('/dm'));                 // bare → still hidden from agent
+  assert.equal(isDmControlMessage('/dmesg now'), false); // not the dm command (no separator)
+  assert.equal(isDmControlMessage('hello /dm'), false);  // not at start
+  assert.equal(isDmControlMessage('/spawn luni'), false);
+  assert.equal(isDmControlMessage(null), false);
+});
+
+test('stripDmControlPrefix: /dm <cmd> → /<cmd>; bare /dm → null; inner slash kept', () => {
+  assert.equal(stripDmControlPrefix('/dm setup -100 --code x'), '/setup -100 --code x');
+  assert.equal(stripDmControlPrefix('/DM spawn luni'), '/spawn luni');
+  assert.equal(stripDmControlPrefix('/dm /ls'), '/ls');   // already-slashed inner kept as-is
+  assert.equal(stripDmControlPrefix('/dm'), null);        // nothing to dispatch
+  assert.equal(stripDmControlPrefix('/dm   '), null);
+  assert.equal(stripDmControlPrefix('/spawn luni'), null); // not a /dm message
+});
+
+test('collectMessagesToProcess: drops /dm control messages from the agent prompt', () => {
+  const updates = [
+    upd(20, { thread: 55, text: 'normal question' }),
+    upd(21, { thread: 55, text: '/dm setup -100' }),    // daemon-control → must be dropped
+    upd(22, { thread: 55, text: '/dm' }),               // bare → dropped too
+  ];
+  const out = collectMessagesToProcess(updates, ADMINS, null, 'convo', TMAP);
+  assert.equal(out.length, 1);
+  assert.equal(out[0].msg.message_id, 20);
+});

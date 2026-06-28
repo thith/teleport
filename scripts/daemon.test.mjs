@@ -56,7 +56,7 @@ const REG = {
 test('dispatchCommand: unknown command → stays silent (no send)', async () => {
   const sent = []; let ran = false;
   await dispatchCommand({ cmd: 'nope', rest: '' }, { id: '7' }, {
-    daemonChatId: '1', projectsConfig: { _default: { roles: { '7': { role: 'admin' } } } }, registry: REG,
+    daemonUserId: '1', projectsConfig: { _default: { roles: { '7': { role: 'admin' } } } }, registry: REG,
     sendText: async (_c, t) => sent.push(t), runner: async () => { ran = true; return { stdout: '', stderr: '' }; },
   });
   assert.equal(ran, false);
@@ -66,7 +66,7 @@ test('dispatchCommand: unknown command → stays silent (no send)', async () => 
 test('dispatchCommand: gates by minRole (member cannot run a maintainer command)', async () => {
   const sent = []; let ran = false;
   await dispatchCommand({ cmd: 'run', rest: 'proj dev' }, { id: '9' }, {
-    daemonChatId: '1', projectsConfig: { _default: { roles: { '9': { role: 'member' } } } }, registry: REG,
+    daemonUserId: '1', projectsConfig: { _default: { roles: { '9': { role: 'member' } } } }, registry: REG,
     sendText: async (_c, t) => sent.push(t), runner: async () => { ran = true; return {}; },
   });
   assert.equal(ran, false);
@@ -78,7 +78,7 @@ test('dispatchCommand: needsProject → folder is the positional first token, dr
   fs.mkdirSync(path.join(parent, 'luni'));
   const calls = []; const sent = [];
   await dispatchCommand({ cmd: 'run', rest: 'luni dev --port 3000' }, { id: '7', first_name: 'Thi', username: 'thi' }, {
-    daemonChatId: '1', projectsConfig: { _default: { roles: { '7': { role: 'admin' } } } }, registry: REG,
+    daemonUserId: '1', projectsConfig: { _default: { roles: { '7': { role: 'admin' } } } }, registry: REG,
     parentDir: parent, scriptsDir: '/scripts',
     sendText: async (_c, t) => sent.push(t),
     runner: async (bin, argv, opts) => { calls.push({ bin, argv, cwd: opts.cwd, env: opts.env }); return { stdout: 'served', stderr: '' }; },
@@ -97,7 +97,7 @@ test('dispatchCommand: needsProject → folder is the positional first token, dr
 test('dispatchCommand: TELE_REPLY_TEXT goes to /whisper (capped), absent for /run, /ls', async () => {
   const cap = 'x'.repeat(400); // > 256 → must be truncated
   const grab = async () => { let env; await dispatchCommand({ cmd: 'whisper', rest: 'hi' }, { id: '7' }, {
-    daemonChatId: '1', projectsConfig: { _default: { roles: { '7': { role: 'admin' } } } }, registry: REG, scriptsDir: '/s',
+    daemonUserId: '1', projectsConfig: { _default: { roles: { '7': { role: 'admin' } } } }, registry: REG, scriptsDir: '/s',
     sendText: async () => {}, runner: async (_b, _a, o) => { env = o.env; return { stdout: '', stderr: '' }; },
   }, cap); return env; };
   const wenv = await grab();
@@ -107,7 +107,7 @@ test('dispatchCommand: TELE_REPLY_TEXT goes to /whisper (capped), absent for /ru
   // /ls (no wantsReplyText) → reply text must NOT leak into its child env.
   let lenv;
   await dispatchCommand({ cmd: 'ls', rest: '' }, { id: '7' }, {
-    daemonChatId: '1', projectsConfig: { _default: { roles: { '7': { role: 'admin' } } } }, registry: REG, scriptsDir: '/s',
+    daemonUserId: '1', projectsConfig: { _default: { roles: { '7': { role: 'admin' } } } }, registry: REG, scriptsDir: '/s',
     sendText: async () => {}, runner: async (_b, _a, o) => { lenv = o.env; return { stdout: '', stderr: '' }; },
   }, cap);
   assert.equal(lenv.TELE_REPLY_TEXT, '');                  // gated off — no leak to non-whisper children
@@ -119,7 +119,7 @@ test('dispatchCommand: TELE_REPLY_TEXT goes to /whisper (capped), absent for /ru
   try {
     let renv;
     await dispatchCommand({ cmd: 'ls', rest: '' }, { id: '7' }, {
-      daemonChatId: '1', projectsConfig: { _default: { roles: { '7': { role: 'admin' } } } }, registry: REG, scriptsDir: '/s',
+      daemonUserId: '1', projectsConfig: { _default: { roles: { '7': { role: 'admin' } } } }, registry: REG, scriptsDir: '/s',
       sendText: async () => {}, runner: async (_b, _a, o) => { renv = o.env; return { stdout: '', stderr: '' }; },
     }, null);
     assert.equal(renv.TELE_REPLY_TEXT, ''); // inherited value did NOT pass through
@@ -132,7 +132,7 @@ test('dispatchCommand: TELE_REPLY_TEXT goes to /whisper (capped), absent for /ru
 test('handleControlMessages: bridges msg.reply_to_message.text into the whisper child env', async () => {
   let env;
   handleControlMessages([{ message: { text: '/whisper hi', from: { id: '7' }, reply_to_message: { text: 'ack #abc123' } } }], {
-    daemonChatId: '1', projectsConfig: { _default: { roles: { '7': { role: 'admin' } } } }, registry: REG, scriptsDir: '/s',
+    daemonUserId: '1', projectsConfig: { _default: { roles: { '7': { role: 'admin' } } } }, registry: REG, scriptsDir: '/s',
     sendText: async () => {}, runner: async (_b, _a, o) => { env = o.env; return { stdout: '', stderr: '' }; },
   });
   await new Promise((r) => setTimeout(r, 10)); // dispatch is fire-and-forget
@@ -146,7 +146,7 @@ test('dispatchCommand: strips teleport secrets from the child env, keeps identit
   let childEnv;
   try {
     await dispatchCommand({ cmd: 'run', rest: 'app build' }, { id: '7' }, {
-      daemonChatId: '1', projectsConfig: { _default: { roles: { '7': { role: 'admin' } } } }, registry: REG,
+      daemonUserId: '1', projectsConfig: { _default: { roles: { '7': { role: 'admin' } } } }, registry: REG,
       parentDir: parent, scriptsDir: '/scripts', secretEnvKeys: ['SNEAKY_SECRET', 'REPORT_BOT_TOKEN'],
       sendText: async () => {},
       runner: async (bin, argv, opts) => { childEnv = opts.env; return { stdout: 'ok', stderr: '' }; },
@@ -166,7 +166,7 @@ test('dispatchCommand: quoted args survive as one token (not split on inner spac
   fs.mkdirSync(path.join(parent, 'app'));
   const calls = [];
   await dispatchCommand({ cmd: 'run', rest: 'app test --grep "a b c"' }, { id: '7' }, {
-    daemonChatId: '1', projectsConfig: { _default: { roles: { '7': { role: 'admin' } } } }, registry: REG,
+    daemonUserId: '1', projectsConfig: { _default: { roles: { '7': { role: 'admin' } } } }, registry: REG,
     parentDir: parent, scriptsDir: '/scripts',
     sendText: async () => {},
     runner: async (bin, argv) => { calls.push(argv); return { stdout: 'ok', stderr: '' }; },
@@ -179,7 +179,7 @@ test('dispatchCommand: !needsProject → cwd=workspace root, no token dropped', 
   const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'ws-'));
   const calls = [];
   await dispatchCommand({ cmd: 'whisper', rest: '#abc12345 nhắc nhẹ' }, { id: '7' }, {
-    daemonChatId: '1', projectsConfig: { _default: { roles: { '7': { role: 'admin' } } } }, registry: REG,
+    daemonUserId: '1', projectsConfig: { _default: { roles: { '7': { role: 'admin' } } } }, registry: REG,
     parentDir: parent, scriptsDir: '/scripts',
     sendText: async () => {},
     runner: async (bin, argv, opts) => { calls.push({ argv, cwd: opts.cwd }); return { stdout: 'ok', stderr: '' }; },
@@ -193,7 +193,7 @@ test('dispatchCommand: needsProject with a bad folder → error, never runs', as
   const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'ws-'));
   const sent = []; let ran = false;
   await dispatchCommand({ cmd: 'spawn', rest: '../etc' }, { id: '7' }, {
-    daemonChatId: '1', projectsConfig: { _default: { roles: { '7': { role: 'maintainer' } } } }, registry: REG,
+    daemonUserId: '1', projectsConfig: { _default: { roles: { '7': { role: 'maintainer' } } } }, registry: REG,
     parentDir: parent, sendText: async (_c, t) => sent.push(t), runner: async () => { ran = true; return {}; },
   });
   assert.equal(ran, false);
@@ -204,7 +204,7 @@ test('dispatchCommand: needsProject with a bad folder → error, never runs', as
 test('dispatchCommand: a failing child relays its own stdout/stderr', async () => {
   const sent = [];
   await dispatchCommand({ cmd: 'ls', rest: '' }, { id: '7' }, {
-    daemonChatId: '1', projectsConfig: { _default: { roles: { '7': { role: 'admin' } } } }, registry: REG,
+    daemonUserId: '1', projectsConfig: { _default: { roles: { '7': { role: 'admin' } } } }, registry: REG,
     sendText: async (_c, t) => sent.push(t),
     runner: async () => { const e = new Error('exit 1'); e.stdout = 'partial'; e.stderr = 'boom'; throw e; },
   });
@@ -217,7 +217,7 @@ test('handleControlMessages: fire-and-forget — returns synchronously, relays o
   const gate = new Promise((res) => { release = res; });
   const sent = [];
   const ctx = {
-    daemonChatId: '1', projectsConfig: { _default: { roles: { '7': { role: 'admin' } } } }, registry: REG,
+    daemonUserId: '1', projectsConfig: { _default: { roles: { '7': { role: 'admin' } } } }, registry: REG,
     parentDir: '/tmp', scriptsDir: '/scripts',
     sendText: async (_c, t) => sent.push(t),
     runner: () => gate.then(() => ({ stdout: 'late', stderr: '' })), // pending until released
@@ -266,18 +266,18 @@ test('validateDaemonConfig: enforces group/private split', () => {
   // ok: groups negative, daemon private positive
   assert.doesNotThrow(() => validateDaemonConfig({
     projectsConfig: { d_be: { chatId: '-1001' }, luni: { chatId: '-1002' } },
-    catchAllIds: ['-100999'], daemonChatId: '144242180',
+    catchAllIds: ['-100999'], daemonUserId: '144242180',
   }));
   // daemon chat must be private
-  assert.throws(() => validateDaemonConfig({ projectsConfig: {}, catchAllIds: ['-100'], daemonChatId: '-100' }), /daemonChatId.* must be a PRIVATE/);
+  assert.throws(() => validateDaemonConfig({ projectsConfig: {}, catchAllIds: ['-100'], daemonUserId: '-100' }), /daemonUserId.* must be a PRIVATE/);
   // missing daemon chat
-  assert.throws(() => validateDaemonConfig({ projectsConfig: {}, catchAllIds: ['-100'], daemonChatId: '' }), /Missing daemonChatId/);
+  assert.throws(() => validateDaemonConfig({ projectsConfig: {}, catchAllIds: ['-100'], daemonUserId: '' }), /Missing daemonUserId/);
   // a project chat that is private → error
-  assert.throws(() => validateDaemonConfig({ projectsConfig: { bad: { chatId: '144242180' } }, catchAllIds: ['-100'], daemonChatId: '1' }), /project 'bad' chatId must be a GROUP/);
+  assert.throws(() => validateDaemonConfig({ projectsConfig: { bad: { chatId: '144242180' } }, catchAllIds: ['-100'], daemonUserId: '1' }), /project 'bad' chatId must be a GROUP/);
   // catch-all private → error
-  assert.throws(() => validateDaemonConfig({ projectsConfig: {}, catchAllIds: ['144242180'], daemonChatId: '1' }), /_default.chatId.* must be a GROUP/);
+  assert.throws(() => validateDaemonConfig({ projectsConfig: {}, catchAllIds: ['144242180'], daemonUserId: '1' }), /_default.chatId.* must be a GROUP/);
   // reserved _config / _default keys are skipped during project iteration
-  assert.doesNotThrow(() => validateDaemonConfig({ projectsConfig: { _config: { daemonChatId: '1' }, _default: { chatId: '-100' }, ok: { chatId: '-101' } }, catchAllIds: ['-100'], daemonChatId: '1' }));
+  assert.doesNotThrow(() => validateDaemonConfig({ projectsConfig: { _config: { daemonUserId: '1' }, _default: { chatId: '-100' }, ok: { chatId: '-101' } }, catchAllIds: ['-100'], daemonUserId: '1' }));
 });
 
 test('singleton: acquire writes pid, second acquire fails while alive, status reflects it, release clears', () => {
@@ -301,4 +301,34 @@ test('singleton: stale pid (dead) is reaped and acquired', () => {
   assert.equal(a.ok, true);
   assert.equal(a.pid, process.pid);
   releaseSingleton(pidFile);
+});
+
+// ── RFC 08: handleControlMessages rewrites a group `/dm <cmd>` to `/<cmd>` ─────
+test('handleControlMessages: /dm ls from a group dispatches the stripped /ls', async () => {
+  const calls = [];
+  handleControlMessages(
+    [{ update_id: 1, message: { text: '/dm ls', from: { id: 7 }, chat: { id: -100, type: 'supergroup' } } }],
+    {
+      daemonUserId: '7', projectsConfig: { _default: { roles: { '7': { role: 'admin' } } } },
+      registry: REG, scriptsDir: '/s', sendText: async () => {},
+      runner: async (_bin, argv) => { calls.push(argv); return { stdout: '', stderr: '' }; },
+    },
+  );
+  await new Promise((r) => setTimeout(r, 30)); // dispatch is fire-and-forget
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0], ['/s/spawn.mjs', '--list']); // /dm ls → /ls → spawn.mjs --list
+});
+
+test('handleControlMessages: bare /dm from a group is a no-op (nothing dispatched)', async () => {
+  let ran = false;
+  handleControlMessages(
+    [{ update_id: 2, message: { text: '/dm', from: { id: 7 }, chat: { id: -100, type: 'supergroup' } } }],
+    {
+      daemonUserId: '7', projectsConfig: { _default: { roles: { '7': { role: 'admin' } } } },
+      registry: REG, scriptsDir: '/s', sendText: async () => {},
+      runner: async () => { ran = true; return { stdout: '', stderr: '' }; },
+    },
+  );
+  await new Promise((r) => setTimeout(r, 30));
+  assert.equal(ran, false);
 });

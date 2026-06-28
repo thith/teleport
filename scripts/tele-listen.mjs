@@ -674,8 +674,46 @@ export function findOrphanMessages(updates, adminIds, systemMsgIds = new Set()) 
   }).map((u) => ({ update: u, msg: u.message, orphan: true }));
 }
 
+// ── Daemon control from a group topic (RFC 08) ────────────────────────────────
+// The daemon owner can drive the supervisor daemon from inside ANY topic by
+// typing `/dm <cmd> <args>` (e.g. `/dm setup -100…`). Two consumers see the same
+// shared cache: the per-convo AGENT and the daemon. To stop the agent from also
+// answering ("giành khách"), the listener DROPS these messages from the convo
+// prompt deterministically (in code, never relying on the agent's discretion);
+// the daemon picks them up from the cache and dispatches them, rewriting
+// `/dm <cmd>` → `/<cmd>`. ONE shared prefix so both sides agree.
+//
+// Name note: `dm` is overloaded (daemon vs direct-message). It is intentionally
+// a single exported constant here so renaming to e.g. `sup` is a one-line change.
+export const DM_CONTROL_PREFIX = 'dm';
+const DM_CONTROL_RE = new RegExp(`^\\s*/${DM_CONTROL_PREFIX}(?:@[A-Za-z0-9_]+)?(?:\\s+([\\s\\S]*))?$`, 'i');
+
+// True when `text` is a `/dm …` daemon-control message (case-insensitive,
+// tolerates a `/dm@botname` suffix). A bare `/dm` still counts as control here so
+// the agent never sees it; the daemon separately treats bare `/dm` as a no-op.
+export function isDmControlMessage(text) {
+  return typeof text === 'string' && DM_CONTROL_RE.test(text);
+}
+
+// Rewrite `/dm <cmd> <args>` → `/<cmd> <args>` for the daemon dispatcher. Returns
+// null when `text` isn't a /dm-control message OR carries no inner command (bare
+// `/dm`). Accepts the inner command with or without its own leading slash.
+export function stripDmControlPrefix(text) {
+  if (typeof text !== 'string') return null;
+  const m = text.match(DM_CONTROL_RE);
+  if (!m) return null;
+  const inner = (m[1] ?? '').trim();
+  if (!inner) return null;
+  return inner.startsWith('/') ? inner : `/${inner}`;
+}
+
 export function collectMessagesToProcess(updates, adminIds, filterReplyTo, mode = 'legacy', threadByChat = null) {
-  return filterAdminMessages(updates, adminIds, filterReplyTo, mode, threadByChat);
+  return filterAdminMessages(updates, adminIds, filterReplyTo, mode, threadByChat)
+    // Drop `/dm …` daemon-control commands so this convo's AGENT never handles
+    // them — they belong to the supervisor daemon, which reads the same shared
+    // cache independently (RFC 08). Dropping here is the deterministic guard that
+    // prevents the agent and the daemon from both acting on one message.
+    .filter((m) => !isDmControlMessage(m.msg?.text));
 }
 
 /**

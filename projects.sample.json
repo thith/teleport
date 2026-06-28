@@ -1,6 +1,6 @@
 {
   "_config": {
-    "daemonChatId": "100000001",
+    "daemonUserId": "100000001",
     "quietHours": { "start": 22, "end": 8 }
   },
   "_default": {

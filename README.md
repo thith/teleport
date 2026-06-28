@@ -55,7 +55,7 @@ Non-secret config lives in `projects.json` (copy `projects.sample.json` → `pro
     "roles": { "<your telegram user id>": { "role": "admin", "name": "You" } }
   },
   "_config": {
-    "daemonChatId": "<your private chat id — only if you run the daemon>",
+    "daemonUserId": "<your telegram user id — only if you run the daemon>",
     "quietHours": { "start": 22, "end": 8 }
   }
 }
@@ -109,6 +109,10 @@ After sending any Telegram message, you **MUST immediately** start the reply-lis
 ## Start the supervisor daemon
 
 **WHENEVER** the user asks to start / launch / run the teleport **daemon** (the supervisor / control plane that lets you steer & recover from Telegram even when every agent has died) — e.g. "start the daemon", "launch the daemon", "run the daemon", "chạy daemon", "bật daemon", "khởi động daemon" — **or any similar phrasing in any language** — you **MUST** read `../teleport/rules/telegram-guide.md` section "Supervisor daemon" and follow it (run it from a project root). The trigger word is **"daemon"** specifically — "start an agent" *without* "daemon" is a spawn (above), not this. Starting the daemon is a **sensitive admin/maintainer action** (like spawning). Do **NOT** rely on invocation details from this snippet; the guide is the single source of truth.
+
+## Slides / pitch deck
+
+**WHENEVER** the user asks to build a **slide deck / pitch deck / presentation**, or to **convert a proposal/document into slides** — e.g. "tạo/làm slide", "convert proposal to slides", "make a deck/presentation", "pitch deck" — **or any similar phrasing in any language** — you **MUST** read `../teleport/rules/slidecraft-guide.md` and follow it. It is the single source of truth for the deck workflow (outline → per-slide layout debate with 3 AIs → build HTML deck with varied layouts → cohesive illustrations via `gen-image.mjs` → render landscape PDF → 3-AI content+visual review → deliver PDF) plus the editorial style system. Render with `node ../teleport/scripts/render-slides.mjs <deck-dir> [out.pdf]` (zero-dep; needs Google Chrome). Output is the **PDF**; HTML is the build source. Do **NOT** rely on invocation details from this snippet; the guide is the single source of truth.
 ````
 
 #### Per-project setup for spawn
@@ -128,7 +132,7 @@ The spawn helper lives at `teleport/scripts/spawn.mjs`. Add these scripts to eac
 
 A small, **non-AI**, **manually-started** process (`scripts/daemon.mjs`) that gives you remote control even when **every agent has died** (quota / network / API) — the one case the normal "an agent runs the command" model can't recover from, because a dead agent can't receive "spawn a new one". It's best-effort: start it before you step away (or have a live agent start it); forget to, and teleport behaves exactly as before.
 
-It listens to **one private DM** (`DAEMON_CHAT_ID`) and is a thin, **registry-driven dispatcher**: every command is declared in `commands.json` (teleport's committed, self-sufficient built-ins) and may be extended per-deployment via `projects.json._commands`. The daemon parses `/<cmd> [folder] [args]`, gates by the command's `minRole`, and runs the mapped teleport script — it never calls an LLM, and adding a command is a JSON entry + a script, not daemon code. Built-ins:
+It's driven by **one owner user** (`_config.daemonUserId`) and is a thin, **registry-driven dispatcher**: every command is declared in `commands.json` (teleport's committed, self-sufficient built-ins) and may be extended per-deployment via `projects.json._commands`. The daemon parses `/<cmd> [folder] [args]`, gates by the command's `minRole`, and runs the mapped teleport script — it never calls an LLM, and adding a command is a JSON entry + a script, not daemon code. Built-ins:
 
 | Command | Role | What |
 |---|---|---|
@@ -141,7 +145,9 @@ It listens to **one private DM** (`DAEMON_CHAT_ID`) and is a thin, **registry-dr
 | `/pending` | member | convos waiting on an admin reply |
 | `/start` | public | onboarding help |
 
-When `needsProject` is set (spawn/headless/run), the **first positional token is the folder**; remaining tokens are the script's args (quote-aware, so `--grep "a b"` is one arg). Plus the heartbeat auto-reminder (which now lives **only** here, moved out of the agent listeners). It "harvests" Telegram updates into the *same* shared cache the agent listeners use (cooperative, no offset war); only its own private-DM lane is processed by the daemon.
+When `needsProject` is set (spawn/headless/run), the **first positional token is the folder**; remaining tokens are the script's args (quote-aware, so `--grep "a b"` is one arg). Plus the heartbeat auto-reminder (which now lives **only** here, moved out of the agent listeners). It "harvests" Telegram updates into the *same* shared cache the agent listeners use (cooperative, no offset war); the daemon processes only the **owner's** messages (`from.id === daemonUserId`) — both the owner's private DM and any `/dm <cmd>` typed inside a group topic.
+
+**Drive the daemon from a topic (`/dm`, RFC 08).** You don't have to open the private DM: in any group topic, type `/dm <cmd> <args>` (e.g. `/dm setup`, `/dm ls`). The listener strips it from the topic agent's view (so no agent answers it) and the daemon dispatches the stripped `/<cmd>`, replying in your DM. Authorization is purely by `from.id === daemonUserId`; a non-owner's `/dm` is **silently ignored** (no dispatch, no reply). The `dm` prefix is a single constant (`DM_CONTROL_PREFIX` in `tele-listen.mjs`) so it's trivial to rename.
 
 ```bash
 node ../teleport/scripts/daemon.mjs            # run (keep a terminal/screen open)
@@ -153,7 +159,7 @@ screen -dmS teleport-daemon node ../teleport/scripts/daemon.mjs
 
 teleport has no `package.json` of its own — always invoke the daemon as `node ../teleport/scripts/daemon.mjs` (a sibling project may of course wrap that in its own `package.json` script if it likes). Agents recognise *"start/launch/chạy daemon"* via the wiring snippet above and run it for you (admin/maintainer only).
 
-**Config:** set `_config.daemonChatId` (your private chat id) in `projects.json`. Chat-id rule (validated at startup): every project / `_default.chatId` chat must be a **group** (negative id); `daemonChatId` must be a **private** chat (positive id). a `needsProject` command resolves `<workspace-parent>/<folder>` as the script's cwd (which, for spawn, is how the new agent joins that project's group), with realpath containment so a symlinked folder can't escape the workspace. **Whisper** injects a discreet steer into a topic with `whisper:true` — invisible in the group; the receiving agent acts on it without announcing it (see `rules/telegram-guide.md`).
+**Config:** set `_config.daemonUserId` (your Telegram user id) in `projects.json`. Id rule (validated at startup): every project / `_default.chatId` chat must be a **group** (negative id); `daemonUserId` must be a **positive** user id. (The older `_config.daemonChatId` and env `DAEMON_CHAT_ID` are still read as a fallback — in a private DM the chat id equals the user id, so the old value migrates verbatim.) a `needsProject` command resolves `<workspace-parent>/<folder>` as the script's cwd (which, for spawn, is how the new agent joins that project's group), with realpath containment so a symlinked folder can't escape the workspace. **Whisper** injects a discreet steer into a topic with `whisper:true` — invisible in the group; the receiving agent acts on it without announcing it (see `rules/telegram-guide.md`).
 
 ## How to use
 

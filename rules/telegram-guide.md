@@ -141,6 +141,14 @@ chuyển từ tele-listen sang đây — nên **khi daemon KHÔNG chạy thì s�
 `/run` tự detect npm/pnpm/yarn của project, validate script trong package.json, rồi chạy
 `<pm> run <script>` (chỉ admin/maintainer — remote exec).
 
+**Điều khiển daemon từ một topic — `/dm <cmd>` (RFC 08).** Không cần mở DM riêng: trong
+bất kỳ topic nào, owner gõ `/dm <cmd> <args>` (vd `/dm setup`, `/dm ls`). tele-listen **DROP**
+message đó khỏi prompt của agent topic (deterministic — agent không bao giờ thấy, không "giành
+khách"), còn daemon đọc nó từ shared cache, rewrite `/dm <cmd>` → `/<cmd>` rồi dispatch, **trả
+lời vào DM** của owner. Phân quyền **chỉ theo `from.id === daemonUserId`** (Telegram set, tin
+được) — `/dm` của người khác bị **ngó lơ hoàn toàn** (không dispatch, không báo). Tiền tố `dm`
+là một hằng số (`DM_CONTROL_PREFIX`) nên đổi tên cực dễ.
+
 - **Bật:** từ project root chạy `node ../teleport/scripts/daemon.mjs` (giữ terminal/screen
   mở để nó sống). Trạng thái: `--status`; dừng: `--stop`. Single-instance (pidfile).
 - **Khi user bảo "bật/chạy daemon"** → đây là hành động **sensitive** (như spawn): chỉ
