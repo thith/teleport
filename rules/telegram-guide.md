@@ -4,14 +4,19 @@
 
 `node ../teleport/scripts/send-telegram.mjs` sends messages/files to admins in `../teleport/.env`. The project is resolved from `basename(cwd)` (= the `projects.json` key); its display label is that entry's `code` field when set (a short alias, e.g. `d_be`), else the key itself. (No env override — the old `TELE_PROJECT_CODE` was removed; configure `code` in `projects.json` instead.)
 
-## Answer in the channel you were asked (MUST)
+## Reply on the channel the prompt arrived on (MUST)
 
-Reply on the **SAME channel** the prompt arrived on — do **NOT** reflexively send everything to Telegram. Two cases:
+A prompt reaches you on one of two channels — **answer on the same one**, don't reflexively send everything to Telegram:
 
-- **Telegram (relayed):** the prompt came through the **listener** (`tele-listen` wrote a `prompt-convo-<id>.json`, picked up via the Monitor/`--wait-once` loop) → reply with `send-telegram.mjs`.
-- **The host interface (direct):** the user is talking to you **directly** through whatever client they're driving you with — terminal CLI, IDE extension (VS Code / JetBrains), the Claude/Codex desktop or web app, etc. There is **no** `prompt-convo-<id>.json` for it → just reply **normally in that same interface**, and **MUST NOT** push it to Telegram. ("CLI" is only the most common such host; the rule is the host channel, whatever it is.)
+- **Telegram (relayed):** a normal user message that arrived **through the listener** — you had to go *read* a `prompt-convo-<id>.json` (the `cat prompt-convo…` step) to see it. Reply with `send-telegram.mjs`. (See "Listening for replies".)
+- **Host (direct):** the user typed to you **directly** in whatever client drives the agent — terminal CLI (most common), IDE extension, desktop/web app. It just **appeared as your normal input** (no prompt-file to read). Reply **in that same interface**; do **NOT** mirror it to Telegram.
 
-**Quick tell — from HOW the message reached you (no need to check anything):** a **Telegram** prompt always arrives *through the listener* — you get a listener event and have to **go read** the `prompt-convo-<id>.json` (the `cat prompt-convo…` step) before you can answer. A **host/direct** prompt just **appears as your normal input**, with no such fetch step. So: **if you DIDN'T have to read a prompt-file to see this message, it's the host channel → answer right there; if you DID, it's Telegram → use `send-telegram.mjs`.** Don't mirror a host message to Telegram (wrong-channel noise, hard to follow). Keep the Telegram listener alive regardless — see "Listening for replies".
+**Tell (no active check needed):** had to read a prompt-file to see it → **Telegram**; it just appeared as your input → **host**.
+
+**Carve-outs:**
+- **Inter-agent primitives** (`whisper`, `handover`, `ask`/`askReply`, `broadcast`) also arrive as prompt-files but are **NOT** answered with a plain Telegram reply — each has its own routing (whisper = discreet; `ask` → `ask.mjs --reply`; broadcast → apply + brief ack; handover → adopt). This channel rule is about **normal relayed user messages** only; for the primitives follow their own sections below.
+- **Explicit send is fine.** If a *host* user explicitly asks you to send something to Telegram (a report, a file), do it — the rule only forbids *reflexively mirroring* a host reply, not an instructed send. Proactive Telegram reports (task finished while the user is away) are likewise unaffected.
+- The "listen after every send" obligation attaches to **Telegram-originated** convos, not host sessions.
 
 ## When to use
 - Finished a task while user is away.
@@ -315,6 +320,8 @@ Send stdout ends with:
 Capture `<N>` once; pass to the listener as `--convo <N>`.
 
 ## Listening for replies (MUST after every successful send)
+
+> Scope: this obligation attaches to **Telegram-originated convos** (a real `send-telegram.mjs` send). A **host/direct** session has no convo to listen on — see "Reply on the channel the prompt arrived on".
 
 Two cases. `send-telegram.mjs` prints the matching hint on stdout.
 
