@@ -16,16 +16,28 @@ project-template/
     code-bot/   code-web/   monorepo/   content/
 ```
 
-## How to scaffold (manual for now — `/setup --init` later, see RFC 08)
+## How to scaffold
 
+**Recommended — one command** (`scripts/scaffold.mjs`, hand-run; the daemon-driven `/setup` is deferred, see RFC 08):
+
+```bash
+node ../teleport/scripts/scaffold.mjs <project> --type <code-bot|code-web|monorepo|content>
+#   [--dry-run]  preview the file list, write nothing
+#   [--no-git]   skip git init + first commit
+#   [--into <dir>]  scaffold somewhere other than ../<project>
+```
+
+It creates `../<project>/`, copies `core/` + the profile's `overlay.md`, substitutes the
+template placeholders (`<PROJECT>`, `<profile>`, …), and does `git init` + the first commit.
+Then fill `<one-line description>`, the `CLAUDE.md` project context, and `docs/project_overview.md`.
+
+**Manual equivalent** (if you'd rather):
 1. `cp -r project-template/core/. <workspace>/<project>/` then `git init`.
-2. Copy the chosen profile's `overlay.md` into the project root next to `process.md`
-   (`cp project-template/profiles/<type>/overlay.md <project>/overlay.md`). The core docs and
-   `CLAUDE.md` reference it by name — it supplies branch/deploy policy, test gate, spec schema,
-   and artifact-specific review modes for that project type.
-3. Fill the stubs: `CLAUDE.md` project context, `docs/project_overview.md`.
-4. Canonical output dirs (`templates/ samples/ prompts/ marketing/ pm/ data/ reports/ assets/`)
-   are created **lazily** — only when first needed.
+2. `cp project-template/profiles/<type>/overlay.md <project>/overlay.md` (core docs reference it by name).
+3. Replace `<PROJECT>` / `<profile>` placeholders in `CLAUDE.md`/`AGENTS.md`/`GEMINI.md`/`README.md`/`docs/project_overview.md`.
+
+Canonical output dirs (`templates/ samples/ prompts/ marketing/ pm/ data/ reports/ assets/`) are
+created **lazily** — only when first needed.
 
 ## Core vs overlay
 
