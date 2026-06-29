@@ -4,6 +4,15 @@
 
 `node ../teleport/scripts/send-telegram.mjs` sends messages/files to admins in `../teleport/.env`. The project is resolved from `basename(cwd)` (= the `projects.json` key); its display label is that entry's `code` field when set (a short alias, e.g. `d_be`), else the key itself. (No env override — the old `TELE_PROJECT_CODE` was removed; configure `code` in `projects.json` instead.)
 
+## Answer in the channel you were asked (MUST)
+
+Reply on the **SAME channel** the prompt arrived on — do **NOT** reflexively send everything to Telegram:
+
+- Prompt arrived through the **listener** (`tele-listen` wrote a `prompt-convo-<id>.json`, or you picked it up via the Monitor/`--wait-once` loop) → it came from **Telegram** → reply with `send-telegram.mjs`.
+- Prompt typed **directly into the CLI** (the user spoke to you in the terminal; there is **no** `prompt-convo-<id>.json` for it) → reply **in the CLI** as normal text output, and **MUST NOT** send it to Telegram.
+
+**Quick tell:** no `prompt-convo-<id>.json` for the message ⇒ it's a CLI prompt ⇒ answer in the CLI. Mirroring a CLI question onto Telegram is wrong-channel noise and hard for the operator to follow. (Keep the Telegram listener alive regardless of which channel a given prompt came from — see "Listening for replies".)
+
 ## When to use
 - Finished a task while user is away.
 - User asks for a file (spec/RFC/log) → use `--file`.
