@@ -1,0 +1,39 @@
+# Core .gitignore — every teleport project starts from this (RFC 09 §3.3).
+
+# Scratch / ephemeral working area — never the final home; NOT auto-deleted.
+tmp/
+
+# Dependencies / build output
+node_modules/
+dist/
+build/
+.next/
+coverage/
+
+# Secrets — MUST never be committed. Scrub before saving session.md / decisions-log.
+.env
+.env.*
+!.env.example
+
+# Session archive: commit only the .md knowledge files (session.md, decisions-log).
+# Drafts and binary/media outputs under a session are NOT committed (avoid history bloat).
+sessions/**/drafts/
+sessions/**/*.png
+sessions/**/*.jpg
+sessions/**/*.jpeg
+sessions/**/*.gif
+sessions/**/*.webp
+sessions/**/*.mp3
+sessions/**/*.wav
+sessions/**/*.mp4
+sessions/**/*.mov
+sessions/**/*.zip
+
+# Large/binary outputs in canonical dirs: prefer Git-LFS or an external store.
+# (Uncomment per project if these dirs hold heavy media.)
+# assets/**/*.png
+# samples/**/*.mp4
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
