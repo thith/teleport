@@ -11,7 +11,7 @@ Reply on the **SAME channel** the prompt arrived on — do **NOT** reflexively s
 - **Telegram (relayed):** the prompt came through the **listener** (`tele-listen` wrote a `prompt-convo-<id>.json`, picked up via the Monitor/`--wait-once` loop) → reply with `send-telegram.mjs`.
 - **The host interface (direct):** the user is talking to you **directly** through whatever client they're driving you with — terminal CLI, IDE extension (VS Code / JetBrains), the Claude/Codex desktop or web app, etc. There is **no** `prompt-convo-<id>.json` for it → just reply **normally in that same interface**, and **MUST NOT** push it to Telegram. ("CLI" is only the most common such host; the rule is the host channel, whatever it is.)
 
-**Quick tell (channel-agnostic):** no `prompt-convo-<id>.json` for the message ⇒ it did **not** come from Telegram ⇒ answer it in the same host interface you received it in; don't mirror it to Telegram (wrong-channel noise, hard to follow). Keep the Telegram listener alive regardless — see "Listening for replies".
+**Quick tell — from HOW the message reached you (no need to check anything):** a **Telegram** prompt always arrives *through the listener* — you get a listener event and have to **go read** the `prompt-convo-<id>.json` (the `cat prompt-convo…` step) before you can answer. A **host/direct** prompt just **appears as your normal input**, with no such fetch step. So: **if you DIDN'T have to read a prompt-file to see this message, it's the host channel → answer right there; if you DID, it's Telegram → use `send-telegram.mjs`.** Don't mirror a host message to Telegram (wrong-channel noise, hard to follow). Keep the Telegram listener alive regardless — see "Listening for replies".
 
 ## When to use
 - Finished a task while user is away.
