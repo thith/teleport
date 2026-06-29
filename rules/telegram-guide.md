@@ -96,6 +96,11 @@ chọn **topic active gần nhất** trùng tên và báo các topic cũ bị sh
 | 5 | trùng tên + hoà recency | đọc list ở stdout, hỏi user chọn theo hashtag → gọi lại `--to "#…"` |
 | 6 | `--new` nhưng role không đủ | báo cần admin/maintainer xác nhận |
 
+**Trước khi soạn handover notes (MUST):** chạy **Bước PRESERVE** (xem "Folder structure & session
+archive") — ghi `session.md`, append decisions-log, promote output official chưa-tiêu-hoá — để
+người tiếp quản (agent khác) có bản lưu đầy đủ, không phải mò lại từ chat. Trong notes, *trỏ tới*
+`session.md`/decisions-log đã lưu.
+
 **Sau khi handover (convo NGUỒN — của bạn):** chỉ xử lý **exit 0** mới coi là đã giao. Khi
 exit 0: (a) report kết quả ở topic của bạn; (b) **stand down trên việc vừa giao** — ngừng tự
 làm tiếp phần đó (tránh hai agent cùng làm); (c) **vẫn keep listening** cho follow-up —
@@ -411,13 +416,49 @@ Then delete the prompt JSON. Restart the listener (same command).
 **Two Monitors per convo = silent loss bug.** Always `TaskStop` the previous before starting a new one. Auto-supersede is a safety net but not a substitute.
 
 
+## Folder structure & session archive (chuẩn — RFC 09)
+
+> Một chuẩn cấu trúc + lưu trữ cho **mọi** project, để **output phiên không bị mất** khi đóng topic / handover. Chi tiết & lý do: `../teleport-docs/rfc/09-project-structure-and-process.md`. Đây là bản tóm tắt agent **MUST** theo.
+
+**Thuật ngữ (3 lớp khác nhau — không gộp):**
+- **convo** (`convoId`) — danh tính hội thoại trong code/runtime (teleport gán). Dùng khắp nơi.
+- **topic** — forum topic Telegram (mặt người dùng thấy). convo ↔ topic = 2 mặt của *cùng một kênh sống*.
+- **session** — **bản lưu trữ** kết quả một phiên (`sessions/<…>/`). *"Không archive convo, mà viết session."*
+
+**Cấu trúc chuẩn (mỗi project):**
+```
+<project>/
+  sessions/<YYYY-MM-DD-slug-cXXXX>/   # bản lưu phiên; cXXXX = short-convo-hash CHỐNG VA CHẠM
+    session.md        # MẶC ĐỊNH 1 file: metadata + compact summary + biên bản inline
+    minutes.md  <kind>/   # tách RA chỉ khi phiên dài/nhiều output; <kind>/ = GITIGNORE
+  docs/<topic>-decisions-log.md   # decision log PER-FEATURE, gom NHIỀU phiên (chống leak)
+  templates/ samples/ prompts/ marketing/ pm/ data/ reports/ assets/   # canonical, LAZY-create
+  rfc/ specs/ src/ tests/   docs/   tmp/   # tmp = GITIGNORE, KHÔNG auto-xoá
+```
+- **Canonical** = output official dùng thật; tạo **lazy** khi lần đầu cần (không pre-create rỗng). `assets` = media/linh tinh (KHÔNG phải bãi rác — criteria/spec ở `docs/`/`specs/`, dữ liệu ở `data/`, báo cáo ở `reports/`).
+- **`decisions-log` ở `docs/`, KHÔNG trong `sessions/`** — nó gom quyết định *per-feature qua nhiều phiên*; shard theo ngày sẽ phá tác dụng chống-leak.
+
+**Gitignore + secrets (MUST):**
+- Chỉ commit **`.md` knowledge** (`session.md`, `<topic>-decisions-log.md`, docs). **Gitignore** `sessions/**/<kind>/` + mọi **binary/media** (ảnh/nhạc/video gen). Binary lớn ở canonical → cân nhắc size-gate/LFS, đừng nhồi history.
+- **Scrub secrets** (token/`.env` dán trong chat) **trước khi** ghi `session.md`/decisions-log và trước commit. Nên có pre-commit gitleaks/regex.
+
+**Bước PRESERVE (chạy ở *cả* wind-down lẫn handover, MUST):**
+1. **Ghi knowledge** (luôn, *không chặn*, không cần đợi user): `sessions/<date-slug-cXXXX>/session.md` (summary + biên bản). Scrub secrets trước.
+2. **Append decisions** chốt-trong-chat vào `docs/<topic>-decisions-log.md` (aggregated, không tạo file mới mỗi phiên).
+3. **Rà output chưa-tiêu-hoá** (*"phiên tạo gì CHƯA ở spec/src/rfc?"* — templates/prompts/samples/marketing/pm/data/reports/drafts) → cái đáng giữ bỏ vào canonical đúng nhất; lưỡng lự → tự chọn, *ưu tiên KHÔNG MẤT*. (Đây là *promote*; nháp đã ở `tmp/`.)
+4. **Promote official** (đã official + đã approve) → **MOVE** ra canonical + để **provenance stub** (relative link + 1 dòng what/when) trong session. Đã vào src/spec thì thôi.
+5. **Commit — OPT-IN, KHÔNG chặn wind-down:** user còn *active* → liệt kê thứ lưu + chỗ + message, confirm → commit (sensitive, cần admin/maintainer). User đã im/đi → **vẫn lưu đĩa (1–4), KHÔNG block chờ commit**; để uncommitted cho phiên sau. **KHÔNG push** trừ khi user bảo.
+
+> *Im lặng của user KHÔNG được làm mất knowledge* — bước 1 luôn ghi đĩa. `tmp/` không auto-xoá nên crash/đóng-đột-ngột vẫn còn nháp để cứu.
+
 ## Winding down a topic — "Chào và đóng topic" (MUST follow in order)
 
-When the user says **"Chào và đóng topic"** (or any clear variant: "đóng topic đi", "chào rồi đóng topic", "close & wrap this topic", "kết thúc topic này") for the convo you're handling, perform these **three steps IN ORDER** — none skipped:
+When the user says **"Chào và đóng topic"** (or any clear variant: "đóng topic đi", "chào rồi đóng topic", "close & wrap this topic", "kết thúc topic này") for the convo you're handling, perform these **four steps IN ORDER** — none skipped:
 
 > **Scope + role.** Only wind down / close **your OWN** topic (the convo you're handling, `--convo` = your `convoId`). Closing **another** agent's topic (a different `--convo`) is a sensitive lifecycle action — like `--kill` on a spawn — so only do it on an **admin/maintainer** request (see Roles & sensitive actions). Never close a sibling's topic just because you can reach it.
 
-1. **Post a closing summary** in the topic (`--convo <N>`): what was done, **state explicitly you will no longer listen here**, and **how to follow up** — open a *new topic* (a *different agent* may pick it up; if you produced docs/artifacts, say they're saved so whoever continues can resume without losing the thread). Address the people in the topic warmly.
+0. **PRESERVE first (MUST).** Run the **Bước PRESERVE** above (Folder structure & session archive) — write `session.md`, append the decisions-log, promote any un-digested official output — so nothing produced this session is lost when the topic closes. Save is non-blocking; commit is opt-in (don't stall the close waiting on a silent user).
+1. **Post a closing summary** in the topic (`--convo <N>`): what was done, **state explicitly you will no longer listen here**, and **how to follow up** — open a *new topic* (a *different agent* may pick it up; say where the saved `session.md`/artifacts are so whoever continues can resume without losing the thread). Address the people in the topic warmly.
 2. **Stop ALL listeners + scheduled wake-ups of this session.** `TaskStop` every Monitor/`tele-listen` task you started for this convo, and cancel/neutralise any scheduled nudge/auto-wake (e.g. a `ScheduleWakeup` loop) so nothing fires into the topic after you've said goodbye. Leaving a listener or nudge alive after "đóng topic" is a bug.
 3. **Close the topic** (reversible — Telegram keeps history, can be reopened):
    ```bash
