@@ -1,6 +1,7 @@
 {
   "_note": "Custom emoji IDs hợp lệ cho topicIcon.emoji (forum topic icon) — Bot API getForumTopicIconStickers, KHÔNG cần premium. Refresh: node scripts/refresh-topic-icons.mjs",
   "_assigned": {
+    "iw": "💼",
     "307": "👨‍👩‍👧‍👦",
     "luni": "🤖",
     "digesty-frontend": "🎨",
