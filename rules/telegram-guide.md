@@ -6,12 +6,12 @@
 
 ## Answer in the channel you were asked (MUST)
 
-Reply on the **SAME channel** the prompt arrived on — do **NOT** reflexively send everything to Telegram:
+Reply on the **SAME channel** the prompt arrived on — do **NOT** reflexively send everything to Telegram. Two cases:
 
-- Prompt arrived through the **listener** (`tele-listen` wrote a `prompt-convo-<id>.json`, or you picked it up via the Monitor/`--wait-once` loop) → it came from **Telegram** → reply with `send-telegram.mjs`.
-- Prompt typed **directly into the CLI** (the user spoke to you in the terminal; there is **no** `prompt-convo-<id>.json` for it) → reply **in the CLI** as normal text output, and **MUST NOT** send it to Telegram.
+- **Telegram (relayed):** the prompt came through the **listener** (`tele-listen` wrote a `prompt-convo-<id>.json`, picked up via the Monitor/`--wait-once` loop) → reply with `send-telegram.mjs`.
+- **The host interface (direct):** the user is talking to you **directly** through whatever client they're driving you with — terminal CLI, IDE extension (VS Code / JetBrains), the Claude/Codex desktop or web app, etc. There is **no** `prompt-convo-<id>.json` for it → just reply **normally in that same interface**, and **MUST NOT** push it to Telegram. ("CLI" is only the most common such host; the rule is the host channel, whatever it is.)
 
-**Quick tell:** no `prompt-convo-<id>.json` for the message ⇒ it's a CLI prompt ⇒ answer in the CLI. Mirroring a CLI question onto Telegram is wrong-channel noise and hard for the operator to follow. (Keep the Telegram listener alive regardless of which channel a given prompt came from — see "Listening for replies".)
+**Quick tell (channel-agnostic):** no `prompt-convo-<id>.json` for the message ⇒ it did **not** come from Telegram ⇒ answer it in the same host interface you received it in; don't mirror it to Telegram (wrong-channel noise, hard to follow). Keep the Telegram listener alive regardless — see "Listening for replies".
 
 ## When to use
 - Finished a task while user is away.
