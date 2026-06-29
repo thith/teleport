@@ -6,5 +6,6 @@
   "run":      { "run": "run.mjs",     "args": [],                "needsProject": true,  "minRole": "maintainer", "desc": "run a package.json script: /run <project> <script> [args]" },
   "whisper":  { "run": "whisper.mjs", "args": [],                "needsProject": false, "minRole": "admin",      "wantsReplyText": true, "desc": "discreet steer into a topic: /whisper #<hash> <text> (or reply to a previous whisper)" },
   "pending":  { "run": "pending.mjs", "args": [],                "needsProject": false, "minRole": "member",     "desc": "list convos waiting on an admin reply" },
+  "broadcast":{ "run": "broadcast.mjs","args": [],                "needsProject": false, "minRole": "admin",      "desc": "system message to ALL live topics: /broadcast [--chat <id>] <text>" },
   "start":    { "run": "start.mjs",   "args": [],                "needsProject": false, "minRole": "public",     "desc": "onboarding help" }
 }

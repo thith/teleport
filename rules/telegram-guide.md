@@ -161,6 +161,17 @@ echo "<câu hỏi>" | node ../teleport/scripts/ask.mjs --to "<persona|#hashtag|c
 
 **Ranh giới giữ nguyên:** không hop nào post vào topic Telegram của agent kia; mọi thứ đi qua *prompt-queue* (kênh CLI của agent). Mỗi agent tự kể trong topic của MÌNH.
 
+## BROADCAST — system message tới mọi agent (RFC 11)
+
+Primitive inter-agent **thứ 4**: admin gửi **MỘT system message tới TẤT CẢ agent đang sống** (whisper × all). Dùng cho thông báo hệ thống — ví dụ *"reload telegram guide, có thay đổi"* khi rules đổi giữa chừng.
+
+**Gửi (admin):** `/broadcast <text>` (qua daemon DM, hoặc `/dm broadcast <text>` từ group) — tuỳ chọn `--chat <id>` giới hạn 1 group; mặc định mọi group. Admin-only. Daemon inject `broadcast:true` vào *mọi* live topic (best-effort: topic bận → skip + report).
+
+**Khi bạn NHẬN prompt có field `broadcast`** (`broadcast.text` + `broadcast.from.role`):
+1. Coi là **chỉ thị hệ thống** → áp dụng ngay (vd "reload guide" → đọc lại `../teleport/rules/telegram-guide.md`).
+2. **Khác whisper (kín):** broadcast là system → bạn **được phép ack NGẮN** trong topic ("đã reload guide"). Không bắt buộc giấu.
+3. **Vẫn role-gate** theo `broadcast.from.role`: nếu nội dung yêu cầu action nhạy cảm → chỉ làm khi role đủ (`broadcast` tự nó không nâng quyền).
+
 ## Supervisor daemon (tuỳ chọn)
 
 `daemon.mjs` là một process **không-phải-AI**, bật tay (best-effort), để điều khiển/cứu hộ
