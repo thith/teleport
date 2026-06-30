@@ -308,42 +308,45 @@ export function formatSessionList(sessions) {
 
 /**
  * Resolve `--attach <raw>` against the LIVE sessions (convenience, RFC 03 follow-up):
- *  1. Exactly ONE live session → attach it (the id is optional / ignored — "nếu chỉ
- *     có 1 session thì bỏ qua ID").
- *  2. `raw` is a 3-char suffix → match sessions whose hashtag ENDS with it
+ *  1. NO id → attach iff exactly ONE session is live ("nếu chỉ có 1 thì bỏ qua ID").
+ *     With ≥2 → require an id.
+ *  2. `raw` is exactly 3 chars → an EXACT hashtag wins, else match the hashtag TAIL
  *     (`116` → `tele-c8630116`). 0 → not-found, 1 → attach, ≥2 → ambiguous (list).
  *  3. Otherwise → the full form (bare hashtag / `#hashtag` / `tele-name`), which must
- *     exist among the live sessions.
- * Pure → testable. Returns `{ ok, name, note? }` or `{ error }`.
+ *     exist among the live sessions (case-insensitive).
+ * A *given* id is always validated — a wrong id never silently attaches to the lone
+ * survivor. Pure → testable. Returns `{ ok, name }` or `{ error }`.
  */
 export function resolveAttachTarget(raw, sessions) {
-  if (!sessions.length) return { error: 'no live agent sessions (try: pnpm spawn:ls).' };
+  if (!sessions.length) return { error: 'no live agent sessions (try: spawn.mjs --list).' };
   const id = raw == null ? '' : String(raw).trim().replace(/^#/, '');
 
-  // (1) single session → attach it regardless of id
-  if (sessions.length === 1) {
-    const only = sessions[0];
-    const note = id && sessHashtag(only) !== id.toLowerCase() && !sessHashtag(only).endsWith(id.toLowerCase())
-      ? `only one live session (#${sessHashtag(only)}) — ignoring "${id}".`
-      : null;
-    return { ok: true, name: only.name, note };
+  // (1) NO id → attach iff exactly one session is live (the "nếu chỉ 1 thì bỏ qua
+  //     ID" case). With ≥2, require an id. A *given* id is always validated below —
+  //     a wrong id never silently lands you in the lone survivor.
+  if (!id) {
+    if (sessions.length === 1) return { ok: true, name: sessions[0].name };
+    return { error: `${sessions.length} live sessions — give an id (3-char tail or #hashtag): ${formatSessionList(sessions)}` };
   }
+  const lid = id.toLowerCase();
 
-  if (!id) return { error: `${sessions.length} live sessions — need an id (3-char suffix or #hashtag): ${formatSessionList(sessions)}` };
-
-  // (2) 3-char suffix shorthand
+  // (2) 3-char shorthand: an EXACT hashtag wins (e.g. Gemini `t12`), else match the
+  //     hashtag TAIL (`116` → `tele-c8630116`). ≥2 tail matches → ambiguous.
   if (/^[A-Za-z0-9]{3}$/.test(id)) {
-    const hits = sessions.filter((s) => sessHashtag(s).endsWith(id.toLowerCase()));
-    if (hits.length === 0) return { error: `no session ending in "${id}". live: ${formatSessionList(sessions)}` };
+    const exact = sessions.find((s) => sessHashtag(s) === lid);
+    if (exact) return { ok: true, name: exact.name };
+    const hits = sessions.filter((s) => sessHashtag(s).endsWith(lid));
+    if (hits.length === 0) return { error: `no session matching "${id}". live: ${formatSessionList(sessions)}` };
     if (hits.length > 1) return { error: `"${id}" matches ${hits.length} sessions (${formatSessionList(hits)}) — use the full #hashtag.` };
     return { ok: true, name: hits[0].name };
   }
 
-  // (3) full form → normalize + must exist
+  // (3) full form (bare / #/ tele- hashtag) → must exist among live sessions (case-insensitive).
   let name;
   try { name = normalizeSessionName(id); } catch (e) { return { error: e.message }; }
-  if (!sessions.some((s) => s.name === name)) return { error: `no live session "${name}". live: ${formatSessionList(sessions)}` };
-  return { ok: true, name };
+  const hit = sessions.find((s) => s.name.toLowerCase() === name.toLowerCase());
+  if (!hit) return { error: `no live session "${name}". live: ${formatSessionList(sessions)}` };
+  return { ok: true, name: hit.name };
 }
 
 /**
@@ -430,7 +433,7 @@ if (isDirectRun) {
     try { name = normalizeSessionName(kill.raw); }
     catch (e) { console.error(`[spawn] ${e.message}`); process.exit(1); }
     if (!screenSessionExists(name)) {
-      console.error(`[spawn] no screen session "${name}" (try: pnpm spawn:ls).`);
+      console.error(`[spawn] no screen session "${name}" (try: spawn.mjs --list). NB: --kill needs the FULL hashtag — the 3-char tail / no-id shortcuts are --attach only (destructive, so kill stays explicit).`);
       process.exit(1);
     }
     // Graceful: try claude's own /exit first, wait up to 10s, force-quit if stubborn.
@@ -457,7 +460,6 @@ if (isDirectRun) {
     const r = resolveAttachTarget(attach.raw, listSpawnSessions());
     if (r.error) { console.error(`[spawn] ${r.error}`); process.exit(1); }
     const name = r.name;
-    if (r.note) console.log(`[spawn] ${r.note}`);
     // Hand the TTY to screen. `-r` re-attaches; `-d -r` steals it back if the
     // session is already attached elsewhere (e.g. another terminal). stdio
     // 'inherit' gives screen the real pty; detach with Ctrl-A D to leave it

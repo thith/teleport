@@ -350,12 +350,33 @@ test('gracefulKill: already-gone session returns instantly (no pre-check sleep)'
 // ── resolveAttachTarget: 3-char suffix + single-session convenience ───────────
 const S = (h) => ({ pid: '1', name: `tele-${h}` });
 
-test('resolveAttachTarget: single live session → attach it (id optional)', () => {
+test('resolveAttachTarget: single live session, NO id → attach it', () => {
+  assert.deepEqual(resolveAttachTarget(null, [S('c8630116')]), { ok: true, name: 'tele-c8630116' });
+});
+
+test('resolveAttachTarget: single session + a WRONG id → error (no silent attach to lone survivor)', () => {
   const sess = [S('c8630116')];
-  assert.deepEqual(resolveAttachTarget(null, sess), { ok: true, name: 'tele-c8630116', note: null });
-  // even a non-matching id is ignored, with a note
-  const r = resolveAttachTarget('zzz', sess);
-  assert.equal(r.ok, true); assert.equal(r.name, 'tele-c8630116'); assert.match(r.note, /ignoring "zzz"/);
+  assert.ok(resolveAttachTarget('999', sess).error);          // 3-char, no match → error, not attach
+  assert.ok(resolveAttachTarget('deadbeef', sess).error);     // full form, no match → error
+  // but a CORRECT id on the lone session still attaches
+  assert.equal(resolveAttachTarget('116', sess).name, 'tele-c8630116');
+  assert.equal(resolveAttachTarget('c8630116', sess).name, 'tele-c8630116');
+});
+
+test('resolveAttachTarget: 3-char EXACT hashtag wins over a tail match (Gemini t12)', () => {
+  const sess = [S('t12'), S('foot12')];   // both end in "t12"; exact should pick tele-t12
+  assert.deepEqual(resolveAttachTarget('t12', sess), { ok: true, name: 'tele-t12' });
+});
+
+test('resolveAttachTarget: case-insensitive (suffix + full form)', () => {
+  const sess = [S('c8630116'), S('a1234999')];
+  assert.equal(resolveAttachTarget('116', sess).name, 'tele-c8630116');
+  assert.equal(resolveAttachTarget('A1234999', sess).name, 'tele-a1234999');  // upper full → matches lowercase session
+});
+
+test('resolveAttachTarget: 2-char id routes to full-form (not suffix) → not found', () => {
+  const r = resolveAttachTarget('11', [S('c8630116'), S('a1234999')]);
+  assert.ok(r.error); assert.match(r.error, /no live session "tele-11"/);
 });
 
 test('resolveAttachTarget: 3-char suffix matches the hashtag tail', () => {
@@ -375,7 +396,7 @@ test('resolveAttachTarget: ambiguous 3-char suffix → error listing matches', (
 
 test('resolveAttachTarget: 3-char suffix with no match → error', () => {
   const r = resolveAttachTarget('xyz', [S('c8630116'), S('a1234999')]);
-  assert.ok(r.error); assert.match(r.error, /no session ending in "xyz"/);
+  assert.ok(r.error); assert.match(r.error, /no session matching "xyz"/);
 });
 
 test('resolveAttachTarget: full hashtag/#/tele- still works among many', () => {
@@ -389,7 +410,7 @@ test('resolveAttachTarget: full hashtag/#/tele- still works among many', () => {
 test('resolveAttachTarget: no live sessions / multi + no id → errors', () => {
   assert.ok(resolveAttachTarget('116', []).error);
   const r = resolveAttachTarget(null, [S('c8630116'), S('a1234999')]);
-  assert.ok(r.error); assert.match(r.error, /need an id/);
+  assert.ok(r.error); assert.match(r.error, /give an id/);
 });
 
 test('formatSessionList: renders #hashtags', () => {

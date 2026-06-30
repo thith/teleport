@@ -61,7 +61,9 @@ When the user asks to **spawn / start / launch** a Claude agent — e.g. "spawn 
   may end the session. Interactive sessions only (headless has no pty). NB: an attach takes over
   the current terminal — don't run it from inside an agent's own automated flow.
 - **"kill / stop agent <id>"** → `node ../teleport/scripts/spawn.mjs --kill <id>` — `<id>` may be the bare hashtag
-  (`d1331668`), the Telegram form (`#d1331668`), or the full name (`tele-d1331668`); it's
+  (`d1331668`), the Telegram form (`#d1331668`), or the full name (`tele-d1331668`). **`--kill` needs the FULL
+  hashtag** — unlike `--attach`, it has **no** 3-char-tail / single-session shortcut (it's destructive, so a tail
+  typo or "there's only one, kill it" must never nuke the wrong agent). It's
   normalized then **gracefully** torn down: the helper types the agent's own `/exit`
   (clean CLI quit, flushes session — softer than a SIGHUP), waits up to **10s**, and only
   force-`quit`s if it's still "bướng" (e.g. busy mid-loop so `/exit` never reached an idle
