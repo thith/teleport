@@ -54,8 +54,10 @@ When the user asks to **spawn / start / launch** a Claude agent — e.g. "spawn 
   session + its topic hashtag).
 - **"attach / open / xem agent <id>"** → `node ../teleport/scripts/spawn.mjs --attach <id>` — re-attaches your terminal
   to that interactive `claude` session (it runs `screen -U -d -r tele-<id>`; `-U` = UTF-8 so
-  Vietnamese/multibyte output isn't garbled). Same `<id>` forms as
-  kill. **Detach with `Ctrl-A` then `D`** to leave the agent running; closing/`Ctrl-C` inside
+  Vietnamese/multibyte output isn't garbled). `<id>` accepts the **3-char hashtag tail** (`116` ⇒
+  `#c8630116`), a bare/`#`/`tele-` hashtag, or can be **omitted when only one session is live**
+  (it attaches that one); ≥2 sessions sharing the same 3-char tail → it errors and lists them.
+  **Detach with `Ctrl-A` then `D`** to leave the agent running; closing/`Ctrl-C` inside
   may end the session. Interactive sessions only (headless has no pty). NB: an attach takes over
   the current terminal — don't run it from inside an agent's own automated flow.
 - **"kill / stop agent <id>"** → `node ../teleport/scripts/spawn.mjs --kill <id>` — `<id>` may be the bare hashtag

@@ -299,6 +299,53 @@ export function resolveAttachId(argv) {
   return { found: true, raw: !raw || raw.startsWith('-') ? null : raw };
 }
 
+// The hashtag of a `tele-<hashtag>` session, lowercased (for suffix matching).
+const sessHashtag = (s) => String(s.name).replace(/^tele-/, '').toLowerCase();
+/** Render a session list as `#c8630116, #t1234` for error/help output. */
+export function formatSessionList(sessions) {
+  return sessions.map((s) => `#${sessHashtag(s)}`).join(', ');
+}
+
+/**
+ * Resolve `--attach <raw>` against the LIVE sessions (convenience, RFC 03 follow-up):
+ *  1. Exactly ONE live session → attach it (the id is optional / ignored — "nếu chỉ
+ *     có 1 session thì bỏ qua ID").
+ *  2. `raw` is a 3-char suffix → match sessions whose hashtag ENDS with it
+ *     (`116` → `tele-c8630116`). 0 → not-found, 1 → attach, ≥2 → ambiguous (list).
+ *  3. Otherwise → the full form (bare hashtag / `#hashtag` / `tele-name`), which must
+ *     exist among the live sessions.
+ * Pure → testable. Returns `{ ok, name, note? }` or `{ error }`.
+ */
+export function resolveAttachTarget(raw, sessions) {
+  if (!sessions.length) return { error: 'no live agent sessions (try: pnpm spawn:ls).' };
+  const id = raw == null ? '' : String(raw).trim().replace(/^#/, '');
+
+  // (1) single session → attach it regardless of id
+  if (sessions.length === 1) {
+    const only = sessions[0];
+    const note = id && sessHashtag(only) !== id.toLowerCase() && !sessHashtag(only).endsWith(id.toLowerCase())
+      ? `only one live session (#${sessHashtag(only)}) — ignoring "${id}".`
+      : null;
+    return { ok: true, name: only.name, note };
+  }
+
+  if (!id) return { error: `${sessions.length} live sessions — need an id (3-char suffix or #hashtag): ${formatSessionList(sessions)}` };
+
+  // (2) 3-char suffix shorthand
+  if (/^[A-Za-z0-9]{3}$/.test(id)) {
+    const hits = sessions.filter((s) => sessHashtag(s).endsWith(id.toLowerCase()));
+    if (hits.length === 0) return { error: `no session ending in "${id}". live: ${formatSessionList(sessions)}` };
+    if (hits.length > 1) return { error: `"${id}" matches ${hits.length} sessions (${formatSessionList(hits)}) — use the full #hashtag.` };
+    return { ok: true, name: hits[0].name };
+  }
+
+  // (3) full form → normalize + must exist
+  let name;
+  try { name = normalizeSessionName(id); } catch (e) { return { error: e.message }; }
+  if (!sessions.some((s) => s.name === name)) return { error: `no live session "${name}". live: ${formatSessionList(sessions)}` };
+  return { ok: true, name };
+}
+
 /**
  * Resolve the `--mode <permissionMode>` override from argv. Pure → testable.
  * - Absent → `DEFAULT_PERMISSION_MODE` ('auto').
@@ -400,18 +447,17 @@ if (isDirectRun) {
   }
 
   // --attach <id>: re-attach this terminal to a running agent's screen session.
-  // id may be `d1331668`, `#d1331668`, or `tele-d1331668` (same as --kill).
+  // id may be the 3-char hashtag tail (`116`), a bare/`#`/`tele-` hashtag, or OMITTED
+  // when only one session is live (see resolveAttachTarget). ≥2 suffix matches → error.
   const attach = resolveAttachId(argv);
   if (attach.found) {
-    if (!attach.raw) { console.error('[spawn] --attach needs an id, e.g. `pnpm spawn:attach d1331668` (or #d1331668 / tele-d1331668).'); process.exit(1); }
     if (!hasBinary('screen')) { console.error('[spawn] `screen` not found on PATH.'); process.exit(1); }
-    let name;
-    try { name = normalizeSessionName(attach.raw); }
-    catch (e) { console.error(`[spawn] ${e.message}`); process.exit(1); }
-    if (!screenSessionExists(name)) {
-      console.error(`[spawn] no screen session "${name}" (try: pnpm spawn:ls).`);
-      process.exit(1);
-    }
+    // Resolve against the live session list: a 3-char suffix (`116`) is enough, and
+    // when only ONE session is live the id is optional. ≥2 matches → ambiguous error.
+    const r = resolveAttachTarget(attach.raw, listSpawnSessions());
+    if (r.error) { console.error(`[spawn] ${r.error}`); process.exit(1); }
+    const name = r.name;
+    if (r.note) console.log(`[spawn] ${r.note}`);
     // Hand the TTY to screen. `-r` re-attaches; `-d -r` steals it back if the
     // session is already attached elsewhere (e.g. another terminal). stdio
     // 'inherit' gives screen the real pty; detach with Ctrl-A D to leave it

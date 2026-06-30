@@ -5,7 +5,7 @@ import path from 'node:path';
 // Isolate the persona pin store so `--list` persona mapping DERIVES instead of
 // reading machine-local pins (resolved at call-time from TELE_PERSONA_STORE).
 process.env.TELE_PERSONA_STORE = path.join(os.tmpdir(), `teleport-persona-store-spawn-${process.pid}.jsonl`);
-import { buildSpawnPlan, genSessionSeed, runSpawn, hasBinary, screenSessionExists, normalizeSessionName, parseScreenSessions, listSpawnSessions, resolveKillId, resolveAttachId, resolveMode, SPAWN_PROMPT, PERMISSION_MODES, DEFAULT_PERMISSION_MODE, personaByHashtag, gracefulKill, KILL_GRACE_MS } from './spawn.mjs';
+import { buildSpawnPlan, genSessionSeed, runSpawn, hasBinary, screenSessionExists, normalizeSessionName, parseScreenSessions, listSpawnSessions, resolveKillId, resolveAttachId, resolveAttachTarget, formatSessionList, resolveMode, SPAWN_PROMPT, PERMISSION_MODES, DEFAULT_PERMISSION_MODE, personaByHashtag, gracefulKill, KILL_GRACE_MS } from './spawn.mjs';
 import { uuidToConvoInt } from './convo-registry.mjs';
 import { shortConvoHash } from './convo-hash.mjs';
 import { personaForConvo } from './persona.mjs';
@@ -345,4 +345,53 @@ test('gracefulKill: already-gone session returns instantly (no pre-check sleep)'
   const r = await gracefulKill('tele-gone', { exec: () => {}, sleep: async () => { sleeps++; }, sessionExists: () => false, pollMs: 500, graceMs: 10000 });
   assert.deepEqual(r, { method: 'exit', killed: true });
   assert.equal(sleeps, 0); // checked before sleeping → zero delay
+});
+
+// ── resolveAttachTarget: 3-char suffix + single-session convenience ───────────
+const S = (h) => ({ pid: '1', name: `tele-${h}` });
+
+test('resolveAttachTarget: single live session → attach it (id optional)', () => {
+  const sess = [S('c8630116')];
+  assert.deepEqual(resolveAttachTarget(null, sess), { ok: true, name: 'tele-c8630116', note: null });
+  // even a non-matching id is ignored, with a note
+  const r = resolveAttachTarget('zzz', sess);
+  assert.equal(r.ok, true); assert.equal(r.name, 'tele-c8630116'); assert.match(r.note, /ignoring "zzz"/);
+});
+
+test('resolveAttachTarget: 3-char suffix matches the hashtag tail', () => {
+  const sess = [S('c8630116'), S('a1234999')];
+  const r = resolveAttachTarget('116', sess);
+  assert.deepEqual(r, { ok: true, name: 'tele-c8630116' });
+  assert.deepEqual(resolveAttachTarget('999', sess), { ok: true, name: 'tele-a1234999' });
+});
+
+test('resolveAttachTarget: ambiguous 3-char suffix → error listing matches', () => {
+  const sess = [S('c8630116'), S('a1234116')];   // both end in 116
+  const r = resolveAttachTarget('116', sess);
+  assert.ok(r.error);
+  assert.match(r.error, /matches 2 sessions/);
+  assert.match(r.error, /#c8630116/);
+});
+
+test('resolveAttachTarget: 3-char suffix with no match → error', () => {
+  const r = resolveAttachTarget('xyz', [S('c8630116'), S('a1234999')]);
+  assert.ok(r.error); assert.match(r.error, /no session ending in "xyz"/);
+});
+
+test('resolveAttachTarget: full hashtag/#/tele- still works among many', () => {
+  const sess = [S('c8630116'), S('a1234999')];
+  assert.equal(resolveAttachTarget('a1234999', sess).name, 'tele-a1234999');   // bare
+  assert.equal(resolveAttachTarget('#a1234999', sess).name, 'tele-a1234999');  // #
+  assert.equal(resolveAttachTarget('tele-a1234999', sess).name, 'tele-a1234999');
+  assert.ok(resolveAttachTarget('deadbeef', sess).error);                      // not live
+});
+
+test('resolveAttachTarget: no live sessions / multi + no id → errors', () => {
+  assert.ok(resolveAttachTarget('116', []).error);
+  const r = resolveAttachTarget(null, [S('c8630116'), S('a1234999')]);
+  assert.ok(r.error); assert.match(r.error, /need an id/);
+});
+
+test('formatSessionList: renders #hashtags', () => {
+  assert.equal(formatSessionList([S('c8630116'), S('t1234')]), '#c8630116, #t1234');
 });
