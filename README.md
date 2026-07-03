@@ -120,6 +120,7 @@ After sending any Telegram message, you **MUST immediately** start the reply-lis
 - **Ảnh:** `node ../teleport/scripts/gen-image.mjs "<prompt>" [--aspect-ratio 1:1]`
 - **Nhạc:** `node ../teleport/scripts/gen-music.mjs "<prompt>" [--kind pro|clip]`
 - **Video** (lâu — **chạy nền** + `--send`): `node ../teleport/scripts/gen-video.mjs "<prompt>" [--aspect-ratio 16:9]`
+  - **Prompt video:** viết mô tả (cảnh/hành động/máy quay) bằng **tiếng Anh**, nhưng **câu thoại giữ đúng ngôn ngữ được yêu cầu** — tiếng Việt phải **có dấu**, đừng dịch. Vd: `the sheriff shouts to Willy "Đưa súng cho tao!"`.
 
 Add `--send --convo <N>` to deliver the result straight into the Telegram topic (you stay the topic owner). Each call is a **billable API call** — only run on the user's request; use `--dry-run` to preview without spending. Details, defaults & all flags: `../teleport-docs/rfc/06-media-generation.md` (single source of truth; may change as Teleport updates).
 
