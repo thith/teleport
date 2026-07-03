@@ -6,6 +6,7 @@ import path from 'node:path';
 import {
   authHeaders, firstInlineData, firstAudioData, collectText, extFromMime,
   resolveOutPath, writeMediaFile, redact, debugDump, callGemini, parseMediaArgs, validateSend, loadGeminiKey,
+  mimeFromPath, encodeInlineImage,
 } from './media-common.mjs';
 
 test('extFromMime: known mimes + unknown → .bin', () => {
@@ -109,6 +110,45 @@ test('parseMediaArgs: missing value + unknown flag → errors', () => {
   const b = parseMediaArgs(['p', '--send=false'], { boolFlags: ['send'] });
   assert.ok(b.errors.some((e) => /--send takes no value/.test(e)));
   assert.equal(b.flags.send, undefined);
+});
+
+test('parseMediaArgs: multiFlags accumulate (repeatable), value/bool unaffected', () => {
+  const r = parseMediaArgs(['edit it', '--image', 'a.png', '--image', 'b.png', '--model', 'm'],
+    { valueFlags: ['model'], multiFlags: ['image'] });
+  assert.equal(r.prompt, 'edit it');
+  assert.deepEqual(r.flags.image, ['a.png', 'b.png']);
+  assert.equal(r.flags.model, 'm');
+  assert.deepEqual(r.errors, []);
+  // absent multiFlag → undefined (caller defaults to []), single use → 1-elem array
+  assert.equal(parseMediaArgs(['p'], { multiFlags: ['image'] }).flags.image, undefined);
+  assert.deepEqual(parseMediaArgs(['p', '--image=x.png'], { multiFlags: ['image'] }).flags.image, ['x.png']);
+  // a multiFlag still errors when its value is missing
+  assert.ok(parseMediaArgs(['p', '--image'], { multiFlags: ['image'] }).errors.some((e) => /--image needs a value/.test(e)));
+});
+
+test('parseMediaArgs: aliases canonicalize in place (order preserved for multiFlags)', () => {
+  const r = parseMediaArgs(['p', '--ref', 'a', '--image', 'b'],
+    { multiFlags: ['image'], aliases: { ref: 'image' } });
+  assert.deepEqual(r.flags.image, ['a', 'b']); // CLI order, not image-then-ref
+  assert.equal(r.flags.ref, undefined);
+});
+
+test('mimeFromPath: ext → image mime, canonical jpeg, default fallback', () => {
+  assert.equal(mimeFromPath('a.png'), 'image/png');
+  assert.equal(mimeFromPath('/x/y.JPG'), 'image/jpeg');
+  assert.equal(mimeFromPath('z.jpeg'), 'image/jpeg');
+  assert.equal(mimeFromPath('w.webp'), 'image/webp');
+  assert.equal(mimeFromPath('noext'), 'image/jpeg'); // fallback
+});
+
+test('encodeInlineImage: reads file → inlineData part (base64 + mime)', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'enc-'));
+  const p = path.join(dir, 'pic.png');
+  fs.writeFileSync(p, Buffer.from('hello'));
+  const part = encodeInlineImage(p);
+  assert.equal(part.inlineData.mimeType, 'image/png');
+  assert.equal(Buffer.from(part.inlineData.data, 'base64').toString(), 'hello');
+  fs.rmSync(dir, { recursive: true, force: true });
 });
 
 test('validateSend: --send requires --convo', () => {

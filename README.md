@@ -114,15 +114,9 @@ After sending any Telegram message, you **MUST immediately** start the reply-lis
 
 **WHENEVER** the user asks to start / launch / run the teleport **daemon** (the supervisor / control plane that lets you steer & recover from Telegram even when every agent has died) — e.g. "start the daemon", "launch the daemon", "run the daemon", "chạy daemon", "bật daemon", "khởi động daemon" — **or any similar phrasing in any language** — you **MUST** read `../teleport/rules/telegram-guide.md` section "Supervisor daemon" and follow it (run it from a project root). The trigger word is **"daemon"** specifically — "start an agent" *without* "daemon" is a spawn (above), not this. Starting the daemon is a **sensitive admin/maintainer action** (like spawning). Do **NOT** rely on invocation details from this snippet; the guide is the single source of truth.
 
-## Tạo media — ảnh / nhạc / video
+## Tạo media — ảnh / nhạc / video (+ sửa ảnh)
 
-**WHENEVER** the user asks to create / draw / generate an **image, music, or video** — e.g. "vẽ ảnh", "tạo nhạc", "làm video", "draw/generate an image", "make a song/clip/video" — **or any similar phrasing in any language** — agents don't produce media natively, so use the centralized **teleport** scripts (Gemini REST, key from `../teleport/.env`):
-- **Ảnh:** `node ../teleport/scripts/gen-image.mjs "<prompt>" [--aspect-ratio 1:1]`
-- **Nhạc:** `node ../teleport/scripts/gen-music.mjs "<prompt>" [--kind pro|clip]`
-- **Video** (lâu — **chạy nền** + `--send`): `node ../teleport/scripts/gen-video.mjs "<prompt>" [--aspect-ratio 16:9]`
-  - **Prompt video:** viết mô tả (cảnh/hành động/máy quay) bằng **tiếng Anh**, nhưng **câu thoại giữ đúng ngôn ngữ được yêu cầu** — tiếng Việt phải **có dấu**, đừng dịch. Vd: `the sheriff shouts to Willy "Đưa súng cho tao!"`.
-
-Add `--send --convo <N>` to deliver the result straight into the Telegram topic (you stay the topic owner). Each call is a **billable API call** — only run on the user's request; use `--dry-run` to preview without spending. Details, defaults & all flags: `../teleport-docs/rfc/06-media-generation.md` (single source of truth; may change as Teleport updates).
+**WHENEVER** the user asks to create / draw / generate — or **edit** — an **image, music, or video** — e.g. "vẽ ảnh", "sửa ảnh", "tạo nhạc", "làm video", "draw/generate/edit an image", "make a song/clip/video" — **or any similar phrasing in any language** — agents don't produce media natively, so you **MUST** read `../teleport/rules/media-guide.md` and follow it. It is the single source of truth: the three scripts `gen-{image,music,video}.mjs` (Gemini, key from `../teleport/.env`), all flags, `--send --convo <N>` delivery, and safety. Two things worth remembering here: **image editing** uses `gen-image.mjs --image <path>` (repeatable); and for **video**, write the description in English but keep **dialogue in the requested language** (Vietnamese with diacritics — `the sheriff shouts to Willy "Đưa súng cho tao!"`). Each call is a **billable API call** — only run on the user's request; `--dry-run` previews without spending. Do **NOT** rely on invocation details from this snippet; the guide is the single source of truth.
 
 ## Slides / pitch deck
 

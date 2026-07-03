@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { parseImageArgs, buildImageRequest, ASPECT_RATIOS } from './gen-image.mjs';
+import { parseImageArgs, buildImageRequest, previewBody, ASPECT_RATIOS } from './gen-image.mjs';
 import { parseMusicArgs, buildMusicRequest, MUSIC_MODEL_FOR_KIND } from './gen-music.mjs';
 import {
   parseVideoArgs, buildVideoRequest, operationUrl, videoUriFromOperation, pollOperation,
@@ -25,6 +25,54 @@ test('gen-image: invalid aspect ratio + missing prompt + send-needs-convo', () =
   assert.ok(parseImageArgs(['p', '--send']).errors.some((e) => /--send requires --convo/.test(e)));
   assert.ok(ASPECT_RATIOS.includes('16:9'));
   assert.deepEqual(parseImageArgs(['p', '--aspect-ratio', '16:9', '--send', '--convo', '9']).errors, []);
+});
+
+// ---- gen-image EDIT (input images) ----
+test('gen-image edit: --image (repeatable) + --ref alias collect into images[]', () => {
+  const a = parseImageArgs(['add a hat', '--image', 'a.png', '--image', 'b.png', '--ref', 'c.png']);
+  assert.deepEqual(a.images, ['a.png', 'b.png', 'c.png']);
+  assert.deepEqual(a.errors, []);
+});
+
+test('gen-image edit: --ref alias preserves interleaved CLI order (not image-then-ref)', () => {
+  // --ref canonicalizes to --image IN PLACE, so order follows the command line.
+  assert.deepEqual(parseImageArgs(['x', '--ref', 'a.png', '--image', 'b.png']).images, ['a.png', 'b.png']);
+});
+
+test('gen-image: previewBody redacts inlineData base64 without mutating the source', () => {
+  const body = { contents: [{ parts: [{ inlineData: { mimeType: 'image/png', data: 'QUJDRA==' } }, { text: 'hi' }] }], generationConfig: {} };
+  const preview = previewBody(body);
+  assert.match(preview.contents[0].parts[0].inlineData.data, /^<base64 \d+ chars>$/);
+  assert.equal(preview.contents[0].parts[1].text, 'hi');
+  // original untouched (the real API request must still carry full bytes)
+  assert.equal(body.contents[0].parts[0].inlineData.data, 'QUJDRA==');
+});
+
+test('gen-image edit: aspect preserved (null) unless --aspect-ratio given', () => {
+  // editing without explicit ratio → aspectRatio null → NO imageConfig in body
+  const edit = parseImageArgs(['x', '--image', 'a.png']);
+  assert.equal(edit.aspectRatio, null);
+  const b1 = buildImageRequest({ ...edit, images: [{ inlineData: { mimeType: 'image/png', data: 'ZZ' } }] });
+  assert.equal(b1.body.generationConfig.imageConfig, undefined);
+  assert.deepEqual(b1.body.generationConfig.responseModalities, ['IMAGE']);
+  // explicit ratio while editing → honored
+  const edit2 = parseImageArgs(['x', '--image', 'a.png', '--aspect-ratio', '4:5']);
+  assert.equal(edit2.aspectRatio, '4:5');
+  // pure text-gen still defaults 1:1
+  assert.equal(parseImageArgs(['x']).aspectRatio, '1:1');
+});
+
+test('gen-image edit: buildImageRequest prepends inlineData parts before text', () => {
+  const images = [
+    { inlineData: { mimeType: 'image/png', data: 'AA' } },
+    { inlineData: { mimeType: 'image/jpeg', data: 'BB' } },
+  ];
+  const { body } = buildImageRequest({ prompt: 'merge them', model: 'm', aspectRatio: null, images });
+  const parts = body.contents[0].parts;
+  assert.equal(parts.length, 3);
+  assert.equal(parts[0].inlineData.mimeType, 'image/png');
+  assert.equal(parts[1].inlineData.mimeType, 'image/jpeg');
+  assert.equal(parts[2].text, 'merge them'); // text part last
 });
 
 // ---- gen-music ----

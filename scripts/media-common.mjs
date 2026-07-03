@@ -90,6 +90,22 @@ export function extFromMime(mime, fallback = '.bin') {
   return fallback;
 }
 
+// path extension → image mime, for INPUT images passed to an edit request. The
+// reverse of MIME_EXT (which is output-side); canonical choice per ext so
+// `.jpg`/`.jpeg` both → image/jpeg. Unknown ext → image/jpeg (Gemini sniffs the
+// bytes anyway; the declared mime is a hint).
+const IMAGE_MIME_BY_EXT = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp' };
+export function mimeFromPath(p) {
+  return IMAGE_MIME_BY_EXT[path.extname(String(p || '')).toLowerCase()] || 'image/jpeg';
+}
+
+/** Read a local image → a Gemini `inlineData` request part (base64 + mime). Used
+ *  to pass input images into an edit request (gen-image --image). */
+export function encodeInlineImage(p) {
+  const data = fs.readFileSync(p).toString('base64');
+  return { inlineData: { mimeType: mimeFromPath(p), data } };
+}
+
 /** Output path: honors --out, else tmp/tele-media/<kind>-<random><ext>. The random
  *  suffix (not a timestamp) avoids collisions between concurrent calls. */
 export function resolveOutPath(kind, ext, outFlag, { dir = MEDIA_DIR, rand = () => crypto.randomBytes(5).toString('hex') } = {}) {
@@ -160,8 +176,8 @@ export function deliverToTelegram(filePath, convo, caption = '') {
  * Supports `--flag value` and `--flag=value`. Returns { prompt, flags, errors }.
  * boolFlags take no value; valueFlags require one (missing/flag-looking → error).
  */
-export function parseMediaArgs(argv, { valueFlags = [], boolFlags = [] } = {}) {
-  const vf = new Set(valueFlags), bf = new Set(boolFlags);
+export function parseMediaArgs(argv, { valueFlags = [], boolFlags = [], multiFlags = [], aliases = {} } = {}) {
+  const vf = new Set(valueFlags), bf = new Set(boolFlags), mf = new Set(multiFlags);
   const flags = {}; let prompt = null; const errors = [];
   for (let i = 0; i < argv.length; i++) {
     const tok = argv[i];
@@ -169,19 +185,25 @@ export function parseMediaArgs(argv, { valueFlags = [], boolFlags = [] } = {}) {
       let name = tok.slice(2), val;
       const eq = name.indexOf('=');
       if (eq !== -1) { val = name.slice(eq + 1); name = name.slice(0, eq); }
+      // Canonicalize aliases BEFORE dispatch so an alias writes into its target's
+      // slot — a repeatable alias (e.g. --ref → --image) then preserves CLI order.
+      if (Object.prototype.hasOwnProperty.call(aliases, name)) name = aliases[name];
       if (bf.has(name)) {
         // A bool flag takes NO value; reject `--send=false` rather than silently
         // treating it as true (which would surprise the caller).
         if (val !== undefined) { errors.push(`--${name} takes no value (got --${name}=${val})`); continue; }
         flags[name] = true; continue;
       }
-      if (vf.has(name)) {
+      if (vf.has(name) || mf.has(name)) {
         if (val === undefined) {
           const next = argv[i + 1];
           if (next === undefined || next.startsWith('-')) { errors.push(`--${name} needs a value`); continue; }
           val = next; i++;
         }
-        flags[name] = val; continue;
+        // multiFlags accumulate into an array (repeatable, e.g. --image a --image b);
+        // valueFlags keep last-wins single-value semantics.
+        if (mf.has(name)) { (flags[name] ??= []).push(val); } else { flags[name] = val; }
+        continue;
       }
       errors.push(`unknown flag --${name}`); continue;
     }
