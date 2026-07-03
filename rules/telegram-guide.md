@@ -16,6 +16,7 @@ A prompt reaches you on one of two channels — **answer on the same one**, don'
 **Carve-outs:**
 - **Inter-agent primitives** (`whisper`, `handover`, `ask`/`askReply`, `broadcast`) also arrive as prompt-files but are **NOT** answered with a plain Telegram reply — each has its own routing (whisper = discreet; `ask` → `ask.mjs --reply`; broadcast → apply + brief ack; handover → adopt). This channel rule is about **normal relayed user messages** only; for the primitives follow their own sections below.
 - **Explicit send is fine.** If a *host* user explicitly asks you to send something to Telegram (a report, a file), do it — the rule only forbids *reflexively mirroring* a host reply, not an instructed send. Proactive Telegram reports (task finished while the user is away) are likewise unaffected.
+- **DM to the owner** (`--dm`) is a deliberate *change of recipient*: when an admin/maintainer explicitly says "DM cho admin / DM me …", route to the owner's private chat instead of the topic — see "DM cho admin (RFC 12)".
 - The "listen after every send" obligation attaches to **Telegram-originated** convos, not host sessions.
 
 ## When to use
@@ -191,6 +192,48 @@ Primitive inter-agent **thứ 4**: admin gửi **MỘT system message tới TẤ
 1. Coi là **chỉ thị hệ thống** → áp dụng ngay (vd "reload guide" → đọc lại `../teleport/rules/telegram-guide.md`).
 2. **Khác whisper (kín):** broadcast là system → bạn **được phép ack NGẮN** trong topic ("đã reload guide"). Không bắt buộc giấu.
 3. **Vẫn role-gate** theo `broadcast.from.role`: nếu nội dung yêu cầu action nhạy cảm → chỉ làm khi role đủ (`broadcast` tự nó không nâng quyền).
+
+## DM cho admin — đẩy riêng cho owner (RFC 12)
+
+Mặc định mọi thứ bạn gửi đi vào **group topic**. Đôi khi user muốn bạn **DM riêng cho admin**
+(vd *"DM cho admin file abc"*, *"gửi riêng cho admin/owner"*, *"nhắn riêng owner"*, *"DM me the
+summary"* — **hoặc bất kỳ cách nói nào cùng ý, ở bất kỳ ngôn ngữ nào**). Đây là kênh **một
+chiều agent→admin** để *đẩy* nội dung/nhạy cảm, KHÔNG lộ ra group.
+
+> **`--dm` (RFC 12) ≠ `/dm <cmd>` (RFC 08).** `--dm` = *agent đẩy* một message tới owner. `/dm`
+> = *owner điều khiển daemon* từ group (chiều ngược lại). Đừng nhầm.
+> **"DM cho tôi" = DM cho owner** (`daemonUserId`), KHÔNG phải người đang gõ — v1 chỉ tới owner.
+
+**Gọi (chạy từ project root):**
+```bash
+# text
+node ../teleport/scripts/send-telegram.mjs --dm "<nội dung>"
+# file (kèm caption tuỳ chọn)
+node ../teleport/scripts/send-telegram.mjs --dm --file <path> "<caption>"
+```
+- **Đích = owner** (`_config.daemonUserId` = user id của admin, đồng thời là DM chat id vì trong
+  chat riêng `chat.id === user id`). v1 **chỉ DM được owner** (người có quyền chạy daemon) — không
+  DM tới admin khác trong roster.
+- `--dm` **bỏ qua toàn bộ topic machinery** (không convo/persona/hashtag/git-footer), không ghi
+  sent-registry. Text quá dài → tự thành file `.md` (như send thường).
+
+**MUST khi xử lý yêu cầu DM:**
+1. **Role-gate — chỉ `admin`/`maintainer`** (`fromRole` của prompt) mới được DM cho admin. Member
+   xin "DM cho admin X" → **từ chối** (mời họ nói thẳng trong topic); đừng biến bot thành kênh
+   spam riêng cho owner. **Script KHÔNG tự kiểm role** (nó không biết `fromRole`) — gate là việc
+   của BẠN. (Đây là ngoại lệ có chủ đích của rule *[[feedback-answer-channel]]* — user ở topic bảo
+   "DM" là **chỉ thị đổi kênh rõ ràng**, cứ đẩy sang DM.)
+2. **Một chiều (push).** Nếu owner **trả lời** trong DM, reply rơi vào **lane của daemon**, KHÔNG
+   quay về listener topic của bạn. Nên **đừng ngồi chờ reply trong topic**; DM ≠ kênh hỏi-đáp
+   (Q&A đã có [[whisper]]/daemon). Muốn owner steer lại → họ dùng whisper/`/dm`. `--dm` **không tự
+   mở listen cycle** — cứ tiếp tục listen trên topic của bạn như thường.
+3. **Ack đúng kênh** (theo *[[feedback-answer-channel]]*). Xác nhận NGẮN "đã DM cho admin <cái
+   gì>" (*không* lộ nội dung) **ở đúng kênh prompt tới**: yêu cầu qua **CLI/host** → ack ở CLI;
+   yêu cầu trong **topic Telegram** → ack ở topic đó. Nội dung vẫn đi riêng vào DM (đó là điểm
+   của `--dm`). Nếu user bảo "DM **kín**" / "đừng báo" → im hoàn toàn (như whisper).
+4. **Telegram constraint.** Bot **không tự mở DM** được — owner phải đã `/start` bot (và không
+   block). Nếu script trả lỗi 403 (`can't initiate conversation`/`Forbidden`) → báo user "admin
+   chưa mở chat riêng với bot", đừng coi là đã gửi.
 
 ## Supervisor daemon (tuỳ chọn)
 
@@ -545,6 +588,7 @@ Do the steps in this order: summary first (while the topic is still open), then 
 - `--plain` — send as plain text without Markdown parsing.
 - `--raw` — send pre-escaped MarkdownV2 text.
 - `--react <messageId>` — react 👍 to a message.
+- `--dm` — **private-DM the admin** (owner = `_config.daemonUserId`) instead of the group topic. Works with a text arg/stdin or `--file`. One-way push; bypasses all topic/convo machinery. Mutually exclusive with `--convo`/`--react`/`--close-topic`/`--gc-topics`. See "DM cho admin (RFC 12)". Exits non-zero on failure (incl. 403 when the admin hasn't `/start`ed the bot).
 - `--gc-topics` — close every topic idle past TTL (`TELE_TOPIC_TTL_H`, default 48h) across all admin chats. Reversible; intended for cron.
 - `--close-topic` — close ONE topic on demand: the topic of `--convo <N>` (required), across every admin chat that has it mapped. Reversible. Exits **non-zero** if any close failed (vs an idempotent no-op when the convo has no topic). Used by the "Chào và đóng topic" wind-down above.
 

@@ -37,7 +37,7 @@ import {
 import { CONVO_HASH_LONG_LEN, shortConvoHash as _shortConvoHash } from './convo-hash.mjs';
 import { formatPersona } from './persona.mjs';
 import { resolvePersonaInGroup, peekPersona } from './persona-store.mjs';
-import { readProjectsConfig, resolveProjectConfig, adminIdsFrom, resolveDefaultChatId } from './projects-config.mjs';
+import { readProjectsConfig, resolveProjectConfig, adminIdsFrom, resolveDefaultChatId, resolveDaemonUserId, assertChatIdKind } from './projects-config.mjs';
 
 // Re-export so existing imports of `shortConvoHash` from send-telegram keep
 // working. Logic now lives in convo-hash.mjs (leaf, no circular deps).
@@ -206,7 +206,7 @@ export async function postReaction(token, chatId, messageId, emoji = '👍') {
 }
 
 export function parseArgs(argv) {
-  const result = { filePath: null, positional: [], raw: false, plain: false, replyTo: null, react: null, convo: null, gcTopics: false, closeTopic: false };
+  const result = { filePath: null, positional: [], raw: false, plain: false, replyTo: null, react: null, convo: null, gcTopics: false, closeTopic: false, dm: false };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === '--convo') {
@@ -245,11 +245,16 @@ export function parseArgs(argv) {
     if (arg === '--plain') { result.plain = true; continue; }
     if (arg === '--gc-topics') { result.gcTopics = true; continue; }
     if (arg === '--close-topic') { result.closeTopic = true; continue; }
+    if (arg === '--dm') { result.dm = true; continue; }
     // (mutual exclusion validated after the loop so order doesn't matter)
     if (arg.startsWith('--')) throw new Error(`Unknown flag: ${arg}`);
     result.positional.push(arg);
   }
   if (result.raw && result.plain) throw new Error('--raw and --plain are mutually exclusive');
+  // --dm is a private push to the admin (no convo/topic), so it can't combine
+  // with the group/topic-scoped operations. Text/file/plain/raw are fine.
+  if (result.dm && (result.gcTopics || result.closeTopic || result.react != null || result.convo != null || result.replyTo != null))
+    throw new Error('--dm cannot be combined with --gc-topics / --close-topic / --react / --convo / --reply-to (a DM has no topic/convo to reply into)');
   return result;
 }
 
@@ -1266,6 +1271,14 @@ async function sendDocumentToAdmin(token, chatId, filePath, caption, opts) {
   throw new Error(desc);
 }
 
+// A bot cannot open a DM first: Telegram returns a 403 (or "chat not found")
+// when the target user hasn't pressed /start (or has blocked the bot). Detect
+// those so the --dm branch can surface an actionable hint instead of a raw API
+// error. Exported for unit testing (the strings are English + Telegram-specific).
+export function isDmUnreachableError(desc) {
+  return /can't initiate conversation|can’t initiate conversation|bot was blocked|chat not found|Forbidden/i.test(String(desc ?? ''));
+}
+
 async function main() {
   const envFromFile = loadEnvFromFile(ENV_FILE);
   const token = process.env.REPORT_BOT_TOKEN || envFromFile.REPORT_BOT_TOKEN;
@@ -1297,16 +1310,20 @@ async function main() {
     console.error('Missing REPORT_BOT_TOKEN in .env or process env.');
     process.exit(1);
   }
-  if (adminIds.length === 0) {
-    console.error(`[send-telegram] project "${lookupKey}" chưa cấu hình group: thêm "${lookupKey}".chatId vào teleport/projects.json, hoặc đặt _default.chatId trong projects.json (shared catch-all).`);
-    process.exit(1);
-  }
 
   let args;
   try {
     args = parseArgs(process.argv.slice(2));
   } catch (error) {
     console.error(`[send-telegram] ${error.message}`);
+    process.exit(1);
+  }
+
+  // A group target is required for every path EXCEPT --dm (which pushes to the
+  // owner's private chat and never touches the group). Gate the group-config
+  // fail-fast on !args.dm so a DM works even in a project with no group mapped.
+  if (!args.dm && adminIds.length === 0) {
+    console.error(`[send-telegram] project "${lookupKey}" chưa cấu hình group: thêm "${lookupKey}".chatId vào teleport/projects.json, hoặc đặt _default.chatId trong projects.json (shared catch-all).`);
     process.exit(1);
   }
 
@@ -1402,6 +1419,62 @@ async function main() {
     // Fail loud: a caller/agent scripting the wind-down must be able to detect a
     // close that didn't happen (vs the "absent" idempotent no-op, which is ok).
     if (failed > 0) process.exit(1);
+    return;
+  }
+
+  // DM the admin directly (RFC 12) — a PRIVATE push to the owner instead of the
+  // group topic. Used when the user says "DM cho admin …" / "DM me file abc".
+  // Deliberately bypasses ALL topic machinery: no convo id, no persona, no
+  // hashtag, no git footer, no sent-registry — a DM is not a convo, and NOT
+  // registering it keeps the agent's topic listener from mis-associating a DM
+  // reply (DM replies belong to the daemon lane, not this agent). One-way push.
+  if (args.dm) {
+    // Target = the owner's private chat id. In a private DM chat.id === user id,
+    // so `_config.daemonUserId` (the daemon owner = "admin who can run the
+    // daemon") doubles as the DM chat id. v1 targets this single owner only.
+    const dmChatId = resolveDaemonUserId(projectsConfig, { env: process.env, envFile: envFromFile });
+    if (!dmChatId) {
+      console.error('[send-telegram] --dm needs an admin DM target: set `_config.daemonUserId` in teleport/projects.json (the owner\'s Telegram user id = their private chat id).');
+      process.exit(1);
+    }
+    try {
+      assertChatIdKind(dmChatId, 'private', '_config.daemonUserId');
+    } catch (e) {
+      console.error(`[send-telegram] ${e instanceof Error ? e.message : String(e)}`);
+      process.exit(1);
+    }
+    // messageThreadId: null → lands in the private chat root, never a topic.
+    const dmOpts = { raw: args.raw, plain: args.plain, replyTo: null, messageThreadId: null };
+    try {
+      let messageId;
+      if (args.filePath) {
+        if (!fs.existsSync(args.filePath)) {
+          console.error(`[send-telegram] file not found: ${args.filePath}`);
+          process.exit(1);
+        }
+        const caption = args.positional.join('\n').trim() || readStdinIfPiped().trim() || '';
+        ({ messageId } = await sendDocumentToAdmin(token, dmChatId, args.filePath, caption, dmOpts));
+        console.log(`[send-telegram] DM document sent to admin ${dmChatId}${messageId ? ` (messageId: ${messageId})` : ''}`);
+      } else {
+        const text = (args.positional.join(' ').trim() || readStdinIfPiped()).trim();
+        if (!text) {
+          console.error('[send-telegram] --dm requires message text (positional or stdin) or --file <path>');
+          process.exit(1);
+        }
+        ({ messageId } = await sendTextToAdmin(token, dmChatId, text, dmOpts));
+        console.log(`[send-telegram] DM sent to admin ${dmChatId}${messageId ? ` (messageId: ${messageId})` : ''}`);
+      }
+    } catch (error) {
+      const scrubbed = scrubToken(error instanceof Error ? error.message : String(error), token);
+      // A bot cannot open a DM first: the admin must have /started the bot (or
+      // not blocked it). Surface that actionable hint instead of a raw 403.
+      if (isDmUnreachableError(scrubbed)) {
+        console.error(`[send-telegram] DM to admin ${dmChatId} failed: ${scrubbed}\n  → The admin must open a private chat with the bot and press /start first (a bot cannot initiate a DM), and must not have blocked it.`);
+      } else {
+        console.error(`[send-telegram] DM to admin ${dmChatId} failed: ${scrubbed}`);
+      }
+      process.exit(1);
+    }
     return;
   }
 
@@ -1529,6 +1602,8 @@ async function main() {
         '  --raw "<text>"          pre-escaped MdV2, no extra escaping\n' +
         '  --plain "<text>"        plain text, no markdown parsing\n' +
         '  --file <path> [caption] send file as document\n' +
+        '  --dm "<text>"           private-DM the admin (owner) instead of the group topic\n' +
+        '  --dm --file <path>      DM a file to the admin\n' +
         '  (or pipe via stdin)',
     );
     process.exit(1);
