@@ -149,10 +149,12 @@ It's driven by **one owner user** (`_config.daemonUserId`) and is a thin, **regi
 | `/kill <id>` | maintainer | kill an agent by id/hashtag |
 | `/ls` | member | list running agents |
 | `/run <project> <script> [args]` | maintainer | run a `package.json` script — auto-detects npm/pnpm/yarn, validates the script, runs `<pm> run <script> -- <args>` (remote exec) |
-| `/whisper #<hash> <text>` | admin | discreet steer into a topic (also accepts a persona name or convoId as the target) |
-| `/instruct #<hash> <text>` | admin | official *private* instruction to a topic — nothing hits the group; the agent replies to you via DM (reply to continue) |
+| `/whisper #<hash> <text>` | admin | discreet steer into a topic (also accepts a persona name or convoId as the target) — alias `/w` |
+| `/instruct #<hash> <text>` | admin | official *private* instruction to a topic — nothing hits the group; the agent replies to you via DM (reply to continue) — alias `/i` |
 | `/pending` | member | convos waiting on an admin reply |
 | `/start` | public | onboarding help |
+
+A command can also be a **short alias** of another: `{ "w": { "alias": "whisper" } }` in `commands.json` (or a per-deployment `_commands` override) makes `/w` run `/whisper` with the *target's* script, `minRole`, and reply behaviour — the alias adds only the short name and can't weaken the gate. `/w`→`/whisper` and `/i`→`/instruct` ship by default.
 
 When `needsProject` is set (spawn/headless/run), the **first positional token is the folder**; remaining tokens are the script's args (quote-aware, so `--grep "a b"` is one arg). Plus the heartbeat auto-reminder (which now lives **only** here, moved out of the agent listeners). It "harvests" Telegram updates into the *same* shared cache the agent listeners use (cooperative, no offset war); the daemon processes only the **owner's** messages (`from.id === daemonUserId`) — both the owner's private DM and any `/dm <cmd>` typed inside a group topic.
 

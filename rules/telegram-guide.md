@@ -266,7 +266,8 @@ node ../teleport/scripts/send-telegram.mjs --dm --file <path> "<caption>"
 `daemon.mjs` là một process **không-phải-AI**, bật tay (best-effort), để điều khiển/cứu hộ
 từ xa **kể cả khi mọi agent đã chết** (quota/network). Nó nghe một **private DM**
 (`DAEMON_CHAT_ID`) và xử lý lệnh: `/spawn <project>`, `/run <project> <script> [args]`,
-`/whisper topic:#<hash> <text>`, `/pending`, `/start`, cùng **heartbeat auto-reminder** (đã
+`/whisper #<hash> <text>` (alias `/w`), `/instruct #<hash> <text>` (alias `/i`, agent trả lời
+qua DM), `/pending`, `/start`, cùng **heartbeat auto-reminder** (đã
 chuyển từ tele-listen sang đây — nên **khi daemon KHÔNG chạy thì sẽ không có reminder/`/pending`**).
 `/run` tự detect npm/pnpm/yarn của project, validate script trong package.json, rồi chạy
 `<pm> run <script>` (chỉ admin/maintainer — remote exec).
