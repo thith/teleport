@@ -3,6 +3,7 @@
 // extended/overridden per-deployment via `projects.json._commands`. Each command
 // maps a name → a teleport script the daemon runs:
 //   { run: "<script>.mjs", args?: [...], needsProject?: bool, minRole?: role, desc?: str }
+// A short alias for another command is `{ alias: "<name>" }` (e.g. `/w` → `/whisper`).
 // The daemon is a thin, generic dispatcher: parse `/<cmd> [project] [args]`, gate
 // by minRole, run `node scripts/<run> [...args]` (cwd = the project when
 // needsProject), relay the script's stdout. Adding a command = a JSON entry + a
@@ -44,6 +45,18 @@ export function resolveCommand(name, registry) {
   // `/constructor`) must never resolve to a prototype value.
   const c = (registry && Object.prototype.hasOwnProperty.call(registry, name)) ? registry[name] : null;
   if (!c || typeof c !== 'object') return null;
+  // Alias — `{ "w": { "alias": "whisper" } }` maps a short name onto another
+  // command; the alias carries nothing of its own, everything comes from the
+  // target. Resolve exactly ONE hop: the target must be a real command — a `run`
+  // and NO `alias` of its own. Rejecting a target that itself carries an `alias`
+  // (even alongside a `run`) is what makes this loop-proof: a cycle like
+  // `{a:{alias:'a',run:'x.mjs'}}` or `a↔b` would otherwise re-enter this branch
+  // every hop and blow the stack. The recursive call then can't re-enter here.
+  if (typeof c.alias === 'string') {
+    const target = Object.prototype.hasOwnProperty.call(registry, c.alias) ? registry[c.alias] : null;
+    if (!target || typeof target !== 'object' || typeof target.run !== 'string' || typeof target.alias === 'string') return null;
+    return resolveCommand(c.alias, registry);
+  }
   if (typeof c.run !== 'string' || !/^[A-Za-z0-9._-]+\.mjs$/.test(c.run) || c.run.includes('..')) return null;
   return {
     run: c.run,

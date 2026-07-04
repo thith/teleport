@@ -39,6 +39,49 @@ test('resolveCommand: normalises defaults (args/needsProject/minRole)', () => {
   assert.equal(resolveCommand('w', { w: { run: 'whisper.mjs', wantsReplyText: true } }).wantsReplyText, true);
 });
 
+test('resolveCommand: alias resolves to the target spec (one hop)', () => {
+  const reg = {
+    whisper: { run: 'whisper.mjs', minRole: 'admin', wantsReplyText: true, desc: 'real' },
+    w: { alias: 'whisper' },
+    i: { alias: 'instruct' },                 // dangling → target missing
+    loop: { alias: 'loop' },                  // self-reference
+    chain: { alias: 'w' },                    // alias→alias (w has no run)
+  };
+  // /w resolves to whisper's normalised spec, verbatim (short name contributes nothing)
+  assert.deepEqual(resolveCommand('w', reg), resolveCommand('whisper', reg));
+  assert.equal(resolveCommand('w', reg).run, 'whisper.mjs');
+  assert.equal(resolveCommand('w', reg).minRole, 'admin');
+  assert.equal(resolveCommand('w', reg).wantsReplyText, true);
+  // safety: dangling / cyclic / chained aliases never resolve (and never loop)
+  assert.equal(resolveCommand('i', reg), null);       // target 'instruct' absent
+  assert.equal(resolveCommand('loop', reg), null);    // self-alias → target has no run
+  assert.equal(resolveCommand('chain', reg), null);   // alias→alias rejected (one hop only)
+});
+
+test('resolveCommand: an entry carrying BOTH alias+run cannot recurse forever', () => {
+  // The dangerous shape: the target has a `run` (so a run-only guard would pass)
+  // AND an `alias` (so it re-enters the alias branch). Must resolve to null, never
+  // throw RangeError. (Threat model: a malicious/misconfigured _commands override.)
+  assert.equal(resolveCommand('a', { a: { alias: 'a', run: 'x.mjs' } }), null);           // self-loop
+  assert.equal(resolveCommand('a', { a: { alias: 'b', run: 'x.mjs' }, b: { alias: 'a', run: 'x.mjs' } }), null); // 2-cycle
+  assert.equal(resolveCommand('a', {                                                       // 3-cycle
+    a: { alias: 'b', run: 'x.mjs' }, b: { alias: 'c', run: 'x.mjs' }, c: { alias: 'a', run: 'x.mjs' },
+  }), null);
+  // a real command that merely HAPPENS to be pointed at still resolves fine
+  assert.deepEqual(
+    resolveCommand('w', { w: { alias: 'real' }, real: { run: 'real.mjs' } }),
+    resolveCommand('real', { real: { run: 'real.mjs' } }),
+  );
+});
+
+test('resolveCommand: shipped commands.json wires /w→whisper and /i→instruct', () => {
+  const reg = readCommandsFile(); // default = the shipped commands.json
+  assert.equal(resolveCommand('w', reg).run, 'whisper.mjs');
+  assert.equal(resolveCommand('i', reg).run, 'instruct.mjs');
+  assert.equal(resolveCommand('i', reg).wantsReplyText, true);   // inherits instruct's opt-in
+  assert.equal(resolveCommand('i', reg).minRole, 'admin');
+});
+
 test('resolveCommand: rejects non-.mjs, path separators, traversal, unknown', () => {
   assert.equal(resolveCommand('x', { x: { run: 'evil.sh' } }), null);         // not .mjs
   assert.equal(resolveCommand('x', { x: { run: '../evil.mjs' } }), null);     // traversal
