@@ -5,6 +5,7 @@
   "ls":       { "run": "spawn.mjs",   "args": ["--list"],        "needsProject": false, "minRole": "member",     "desc": "list running agents" },
   "run":      { "run": "run.mjs",     "args": [],                "needsProject": true,  "minRole": "maintainer", "desc": "run a package.json script: /run <project> <script> [args]" },
   "whisper":  { "run": "whisper.mjs", "args": [],                "needsProject": false, "minRole": "admin",      "wantsReplyText": true, "desc": "discreet steer into a topic: /whisper #<hash> <text> (or reply to a previous whisper)" },
+  "instruct": { "run": "instruct.mjs","args": [],                "needsProject": false, "minRole": "admin",      "wantsReplyText": true, "desc": "official private instruction to a topic; agent replies via DM: /instruct #<hash> <text> (or reply to continue)" },
   "pending":  { "run": "pending.mjs", "args": [],                "needsProject": false, "minRole": "member",     "desc": "list convos waiting on an admin reply" },
   "broadcast":{ "run": "broadcast.mjs","args": [],                "needsProject": false, "minRole": "admin",      "desc": "system message to ALL live topics: /broadcast [--chat <id>] <text>" },
   "start":    { "run": "start.mjs",   "args": [],                "needsProject": false, "minRole": "public",     "desc": "onboarding help" }

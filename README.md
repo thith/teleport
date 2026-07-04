@@ -150,6 +150,7 @@ It's driven by **one owner user** (`_config.daemonUserId`) and is a thin, **regi
 | `/ls` | member | list running agents |
 | `/run <project> <script> [args]` | maintainer | run a `package.json` script — auto-detects npm/pnpm/yarn, validates the script, runs `<pm> run <script> -- <args>` (remote exec) |
 | `/whisper #<hash> <text>` | admin | discreet steer into a topic (also accepts a persona name or convoId as the target) |
+| `/instruct #<hash> <text>` | admin | official *private* instruction to a topic — nothing hits the group; the agent replies to you via DM (reply to continue) |
 | `/pending` | member | convos waiting on an admin reply |
 | `/start` | public | onboarding help |
 
@@ -167,7 +168,7 @@ screen -dmS teleport-daemon node ../teleport/scripts/daemon.mjs
 
 teleport has no `package.json` of its own — always invoke the daemon as `node ../teleport/scripts/daemon.mjs` (a sibling project may of course wrap that in its own `package.json` script if it likes). Agents recognise *"start/launch/chạy daemon"* via the wiring snippet above and run it for you (admin/maintainer only).
 
-**Config:** set `_config.daemonUserId` (your Telegram user id) in `projects.json`. Id rule (validated at startup): every project / `_default.chatId` chat must be a **group** (negative id); `daemonUserId` must be a **positive** user id. (The older `_config.daemonChatId` and env `DAEMON_CHAT_ID` are still read as a fallback — in a private DM the chat id equals the user id, so the old value migrates verbatim.) a `needsProject` command resolves `<workspace-parent>/<folder>` as the script's cwd (which, for spawn, is how the new agent joins that project's group), with realpath containment so a symlinked folder can't escape the workspace. **Whisper** injects a discreet steer into a topic with `whisper:true` — invisible in the group; the receiving agent acts on it without announcing it (see `rules/telegram-guide.md`).
+**Config:** set `_config.daemonUserId` (your Telegram user id) in `projects.json`. Id rule (validated at startup): every project / `_default.chatId` chat must be a **group** (negative id); `daemonUserId` must be a **positive** user id. (The older `_config.daemonChatId` and env `DAEMON_CHAT_ID` are still read as a fallback — in a private DM the chat id equals the user id, so the old value migrates verbatim.) a `needsProject` command resolves `<workspace-parent>/<folder>` as the script's cwd (which, for spawn, is how the new agent joins that project's group), with realpath containment so a symlinked folder can't escape the workspace. **Whisper** injects a discreet steer into a topic with `whisper:true` — invisible in the group; the receiving agent acts on it without announcing it. **Instruct** (`instruct:true`) is its sibling for the opposite need: an *official* private instruction — still invisible in the group, but the agent **replies back to you via DM** (`--dm`) instead of staying silent, so you can steer an agent 1-on-1 (e.g. at night) without spamming the topic. Reply to the agent's DM with `/instruct <text>` to continue (see `rules/telegram-guide.md`).
 
 ## How to use
 

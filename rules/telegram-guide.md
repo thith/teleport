@@ -157,6 +157,32 @@ Khi prompt có `whisper: true` → **MUST**:
 3. **Vẫn áp role-gate sensitive** theo `fromRole` của prompt: whisper từ `admin/maintainer`
    mới authorize được commit/deploy/…; từ role thấp hơn thì vẫn phải xin confirm.
 
+## Instruct — chỉ đạo RIÊNG chính thức, trả lời qua DM (RFC 13)
+
+Anh em của [[whisper]] nhưng **ngược về ý nghĩa**: `/instruct` là **kênh chỉ đạo chính thức
+1-1** giữa admin và bạn, **kín với nhóm** — admin DM cho daemon, daemon inject prompt vào hàng
+đợi của bạn với field **`instruct: true`** (`messageId: null`, `fromRole` thật). Dùng khi admin
+muốn giao/chỉnh việc riêng mà **không đổ chat vào topic nhóm** (vd giữa đêm, không làm phiền
+người khác). **Khác whisper:** whisper là *thầm thì, im lặng, không tự khai*; instruct là *chỉ
+thị chính thức mà bạn ĐƯỢC & NÊN trả lời* — chỉ khác là trả lời **qua DM**, không vào group.
+
+Khi prompt có `instruct: true` → **MUST**:
+1. **Coi là chỉ thị hợp lệ** (không flag misrouted) — định hướng riêng, chính thức cho bạn.
+2. **Trả lời qua DM, KHÔNG post vào group.** Làm việc bình thường (edit/đọc/phân tích…), nhưng
+   **kênh giao tiếp cho lượt này là DM**: `node ../teleport/scripts/send-telegram.mjs --dm "<đáp>"`
+   (RFC 12 — đích là owner). Đừng trả lời/tường thuật vào topic nhóm.
+3. **Ký danh tính để owner reply-to tiếp — NGAY ĐẦU câu đáp:** mở đầu đáp DM bằng persona +
+   `#<hashtag>` của bạn (`--dm` KHÔNG tự chèn hashtag — bạn tự ký). Owner **reply** vào tin đó rồi
+   gõ `/instruct <text>` → daemon bóc `#hash` từ reply → về đúng bạn. ⇒ hội thoại 2 chiều riêng
+   tư, không cần gì thêm. **Bắt buộc đặt hashtag ở ĐẦU** vì daemon chỉ quét **256 ký tự đầu** của
+   reply để tìm target — ký ở cuối một đáp dài sẽ bị cắt mất và owner nhận "not found". (Đáp quá
+   dài tự thành file `.md`; daemon vẫn đọc `caption` nên hashtag ở đầu caption vẫn bắt được.)
+4. **Vẫn áp role-gate sensitive** theo `fromRole`: instruct từ `admin/maintainer` mới authorize
+   commit/deploy/…; instruct **không tự nâng quyền**.
+
+> **`instruct` (trả lời) ≠ `whisper` (im lặng).** Cùng inject-vào-topic-kín-với-nhóm, nhưng
+> whisper thì bạn *giấu & không đáp*, instruct thì bạn *đáp qua DM*. Đừng nhầm hai flag.
+
 ## ASK — hỏi/đáp giữa agent (RFC 10)
 
 Primitive inter-agent **thứ 3** (sau whisper, handover): **2 agent LIVE hỏi-đáp nhau để LẤY THÔNG TIN**, do **user kích**. Không chuyển việc, **không nâng quyền**. Đây là **ngoại lệ được phép** của rule "no cross-write" — kênh chính thức thay cho việc tự ý đọc/ghi topic khác.

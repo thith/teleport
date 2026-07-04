@@ -51,6 +51,7 @@ const REG = {
   spawn:   { run: 'spawn.mjs',   args: ['--interactive'], needsProject: true, minRole: 'maintainer' },
   run:     { run: 'run.mjs',     args: [], needsProject: true, minRole: 'maintainer' },
   whisper: { run: 'whisper.mjs', args: [], needsProject: false, minRole: 'admin', wantsReplyText: true },
+  instruct:{ run: 'instruct.mjs',args: [], needsProject: false, minRole: 'admin', wantsReplyText: true },
 };
 
 test('dispatchCommand: unknown command → stays silent (no send)', async () => {
@@ -137,6 +138,18 @@ test('handleControlMessages: bridges msg.reply_to_message.text into the whisper 
   });
   await new Promise((r) => setTimeout(r, 10)); // dispatch is fire-and-forget
   assert.equal(env.TELE_REPLY_TEXT, 'ack #abc123');
+});
+
+// A long agent DM reply becomes a `.md` document whose text rides in `caption`
+// (not `text`) — reply-to-continue must still find the #hash there (RFC 13 M1).
+test('handleControlMessages: falls back to reply_to_message.caption when .text is absent', async () => {
+  let env;
+  handleControlMessages([{ message: { text: '/instruct go on', from: { id: '7' }, reply_to_message: { caption: '📩 báo cáo dài … #abc123' } } }], {
+    daemonUserId: '1', projectsConfig: { _default: { roles: { '7': { role: 'admin' } } } }, registry: REG, scriptsDir: '/s',
+    sendText: async () => {}, runner: async (_b, _a, o) => { env = o.env; return { stdout: '', stderr: '' }; },
+  });
+  await new Promise((r) => setTimeout(r, 10));
+  assert.equal(env.TELE_REPLY_TEXT, '📩 báo cáo dài … #abc123'); // caption bridged, not dropped
 });
 
 test('dispatchCommand: strips teleport secrets from the child env, keeps identity', async () => {

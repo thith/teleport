@@ -25,8 +25,9 @@
 // [args]`, gates by the command's minRole, and runs `node scripts/<run>` (cwd =
 // the project when needsProject, else the workspace root), passing the sender's
 // identity via env (TELE_FROM_*) and relaying the script's stdout back to the DM.
-// Built-ins (spawn/headless/kill/ls/run/whisper/pending/start) live in teleport's
-// own commands.json so it stays self-sufficient. Plus the heartbeat auto-reminder
+// Built-ins (spawn/headless/kill/ls/run/whisper/instruct/pending/broadcast/start)
+// live in teleport's own commands.json so it stays self-sufficient. Plus the
+// heartbeat auto-reminder
 // pass (moved here from tele-listen).
 
 import fs from 'node:fs';
@@ -311,9 +312,13 @@ export function handleControlMessages(mine, ctx) {
     const dispatchText = isDmControlMessage(msg.text) ? stripDmControlPrefix(msg.text) : msg.text;
     const parsed = parseDaemonCommand(dispatchText);
     if (!parsed) continue;
-    // Pass the replied-to message text (if this DM is a Telegram reply) so /whisper
-    // can pick the target from a previous whisper/ack instead of retyping it (RFC 07).
-    dispatchCommand(parsed, msg.from || {}, ctx, msg.reply_to_message?.text).catch((e) =>
+    // Pass the replied-to message text (if this DM is a Telegram reply) so
+    // /whisper|/instruct can pick the target from a previous ack/reply instead of
+    // retyping it (RFC 07/13). Fall back to `.caption`: a long agent reply is
+    // auto-converted to a `.md` DOCUMENT whose text rides in `caption`, not `text`
+    // — without this, replying to continue an instruct thread would find no #hash.
+    const rt = msg.reply_to_message;
+    dispatchCommand(parsed, msg.from || {}, ctx, rt?.text ?? rt?.caption).catch((e) =>
       ctx.sendText(ctx.daemonUserId, `❌ /${parsed.cmd} failed: ${e instanceof Error ? e.message : e}`));
   }
 }
@@ -357,8 +362,9 @@ export async function dispatchCommand(parsed, from, {
     TELE_FROM_NAME: (from && (from.first_name || from.username)) || 'admin',
     TELE_FROM_USERNAME: (from && from.username) || '',
     // Replied-to text (capped) — ONLY for commands that opt in (`wantsReplyText`,
-    // i.e. /whisper). Arbitrary DM reply content must NOT leak to other children
-    // (esp. /run, which executes project scripts). NEVER a privilege input.
+    // i.e. /whisper and /instruct). Arbitrary DM reply content must NOT leak to
+    // other children (esp. /run, which executes project scripts). NEVER a
+    // privilege input.
     TELE_REPLY_TEXT: (spec.wantsReplyText && replyText) ? String(replyText).slice(0, 256) : '',
   });
   try {
