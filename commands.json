@@ -8,5 +8,7 @@
   "instruct": { "run": "instruct.mjs","args": [],                "needsProject": false, "minRole": "admin",      "wantsReplyText": true, "desc": "official private instruction to a topic; agent replies via DM: /instruct #<hash> <text> (or reply to continue)" },
   "pending":  { "run": "pending.mjs", "args": [],                "needsProject": false, "minRole": "member",     "desc": "list convos waiting on an admin reply" },
   "broadcast":{ "run": "broadcast.mjs","args": [],                "needsProject": false, "minRole": "admin",      "desc": "system message to ALL live topics: /broadcast [--chat <id>] <text>" },
-  "start":    { "run": "start.mjs",   "args": [],                "needsProject": false, "minRole": "public",     "desc": "onboarding help" }
+  "start":    { "run": "start.mjs",   "args": [],                "needsProject": false, "minRole": "public",     "desc": "onboarding help" },
+  "w":        { "alias": "whisper" },
+  "i":        { "alias": "instruct" }
 }
