@@ -6,7 +6,8 @@ import path from 'node:path';
 import {
   authHeaders, firstInlineData, firstAudioData, collectText, extFromMime,
   resolveOutPath, writeMediaFile, redact, debugDump, callGemini, parseMediaArgs, validateSend, loadGeminiKey,
-  mimeFromPath, encodeInlineImage,
+  mimeFromPath, encodeInlineImage, pcmToWav, sampleRateFromMime, isEncodedAudioMime,
+  ffmpegAvailable, wavToMp3,
 } from './media-common.mjs';
 
 test('extFromMime: known mimes + unknown → .bin', () => {
@@ -149,6 +150,53 @@ test('encodeInlineImage: reads file → inlineData part (base64 + mime)', () => 
   assert.equal(part.inlineData.mimeType, 'image/png');
   assert.equal(Buffer.from(part.inlineData.data, 'base64').toString(), 'hello');
   fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('pcmToWav: valid 44-byte RIFF/WAVE header + correct sizes for 24kHz mono 16-bit', () => {
+  const pcm = Buffer.alloc(100, 7);
+  const wav = pcmToWav(pcm, { sampleRate: 24000, channels: 1, bitDepth: 16 });
+  assert.equal(wav.length, 44 + 100);
+  assert.equal(wav.toString('ascii', 0, 4), 'RIFF');
+  assert.equal(wav.toString('ascii', 8, 12), 'WAVE');
+  assert.equal(wav.toString('ascii', 12, 16), 'fmt ');
+  assert.equal(wav.toString('ascii', 36, 40), 'data');
+  assert.equal(wav.readUInt32LE(4), 36 + 100);   // RIFF size = 36 + dataLen
+  assert.equal(wav.readUInt16LE(20), 1);          // PCM
+  assert.equal(wav.readUInt16LE(22), 1);          // channels
+  assert.equal(wav.readUInt32LE(24), 24000);      // sample rate
+  assert.equal(wav.readUInt32LE(28), 48000);      // byteRate = 24000 * 1 * 2
+  assert.equal(wav.readUInt16LE(32), 2);          // blockAlign = 1 * 16/8
+  assert.equal(wav.readUInt16LE(34), 16);         // bitDepth
+  assert.equal(wav.readUInt32LE(40), 100);        // data size
+  assert.equal(wav.readUInt8(44), 7);             // payload follows header
+});
+
+test('sampleRateFromMime / isEncodedAudioMime', () => {
+  assert.equal(sampleRateFromMime('audio/L16;rate=24000'), 24000);
+  assert.equal(sampleRateFromMime('audio/L16;rate=48000'), 48000);
+  assert.equal(sampleRateFromMime('audio/pcm'), 24000);       // default
+  assert.equal(sampleRateFromMime(null), 24000);
+  assert.equal(isEncodedAudioMime('audio/mpeg'), true);
+  assert.equal(isEncodedAudioMime('audio/wav'), true);
+  assert.equal(isEncodedAudioMime('audio/L16;rate=24000'), false); // raw PCM → wrap
+  assert.equal(isEncodedAudioMime(null), false);
+});
+
+test('ffmpegAvailable: true when runner succeeds, false when it throws (ENOENT)', () => {
+  assert.equal(ffmpegAvailable({ runner: () => undefined }), true);
+  assert.equal(ffmpegAvailable({ runner: () => { const e = new Error('spawn ffmpeg ENOENT'); e.code = 'ENOENT'; throw e; } }), false);
+});
+
+test('wavToMp3: builds the expected ffmpeg command (injected runner)', () => {
+  let call;
+  const dst = wavToMp3('/tmp/a.wav', '/tmp/a.mp3', { bitrate: '192k', runner: (cmd, args) => { call = { cmd, args }; } });
+  assert.equal(dst, '/tmp/a.mp3');
+  assert.equal(call.cmd, 'ffmpeg');
+  assert.deepEqual(call.args, ['-y', '-loglevel', 'error', '-i', '/tmp/a.wav', '-b:a', '192k', '/tmp/a.mp3']);
+});
+
+test('wavToMp3: propagates a runner failure (caller keeps the WAV)', () => {
+  assert.throws(() => wavToMp3('/tmp/a.wav', '/tmp/a.mp3', { runner: () => { throw new Error('ffmpeg exit 1'); } }), /ffmpeg exit 1/);
 });
 
 test('validateSend: --send requires --convo', () => {

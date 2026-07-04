@@ -5,6 +5,9 @@ import { parseMusicArgs, buildMusicRequest, MUSIC_MODEL_FOR_KIND } from './gen-m
 import {
   parseVideoArgs, buildVideoRequest, operationUrl, videoUriFromOperation, pollOperation,
 } from './gen-video.mjs';
+import {
+  parseTtsArgs, buildTtsRequest, ttsAudioFrom, canonicalVoice, TTS_VOICES,
+} from './gen-tts.mjs';
 
 // ---- gen-image ----
 test('gen-image: defaults (aspect 1:1, default model) + request shape', () => {
@@ -150,4 +153,62 @@ test('pollOperation: returns when done; throws on timeout — all mocked, no net
     () => pollOperation('operations/y', { key: 'K', maxWaitMs: 50, intervalMs: 0, fetchFn: fetchNeverDone, sleepFn: async () => {}, nowFn: () => (t += 100) }),
     /timed out .* operations\/y .* unrecoverable/s,
   );
+});
+
+// ---- gen-tts (text-to-speech) ----
+test('gen-tts: default voice Kore, model, single-speaker request shape', () => {
+  const a = parseTtsArgs(['Say hi cheerfully']);
+  assert.equal(a.prompt, 'Say hi cheerfully');
+  assert.equal(a.voice, 'Kore');
+  assert.equal(a.model, 'gemini-3.1-flash-tts-preview');
+  assert.deepEqual(a.errors, []);
+  const { url, body } = buildTtsRequest(a);
+  assert.match(url, /\/interactions$/);
+  assert.equal(body.input, 'Say hi cheerfully');
+  assert.deepEqual(body.response_format, { type: 'audio' });
+  assert.deepEqual(body.generation_config.speech_config, [{ voice: 'Kore' }]);
+});
+
+test('gen-tts: --voice is case-insensitive → canonical', () => {
+  assert.equal(canonicalVoice('kore'), 'Kore');
+  assert.equal(canonicalVoice('PUCK'), 'Puck');
+  assert.equal(canonicalVoice('nope'), null);
+  assert.equal(parseTtsArgs(['hi', '--voice', 'puck']).voice, 'Puck');
+  assert.equal(TTS_VOICES.length, 30);
+});
+
+test('gen-tts: multi-speaker → speech_config with speaker+voice per speaker', () => {
+  const a = parseTtsArgs(['Joe: hi Jane: hey', '--speaker', 'Joe:Kore', '--speaker', 'Jane:Puck']);
+  assert.deepEqual(a.speakers, [{ name: 'Joe', voice: 'Kore' }, { name: 'Jane', voice: 'Puck' }]);
+  assert.deepEqual(a.errors, []);
+  const { body } = buildTtsRequest(a);
+  assert.deepEqual(body.generation_config.speech_config, [
+    { speaker: 'Joe', voice: 'Kore' },
+    { speaker: 'Jane', voice: 'Puck' },
+  ]);
+});
+
+test('gen-tts: --mp3 is an opt-in bool flag (default off)', () => {
+  assert.equal(parseTtsArgs(['hi']).mp3, false);
+  assert.equal(parseTtsArgs(['hi', '--mp3']).mp3, true);
+  assert.deepEqual(parseTtsArgs(['hi', '--mp3']).errors, []);
+});
+
+test('gen-tts: validation — bad voice, both modes, >2 speakers, bad speaker format', () => {
+  assert.ok(parseTtsArgs(['hi', '--voice', 'Nope']).errors.some((e) => /unknown voice/.test(e)));
+  assert.ok(parseTtsArgs(['hi', '--voice', 'Kore', '--speaker', 'A:Puck']).errors.some((e) => /mutually exclusive/.test(e)));
+  assert.ok(parseTtsArgs(['hi', '--speaker', 'A:Kore', '--speaker', 'B:Puck', '--speaker', 'C:Leda']).errors.some((e) => /at most 2/.test(e)));
+  assert.ok(parseTtsArgs(['hi', '--speaker', 'NoColon']).errors.some((e) => /Name:Voice/.test(e)));
+  assert.ok(parseTtsArgs(['hi', '--speaker', 'A:Bogus']).errors.some((e) => /unknown voice/.test(e)));
+  assert.ok(parseTtsArgs([]).errors.some((e) => /missing <prompt>/.test(e)));
+});
+
+test('gen-tts: ttsAudioFrom reads output_audio, then steps; null when absent', () => {
+  assert.deepEqual(ttsAudioFrom({ interaction: { output_audio: { data: 'AA', mimeType: 'audio/L16;rate=24000' } } }),
+    { data: 'AA', mimeType: 'audio/L16;rate=24000' });
+  assert.deepEqual(ttsAudioFrom({ output_audio: { data: 'BB' } }), { data: 'BB', mimeType: null });
+  assert.deepEqual(ttsAudioFrom({ steps: [{ type: 'model_output', content: [{ type: 'audio', data: 'CC' }] }] }),
+    { data: 'CC', mimeType: null });
+  assert.equal(ttsAudioFrom({ steps: [{ content: [{ type: 'text', text: 'refused' }] }] }), null);
+  assert.equal(ttsAudioFrom({}), null);
 });
