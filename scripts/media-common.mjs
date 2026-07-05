@@ -106,6 +106,58 @@ export function encodeInlineImage(p) {
   return { inlineData: { mimeType: mimeFromPath(p), data } };
 }
 
+/** Wrap raw PCM audio in a minimal WAV (RIFF) container. Gemini TTS returns raw
+ *  little-endian PCM (default 24kHz mono 16-bit) that has no container, so it
+ *  must be framed before it plays. Zero-dep (Buffer only). */
+export function pcmToWav(pcm, { sampleRate = 24000, channels = 1, bitDepth = 16 } = {}) {
+  const bytes = Buffer.isBuffer(pcm) ? pcm : Buffer.from(pcm);
+  const blockAlign = (channels * bitDepth) >> 3;
+  const byteRate = sampleRate * blockAlign;
+  const header = Buffer.alloc(44);
+  header.write('RIFF', 0);
+  header.writeUInt32LE(36 + bytes.length, 4); // file size - 8
+  header.write('WAVE', 8);
+  header.write('fmt ', 12);
+  header.writeUInt32LE(16, 16);          // fmt chunk size (PCM)
+  header.writeUInt16LE(1, 20);           // audio format = 1 (PCM)
+  header.writeUInt16LE(channels, 22);
+  header.writeUInt32LE(sampleRate, 24);
+  header.writeUInt32LE(byteRate, 28);
+  header.writeUInt16LE(blockAlign, 32);
+  header.writeUInt16LE(bitDepth, 34);
+  header.write('data', 36);
+  header.writeUInt32LE(bytes.length, 40);
+  return Buffer.concat([header, bytes]);
+}
+
+/** Parse `rate=NNNN` from an audio mime (e.g. `audio/L16;rate=24000`); else default. */
+export function sampleRateFromMime(mime, def = 24000) {
+  const m = /rate=(\d+)/i.exec(String(mime || ''));
+  return m ? Number(m[1]) : def;
+}
+/** True if a mime is an already-framed/encoded audio container (mp3/ogg/wav) — i.e.
+ *  NOT raw PCM. Raw PCM (or missing/L16/pcm) → false → caller wraps in WAV. */
+export function isEncodedAudioMime(mime) {
+  return /audio\/(mpeg|mp3|ogg|wav|x-wav|aac|opus|flac|mp4)/i.test(String(mime || ''));
+}
+
+/** Is `ffmpeg` on PATH? Used to gate the OPT-IN wav→mp3 conversion — teleport is
+ *  zero-dep, so ffmpeg is never bundled; if absent we keep the WAV and tell the
+ *  user to install it. `runner` is injectable for tests. */
+export function ffmpegAvailable({ runner = execFileSync } = {}) {
+  try { runner('ffmpeg', ['-version'], { stdio: 'ignore' }); return true; }
+  catch { return false; }
+}
+/** Transcode `src` → `dst` with ffmpeg (caller must have checked ffmpegAvailable).
+ *  Throws if ffmpeg fails. `runner` injectable for tests. */
+export function wavToMp3(src, dst, { bitrate = '128k', runner = execFileSync } = {}) {
+  // `-y` = overwrite without an interactive prompt (ffmpeg would otherwise hang or
+  // auto-answer inconsistently on a non-tty). The never-clobber policy is enforced
+  // by the CALLER (an existsSync check before calling), not by ffmpeg.
+  runner('ffmpeg', ['-y', '-loglevel', 'error', '-i', src, '-b:a', bitrate, dst], { stdio: 'ignore' });
+  return dst;
+}
+
 /** Output path: honors --out, else tmp/tele-media/<kind>-<random><ext>. The random
  *  suffix (not a timestamp) avoids collisions between concurrent calls. */
 export function resolveOutPath(kind, ext, outFlag, { dir = MEDIA_DIR, rand = () => crypto.randomBytes(5).toString('hex') } = {}) {
