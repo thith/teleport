@@ -2,10 +2,12 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import os from 'node:os';
 import path from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 // Isolate the persona pin store so `--list` persona mapping DERIVES instead of
 // reading machine-local pins (resolved at call-time from TELE_PERSONA_STORE).
 process.env.TELE_PERSONA_STORE = path.join(os.tmpdir(), `teleport-persona-store-spawn-${process.pid}.jsonl`);
-import { buildSpawnPlan, genSessionSeed, runSpawn, hasBinary, screenSessionExists, normalizeSessionName, parseScreenSessions, listSpawnSessions, resolveKillId, resolveAttachId, resolveAttachTarget, formatSessionList, resolveMode, SPAWN_PROMPT, PERMISSION_MODES, DEFAULT_PERMISSION_MODE, personaByHashtag, gracefulKill, KILL_GRACE_MS } from './spawn.mjs';
+import { buildSpawnPlan, genSessionSeed, runSpawn, hasBinary, screenSessionExists, normalizeSessionName, parseScreenSessions, listSpawnSessions, resolveKillId, resolveAttachId, resolveAttachTarget, formatSessionList, resolveMode, SPAWN_PROMPT, PERMISSION_MODES, DEFAULT_PERMISSION_MODE, USAGE, personaByHashtag, gracefulKill, KILL_GRACE_MS } from './spawn.mjs';
 import { uuidToConvoInt } from './convo-registry.mjs';
 import { shortConvoHash } from './convo-hash.mjs';
 import { personaForConvo } from './persona.mjs';
@@ -416,3 +418,45 @@ test('resolveAttachTarget: no live sessions / multi + no id → errors', () => {
 test('formatSessionList: renders #hashtags', () => {
   assert.equal(formatSessionList([S('c8630116'), S('t1234')]), '#c8630116, #t1234');
 });
+
+// Match a flag as a STANDALONE token, not a substring — otherwise `-i` is
+// trivially satisfied by `--interactive` and `-h` by `--help`, so deleting a
+// short alias from USAGE wouldn't fail the guard (review: Codex + subagent Nit).
+// A flag token is bounded left by a non-[A-Za-z-] char (or start) and right by a
+// non-[A-Za-z] char (or end): the left rule rejects `-i` inside `--interactive`
+// (its left neighbour is `-`), the right rule rejects a longer-flag prefix.
+const hasFlagToken = (usage, flag) =>
+  new RegExp(`(^|[^A-Za-z-])${flag.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}([^A-Za-z]|$)`).test(usage);
+
+test('USAGE documents every flag, mode, and the hard-coded prompt (drift guard)', () => {
+  // Each user-facing flag / alias must appear in --help as a standalone token so
+  // the text can't drift away from the direct-run dispatch.
+  for (const flag of ['-i', '--interactive', '--mode', '--list', '--ls', '--attach', '--resume', '--kill', '--quit', '--help', '-h']) {
+    assert.ok(hasFlagToken(USAGE, flag), `USAGE missing standalone flag ${flag}`);
+  }
+  // Sanity-check the guard itself distinguishes a short alias from its long form:
+  // stripping the standalone `-i` token must make the check fail even though the
+  // sequence "-i" still lives inside "--interactive".
+  assert.ok(!hasFlagToken('only --interactive here', '-i'), 'hasFlagToken false-matches -i inside --interactive');
+  // Every permission mode is enumerated (so `--mode` help stays in sync).
+  for (const m of PERMISSION_MODES) assert.ok(USAGE.includes(m), `USAGE missing mode ${m}`);
+  assert.ok(USAGE.includes(DEFAULT_PERMISSION_MODE), 'USAGE missing the default mode');
+  // The grace window and hard-coded prompt are interpolated, not restated.
+  assert.ok(USAGE.includes(String(KILL_GRACE_MS / 1000)), 'USAGE missing the kill grace seconds');
+  assert.ok(USAGE.includes(SPAWN_PROMPT), 'USAGE missing the hard-coded spawn prompt');
+});
+
+// End-to-end: actually RUN the script so the direct-run help branch is exercised
+// (exit code, stdout-only, and — crucially — that --help does NOT fall through to
+// spawning a real agent). Unit-testing the exports alone never covers this path.
+const SPAWN_SCRIPT = fileURLToPath(new URL('./spawn.mjs', import.meta.url));
+for (const flag of ['--help', '-h']) {
+  test(`\`spawn.mjs ${flag}\` prints USAGE to stdout, exits 0, writes nothing to stderr`, () => {
+    const r = spawnSync(process.execPath, [SPAWN_SCRIPT, flag], { encoding: 'utf8' });
+    assert.equal(r.status, 0, `expected exit 0, got ${r.status}`);
+    assert.equal(r.stderr, '', `expected empty stderr, got: ${r.stderr}`);
+    assert.ok(r.stdout.includes('spawn a new agent instance'), 'stdout is not the help text');
+    // Guard the whole point of the first-check placement: help must NOT spawn.
+    assert.ok(!/agent launched/.test(r.stdout), '--help fell through to a real spawn');
+  });
+}

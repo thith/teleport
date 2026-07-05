@@ -20,6 +20,8 @@
 //
 // Verbal convention (telegram-guide): "spawn Claude" → pnpm spawn:i (interactive);
 // "spawn Claude headless" → pnpm spawn:headless.
+//
+// Run `node spawn.mjs --help` (or `-h`) for the full flag reference (see USAGE).
 
 import { spawn as cpSpawn, execFileSync } from 'node:child_process';
 import crypto from 'node:crypto';
@@ -39,6 +41,42 @@ export const SPAWN_PROMPT = 'Telegram me and wait for instructions';
 // agent can act without prompting for every permission. Override via `--mode`.
 export const PERMISSION_MODES = ['default', 'auto', 'acceptEdits', 'bypassPermissions', 'dontAsk', 'plan'];
 export const DEFAULT_PERMISSION_MODE = 'auto';
+
+export const KILL_GRACE_MS = 10_000;
+
+// `--help` / `-h` text. Printed to STDOUT and exit 0 (a REQUESTED help is not an
+// error — unlike the sibling scripts' `USAGE`-to-stderr-on-misuse convention).
+// Kept in sync with the header comment and the flags handled in the direct-run
+// block below; the spawn.test.mjs "USAGE documents…" test guards that drift.
+export const USAGE = `spawn.mjs — spawn a new agent instance that reports to Telegram (RFC 03).
+
+Usage:
+  node spawn.mjs [-i|--interactive] [--mode <mode>]   spawn an agent (headless by default)
+  node spawn.mjs --list | --ls                        list running agent sessions
+  node spawn.mjs --attach|--resume [<id>]             re-attach your terminal to a session
+  node spawn.mjs --kill|--quit <id>                   gracefully tear a session down
+  node spawn.mjs --help | -h                          show this help
+
+Spawn modes:
+  (default)          headless: detached \`claude -p\` — fire-and-forget, auto-exits.
+                     Bills the Agent SDK pool. Use for true automation only.
+  -i, --interactive  a real interactive Claude session in a detached \`screen\`.
+                     Bills the normal subscription. Persists until killed.
+  --mode <mode>      permission mode for the spawned agent (also --mode=<mode>).
+                     One of: ${PERMISSION_MODES.join(', ')}. Default: ${DEFAULT_PERMISSION_MODE}.
+
+Manage sessions (interactive/screen only):
+  --list, --ls       show running \`tele-*\` sessions with persona, pid, and topic.
+  --attach [<id>]    re-attach; <id> = 3-char tail (116), #hashtag, or tele-name.
+    (--resume)       Omit <id> when exactly one session is live. Detach: Ctrl-A D.
+  --kill <id>        send /exit, wait up to ${KILL_GRACE_MS / 1000}s, then force-quit.
+    (--quit)         Needs the FULL hashtag (no shortcuts — it's destructive).
+
+The prompt is HARD-CODED ("${SPAWN_PROMPT}"): the new
+instance greets you in its own Telegram persona topic and waits for work there.
+
+Verbal convention (telegram-guide): "spawn Claude" → pnpm spawn:i (interactive);
+"spawn Claude headless" → pnpm spawn:headless.`;
 
 // Session names must be shell/argv-safe — they're interpolated into the printed
 // teardown command and passed to `screen`. Reject anything else (review C-Minor).
@@ -221,8 +259,6 @@ export function personaByHashtag(store = readTopicsStore()) {
   }
   return map;
 }
-
-export const KILL_GRACE_MS = 10_000;
 
 /**
  * Graceful teardown of an interactive (screen) agent: first ask claude to quit
@@ -407,6 +443,13 @@ export function runSpawn(plan, { runner, cwd, spawnFn = cpSpawn } = {}) {
 const isDirectRun = fileURLToPath(import.meta.url) === path.resolve(process.argv[1] ?? '');
 if (isDirectRun) {
   const argv = process.argv.slice(2);
+
+  // --help / -h: FIRST check — a requested help prints to stdout and exits 0
+  // (before any subcommand dispatch, so `--help` never falls through to a spawn).
+  if (argv.includes('--help') || argv.includes('-h')) {
+    console.log(USAGE);
+    process.exit(0);
+  }
 
   // --list / --ls: show our spawned screen sessions (name == convo hashtag).
   if (argv.includes('--list') || argv.includes('--ls')) {
