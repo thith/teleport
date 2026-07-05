@@ -171,12 +171,12 @@ Khi prompt có `instruct: true` → **MUST**:
 2. **Trả lời qua DM, KHÔNG post vào group.** Làm việc bình thường (edit/đọc/phân tích…), nhưng
    **kênh giao tiếp cho lượt này là DM**: `node ../teleport/scripts/send-telegram.mjs --dm "<đáp>"`
    (RFC 12 — đích là owner). Đừng trả lời/tường thuật vào topic nhóm.
-3. **Ký danh tính để owner reply-to tiếp — NGAY ĐẦU câu đáp:** mở đầu đáp DM bằng persona +
-   `#<hashtag>` của bạn (`--dm` KHÔNG tự chèn hashtag — bạn tự ký). Owner **reply** vào tin đó rồi
-   gõ `/instruct <text>` → daemon bóc `#hash` từ reply → về đúng bạn. ⇒ hội thoại 2 chiều riêng
-   tư, không cần gì thêm. **Bắt buộc đặt hashtag ở ĐẦU** vì daemon chỉ quét **256 ký tự đầu** của
-   reply để tìm target — ký ở cuối một đáp dài sẽ bị cắt mất và owner nhận "not found". (Đáp quá
-   dài tự thành file `.md`; daemon vẫn đọc `caption` nên hashtag ở đầu caption vẫn bắt được.)
+3. **Ký danh tính để owner reply-to tiếp:** từ RFC 14, `--dm` **tự chèn `[<persona> #hash]` lên
+   đầu** — bạn **không cần tự gõ hashtag** nữa. Owner **reply** vào tin DM đó rồi gõ `/instruct
+   <text>` → daemon bóc `#hash` từ 256 ký tự đầu của reply → về đúng bạn (resolve qua listener-alive,
+   nên chạy được **cả khi bạn chưa từng post topic nhóm**, miễn listener còn sống). ⇒ hội thoại 2
+   chiều riêng tư, không cần gì thêm. (Nếu muốn viết thêm lời chào, cứ để tự nhiên sau tag; đừng
+   chèn văn bản dài *trước* tag kẻo đẩy hash ra ngoài 256 ký tự đầu.)
 4. **Vẫn áp role-gate sensitive** theo `fromRole`: instruct từ `admin/maintainer` mới authorize
    commit/deploy/…; instruct **không tự nâng quyền**.
 
@@ -240,8 +240,14 @@ node ../teleport/scripts/send-telegram.mjs --dm --file <path> "<caption>"
 - **Đích = owner** (`_config.daemonUserId` = user id của admin, đồng thời là DM chat id vì trong
   chat riêng `chat.id === user id`). v1 **chỉ DM được owner** (người có quyền chạy daemon) — không
   DM tới admin khác trong roster.
-- `--dm` **bỏ qua toàn bộ topic machinery** (không convo/persona/hashtag/git-footer), không ghi
-  sent-registry. Text quá dài → tự thành file `.md` (như send thường).
+- `--dm` **bỏ qua topic machinery** (không tạo topic/git-footer, không ghi sent-registry). Text quá
+  dài → tự thành file `.md` (như send thường).
+- **Tự ký `#hash` (RFC 14).** `--dm` giờ **tự chèn identity tag `[<persona> #hash]` lên đầu** tin
+  (derive từ convoId env của session gửi) — bạn **không cần tự gõ**. Nhờ đó owner có thể **reply
+  vào tin DM đó rồi `/instruct <text>`** để chỉ đạo lại đúng session này (kể cả session **chưa từng
+  post topic nhóm**) — daemon bóc `#hash` từ reply, resolve qua registry listener-alive. Điều kiện:
+  session của bạn **còn listener sống** (đang nghe). Nếu gọi `--dm` ngoài mọi session (không có
+  convoId env) → không ký, gửi như cũ.
 
 **MUST khi xử lý yêu cầu DM:**
 1. **Role-gate — chỉ `admin`/`maintainer`** (`fromRole` của prompt) mới được DM cho admin. Member

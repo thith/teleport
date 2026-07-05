@@ -6,7 +6,7 @@
 // thin wrappers that pass `{ flag, usage, ack }`.
 import path from 'node:path';
 import { readTopicsStore } from './topics-store.mjs';
-import { listLiveTopics, normalizeTarget, matchTarget, writePromptExclusive } from './handover.mjs';
+import { listSteerableTargets, normalizeTarget, matchTarget, writePromptExclusive } from './handover.mjs';
 import { DEFAULT_TMP_DIR } from './tele-listen.mjs';
 import { shortConvoHash } from './send-telegram.mjs';
 import { readProjectsConfig, resolveDefaultChatId, projectEntries } from './projects-config.mjs';
@@ -109,7 +109,9 @@ export function doSteer(argv, { flag, usage, ack }, {
   from = {}, config = readProjectsConfig(), store = readTopicsStore(),
   tmpDir = DEFAULT_TMP_DIR, writePrompt = writePromptExclusive, replyText = process.env.TELE_REPLY_TEXT,
 } = {}) {
-  const live = listLiveTopics(store, groupChatIds(config));
+  // RFC 14: steerable = live topics ∪ live-but-topic-less convos (DM-only
+  // sessions), so `/instruct #hash` reaches a session that only DM'd the owner.
+  const live = listSteerableTargets(store, groupChatIds(config));
   const r = resolveSteerTarget(argv, { live, replyText, usage });
   if (r.error) return { ok: false, message: r.error };
   if (!r.text) return { ok: false, message: `${flag} cần nội dung sau target.` };

@@ -148,6 +148,37 @@ export function getLastAliveMs(convoId, { dir = DEFAULT_ALIVE_DIR } = {}) {
 }
 
 /**
+ * List every convo whose alive-file is still fresh (mtime within `freshMs`).
+ * The filename IS the convoId (sanitized numeric string). Used by the steer
+ * commands (RFC 14) to treat a live-but-topic-less session as a valid target,
+ * not just convos that have posted a group topic. Stale/unreadable files are
+ * skipped (same freshness rule as `isAlive`); missing dir → [].
+ * Returns `[{ convoId: '<string>', ts: <mtime_ms> }, ...]`.
+ */
+export function listAliveConvos({ dir = DEFAULT_ALIVE_DIR, now = Date.now(), freshMs = DEFAULT_FRESH_MS } = {}) {
+  let entries;
+  try {
+    entries = fs.readdirSync(dir);
+  } catch (e) {
+    if (e && e.code === 'ENOENT') return [];
+    console.error(`[listener-alive] list readdir failed: ${e instanceof Error ? e.message : String(e)}`);
+    return [];
+  }
+  const out = [];
+  for (const name of entries) {
+    try {
+      const st = fs.statSync(path.join(dir, name));
+      if (now - st.mtimeMs <= freshMs) out.push({ convoId: name, ts: st.mtimeMs });
+    } catch (e) {
+      if (!e || e.code !== 'ENOENT') {
+        console.error(`[listener-alive] list stat ${name} failed: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
+  }
+  return out;
+}
+
+/**
  * Test-only: reset the per-process throttle map. Production code should
  * never call this; tests need it so consecutive recordAlive() calls in the
  * same process actually hit disk.

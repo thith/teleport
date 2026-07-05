@@ -22,6 +22,7 @@ import {
   parseArgs,
   normalizeTarget,
   listLiveTopics,
+  listSteerableTargets,
   matchTarget,
   formatTopicList,
   handoverHeader,
@@ -362,4 +363,69 @@ test('EXIT enum is stable (agents parse these codes)', () => {
   assert.deepEqual(EXIT, {
     OK: 0, ERROR: 1, USAGE: 2, BUSY: 3, NOT_FOUND: 4, AMBIGUOUS: 5, FORBIDDEN: 6,
   });
+});
+
+// --- listSteerableTargets (RFC 14) -----------------------------------------
+
+import { alivePath } from './listener-alive.mjs';
+
+function aliveDirWith(convoIds, now) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'steer-alive-'));
+  for (const id of convoIds) {
+    const p = alivePath(id, dir);
+    fs.writeFileSync(p, '');
+    const t = (now - 1000) / 1000; // 1s ago → fresh
+    fs.utimesSync(p, t, t);
+  }
+  return dir;
+}
+
+test('listSteerableTargets: merges alive-only convos (chatId null, source alive)', () => {
+  const now = 1_000_000_000_000;
+  const aliveDir = aliveDirWith(['823261298239188'], now);
+  const got = listSteerableTargets({}, ['-100'], { aliveDir, now });
+  assert.equal(got.length, 1);
+  const e = got[0];
+  assert.equal(e.convoId, '823261298239188');
+  assert.equal(e.chatId, null);
+  assert.equal(e.threadId, null);
+  assert.equal(e.source, 'alive');
+  assert.equal(e.hashtag, shortConvoHash('823261298239188'));
+  assert.deepEqual(e.persona, personaForConvo('823261298239188'));
+});
+
+test('listSteerableTargets: topic entry WINS over alive (dedup, keeps chatId)', () => {
+  const now = 1_000_000_000_000;
+  const convo = '2205483045424020';
+  const store = { '-100123': { [convo]: 42, _ts: { [convo]: 500 } } };
+  const aliveDir = aliveDirWith([convo], now);
+  const got = listSteerableTargets(store, ['-100123'], { aliveDir, now });
+  assert.equal(got.length, 1);
+  assert.equal(got[0].chatId, '-100123');   // topic entry, not the alive null
+  assert.equal(got[0].threadId, 42);
+  assert.notEqual(got[0].source, 'alive');
+});
+
+test('listSteerableTargets: skips non-watchable alive filenames', () => {
+  const now = 1_000_000_000_000;
+  const aliveDir = aliveDirWith(['not-a-convo'], now);
+  assert.deepEqual(listSteerableTargets({}, ['-100'], { aliveDir, now }), []);
+});
+
+test('matchTarget: resolves alive-only by hashtag/convoId', () => {
+  const now = 1_000_000_000_000;
+  const convo = '823261298239188';
+  const aliveDir = aliveDirWith([convo], now);
+  const live = listSteerableTargets({}, ['-100'], { aliveDir, now });
+  assert.equal(matchTarget(normalizeTarget('#' + shortConvoHash(convo)), live).status, 'found');
+  assert.equal(matchTarget(normalizeTarget(convo), live).status, 'found');
+});
+
+test('matchTarget: does NOT resolve alive-only by persona-name (reuse risk)', () => {
+  const now = 1_000_000_000_000;
+  const convo = '823261298239188';
+  const aliveDir = aliveDirWith([convo], now);
+  const live = listSteerableTargets({}, ['-100'], { aliveDir, now });
+  const persona = personaForConvo(convo);
+  assert.equal(matchTarget(normalizeTarget(persona.name), live).status, 'not_found');
 });

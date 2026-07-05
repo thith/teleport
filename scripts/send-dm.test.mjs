@@ -61,3 +61,39 @@ test('isDmUnreachableError: does not match unrelated errors / empty', () => {
   assert.equal(isDmUnreachableError(null), false);
   assert.equal(isDmUnreachableError(undefined), false);
 });
+
+// --- buildDmSignedBody (RFC 14) --------------------------------------------
+import { buildDmSignedBody } from './send-telegram.mjs';
+import { personaForConvo } from './persona.mjs';
+import { shortConvoHash } from './convo-hash.mjs';
+
+const DM_CONVO = 2205483045424020;               // → #e5424020
+const DM_HASH = shortConvoHash(DM_CONVO);
+const DM_PERSONA = personaForConvo(DM_CONVO);
+
+test('buildDmSignedBody: null convoId → body unchanged', () => {
+  assert.equal(buildDmSignedBody('hello', null), 'hello');
+});
+
+test('buildDmSignedBody: signs with persona + #hash at the front', () => {
+  const out = buildDmSignedBody('report ready', DM_CONVO);
+  assert.equal(out, `[${DM_PERSONA.emoji} ${DM_PERSONA.name} #${DM_HASH}] report ready`);
+  // Hash sits well within the daemon's 256-char reply-scan window.
+  assert.ok(out.indexOf(`#${DM_HASH}`) < 256);
+  // Daemon reply-scan regex must extract the hashtag.
+  assert.equal((out.match(/#[A-Za-z0-9]+/) || [])[0], `#${DM_HASH}`);
+});
+
+test('buildDmSignedBody: empty body → just the tag (caption case)', () => {
+  assert.equal(buildDmSignedBody('', DM_CONVO), `[${DM_PERSONA.emoji} ${DM_PERSONA.name} #${DM_HASH}]`);
+});
+
+test('buildDmSignedBody: raw mode escapes MarkdownV2 specials in the tag', () => {
+  const out = buildDmSignedBody('x', DM_CONVO, { raw: true });
+  // The `[`, `]`, and `#` are escaped so raw (pre-escaped) bodies still parse.
+  assert.ok(out.startsWith('\\['));
+  assert.ok(out.includes(`\\#${DM_HASH}`));
+  // Telegram strips the backslashes for display, so the hash is still extractable
+  // from the delivered text (simulate by removing escape backslashes).
+  assert.equal((out.replace(/\\(.)/g, '$1').match(/#[A-Za-z0-9]+/) || [])[0], `#${DM_HASH}`);
+});
