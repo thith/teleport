@@ -8,6 +8,7 @@ import {
   isAlive,
   getLastAliveMs,
   pruneStale,
+  listAliveConvos,
   alivePath,
   _resetThrottle,
 } from './listener-alive.mjs';
@@ -89,4 +90,37 @@ test('listener-alive — per-process throttle skips writes within 30s', () => {
   assert.strictEqual(recordAlive('c1', { dir, now: t0 + 5_000 }), false);
   // After window, write again.
   assert.strictEqual(recordAlive('c1', { dir, now: t0 + 35_000 }), true);
+});
+
+// --- listAliveConvos (RFC 14) ---
+
+// mtime is real FS time on write; set it explicitly so freshness is compared
+// against our fake `now` deterministically (matches the stale-test pattern above).
+function forceMtime(p, ms) { const t = ms / 1000; fs.utimesSync(p, t, t); }
+
+test('listAliveConvos — returns fresh convos with ts, skips stale', () => {
+  _resetThrottle();
+  const dir = tmpDir();
+  const now = 1_000_000_000_000;
+  recordAlive('111', { dir, now });
+  recordAlive('222', { dir, now });
+  forceMtime(alivePath('111', dir), now - 60_000);            // 1 min ago → fresh
+  forceMtime(alivePath('222', dir), now - 40 * 60 * 1000);    // 40 min ago → stale
+  const got = listAliveConvos({ dir, now, freshMs: 30 * 60 * 1000 });
+  assert.deepStrictEqual(got.map((g) => g.convoId), ['111']);
+  assert.strictEqual(typeof got[0].ts, 'number');
+});
+
+test('listAliveConvos — missing dir returns []', () => {
+  const dir = path.join(tmpDir(), 'does-not-exist');
+  assert.deepStrictEqual(listAliveConvos({ dir }), []);
+});
+
+test('listAliveConvos — all fresh returned', () => {
+  _resetThrottle();
+  const dir = tmpDir();
+  const now = 2_000_000_000_000;
+  for (const id of ['1', '2', '3']) { recordAlive(id, { dir, now }); forceMtime(alivePath(id, dir), now - 1000); }
+  const ids = listAliveConvos({ dir, now, freshMs: 60_000 }).map((g) => g.convoId).sort();
+  assert.deepStrictEqual(ids, ['1', '2', '3']);
 });

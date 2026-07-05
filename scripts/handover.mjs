@@ -24,9 +24,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { formatPersona, PERSONA_POOL } from './persona.mjs';
+import { formatPersona, PERSONA_POOL, personaForConvo } from './persona.mjs';
 import { peekPersona } from './persona-store.mjs';
 import { shortConvoHash } from './convo-hash.mjs';
+import { listAliveConvos } from './listener-alive.mjs';
 import { readTopicsStore } from './topics-store.mjs';
 import { readProjectsConfig, resolveProjectConfig, adminIdsFrom, resolveDefaultChatId } from './projects-config.mjs';
 import { resolveConvoIdFromEnv, validateConvoIdString } from './convo-registry.mjs';
@@ -156,6 +157,46 @@ export function listLiveTopics(store, chatIds) {
 }
 
 /**
+ * Steer target pool (RFC 14): live topics (`listLiveTopics`) PLUS live-but-
+ * topic-less convos (a session that only DM'd the owner, never posted a group
+ * topic — see `listener-alive`). Used by the steer commands (`/whisper`,
+ * `/instruct`) so `#hash`/convoId of such a session resolves instead of
+ * "not found among live topics".
+ *
+ * Merge rule: a convo present as a topic WINS (keeps its real chatId/threadId);
+ * alive-only entries carry `chatId:null`/`threadId:null` + `source:'alive'`, are
+ * `isWatchableConvoId`-filtered, and get a deterministic `personaForConvo` (so
+ * the display persona matches the `--dm` sign tag). Alive-only entries are
+ * matched by hashtag/convoId only — `matchTarget` skips them for persona-name
+ * (names are reused, so a name could resolve the wrong DM-only session).
+ *
+ * NOT used by ask/broadcast/handover — those keep their topic-only / group-scope
+ * invariants (esp. ask's same-group rule, which alive-only chatId:null breaks).
+ */
+export function listSteerableTargets(store, chatIds, { aliveDir, now = Date.now(), freshMs } = {}) {
+  const out = listLiveTopics(store, chatIds);
+  const seen = new Set(out.map((t) => String(t.convoId)));
+  const aliveOpts = { now };
+  if (aliveDir !== undefined) aliveOpts.dir = aliveDir;
+  if (freshMs !== undefined) aliveOpts.freshMs = freshMs;
+  for (const { convoId, ts } of listAliveConvos(aliveOpts)) {
+    const id = String(convoId);
+    if (seen.has(id) || !isWatchableConvoId(id)) continue;
+    seen.add(id);
+    out.push({
+      chatId: null,
+      convoId: id,
+      threadId: null,
+      ts,
+      persona: personaForConvo(id),
+      hashtag: shortConvoHash(id),
+      source: 'alive',
+    });
+  }
+  return out;
+}
+
+/**
  * Match a normalized target against live topics. Returns:
  * - `{ status: 'found', match, shadowed? }`
  * - `{ status: 'ambiguous', candidates }`
@@ -177,8 +218,11 @@ export function matchTarget(target, liveTopics) {
   } else {
     // Persona names have ASCII initials, so plain toLowerCase() is correct and
     // ICU-independent (and matches the hashtag casing rule in normalizeTarget).
+    // RFC 14: skip alive-only (topic-less) entries here — persona names are
+    // reused across the ~40-pair pool, so a name could resolve the wrong DM-only
+    // session. Alive-only targets are reachable by hashtag/convoId (unique) only.
     const want = target.value.toLowerCase();
-    hits = liveTopics.filter((t) => t.persona && t.persona.name.toLowerCase() === want);
+    hits = liveTopics.filter((t) => t.source !== 'alive' && t.persona && t.persona.name.toLowerCase() === want);
   }
   if (hits.length === 0) return { status: 'not_found' };
   if (hits.length === 1) return { status: 'found', match: hits[0] };

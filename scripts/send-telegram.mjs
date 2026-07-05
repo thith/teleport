@@ -35,7 +35,7 @@ import {
   updatePendingStore,
 } from './pending-store.mjs';
 import { CONVO_HASH_LONG_LEN, shortConvoHash as _shortConvoHash } from './convo-hash.mjs';
-import { formatPersona } from './persona.mjs';
+import { formatPersona, personaForConvo } from './persona.mjs';
 import { resolvePersonaInGroup, peekPersona } from './persona-store.mjs';
 import { readProjectsConfig, resolveProjectConfig, adminIdsFrom, resolveDefaultChatId, resolveDaemonUserId, assertChatIdKind } from './projects-config.mjs';
 
@@ -386,6 +386,22 @@ const LEADING_EMOJI_RE = /^(?:(?:(?:\p{Regional_Indicator}\p{Regional_Indicator}
 // Telegram MarkdownV2 specials per https://core.telegram.org/bots/api#markdownv2-style
 // (18 chars). Hoisted to module scope to avoid recompile per call.
 const MDV2_ALL_SPECIALS_RE = /[_*\[\]()~`>#+\-=|{}.!\\]/g;
+
+// RFC 14 — prepend the sending session's identity tag `[<emoji> <name> #hash]`
+// to a `--dm` body so the owner can reply-to it and steer the session back via
+// `/instruct` (the daemon scans the first 256 chars of the reply for `#hash`).
+// `convoId == null` (no env session to sign with) → body unchanged. In raw mode
+// the caller pre-escaped its body, so escape the tag too; non-raw callers escape
+// the whole message downstream (Telegram strips the backslashes → daemon reads a
+// clean `#hash`). Empty body → just the tag (document-caption case).
+export function buildDmSignedBody(body, convoId, { raw = false } = {}) {
+  if (convoId == null) return body;
+  const persona = personaForConvo(convoId);
+  const hash = `#${shortConvoHash(convoId)}`;
+  const rawTag = persona ? `[${persona.emoji} ${persona.name} ${hash}]` : `[${hash}]`;
+  const tag = raw ? rawTag.replace(MDV2_ALL_SPECIALS_RE, (m) => '\\' + m) : rawTag;
+  return body ? `${tag} ${body}` : tag;
+}
 
 // `shortConvoHash` and `CONVO_HASH_LONG_LEN` now live in `./convo-hash.mjs`
 // (leaf module — no circular dep with `pending-store.mjs`). Re-exported at
@@ -1445,6 +1461,15 @@ async function main() {
     }
     // messageThreadId: null → lands in the private chat root, never a topic.
     const dmOpts = { raw: args.raw, plain: args.plain, replyTo: null, messageThreadId: null };
+    // RFC 14 — sign the DM with the sending session's identity tag so the owner
+    // can reply-to it and steer the session back via `/instruct` (the daemon
+    // scans the first 256 chars of the reply for `#hash`). ONLY when a REAL env
+    // convoId exists (`preResolved`): a synthesized fallback would sign a hash no
+    // live listener / alive-file matches, making the round-trip inert. In raw
+    // mode the caller pre-escaped its body, so we MdV2-escape the tag too; in
+    // non-raw mode sendText/DocumentToAdmin escapes the whole message (Telegram
+    // strips the backslashes, so the daemon still reads a clean `#hash`).
+    const signDm = (body) => buildDmSignedBody(body, preResolved, { raw: args.raw });
     try {
       let messageId;
       if (args.filePath) {
@@ -1453,7 +1478,7 @@ async function main() {
           process.exit(1);
         }
         const caption = args.positional.join('\n').trim() || readStdinIfPiped().trim() || '';
-        ({ messageId } = await sendDocumentToAdmin(token, dmChatId, args.filePath, caption, dmOpts));
+        ({ messageId } = await sendDocumentToAdmin(token, dmChatId, args.filePath, signDm(caption), dmOpts));
         console.log(`[send-telegram] DM document sent to admin ${dmChatId}${messageId ? ` (messageId: ${messageId})` : ''}`);
       } else {
         const text = (args.positional.join(' ').trim() || readStdinIfPiped()).trim();
@@ -1461,7 +1486,7 @@ async function main() {
           console.error('[send-telegram] --dm requires message text (positional or stdin) or --file <path>');
           process.exit(1);
         }
-        ({ messageId } = await sendTextToAdmin(token, dmChatId, text, dmOpts));
+        ({ messageId } = await sendTextToAdmin(token, dmChatId, signDm(text), dmOpts));
         console.log(`[send-telegram] DM sent to admin ${dmChatId}${messageId ? ` (messageId: ${messageId})` : ''}`);
       }
     } catch (error) {
