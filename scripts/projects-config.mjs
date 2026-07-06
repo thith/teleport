@@ -138,6 +138,29 @@ export function resolveQuietHours(config, { env = process.env, envFile = {} } = 
 }
 
 /**
+ * Map a repo folder (`basename(cwd)`) to a projects.json project key. Exact keys
+ * win; otherwise a git-worktree folder like `digesty-frontend-uifix` (absent from
+ * projects.json) resolves to the LONGEST existing key K where `folder === K` or
+ * `folder.startsWith(K + '-')` — so `digesty-frontend-uifix` → `digesty-frontend`
+ * (not the shorter `digesty`), and a bare substring like `digest` never matches
+ * `digesty` (the boundary is a literal `-`, or exact). Reserved `_`-keys are
+ * skipped. No prefix match → returns `folder` unchanged (default fallback stands).
+ */
+export function resolveProjectKey(folder, config = {}) {
+  const f = String(folder || '');
+  if (!f) return f;
+  // Exact key (non-reserved) — keep as-is; also short-circuits the prefix scan.
+  if (!f.startsWith('_') && config && Object.prototype.hasOwnProperty.call(config, f)) return f;
+  let best = null;
+  for (const [k] of projectEntries(config)) {
+    if (f === k || f.startsWith(k + '-')) {
+      if (best == null || k.length > best.length) best = k;
+    }
+  }
+  return best ?? f;
+}
+
+/**
  * Resolve `{ chatId, dedicated, roles, code, topicIcon, description }` for a project.
  * `lookupKey` is the projects.json key (= `basename(cwd)`); it is NOT shown to
  * users and is also the roster-harvest target — keep it folder-stable.

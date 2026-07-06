@@ -29,7 +29,7 @@ import { peekPersona } from './persona-store.mjs';
 import { shortConvoHash } from './convo-hash.mjs';
 import { listAliveConvos } from './listener-alive.mjs';
 import { readTopicsStore } from './topics-store.mjs';
-import { readProjectsConfig, resolveProjectConfig, adminIdsFrom, resolveDefaultChatId } from './projects-config.mjs';
+import { readProjectsConfig, resolveProjectConfig, resolveProjectKey, adminIdsFrom, resolveDefaultChatId } from './projects-config.mjs';
 import { resolveConvoIdFromEnv, validateConvoIdString } from './convo-registry.mjs';
 
 /** True iff `s` is a convoId the listener can actually watch (positive,
@@ -330,8 +330,11 @@ export function buildSeedPrompt({ sourceConvoId, notes }) {
  * group, else shared catch-all), honoring an explicit --chat-id override. */
 export function resolveChatIds({ cwd = process.cwd(), env = process.env, envFile = {}, chatIdOverride = null } = {}) {
   if (chatIdOverride) return { chatIds: [String(chatIdOverride)], roles: {} };
-  const lookupKey = path.basename(cwd) || '';
   const projectsConfig = readProjectsConfig();
+  // A git-worktree folder (e.g. `digesty-frontend-uifix`) is not itself a
+  // projects.json key; resolve it to the longest matching project key so it lands
+  // in the project's real group instead of the shared `_default` fallback.
+  const lookupKey = resolveProjectKey(path.basename(cwd) || '', projectsConfig);
   const fallbackChatId = resolveDefaultChatId(projectsConfig, { env, envFile });
   const projCfg = resolveProjectConfig(lookupKey, { config: projectsConfig, fallbackChatId });
   const chatIds = adminIdsFrom(projCfg, fallbackChatId, parseAdminChatIds).filter(Boolean);

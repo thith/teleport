@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { readProjectsConfig, resolveProjectConfig, roleFor, memberFor, adminIdsFrom, isGroupChatId, isPrivateChatId, assertChatIdKind, readGlobalConfig, readDefaultGroup, projectEntries, resolveDefaultChatId, resolveDaemonChatId, resolveQuietHours } from './projects-config.mjs';
+import { readProjectsConfig, resolveProjectConfig, resolveProjectKey, roleFor, memberFor, adminIdsFrom, isGroupChatId, isPrivateChatId, assertChatIdKind, readGlobalConfig, readDefaultGroup, projectEntries, resolveDefaultChatId, resolveDaemonChatId, resolveQuietHours } from './projects-config.mjs';
 
 test('readGlobalConfig/readDefaultGroup + projectEntries: reserved keys separated from projects', () => {
   const cfg = { _config: { daemonChatId: '42' }, _default: { chatId: '-100', roles: { '1': 'admin' } }, luni: { chatId: '-1' }, md: { chatId: '-2' } };
@@ -43,6 +43,39 @@ test('resolveProjectConfig: shared project inherits _default.roles', () => {
   // A shared project's OWN roles are dead config: no `_default.roles` → {} (NOT entryRoles)
   const noDefault = resolveProjectConfig('sharedproj', { config: { sharedproj: { roles: { '5': { role: 'admin' } } } }, fallbackChatId: '-100' });
   assert.deepEqual(noDefault.roles, {}); // never inherits a shared project's own roles
+});
+
+test('resolveProjectKey: worktree folder → longest matching project key (boundary-safe)', () => {
+  const cfg = {
+    _config: { daemonUserId: '1' }, _default: { chatId: '-100' },
+    digesty: { chatId: '-999' }, 'digesty-frontend': { chatId: '-999' }, 'digesty-worker': { chatId: '-999' },
+  };
+  // exact key wins, unchanged
+  assert.equal(resolveProjectKey('digesty', cfg), 'digesty');
+  assert.equal(resolveProjectKey('digesty-frontend', cfg), 'digesty-frontend');
+  // worktree suffix → LONGEST prefix key (not the shorter `digesty`)
+  assert.equal(resolveProjectKey('digesty-frontend-uifix', cfg), 'digesty-frontend');
+  assert.equal(resolveProjectKey('digesty-x', cfg), 'digesty');
+  // boundary safety: bare substring never matches (no `-` boundary)
+  assert.equal(resolveProjectKey('digest', cfg), 'digest');
+  assert.equal(resolveProjectKey('digestyfrontend', cfg), 'digestyfrontend');
+  // unrelated folder → unchanged (default fallback stands)
+  assert.equal(resolveProjectKey('some-other-repo', cfg), 'some-other-repo');
+  // reserved `_`-keys are never matched
+  assert.equal(resolveProjectKey('_default-x', cfg), '_default-x');
+  assert.equal(resolveProjectKey('', cfg), '');
+});
+
+test('resolveProjectKey → resolveProjectConfig: worktree resolves to project group, not _default', () => {
+  const cfg = { _default: { chatId: '-100' }, 'digesty-frontend': { chatId: '-1004470275584' }, digesty: { chatId: '-1004470275584' } };
+  const key = resolveProjectKey('digesty-frontend-uifix', cfg);
+  const proj = resolveProjectConfig(key, { config: cfg, fallbackChatId: '-100' });
+  assert.equal(proj.chatId, '-1004470275584'); // real project group, NOT -100
+  assert.equal(proj.dedicated, true);
+  // unrelated worktree keeps default fallback
+  const other = resolveProjectConfig(resolveProjectKey('unrelated-repo', cfg), { config: cfg, fallbackChatId: '-100' });
+  assert.equal(other.chatId, '-100');
+  assert.equal(other.dedicated, false);
 });
 
 test('isGroupChatId / isPrivateChatId: sign convention', () => {
