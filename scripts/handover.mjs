@@ -58,6 +58,10 @@ export const EXIT = {
   FORBIDDEN: 6,    // --new but --by-role not admin/maintainer
 };
 
+// `--ack` targets an exact convoId (the source's, lifted from the received
+// `handover.from.convoId`) — no persona/hashtag resolution needed, so it never
+// returns NOT_FOUND/AMBIGUOUS. Kept distinct from the (i)/(ii) branches below.
+
 const PRIVILEGED_ROLES = new Set(['admin', 'maintainer']);
 
 /** Fail-closed role gate for --new (spawn = billable + sensitive). Unknown/typo
@@ -70,14 +74,15 @@ const USAGE = `Usage:
   cat notes.md | node handover.mjs --to <persona|#hashtag|convoId> [--from-convo N] [--chat-id ID]
   cat notes.md | node handover.mjs --new --by-role <admin|maintainer> [--from-convo N]
   node handover.mjs --to "Cú" --notes-file ./tmp/handover.md
+  node handover.mjs --ack <sourceConvoId> [--from-convo N]   # receiver confirms receipt back to source
 Notes come from stdin (default) or --notes-file. See teleport-docs/rfc/05-handover.md.`;
 
 /**
- * Parse argv. Returns `{ to, isNew, notesFile, fromConvo, byRole, chatId, error }`.
+ * Parse argv. Returns `{ to, isNew, notesFile, fromConvo, byRole, chatId, ack, error }`.
  * `error` (string) set on a usage violation; caller exits EXIT.USAGE.
  */
 export function parseArgs(argv) {
-  const out = { to: null, isNew: false, notesFile: null, fromConvo: null, byRole: null, chatId: null, error: null };
+  const out = { to: null, isNew: false, notesFile: null, fromConvo: null, byRole: null, chatId: null, ack: null, error: null };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     const needVal = (name) => {
@@ -92,6 +97,7 @@ export function parseArgs(argv) {
     if (a === '--from-convo') { const v = needVal('--from-convo'); if (v != null) out.fromConvo = v.trim(); continue; }
     if (a === '--by-role') { const v = needVal('--by-role'); if (v != null) out.byRole = v.trim(); continue; }
     if (a === '--chat-id') { const v = needVal('--chat-id'); if (v != null) out.chatId = v.trim(); continue; }
+    if (a === '--ack') { const v = needVal('--ack'); if (v != null) out.ack = v.trim(); continue; }
     out.error = `unknown argument: ${a}`;
   }
   if (out.error) return out;
@@ -103,8 +109,13 @@ export function parseArgs(argv) {
     out.error = `--chat-id must be a numeric chat id (got "${out.chatId}")`;
     return out;
   }
+  if (out.ack != null) {
+    if (out.to || out.isNew) { out.error = '--ack is mutually exclusive with --to/--new'; return out; }
+    if (!isWatchableConvoId(out.ack)) { out.error = `--ack must be a positive integer convoId (got "${out.ack}")`; return out; }
+    return out;
+  }
   if (out.to && out.isNew) { out.error = '--to and --new are mutually exclusive'; return out; }
-  if (!out.to && !out.isNew) { out.error = 'one of --to or --new is required'; return out; }
+  if (!out.to && !out.isNew) { out.error = 'one of --to, --new, or --ack is required'; return out; }
   if (out.isNew && !out.byRole) { out.error = '--new requires --by-role <admin|maintainer>'; return out; }
   return out;
 }
@@ -297,6 +308,54 @@ export function buildHandoverPrompt({ targetConvoId, targetChatId, sourceConvoId
   return base;
 }
 
+/** Best-effort chatId lookup for a convoId across ALL chats in the topics
+ * store (not scoped to one project) — handover/ack can legitimately cross
+ * groups (RFC 05 §2.5 --chat-id). Purely descriptive metadata on the injected
+ * prompt (routing is by convoId → prompt-file path, not chatId); returns
+ * `null` if the convoId isn't currently a live topic anywhere, which is fine
+ * — the ack still gets written, the source just sees `chatId: null`. */
+export function resolveConvoChatId(store, convoId) {
+  for (const [chatId, entry] of Object.entries(store || {})) {
+    if (!entry || typeof entry !== 'object') continue;
+    for (const [key, threadId] of Object.entries(entry)) {
+      if (key === String(convoId) && typeof threadId === 'number' && threadId > 0) return chatId;
+    }
+  }
+  return null;
+}
+
+/**
+ * Build the receipt-confirmation prompt injected back into the ORIGINAL
+ * source's queue (RFC 05 ack loop, mirrors ask.mjs's `--reply`). `sourceConvoId`
+ * here is the ACKER (the receiver who just adopted the handover); `targetConvoId`
+ * is the original handover sender, now on the receiving end of the ack. Lets the
+ * source agent know for CERTAIN the handover was picked up, instead of just
+ * "injected" (file written, but maybe never read).
+ */
+export function buildAckPrompt({ targetConvoId, targetChatId, sourceConvoId, note, nowSec }) {
+  const ackerPersona = peekPersona(sourceConvoId);
+  const from = ackerPersona ? formatPersona(ackerPersona) : 'agent khác';
+  const tag = sourceConvoId != null ? ` (topic #${shortConvoHash(sourceConvoId)})` : '';
+  const extra = note && note.trim() ? `\n\n${note.trim()}` : '';
+  const text = `✅ ${from}${tag} đã NHẬN handover và đang tiếp quản.${extra}`;
+  const synthMsg = { message_id: null, chat: { id: targetChatId, type: 'private' }, from: null, text, date: nowSec };
+  const base = buildCombinedPromptData([{ msg: synthMsg, update: { update_id: null } }], null, targetConvoId, null);
+  base.messageId = null;
+  base.fromRole = 'handover-ack';
+  base.fromName = from;
+  base.fromUserId = null;
+  base.fromMember = null;
+  base.attachments = [];
+  base.handoverAck = {
+    from: {
+      persona: ackerPersona,
+      convoId: sourceConvoId != null ? String(sourceConvoId) : null,
+      hashtag: sourceConvoId != null ? `#${shortConvoHash(sourceConvoId)}` : null,
+    },
+  };
+  return base;
+}
+
 /**
  * Write the prompt file with EXCLUSIVE create (`wx`) so we NEVER overwrite an
  * unconsumed prompt (RFC 05 §2.2 — closes both the data-loss and the
@@ -359,16 +418,48 @@ async function main() {
   const args = parseArgs(process.argv.slice(2));
   if (args.error) { err(`[handover] ${args.error}\n${USAGE}`); process.exit(EXIT.USAGE); }
 
-  let notes = '';
-  try { notes = readNotes(args); } catch (e) { err(`[handover] cannot read notes: ${e.message}`); process.exit(EXIT.USAGE); }
-  if (!notes.trim()) { err(`[handover] empty notes (pipe via stdin or pass --notes-file)\n${USAGE}`); process.exit(EXIT.USAGE); }
-
-  // Source convo (attribution): explicit flag overrides env session.
+  // Source convo (attribution): explicit flag overrides env session. For
+  // --ack this is the ACKER's own convo (they're attributing the ack to
+  // themselves), same as the (i)/(ii) branches attribute notes to themselves.
   const sourceConvoId = args.fromConvo ?? resolveConvoIdFromEnv({ argConvo: null }).convoId;
   if (sourceConvoId == null) {
     err('[handover] no source convo: pass --from-convo N or run inside a native session (CLAUDE_CODE_SESSION_ID / CODEX_THREAD_ID)');
     process.exit(EXIT.USAGE);
   }
+
+  if (args.ack) {
+    // Receipt confirmation, round-tripped back to whoever sent the handover
+    // (RFC 05 ack loop). Note is optional — unlike (i)/(ii), an empty note is
+    // NOT a usage error; the ack itself ("đã nhận") already carries the signal.
+    let note = '';
+    try { note = readNotes(args); } catch { /* no piped/--notes-file note → ack with no extra text */ }
+    const store = readTopicsStore();
+    const targetChatId = resolveConvoChatId(store, args.ack);
+    const promptObj = buildAckPrompt({
+      targetConvoId: args.ack,
+      targetChatId,
+      sourceConvoId,
+      note,
+      nowSec: Math.floor(Date.now() / 1000),
+    });
+    const promptFile = path.join(DEFAULT_TMP_DIR, `prompt-convo-${args.ack}.json`);
+    try {
+      writePromptExclusive(promptObj, promptFile);
+    } catch (e) {
+      if (e && e.code === 'EEXIST') {
+        err(`[handover] ack target convo ${args.ack} has an unconsumed prompt — busy, retry shortly`);
+        process.exit(EXIT.BUSY);
+      }
+      err(`[handover] ack write failed: ${e.message}`);
+      process.exit(EXIT.ERROR);
+    }
+    log(`[handover] ack injected → convo ${args.ack}`);
+    process.exit(EXIT.OK);
+  }
+
+  let notes = '';
+  try { notes = readNotes(args); } catch (e) { err(`[handover] cannot read notes: ${e.message}`); process.exit(EXIT.USAGE); }
+  if (!notes.trim()) { err(`[handover] empty notes (pipe via stdin or pass --notes-file)\n${USAGE}`); process.exit(EXIT.USAGE); }
 
   const envFile = loadEnvFromFile(ENV_FILE);
 

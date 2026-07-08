@@ -27,6 +27,8 @@ import {
   formatTopicList,
   handoverHeader,
   buildHandoverPrompt,
+  buildAckPrompt,
+  resolveConvoChatId,
   writePromptExclusive,
   buildSeedPrompt,
   resolveChatIds,
@@ -34,6 +36,7 @@ import {
 } from './handover.mjs';
 import { personaForConvo, formatPersona } from './persona.mjs';
 import { shortConvoHash } from './convo-hash.mjs';
+import { DEFAULT_TMP_DIR } from './tele-listen.mjs';
 
 // Isolate the persona pin store so handover (and the CLI subprocesses it
 // spawns, which inherit this env) DERIVE personas instead of reading the real
@@ -64,8 +67,23 @@ test('parseArgs: --to and --new are mutually exclusive', () => {
   assert.match(parseArgs(['--to', 'Cú', '--new', '--by-role', 'admin']).error, /mutually exclusive/);
 });
 
-test('parseArgs: neither --to nor --new is a usage error', () => {
-  assert.match(parseArgs([]).error, /--to or --new/);
+test('parseArgs: neither --to nor --new nor --ack is a usage error', () => {
+  assert.match(parseArgs([]).error, /--to, --new, or --ack/);
+});
+
+test('parseArgs: --ack with a convoId', () => {
+  const a = parseArgs(['--ack', '2205483045424020']);
+  assert.equal(a.error, null);
+  assert.equal(a.ack, '2205483045424020');
+});
+
+test('parseArgs: --ack rejects a non-convoId value', () => {
+  assert.match(parseArgs(['--ack', 'Cú']).error, /--ack must be a positive integer convoId/);
+});
+
+test('parseArgs: --ack is mutually exclusive with --to/--new', () => {
+  assert.match(parseArgs(['--ack', '123', '--to', 'Cú']).error, /mutually exclusive/);
+  assert.match(parseArgs(['--ack', '123', '--new', '--by-role', 'admin']).error, /mutually exclusive/);
 });
 
 test('parseArgs: missing value + unknown flag are errors', () => {
@@ -225,6 +243,49 @@ test('handoverHeader names source, target, and source hashtag', () => {
   assert.ok(h.includes(formatPersona(TARGET_PERSONA)));
 });
 
+// --- resolveConvoChatId ------------------------------------------------------
+
+test('resolveConvoChatId: finds the chat owning a convoId, across ALL chats', () => {
+  const store = { '-100123': { [TARGET_CONVO]: 124 }, '-100999': { '555': 9 } };
+  assert.equal(resolveConvoChatId(store, TARGET_CONVO), '-100123');
+  assert.equal(resolveConvoChatId(store, '555'), '-100999');
+});
+
+test('resolveConvoChatId: unknown convoId → null (ack still proceeds without it)', () => {
+  assert.equal(resolveConvoChatId({ '-100123': { [TARGET_CONVO]: 124 } }, '999999999'), null);
+});
+
+// --- buildAckPrompt (receipt confirmation, round-tripped to the sender) ----
+
+test('buildAckPrompt: non-privileged, routes to the ORIGINAL sender, attributes to the acker', () => {
+  const p = buildAckPrompt({
+    targetConvoId: SOURCE_CONVO,       // the original handover sender
+    targetChatId: '-100123',
+    sourceConvoId: TARGET_CONVO,       // the acker (who just adopted the handover)
+    note: 'Bắt đầu đọc HANDOVER.md.',
+    nowSec: 1700000000,
+  });
+  assert.equal(p.fromRole, 'handover-ack');
+  assert.notEqual(p.fromRole, 'admin');
+  assert.equal(p.fromMember, null);
+  assert.equal(p.messageId, null);
+  assert.deepEqual(p.attachments, []);
+  // Routes back to the SENDER's own convo.
+  assert.equal(p.convoId, SOURCE_CONVO);
+  // Attribution = the ACKER.
+  assert.deepEqual(p.handoverAck.from.persona, TARGET_PERSONA);
+  assert.equal(p.handoverAck.from.convoId, TARGET_CONVO);
+  assert.equal(p.handoverAck.from.hashtag, `#${TARGET_HASH}`);
+  assert.ok(p.text.includes('đã NHẬN handover'));
+  assert.ok(p.text.includes('Bắt đầu đọc HANDOVER.md.'));
+});
+
+test('buildAckPrompt: empty note still produces a well-formed ack', () => {
+  const p = buildAckPrompt({ targetConvoId: SOURCE_CONVO, targetChatId: null, sourceConvoId: TARGET_CONVO, note: '', nowSec: 1700000000 });
+  assert.ok(p.text.includes('đã NHẬN handover'));
+  assert.equal(p.chatId, 'null'); // buildCombinedPromptData stringifies chat.id verbatim
+});
+
 // --- writePromptExclusive (atomic, no-overwrite) ---------------------------
 
 test('writePromptExclusive: writes once, refuses to overwrite (EEXIST → busy)', () => {
@@ -355,6 +416,24 @@ test('CLI: non-numeric --from-convo → USAGE(2)', () => {
 
 test('CLI: --to no live topic in scoped chat → NOT_FOUND(4)', () => {
   assert.equal(runCli(['--to', '#zzzz9999', '--from-convo', '123', '--chat-id', '-100000000001'], 'notes'), EXIT.NOT_FOUND);
+});
+
+test('CLI: --ack with no note → OK(0), no empty-notes error (note is optional for ack); writes real prompt file, then BUSY(3) on retry', () => {
+  // A fresh convoId so this run can't collide with a leftover file from a
+  // prior run; clean up afterward — DEFAULT_TMP_DIR is the REAL prompt queue
+  // dir (scripts/tmp/tele-reply), not an isolated test tmpdir.
+  const convo = String(9000000000000000n + BigInt(process.pid));
+  const file = path.join(DEFAULT_TMP_DIR, `prompt-convo-${convo}.json`);
+  try {
+    assert.equal(runCli(['--ack', convo, '--from-convo', SOURCE_CONVO], ''), EXIT.OK);
+    const onDisk = JSON.parse(fs.readFileSync(file, 'utf8'));
+    assert.equal(onDisk.fromRole, 'handover-ack');
+    assert.equal(onDisk.handoverAck.from.convoId, SOURCE_CONVO);
+    // Same target still unconsumed → BUSY, not a silent overwrite.
+    assert.equal(runCli(['--ack', convo, '--from-convo', SOURCE_CONVO], 'second'), EXIT.BUSY);
+  } finally {
+    fs.rmSync(file, { force: true });
+  }
 });
 
 // --- EXIT enum -------------------------------------------------------------
