@@ -2,7 +2,7 @@
 
 - **Status:** Draft
 - **Ref:** [RFC NN](../rfc/NN-*.md) <or "— (short-path, no RFC)">
-- **Changelog:** <date — what changed> (append small edits here per process.md §5)
+- **Changelog:** <date — what changed> (append small edits here per `../../teleport-docs/guides/process.md` §5)
 
 ---
 

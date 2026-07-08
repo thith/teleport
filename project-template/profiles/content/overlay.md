@@ -1,7 +1,7 @@
 # Profile overlay — content (NO code lifecycle)
 
 > For a content / docs / planning workspace (e.g. md). There is **no code** here, so the
-> code-oriented stages of core `process.md` do **not** apply. This overlay re-themes them.
+> code-oriented stages of `../teleport-docs/guides/process.md` do **not** apply. This overlay re-themes them.
 
 ## Lifecycle (replaces process §3–§6)
 - The lifecycle is **plan → contract → produce → review**: outline/brief → an agreed **content contract** → produce the piece → content review.

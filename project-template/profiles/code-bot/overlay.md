@@ -1,6 +1,6 @@
 # Profile overlay — code-bot
 
-> Fills the `> [overlay]` hooks in core `process.md` / `review-guide.md` for a
+> Fills the `> [overlay]` hooks in `../teleport-docs/guides/process.md` / `review-guide.md` for a
 > Telegram/CLI bot (single-maintainer experimental service, e.g. luni).
 
 ## Branch / deploy policy (process §1)

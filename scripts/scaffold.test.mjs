@@ -59,9 +59,13 @@ test('scaffold (integration, --no-git): copies core + overlay, substitutes place
   const res = scaffold({ project: 'newbot', type: 'code-bot', into: dest, git: false });
   assert.equal(res.ok, true, JSON.stringify(res.errors));
 
-  // Key files exist
-  for (const f of ['CLAUDE.md', 'AGENTS.md', 'GEMINI.md', 'process.md', 'review-guide.md', 'teleport-conventions.md', '.gitignore', 'overlay.md', 'rfc/_template.md', 'specs/_template.md', 'docs/project_overview.md', 'sessions/.gitkeep']) {
+  // Key files exist. process.md/review-guide.md are intentionally NOT here — they're
+  // shared at ../teleport-docs/guides/ (not copied per-project) to avoid drift.
+  for (const f of ['CLAUDE.md', 'AGENTS.md', 'GEMINI.md', 'teleport-conventions.md', '.gitignore', 'overlay.md', 'rfc/_template.md', 'specs/_template.md', 'docs/project_overview.md', 'sessions/.gitkeep']) {
     assert.ok(fs.existsSync(path.join(dest, f)), `missing ${f}`);
+  }
+  for (const f of ['process.md', 'review-guide.md']) {
+    assert.ok(!fs.existsSync(path.join(dest, f)), `${f} should not be copied — shared at ../teleport-docs/guides/`);
   }
   // Placeholders substituted in CLAUDE.md
   const claude = fs.readFileSync(path.join(dest, 'CLAUDE.md'), 'utf8');

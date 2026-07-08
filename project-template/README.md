@@ -8,13 +8,20 @@ bot vs web vs monorepo vs content). See `../../teleport-docs/rfc/09-project-stru
 ```
 project-template/
   core/                 # COPIED into every new project
-    CLAUDE.md AGENTS.md GEMINI.md   # synced agent rules; point at core process/review
-    process.md  review-guide.md     # type-neutral CORE workflow (English)
+    CLAUDE.md AGENTS.md GEMINI.md   # synced agent rules; point at ../teleport-docs/guides/{process,review-guide}.md
     teleport-conventions.md         # folder structure + terminology + PRESERVE rule
     README.md  .gitignore  sessions/
   profiles/             # pick ONE; its overlay fills the core's [overlay] hooks
     code-bot/   code-web/   monorepo/   content/
 ```
+
+**Not copied — shared instead:** `process.md` and `review-guide.md` used to live in `core/` (one
+copy per scaffolded project, prone to drift). They now live once at
+[`teleport-docs/guides/process.md`](../../teleport-docs/guides/process.md) and
+[`teleport-docs/guides/review-guide.md`](../../teleport-docs/guides/review-guide.md) — every
+project (this template's `CLAUDE.md`/`AGENTS.md`/`GEMINI.md` included) references them as
+`../teleport-docs/guides/{process,review-guide}.md`, relative to the *project root* (one level up
+from this file, which sits two levels under `Projects/`) — instead of keeping a local copy.
 
 ## How to scaffold
 

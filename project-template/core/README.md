@@ -11,8 +11,8 @@
 ## Working here
 
 - **Agent rules:** `CLAUDE.md` (= `AGENTS.md` = `GEMINI.md`, kept in sync).
-- **Process:** `process.md` (core) + the profile overlay applied to this project.
-- **Review:** `review-guide.md`.
+- **Process:** `../teleport-docs/guides/process.md` (shared, not copied here) + the profile overlay applied to this project.
+- **Review:** `../teleport-docs/guides/review-guide.md` (shared).
 - **Conventions** (folders, session archive, PRESERVE-before-close): `teleport-conventions.md`.
 
 ## Layout
