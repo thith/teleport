@@ -578,7 +578,7 @@ Then delete the prompt JSON. Restart the listener (same command).
 - **Scrub secrets** (token/`.env` dán trong chat) **trước khi** ghi `session.md`/`HANDOVER.md`/decisions-log và trước commit. Nên có pre-commit gitleaks/regex.
 
 **Bước PRESERVE (chạy ở *cả* wind-down lẫn handover, MUST):**
-1. **Ghi knowledge** (luôn, *không chặn*, không cần đợi user): `sessions/<date-slug-cXXXX>/session.md` (summary + biên bản). Scrub secrets trước. **Nếu project đã có `sessions/INDEX.md`** (xem "Tìm lại session đã preserve" dưới đây) → **thêm 1 dòng mới vào đó** (ngày · persona · topic · path) trong cùng bước này — quên bước này thì index mất tác dụng cho phiên sau. Project chưa có `INDEX.md` thì bỏ qua (đừng tự tạo nếu chưa được yêu cầu — chỉ đề xuất khi lookup thủ công lặp lại nhiều lần, xem cuối mục dưới).
+1. **Ghi knowledge** (luôn, *không chặn*, không cần đợi user): `sessions/<date-slug-cXXXX>/session.md` (summary + biên bản). Scrub secrets trước. **Cập nhật `sessions/INDEX.md`** (ngày · persona · topic · path) trong cùng bước này — **tạo lazy nếu project chưa có** (giống mọi canonical khác trong guide này: tạo khi lần đầu cần, không pre-create rỗng cho project sẽ không dùng tới) kèm 1 dòng note cách dùng ở đầu file (xem mẫu ở "Tìm lại session đã preserve" dưới đây / `digesty/sessions/INDEX.md` làm ví dụ). Quên bước này thì index mất tác dụng cho phiên sau.
 2. **Ghi `HANDOVER.md`** (luôn, *không chặn*) ngay cạnh `session.md` — bản **hướng-tới-tương-lai** để agent-sau catch up **không phải mò lại chat**. `session.md` là *hồi cố*; `HANDOVER.md` trả lời *"bắt đầu từ đâu"*. Template gọn (theo ngôn ngữ convo):
    ```
    # Handover — catch-up (<date> · <persona>/c<convoId>)
