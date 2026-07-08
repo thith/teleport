@@ -9,6 +9,7 @@
   "pending":  { "run": "pending.mjs", "args": [],                "needsProject": false, "minRole": "member",     "desc": "list convos waiting on an admin reply" },
   "broadcast":{ "run": "broadcast.mjs","args": [],                "needsProject": false, "minRole": "admin",      "desc": "system message to ALL live topics: /broadcast [--chat <id>] <text>" },
   "start":    { "run": "start.mjs",   "args": [],                "needsProject": false, "minRole": "public",     "desc": "onboarding help" },
+  "cswap":    { "run": "cswap.mjs",   "args": [],                "needsProject": false, "minRole": "maintainer", "desc": "Claude account switcher: /cswap = list accounts, /cswap <n> = switch to account n" },
   "w":        { "alias": "whisper" },
   "i":        { "alias": "instruct" }
 }
