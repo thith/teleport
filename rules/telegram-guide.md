@@ -578,7 +578,7 @@ Then delete the prompt JSON. Restart the listener (same command).
 - **Scrub secrets** (token/`.env` dán trong chat) **trước khi** ghi `session.md`/`HANDOVER.md`/decisions-log và trước commit. Nên có pre-commit gitleaks/regex.
 
 **Bước PRESERVE (chạy ở *cả* wind-down lẫn handover, MUST):**
-1. **Ghi knowledge** (luôn, *không chặn*, không cần đợi user): `sessions/<date-slug-cXXXX>/session.md` (summary + biên bản). Scrub secrets trước.
+1. **Ghi knowledge** (luôn, *không chặn*, không cần đợi user): `sessions/<date-slug-cXXXX>/session.md` (summary + biên bản). Scrub secrets trước. **Nếu project đã có `sessions/INDEX.md`** (xem "Tìm lại session đã preserve" dưới đây) → **thêm 1 dòng mới vào đó** (ngày · persona · topic · path) trong cùng bước này — quên bước này thì index mất tác dụng cho phiên sau. Project chưa có `INDEX.md` thì bỏ qua (đừng tự tạo nếu chưa được yêu cầu — chỉ đề xuất khi lookup thủ công lặp lại nhiều lần, xem cuối mục dưới).
 2. **Ghi `HANDOVER.md`** (luôn, *không chặn*) ngay cạnh `session.md` — bản **hướng-tới-tương-lai** để agent-sau catch up **không phải mò lại chat**. `session.md` là *hồi cố*; `HANDOVER.md` trả lời *"bắt đầu từ đâu"*. Template gọn (theo ngôn ngữ convo):
    ```
    # Handover — catch-up (<date> · <persona>/c<convoId>)
@@ -594,6 +594,11 @@ Then delete the prompt JSON. Restart the listener (same command).
 6. **Commit — OPT-IN, KHÔNG chặn wind-down:** user còn *active* → liệt kê thứ lưu + chỗ + message, confirm → commit (sensitive, cần admin/maintainer). User đã im/đi → **vẫn lưu đĩa (1–5), KHÔNG block chờ commit**; để uncommitted cho phiên sau. **KHÔNG push** trừ khi user bảo.
 
 > *Im lặng của user KHÔNG được làm mất knowledge* — bước 1 luôn ghi đĩa. `tmp/` không auto-xoá nên crash/đóng-đột-ngột vẫn còn nháp để cứu.
+
+**Tìm lại session đã preserve (lookup) — user thường chỉ nhớ *persona* (tên con vật) hoặc *topic*, KHÔNG nhớ path chính xác `sessions/<date-slug-cXXXX>/` sau khi đóng phiên:**
+1. **Có `sessions/INDEX.md`** (project đã áp dụng convention này, vd digesty) → đọc file đó trước — 1 dòng/phiên (ngày · persona · topic · path), grep theo persona hoặc từ khoá topic. **Dòng cuối cùng khớp = phiên mới nhất** (topic có thể trải qua nhiều phiên/persona khác nhau theo thời gian — đừng dừng ở dòng đầu tiên tìm thấy). Rồi mở `HANDOVER.md`/`session.md` ở path đó.
+2. **Chưa có `INDEX.md`** → `ls sessions/ | sort` (tên thư mục có `<date>-<slug>-<hash>`, slug thường chứa topic) rồi match theo ngày/từ khoá; nếu vẫn mơ hồ, `grep -rl "<persona hoặc topic>" sessions/*/session.md sessions/*/HANDOVER.md` và ưu tiên file có ngày mới nhất.
+3. Nếu user chủ động nhờ tra cứu kiểu này nhiều lần cho cùng 1 project → cân nhắc đề xuất tạo `sessions/INDEX.md` cho project đó (xem ví dụ tại `digesty/AGENTS.md` § *Session log & handover*) thay vì lặp lại bước 2 mỗi lần.
 
 ## Winding down a topic — "Chào và đóng topic" (MUST follow in order)
 
