@@ -60,7 +60,60 @@ test('empty/null thread map: falls back to legacy reply-to matching', () => {
 // ── RFC 08: daemon-control prefix `/dm <cmd>` ─────────────────────────────────
 import {
   isDmControlMessage, stripDmControlPrefix, collectMessagesToProcess, DM_CONTROL_PREFIX,
+  shouldSettleBatch, settleWindowFor, DEFAULT_SETTLE_MS, DEFAULT_SETTLE_FOLLOWUP_MS,
 } from './tele-listen.mjs';
+
+// Build a minimal batch entry ({ msg }) with a Telegram `date` (seconds).
+const batchAt = (...dateSecs) => dateSecs.map((d) => ({ msg: { date: d } }));
+const F = 12_000; // firstMs (lone message)
+const U = 8_000;  // followupMs (burst confirmed)
+
+test('settleWindowFor: lone message → firstMs; >=2 messages → followupMs', () => {
+  assert.equal(settleWindowFor(1, F, U), F);
+  assert.equal(settleWindowFor(2, F, U), U);
+  assert.equal(settleWindowFor(4, F, U), U);
+  assert.equal(DEFAULT_SETTLE_MS, 12_000);
+  assert.equal(DEFAULT_SETTLE_FOLLOWUP_MS, 8_000);
+});
+
+test('shouldSettleBatch: lone message uses the 12s window', () => {
+  // one message, age 10s < 12s → defer.
+  assert.equal(shouldSettleBatch(batchAt(90), 100_000, F, U), true);
+  // one message, age 13s >= 12s → release.
+  assert.equal(shouldSettleBatch(batchAt(87), 100_000, F, U), false);
+});
+
+test('shouldSettleBatch: a burst (>=2) uses the tighter 8s window', () => {
+  // two messages, newest age 7s < 8s → defer.
+  assert.equal(shouldSettleBatch(batchAt(90, 93), 100_000, F, U), true);
+  // two messages, newest age 9s >= 8s → release (would still be settling under the 12s tier).
+  assert.equal(shouldSettleBatch(batchAt(80, 91), 100_000, F, U), false);
+});
+
+test('shouldSettleBatch: 4 msgs 5s apart — resets window, releases at ~8s after the last', () => {
+  // msgs at t=0,5,10,15s. At t=20s the newest (15s) is only 5s old → defer (8s tier).
+  assert.equal(shouldSettleBatch(batchAt(0, 5, 10, 15), 20_000, F, U), true);
+  // At t=23s the newest is 8s old → release the whole batch (vs 27s under a flat 12s).
+  assert.equal(shouldSettleBatch(batchAt(0, 5, 10, 15), 23_000, F, U), false);
+});
+
+test('shouldSettleBatch: pre-existing OLD backlog releases immediately (age-based, not count)', () => {
+  // Listener resumes after a long turn: now=100s, 4 messages whose NEWEST was
+  // sent at t=80s → age 20s, far past any window → NOT held, processed at once.
+  assert.equal(shouldSettleBatch(batchAt(20, 40, 60, 80), 100_000, F, U), false);
+});
+
+test('shouldSettleBatch: future-dated message (clock skew) does not defer', () => {
+  // newest dated 5s in the future vs now → age < 0 → release, never hang.
+  assert.equal(shouldSettleBatch(batchAt(105), 100_000, F, U), false);
+});
+
+test('shouldSettleBatch: empty batch and disabled tiers never defer', () => {
+  assert.equal(shouldSettleBatch([], 100_000, F, U), false);
+  assert.equal(shouldSettleBatch(batchAt(99), 100_000, 0, U), false);      // lone tier disabled
+  assert.equal(shouldSettleBatch(batchAt(99, 99), 100_000, F, 0), false);  // followup tier disabled
+  assert.equal(shouldSettleBatch(batchAt(99), 100_000, NaN, U), false);
+});
 
 test('isDmControlMessage: matches /dm forms (case-insensitive, @botname, bare), rejects others', () => {
   assert.equal(DM_CONTROL_PREFIX, 'dm');

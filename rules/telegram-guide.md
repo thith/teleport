@@ -435,7 +435,7 @@ Two cases. `send-telegram.mjs` prints the matching hint on stdout.
 TaskStop(task_id: <LAST_MONITOR_ID>)   # skip on first send
 
 Monitor({
-  command: "until node ../teleport/scripts/tele-listen.mjs --convo $CONVO_ID; do sleep 12; done",
+  command: "until node ../teleport/scripts/tele-listen.mjs --convo $CONVO_ID --settle; do sleep 12; done",
   timeout_ms: 300000,
   persistent: true,
   description: "Telegram reply to convo <CONVO_ID>"
@@ -459,9 +459,21 @@ Monitor({
 
 **All other agents:** wait for one prompt at a time.
 ```bash
-node ../teleport/scripts/tele-listen.mjs --wait-once --convo $CONVO_ID
+node ../teleport/scripts/tele-listen.mjs --wait-once --convo $CONVO_ID --settle
 ```
 `--wait-once` is synchronous: it blocks until the next prompt file is ready, prints the prompt path, then exits so the agent can read and handle it. A prompt may aggregate consecutive admin messages using `Admin follow-up:` lines. Run it again after deleting the prompt if you need to keep listening.
+
+**Burst settle (debounce) — `--settle`, listen-loops only.** Humans often type one task across several Telegram bubbles. To avoid acting on the first bubble alone (an incomplete prompt) and then wasting a second pass on the rest, a listener started with **`--settle`** (the Monitor `until` command and `--wait-once` above both pass it) **holds a batch until the newest message has been quiet** for a settle window, then coalesces the whole burst into a single prompt. Every bubble is 👍-reacted as it arrives (within ~5s), so the wait reads as extra processing time, not a hang.
+
+The window is **age-based** (measured from each message's own `date`), and has **two tiers**:
+- **Lone message → `TELE_SETTLE_MS` (default 12s):** we can't yet tell if it's the start of a burst, so give a wide grace.
+- **Burst confirmed (≥2 messages) → `TELE_SETTLE_FOLLOWUP_MS` (default 8s):** intra-burst typing is faster, so a shorter quiet period already means "done".
+
+Each new bubble both resets the window and (past the first) narrows it, so a burst releases ~8s after your *last* message. A genuinely-single fresh message costs ~12s before the agent starts — negligible against a multi-minute task. Set either env var to `0` to disable that tier, or tune per-project. (Mechanism: a settling batch defers via the listener's "no-match" exit code, leaving the messages in cache to replay on the next poll; the per-loop offset is not advanced, so nothing is lost.)
+
+**Why opt-in — the drain must NOT settle.** The pre-critical-action drain (see "re-poll before critical actions") is a **bare `--convo`** one-shot with **no `--settle`**, so it never debounces: it sees pending messages immediately and its exit 0/2 keeps meaning "prompt pending / none". This is deliberate. The settle gate is a **single `Math.max(date)` over the whole batch, deferred all-or-nothing**, so one just-arrived bubble lifts the window for **everything** in the batch — an old backlog riding alongside a fresh bubble is held too, not released. If the drain settled, a last-second correction could defer the whole batch, the drain would report "none", and the destructive action would proceed past it. Keeping `--settle` off the drain preserves that safety contract; forgetting the flag degrades to "no debounce" (safe), never "drain swallows a correction".
+
+**Scope note:** the settle cache/offset are per-convo (topic-routed), so a burst in another topic never affects this convo's window. The only shared surface is the per-**bot-token** updates cache (projects on *different* bot tokens are fully isolated); see the `main()` "Known bound" comment for the machine-rate eviction edge.
 
 After starting `--wait-once`:
 - Do NOT end your turn / send a "final" or similar response while waiting for replies (most agent runtimes stop polling once the turn ends).
@@ -542,7 +554,7 @@ Treat your reply as a clarification turn, not a task completion. **MUST NOT** st
 
 Before any **action with non-trivial blast radius**, you **MUST** drain any pending admin messages. Treat as critical: `git commit`/`git push`/`git reset --hard`/`git rebase`, force flags on destructive commands (`push --force`, `rm -rf`, `chmod -R`), `git tag` / release publish / package publish, DB data deletion or schema migration against non-local DB, cloud/IaC apply, secret rotation, `docker compose down -v`, deploying, sending a billable API call, posting to Slack / GitHub / external chat, or anything else that's hard to reverse. Reading files, running tests, drafting a reply — not critical, no re-poll needed.
 
-How to drain — bare `--convo` one-shot (NOT `--wait-once`, NOT `--watch`):
+How to drain — bare `--convo` one-shot (NOT `--wait-once`, NOT `--watch`, NOT `--settle` — the drain must see pending messages immediately, never debounce them):
 ```bash
 # Delete any prior unconsumed prompt first so a stale file from a previous
 # turn doesn't get re-read as "new" — your prior turn should already have
