@@ -23,7 +23,20 @@ import {
   readCacheStable,
   UPDATES_CACHE_FILE,
   GLOBAL_OFFSET_FILE,
+  parseArgs,
 } from './tele-listen.mjs';
+
+// RFC 02 P0: `--loop` is the opt-in flag that flips the SUPERSEDE exit 0→3 so a
+// persistent `while` wrapper can `break` instead of re-arming. Default off so
+// the legacy `until` command (and every running agent) is unchanged.
+test('parseArgs: --loop opt-in, default false, orthogonal to other flags', () => {
+  assert.equal(parseArgs(['--convo', '1']).loop, false);
+  assert.equal(parseArgs(['--convo', '1', '--loop']).loop, true);
+  const both = parseArgs(['--convo', '1', '--settle', '--loop']);
+  assert.equal(both.settle, true);
+  assert.equal(both.loop, true);
+  assert.equal(both.convo, '1');
+});
 
 let counter = 0;
 function tmp(suffix) {

@@ -208,6 +208,7 @@ export function parseArgs(argv) {
   let watch = false;
   let waitOnce = false;
   let settle = false;
+  let loop = false;
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === '--watch') {
       watch = true;
@@ -219,6 +220,16 @@ export function parseArgs(argv) {
     }
     if (argv[i] === '--settle') {
       settle = true;
+      continue;
+    }
+    // --loop: the caller wraps this one-shot in a persistent shell `while`
+    // (self-re-arm). OPT-IN ONLY. Its sole effect is changing the SUPERSEDE
+    // exit from 0→3 so the wrapper can `break` (stand down) instead of
+    // re-arming a superseded listener forever (which would re-supersede and
+    // flood). The legacy `until …` command (no --loop) keeps supersede=0, so
+    // its behavior — and every currently-running agent — is unchanged.
+    if (argv[i] === '--loop') {
+      loop = true;
       continue;
     }
     if (argv[i] === '--legacy-filter') {
@@ -268,7 +279,7 @@ export function parseArgs(argv) {
   if (watch && waitOnce) {
     throw new Error('--watch and --wait-once are mutually exclusive');
   }
-  return { filterReplyTo, offsetFile, offsetFileProvided, convo, legacyFilter, watch, waitOnce, settle };
+  return { filterReplyTo, offsetFile, offsetFileProvided, convo, legacyFilter, watch, waitOnce, settle, loop };
 }
 
 // extractBotId is imported from send-telegram.mjs (single source of truth).
@@ -1570,7 +1581,7 @@ async function main() {
     console.error(`[tele-listen] ${e instanceof Error ? e.message : String(e)}`);
     process.exit(1);
   }
-  let { filterReplyTo, offsetFile, offsetFileProvided, convo, legacyFilter, settle } = args;
+  let { filterReplyTo, offsetFile, offsetFileProvided, convo, legacyFilter, settle, loop } = args;
 
   // Env resolution.
   // - No --convo / --filter-reply-to → consult env.
@@ -1748,7 +1759,10 @@ async function main() {
     console.log(
       `[tele-listen] superseded by listener pid=${superseder.pid} — exiting`,
     );
-    process.exit(0);
+    // Under --loop, exit 3 so the persistent `while` wrapper breaks (stands
+    // down) instead of re-arming. Legacy (no --loop) keeps exit 0 = ends the
+    // `until` loop the same way it always has.
+    process.exit(loop ? 3 : 0);
   }
 
   // Prompt file path: stable per-convo for `--convo`, filter-keyed for legacy.
@@ -2006,7 +2020,7 @@ async function main() {
       if ((e.convoId ?? null) !== convo) continue;
       if (compareSameConvo(e, mineEntry) > 0) {
         console.log(`[tele-listen] same-convo peer pid=${e.pid} won pre-write race — exiting`);
-        process.exit(0);
+        process.exit(loop ? 3 : 0); // --loop: stand down (3); legacy: end until-loop (0)
       }
     }
   }
