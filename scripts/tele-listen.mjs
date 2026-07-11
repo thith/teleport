@@ -1728,8 +1728,7 @@ async function main() {
   const registry = await refreshRegistry({ pid: myMonitorPid, filter: filterReplyTo, offsetFile, convoId: convo });
   const superseder = findSuperseder({ myPid: myMonitorPid, myFilter: filterReplyTo, myConvoId: convo, registry });
   if (superseder && superseder.__inconclusive) {
-    console.log(`[tele-listen] supersede check inconclusive (${superseder.reason}); retry next poll`);
-    process.exit(2);
+    process.exit(2); // supersede check inconclusive — retry next poll (silent; exit code is the signal)
   }
   if (superseder) {
     console.log(
@@ -1747,13 +1746,11 @@ async function main() {
     : getProcessingFile(filterReplyTo);
 
   if (fs.existsSync(processingFile)) {
-    console.log(`[tele-listen] ${path.basename(processingFile)} exists — still processing, skipping`);
-    process.exit(2);
+    process.exit(2); // still processing — skip silently (exit code is the signal)
   }
 
   if (fs.existsSync(promptFile)) {
-    console.log(`[tele-listen] ${path.basename(promptFile)} exists — not yet consumed, skipping`);
-    process.exit(2);
+    process.exit(2); // prompt not yet consumed — skip silently (exit code is the signal)
   }
 
   // Centralized fetch: acquire lock, fetch updates, cache locally.
@@ -1939,12 +1936,7 @@ async function main() {
     // newly arrived bubbles get their 👍 on the poll they first appear.
     // Best-effort — reaction failure must not block the eventual prompt.
     await reactToMessages(token, toProcess);
-    const windowMs = settleWindowFor(toProcess.length, firstMs, followupMs);
-    console.log(
-      `[tele-listen] burst settling: newest msg quiet < ${Math.round(windowMs / 1000)}s ` +
-      `— acked + deferring ${toProcess.length} msg(s)`,
-    );
-    process.exit(2); // per-loop offset NOT advanced → replays next poll
+    process.exit(2); // burst not settled — defer silently; offset NOT advanced → replays next poll
   }
 
   // Passive roster harvest (best-effort): record each human sender's id/username
@@ -1993,8 +1985,7 @@ async function main() {
     const fresh = readRegistry();
     const mineEntry = fresh.find((e) => e.pid === myMonitorPid);
     if (!mineEntry) {
-      console.log('[tele-listen] my registry row missing pre-write; deferring to next poll');
-      process.exit(2);
+      process.exit(2); // registry row missing pre-write — defer to next poll (silent)
     }
     for (const e of fresh) {
       if (e.pid === myMonitorPid) continue;
