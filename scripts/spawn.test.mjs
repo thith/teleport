@@ -18,7 +18,7 @@ const FIXED_CONVO = uuidToConvoInt(FIXED_UUID);
 const FIXED_NAME = `tele-${shortConvoHash(FIXED_CONVO)}`;
 
 test('SPAWN_PROMPT is the hard-coded greeting (no task passed)', () => {
-  assert.equal(SPAWN_PROMPT, 'Telegram me and wait for instructions');
+  assert.equal(SPAWN_PROMPT, 'Find and read process.md and review-guide.md if present in this project, then Telegram me and wait for instructions');
 });
 
 test('runSpawn: passes cwd through to the spawn call (sibling-project targeting)', () => {
