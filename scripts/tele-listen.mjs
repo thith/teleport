@@ -208,6 +208,7 @@ export function parseArgs(argv) {
   let watch = false;
   let waitOnce = false;
   let settle = false;
+  let loop = false;
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === '--watch') {
       watch = true;
@@ -219,6 +220,16 @@ export function parseArgs(argv) {
     }
     if (argv[i] === '--settle') {
       settle = true;
+      continue;
+    }
+    // --loop: the caller wraps this one-shot in a persistent shell `while`
+    // (self-re-arm). OPT-IN ONLY. Its sole effect is changing the SUPERSEDE
+    // exit from 0→3 so the wrapper can `break` (stand down) instead of
+    // re-arming a superseded listener forever (which would re-supersede and
+    // flood). The legacy `until …` command (no --loop) keeps supersede=0, so
+    // its behavior — and every currently-running agent — is unchanged.
+    if (argv[i] === '--loop') {
+      loop = true;
       continue;
     }
     if (argv[i] === '--legacy-filter') {
@@ -268,7 +279,7 @@ export function parseArgs(argv) {
   if (watch && waitOnce) {
     throw new Error('--watch and --wait-once are mutually exclusive');
   }
-  return { filterReplyTo, offsetFile, offsetFileProvided, convo, legacyFilter, watch, waitOnce, settle };
+  return { filterReplyTo, offsetFile, offsetFileProvided, convo, legacyFilter, watch, waitOnce, settle, loop };
 }
 
 // extractBotId is imported from send-telegram.mjs (single source of truth).
@@ -589,9 +600,23 @@ export function buildPromptData(msg, updateId = null, botId = null, roles = null
   };
 }
 
+// Attribution for a coalesced multi-message batch (P2, RFC 02). Each message is
+// labeled with its ACTUAL sender name + role — replaces the old hardcoded
+// "Admin follow-up:" which wrongly assumed every follow-up came from the admin
+// and hid WHO sent it (authority matters: admin = directive, member = context).
+// Defensive: never throws; falls back to a numeric id / 'member' on any gap.
+export function attributionLabel(from, roles) {
+  const name = formatFromName(from) || `user ${from && from.id != null ? from.id : '?'}`;
+  let role = 'member';
+  try { const r = roleFor(roles, from?.id); if (r) role = r; } catch { /* keep 'member' */ }
+  return `${name} (${role})`;
+}
+
 /**
  * Combine multiple admin messages into one prompt entry.
- * First message is primary; subsequent are appended as "Admin follow-up: …".
+ * Single message → bare text (unchanged). Multi-message batch → each line is
+ * prefixed with its sender's "<name> (<role>):" attribution (P2 — replaces the
+ * old blanket "Admin follow-up:" that mislabeled non-admin senders and hid who).
  * messageId/chatId/timestamp + reply & quote metadata are taken from the
  * LAST message (newest) so the AI replies to the right thread. Reply/quote
  * metadata from earlier messages in the batch is intentionally dropped.
@@ -603,7 +628,7 @@ export function buildCombinedPromptData(messages, botId = null, convoId = null, 
   const text =
     rest.length === 0
       ? getText(first.msg)
-      : [getText(first.msg), ...rest.map((m) => `Admin follow-up: ${getText(m.msg)}`)].join('\n\n');
+      : messages.map((m) => `${attributionLabel(m.msg.from, roles)}: ${getText(m.msg)}`).join('\n\n');
   const last = messages[messages.length - 1].msg;
   const replyTo = realReplyTo(last);
 
@@ -1556,7 +1581,7 @@ async function main() {
     console.error(`[tele-listen] ${e instanceof Error ? e.message : String(e)}`);
     process.exit(1);
   }
-  let { filterReplyTo, offsetFile, offsetFileProvided, convo, legacyFilter, settle } = args;
+  let { filterReplyTo, offsetFile, offsetFileProvided, convo, legacyFilter, settle, loop } = args;
 
   // Env resolution.
   // - No --convo / --filter-reply-to → consult env.
@@ -1728,14 +1753,16 @@ async function main() {
   const registry = await refreshRegistry({ pid: myMonitorPid, filter: filterReplyTo, offsetFile, convoId: convo });
   const superseder = findSuperseder({ myPid: myMonitorPid, myFilter: filterReplyTo, myConvoId: convo, registry });
   if (superseder && superseder.__inconclusive) {
-    console.log(`[tele-listen] supersede check inconclusive (${superseder.reason}); retry next poll`);
-    process.exit(2);
+    process.exit(2); // supersede check inconclusive — retry next poll (silent; exit code is the signal)
   }
   if (superseder) {
     console.log(
       `[tele-listen] superseded by listener pid=${superseder.pid} — exiting`,
     );
-    process.exit(0);
+    // Under --loop, exit 3 so the persistent `while` wrapper breaks (stands
+    // down) instead of re-arming. Legacy (no --loop) keeps exit 0 = ends the
+    // `until` loop the same way it always has.
+    process.exit(loop ? 3 : 0);
   }
 
   // Prompt file path: stable per-convo for `--convo`, filter-keyed for legacy.
@@ -1747,13 +1774,11 @@ async function main() {
     : getProcessingFile(filterReplyTo);
 
   if (fs.existsSync(processingFile)) {
-    console.log(`[tele-listen] ${path.basename(processingFile)} exists — still processing, skipping`);
-    process.exit(2);
+    process.exit(2); // still processing — skip silently (exit code is the signal)
   }
 
   if (fs.existsSync(promptFile)) {
-    console.log(`[tele-listen] ${path.basename(promptFile)} exists — not yet consumed, skipping`);
-    process.exit(2);
+    process.exit(2); // prompt not yet consumed — skip silently (exit code is the signal)
   }
 
   // Centralized fetch: acquire lock, fetch updates, cache locally.
@@ -1939,12 +1964,7 @@ async function main() {
     // newly arrived bubbles get their 👍 on the poll they first appear.
     // Best-effort — reaction failure must not block the eventual prompt.
     await reactToMessages(token, toProcess);
-    const windowMs = settleWindowFor(toProcess.length, firstMs, followupMs);
-    console.log(
-      `[tele-listen] burst settling: newest msg quiet < ${Math.round(windowMs / 1000)}s ` +
-      `— acked + deferring ${toProcess.length} msg(s)`,
-    );
-    process.exit(2); // per-loop offset NOT advanced → replays next poll
+    process.exit(2); // burst not settled — defer silently; offset NOT advanced → replays next poll
   }
 
   // Passive roster harvest (best-effort): record each human sender's id/username
@@ -1993,15 +2013,14 @@ async function main() {
     const fresh = readRegistry();
     const mineEntry = fresh.find((e) => e.pid === myMonitorPid);
     if (!mineEntry) {
-      console.log('[tele-listen] my registry row missing pre-write; deferring to next poll');
-      process.exit(2);
+      process.exit(2); // registry row missing pre-write — defer to next poll (silent)
     }
     for (const e of fresh) {
       if (e.pid === myMonitorPid) continue;
       if ((e.convoId ?? null) !== convo) continue;
       if (compareSameConvo(e, mineEntry) > 0) {
         console.log(`[tele-listen] same-convo peer pid=${e.pid} won pre-write race — exiting`);
-        process.exit(0);
+        process.exit(loop ? 3 : 0); // --loop: stand down (3); legacy: end until-loop (0)
       }
     }
   }

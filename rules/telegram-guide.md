@@ -430,17 +430,22 @@ Capture `<N>` once; pass to the listener as `--convo <N>`.
 
 Two cases. `send-telegram.mjs` prints the matching hint on stdout.
 
-**Claude (Monitor tool):** one-shot tele-listen inside an `until` loop. Monitor restarts it after each reply.
+**Claude (Monitor tool):** a persistent **self-re-arming** `while` loop (RFC 02). The listener **survives each delivery** — you start it **ONCE per convo and never re-arm**; per message you only read the prompt → reply → delete it. Start it once:
 ```
-TaskStop(task_id: <LAST_MONITOR_ID>)   # skip on first send
-
 Monitor({
-  command: "until node ../teleport/scripts/tele-listen.mjs --convo $CONVO_ID --settle; do sleep 12; done",
-  timeout_ms: 300000,
+  command: "while :; do node ../teleport/scripts/tele-listen.mjs --convo $CONVO_ID --settle --loop; case $? in 3) break;; 1) sleep 30;; esac; sleep 2; done",
+  timeout_ms: 3600000,
   persistent: true,
   description: "Telegram reply to convo <CONVO_ID>"
 })
 ```
+`--loop` makes a **superseded** listener exit `3` so the wrapper `break`s (stands down) instead of re-arming forever; a **delivery** (`0`) or **idle** poll (`2`) keeps the loop alive (no re-arm); a **fatal** error (`1`, e.g. bad token/convo) sleeps 30s to avoid a tight loop. If you accidentally start a second Monitor for the same convo, the older listener self-supersedes (exits `3` → its wrapper breaks) — but still prefer one per convo. On wind-down, `TaskStop` it.
+
+> **⚠️ RFC 02 override (self-re-arm active).** Với lệnh `while … --loop` ở trên, listener **tự sống qua mỗi lần giao tin** nên:
+> - **KHÔNG re-arm sau mỗi send** — start MỘT lần/convo, mỗi tin chỉ đọc→đáp→xoá. (Bỏ qua "flow chuẩn sau mỗi send là TaskStop+Monitor mới" bên dưới — đó là của model `until` cũ.)
+> - **`superseded` → ĐỨNG XUỐNG (stand down):** `--loop` cho tele-listen exit `3`, wrapper `break`. Vì bạn không re-arm nên supersede = listener khác thật sự tiếp quản → nhường là đúng (self-cleaning nếu lỡ có 2 Monitor). *(Ghi đè điều "ignore same-convo supersede" bên dưới — điều đó chỉ đúng khi `until` re-arm-per-reply gây self-supersede giả.)*
+>
+> Phần self-heal/heartbeat chi tiết dưới đây là **legacy (chờ cleanup RFC 02)** — vẫn áp dụng cho runtime KHÔNG Monitor (`--wait-once`) và làm tham chiếu.
 
 **Claude Monitor resilience — self-heal + heartbeat (MUST).** Vòng `until … do sleep 12; done` chỉ retry *script bên trong* Monitor; nó KHÔNG cứu khi **task Monitor không sống** (lệnh Monitor lỗi/malformed, không trả `task_id`, exit ngay vì lỗi hạ tầng). Hệ quả: agent tưởng đang nghe nhưng thực ra điếc, reply user không được xử lý. (Runtime khác Monitor dùng `--wait-once` ở dưới.)
 
@@ -461,7 +466,7 @@ Monitor({
 ```bash
 node ../teleport/scripts/tele-listen.mjs --wait-once --convo $CONVO_ID --settle
 ```
-`--wait-once` is synchronous: it blocks until the next prompt file is ready, prints the prompt path, then exits so the agent can read and handle it. A prompt may aggregate consecutive admin messages using `Admin follow-up:` lines. Run it again after deleting the prompt if you need to keep listening.
+`--wait-once` is synchronous: it blocks until the next prompt file is ready, prints the prompt path, then exits so the agent can read and handle it. A prompt may aggregate consecutive messages, each attributed with its sender as `<name> (<role>):` (a multi-message batch only; a single message stays bare). Run it again after deleting the prompt if you need to keep listening.
 
 **Burst settle (debounce) — `--settle`, listen-loops only.** Humans often type one task across several Telegram bubbles. To avoid acting on the first bubble alone (an incomplete prompt) and then wasting a second pass on the rest, a listener started with **`--settle`** (the Monitor `until` command and `--wait-once` above both pass it) **holds a batch until the newest message has been quiet** for a settle window, then coalesces the whole burst into a single prompt. Every bubble is 👍-reacted as it arrives (within ~5s), so the wait reads as extra processing time, not a hang.
 
