@@ -195,7 +195,7 @@ test('self-heal is deferred on a torn cache tail (no spurious rollback)', () => 
 test('readCacheSinceOffset dedups duplicate appends by update_id (co-op cache safety)', () => {
   const cacheFile = tmp('dedup-cache.jsonl');
   // Simulate several pollers re-appending the SAME batch (the bug that made a
-  // prompt repeat "Admin follow-up:" N times): update 100 appended 5×, 101 3×.
+  // prompt repeat an attributed line N times): update 100 appended 5×, 101 3×.
   appendToCache([upd(100), upd(101)], cacheFile);
   appendToCache([upd(100), upd(101)], cacheFile);
   appendToCache([upd(100)], cacheFile);

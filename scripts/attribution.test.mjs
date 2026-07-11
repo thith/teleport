@@ -32,11 +32,26 @@ test('buildPromptData includes fromName', () => {
   assert.equal(out.fromUserId, '7');
 });
 
-test('buildCombinedPromptData uses last sender for fromName', () => {
+test('buildCombinedPromptData uses last sender for fromName; text attributes each sender (P2)', () => {
   const mk = (id, name) => ({ msg: { message_id: id, chat: { id: -100 }, from: { id: id, first_name: name }, text: `m${id}` } });
   const out = buildCombinedPromptData([mk(1, 'Thi'), mk(2, 'Nam')]);
-  assert.equal(out.fromName, 'Nam');
-  assert.match(out.text, /Admin follow-up:/);
+  assert.equal(out.fromName, 'Nam');                 // top-level metadata = last sender (UNCHANGED)
+  assert.doesNotMatch(out.text, /Admin follow-up/);  // old blanket label removed
+  assert.match(out.text, /Thi \(member\): m1/);      // no roles → default 'member'
+  assert.match(out.text, /Nam \(member\): m2/);
+});
+
+test('buildCombinedPromptData: multi-msg attributes real name + role from roles config (P2)', () => {
+  const mk = (id, name) => ({ msg: { message_id: id, chat: { id: -100 }, from: { id, first_name: name }, text: `m${id}` } });
+  const roles = { 1: { role: 'admin' }, 2: { role: 'member' } };
+  const out = buildCombinedPromptData([mk(1, 'Thi'), mk(2, 'Nam')], null, null, roles);
+  assert.match(out.text, /Thi \(admin\): m1/);       // authority now visible: admin ≠ member
+  assert.match(out.text, /Nam \(member\): m2/);
+});
+
+test('buildCombinedPromptData: single message text is bare — no attribution prefix (common case unchanged)', () => {
+  const mk = (id, name) => ({ msg: { message_id: id, chat: { id: -100 }, from: { id, first_name: name }, text: `m${id}` } });
+  assert.equal(buildCombinedPromptData([mk(1, 'Thi')]).text, 'm1');
 });
 
 // Forum phantom-reply: Telegram sets reply_to_message → the topic-creation

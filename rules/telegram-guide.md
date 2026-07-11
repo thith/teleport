@@ -461,7 +461,7 @@ Monitor({
 ```bash
 node ../teleport/scripts/tele-listen.mjs --wait-once --convo $CONVO_ID --settle
 ```
-`--wait-once` is synchronous: it blocks until the next prompt file is ready, prints the prompt path, then exits so the agent can read and handle it. A prompt may aggregate consecutive admin messages using `Admin follow-up:` lines. Run it again after deleting the prompt if you need to keep listening.
+`--wait-once` is synchronous: it blocks until the next prompt file is ready, prints the prompt path, then exits so the agent can read and handle it. A prompt may aggregate consecutive messages, each attributed with its sender as `<name> (<role>):` (a multi-message batch only; a single message stays bare). Run it again after deleting the prompt if you need to keep listening.
 
 **Burst settle (debounce) — `--settle`, listen-loops only.** Humans often type one task across several Telegram bubbles. To avoid acting on the first bubble alone (an incomplete prompt) and then wasting a second pass on the rest, a listener started with **`--settle`** (the Monitor `until` command and `--wait-once` above both pass it) **holds a batch until the newest message has been quiet** for a settle window, then coalesces the whole burst into a single prompt. Every bubble is 👍-reacted as it arrives (within ~5s), so the wait reads as extra processing time, not a hang.
 

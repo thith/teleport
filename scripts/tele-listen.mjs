@@ -589,9 +589,23 @@ export function buildPromptData(msg, updateId = null, botId = null, roles = null
   };
 }
 
+// Attribution for a coalesced multi-message batch (P2, RFC 02). Each message is
+// labeled with its ACTUAL sender name + role — replaces the old hardcoded
+// "Admin follow-up:" which wrongly assumed every follow-up came from the admin
+// and hid WHO sent it (authority matters: admin = directive, member = context).
+// Defensive: never throws; falls back to a numeric id / 'member' on any gap.
+export function attributionLabel(from, roles) {
+  const name = formatFromName(from) || `user ${from && from.id != null ? from.id : '?'}`;
+  let role = 'member';
+  try { const r = roleFor(roles, from?.id); if (r) role = r; } catch { /* keep 'member' */ }
+  return `${name} (${role})`;
+}
+
 /**
  * Combine multiple admin messages into one prompt entry.
- * First message is primary; subsequent are appended as "Admin follow-up: …".
+ * Single message → bare text (unchanged). Multi-message batch → each line is
+ * prefixed with its sender's "<name> (<role>):" attribution (P2 — replaces the
+ * old blanket "Admin follow-up:" that mislabeled non-admin senders and hid who).
  * messageId/chatId/timestamp + reply & quote metadata are taken from the
  * LAST message (newest) so the AI replies to the right thread. Reply/quote
  * metadata from earlier messages in the batch is intentionally dropped.
@@ -603,7 +617,7 @@ export function buildCombinedPromptData(messages, botId = null, convoId = null, 
   const text =
     rest.length === 0
       ? getText(first.msg)
-      : [getText(first.msg), ...rest.map((m) => `Admin follow-up: ${getText(m.msg)}`)].join('\n\n');
+      : messages.map((m) => `${attributionLabel(m.msg.from, roles)}: ${getText(m.msg)}`).join('\n\n');
   const last = messages[messages.length - 1].msg;
   const replyTo = realReplyTo(last);
 
