@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import {
   parseAskArgs, buildAskPrompt, buildReplyPrompt, readText, planAsk,
+  writePromptWithRetry, inactivityNote, RETRY,
 } from './ask.mjs';
 import { EXIT, writePromptExclusive } from './handover.mjs';
 
@@ -101,4 +102,82 @@ test('planAsk: no admin chat configured → USAGE', () => {
   const r = planAsk({ args: { to: 'X', reply: false }, sourceConvoId: '1', text: 'q', nowSec: 1,
     deps: { readTopicsStore: () => ({}), resolveChatIds: () => ({ chatIds: [] }) } });
   assert.equal(r.code, EXIT.USAGE);
+});
+
+// ── T1: auto-retry on transient-busy mailbox ──────────────────────────────────
+
+test('writePromptWithRetry: succeeds on first try, no sleep', async () => {
+  let writes = 0, sleeps = 0;
+  const r = await writePromptWithRetry({ promptObj: {}, promptFile: 'f',
+    deps: { writePromptExclusive: () => { writes++; }, sleep: async () => { sleeps++; } } });
+  assert.equal(r.attempts, 1);
+  assert.equal(writes, 1);
+  assert.equal(sleeps, 0); // no backoff when the first write lands
+});
+
+test('writePromptWithRetry: retries past transient EEXIST, then succeeds', async () => {
+  let calls = 0; const delays = [];
+  const r = await writePromptWithRetry({ promptObj: {}, promptFile: 'f', retry: { attempts: 5, baseMs: 400, maxMs: 8000 },
+    deps: {
+      writePromptExclusive: () => { calls++; if (calls < 3) { const e = new Error('busy'); e.code = 'EEXIST'; throw e; } },
+      sleep: async (ms) => { delays.push(ms); },
+    } });
+  assert.equal(r.attempts, 3);                 // 2 fails + 1 success
+  assert.deepEqual(delays, [400, 800]);        // exponential backoff between tries
+});
+
+test('writePromptWithRetry: EEXIST every time → throws EEXIST after `attempts` tries', async () => {
+  let calls = 0; const delays = [];
+  await assert.rejects(
+    writePromptWithRetry({ promptObj: {}, promptFile: 'f', retry: { attempts: 4, baseMs: 100, maxMs: 1000 },
+      deps: {
+        writePromptExclusive: () => { calls++; const e = new Error('busy'); e.code = 'EEXIST'; throw e; },
+        sleep: async (ms) => { delays.push(ms); },
+      } }),
+    (e) => e.code === 'EEXIST');
+  assert.equal(calls, 4);                       // exactly `attempts` writes
+  assert.deepEqual(delays, [100, 200, 400]);    // one fewer sleep than attempts
+});
+
+test('writePromptWithRetry: non-EEXIST error throws immediately (no retry)', async () => {
+  let calls = 0, sleeps = 0;
+  await assert.rejects(
+    writePromptWithRetry({ promptObj: {}, promptFile: 'f',
+      deps: {
+        writePromptExclusive: () => { calls++; const e = new Error('disk full'); e.code = 'ENOSPC'; throw e; },
+        sleep: async () => { sleeps++; },
+      } }),
+    /disk full/);
+  assert.equal(calls, 1);   // no retry on a real infra error
+  assert.equal(sleeps, 0);
+});
+
+test('RETRY backoff stays bounded by maxMs', () => {
+  // sanity: with defaults the last backoff never exceeds maxMs
+  const last = Math.min(RETRY.baseMs * 2 ** (RETRY.attempts - 2), RETRY.maxMs);
+  assert.ok(last <= RETRY.maxMs);
+});
+
+// ── T2: non-gating liveness advisory ──────────────────────────────────────────
+
+test('inactivityNote: fresh heartbeat → null (no advisory)', () => {
+  const now = 1_000_000;
+  const note = inactivityNote({ convoId: '111', hashtag: 'abcd', now, freshMs: 30 * 60 * 1000,
+    deps: { getLastAliveMs: () => now - 60 * 1000 } }); // touched 1 min ago
+  assert.equal(note, null);
+});
+
+test('inactivityNote: stale heartbeat → advisory with minutes', () => {
+  const now = 100 * 60 * 1000;
+  const note = inactivityNote({ convoId: '111', hashtag: 'abcd', now, freshMs: 30 * 60 * 1000,
+    deps: { getLastAliveMs: () => now - 45 * 60 * 1000 } }); // touched 45 min ago
+  assert.match(note, /#abcd/);
+  assert.match(note, /~45 phút/);
+  assert.match(note, /không active/);
+});
+
+test('inactivityNote: no heartbeat at all → advisory names absent listener', () => {
+  const note = inactivityNote({ convoId: '111', hashtag: 'abcd', now: 1_000_000, freshMs: 30 * 60 * 1000,
+    deps: { getLastAliveMs: () => null } });
+  assert.match(note, /không thấy listener/);
 });

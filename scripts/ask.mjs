@@ -31,6 +31,7 @@ import { readTopicsStore } from './topics-store.mjs';
 import { resolveConvoIdFromEnv } from './convo-registry.mjs';
 import { buildCombinedPromptData, DEFAULT_TMP_DIR } from './tele-listen.mjs';
 import { loadEnvFromFile } from './send-telegram.mjs';
+import { getLastAliveMs, DEFAULT_FRESH_MS as ALIVE_FRESH_MS } from './listener-alive.mjs';
 import {
   normalizeTarget, listLiveTopics, matchTarget, formatTopicList,
   writePromptExclusive, resolveChatIds, EXIT,
@@ -152,6 +153,62 @@ export function planAsk({ args, sourceConvoId, text, envFile = {}, nowSec, deps 
   return { code: EXIT.OK, match, promptFile, promptObj, shadowed: m.shadowed };
 }
 
+// ── T1: auto-retry the exclusive write on a transient-busy mailbox ─────────────
+//
+// The target's mailbox holds at most ONE unconsumed prompt (`wx` flag). A busy
+// target throws EEXIST, but "busy" is almost always momentary — the target
+// drains the prior prompt within seconds and the slot frees. Rather than bounce
+// EXIT.BUSY straight back to the caller (who then has to notice and re-run), we
+// retry a few times with exponential backoff, so most contention resolves
+// silently. Backoff caps at `maxMs`; total wall time for the defaults is ~6s
+// (400+800+1600+3200) across 5 attempts before we finally surface BUSY.
+export const RETRY = { attempts: 5, baseMs: 400, maxMs: 8000 };
+
+// When even the retries are exhausted, tell the CALLER (an agent reading stdout)
+// this is NOT a hard failure — it should re-run the same ask itself after a
+// short wait. This delay is that suggested wait.
+export const RETRY_LATER_MIN = 3;
+
+const defaultSleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Write with bounded exponential backoff on EEXIST. Non-EEXIST errors (real
+// infra failures) throw immediately — no point retrying those. Returns the
+// attempt count on success so the CLI can note when a retry was needed.
+export async function writePromptWithRetry({ promptObj, promptFile, retry = RETRY, deps = {} }) {
+  const writeFn = deps.writePromptExclusive ?? writePromptExclusive;
+  const sleep = deps.sleep ?? defaultSleep;
+  for (let attempt = 1; ; attempt++) {
+    try {
+      writeFn(promptObj, promptFile);
+      return { attempts: attempt };
+    } catch (e) {
+      if (e && e.code === 'EEXIST' && attempt < retry.attempts) {
+        await sleep(Math.min(retry.baseMs * 2 ** (attempt - 1), retry.maxMs));
+        continue;
+      }
+      throw e;
+    }
+  }
+}
+
+// ── T2: non-gating liveness advisory ──────────────────────────────────────────
+//
+// The prompt is ALWAYS written (a dead target's prompt just waits harmlessly).
+// But if the target's listener heartbeat is stale (or absent), nobody is
+// draining that mailbox right now — so we tell the caller, who may need to nudge
+// the target to restart its listener before waiting for a reply. Threshold
+// reuses listener-alive's DEFAULT_FRESH_MS (30 min) — no new constant. Returns
+// the advisory string, or null when the target looks healthy.
+export function inactivityNote({ convoId, hashtag, now = Date.now(), freshMs = ALIVE_FRESH_MS, deps = {} }) {
+  const getFn = deps.getLastAliveMs ?? getLastAliveMs;
+  const last = getFn(convoId);
+  if (last != null && now - last <= freshMs) return null; // fresh heartbeat → healthy
+  const stale = last == null
+    ? 'không thấy listener nào đang chạy'
+    : `listener im ~${Math.max(1, Math.round((now - last) / 60000))} phút`;
+  return `[ask] ⚠️ đã ghi prompt OK nhưng #${hashtag} có vẻ không active (${stale}) — có thể cần nhờ họ bật lại listener trước khi chờ trả lời.`;
+}
+
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
 async function main() {
@@ -175,21 +232,39 @@ async function main() {
   const plan = planAsk({ args, sourceConvoId, text, envFile, nowSec: Math.floor(Date.now() / 1000) });
   if (plan.code !== EXIT.OK) { log(`[ask] ${plan.message}`); process.exit(plan.code); }
 
+  let attempts = 1;
   try {
-    writePromptExclusive(plan.promptObj, plan.promptFile);
+    ({ attempts } = await writePromptWithRetry({ promptObj: plan.promptObj, promptFile: plan.promptFile }));
   } catch (e) {
     if (e && e.code === 'EEXIST') {
-      err(`[ask] target #${plan.match.hashtag} has an unconsumed prompt — busy, retry after it's handled`);
+      // Not a hard failure: the target's mailbox is momentarily full. Emit a
+      // self-retry directive the calling agent can act on (re-run this same ask
+      // after a short wait) instead of giving up. On STDOUT (not stderr): this
+      // is an agent-actionable directive, not a diagnostic — some runtimes only
+      // surface a tool's stdout, so a stderr-only directive could be missed.
+      log(`[ask] ⏳ RETRY-LATER: đã thử ${RETRY.attempts} lần nhưng #${plan.match.hashtag} vẫn bận (agent đó còn prompt chưa xử lý). Đây KHÔNG phải lỗi cứng — hãy TỰ THỬ LẠI sau ~${RETRY_LATER_MIN} phút bằng đúng lệnh ask này.`);
+      // Fold T2 into the busy path: a busy-AND-inactive target likely hung, so
+      // the retry-later may never clear — surface that (also stdout) so the
+      // caller can nudge.
+      const last = getLastAliveMs(plan.match.convoId);
+      if (last == null || Date.now() - last > ALIVE_FRESH_MS) {
+        const stale = last == null ? 'không thấy listener nào đang chạy' : `listener im ~${Math.max(1, Math.round((Date.now() - last) / 60000))} phút`;
+        log(`[ask] (lưu ý: #${plan.match.hashtag} có vẻ không active — ${stale}; nếu thử lại vài lần vẫn bận, có thể agent đã treo — cân nhắc nhờ bật lại listener.)`);
+      }
       process.exit(EXIT.BUSY);
     }
     err(`[ask] write failed: ${e.message}`);
     process.exit(EXIT.ERROR);
   }
   const verb = args.reply ? 'reply' : 'ask';
-  log(`[ask] ${verb} injected → convo ${plan.match.convoId} #${plan.match.hashtag}`);
+  const retried = attempts > 1 ? ` (after ${attempts} tries)` : '';
+  log(`[ask] ${verb} injected → convo ${plan.match.convoId} #${plan.match.hashtag}${retried}`);
   if (plan.shadowed && plan.shadowed.length) {
     log(`[ask] note: ${plan.shadowed.length} older topic(s) share that persona name — picked the most recent; redirect with --to "#${plan.match.hashtag}"`);
   }
+  // T2 — non-gating liveness advisory (target may not be draining its mailbox).
+  const note = inactivityNote({ convoId: plan.match.convoId, hashtag: plan.match.hashtag });
+  if (note) log(note);
   process.exit(EXIT.OK);
 }
 
