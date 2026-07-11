@@ -9,7 +9,10 @@
 //     fire-and-forget, auto-exits when done. Bills against the Agent SDK pool;
 //     use only for true automation/workflow runs.
 //
-// The prompt is HARD-CODED: the new instance just says "Telegram me and wait" and
+// The prompt is HARD-CODED: the new instance onboards by locating + reading
+// process.md + review-guide.md IF PRESENT (path varies per project — e.g. root
+// or guides/, so the agent finds them itself, no hard-coded path; "if present"
+// so a project lacking them just skips ahead), then "Telegram me and wait" — and
 // you give it work over Telegram (it gets its own persona topic via RFC 01/02,
 // and resolves its group from the cwd it's spawned in via RFC 02).
 //
@@ -33,7 +36,7 @@ import { readTopicsStore } from './topics-store.mjs';
 import { formatPersona } from './persona.mjs';
 import { peekPersona } from './persona-store.mjs';
 
-export const SPAWN_PROMPT = 'Telegram me and wait for instructions';
+export const SPAWN_PROMPT = 'Find and read process.md and review-guide.md if present in this project, then Telegram me and wait for instructions';
 
 // Claude CLI `--permission-mode` choices (verified on claude 2.1.186). A spawn
 // ALWAYS sets one — defaulting to `auto`, the new autonomous mode (NOT the old
