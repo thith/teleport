@@ -207,6 +207,7 @@ export function parseArgs(argv) {
   let legacyFilter = false;
   let watch = false;
   let waitOnce = false;
+  let settle = false;
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === '--watch') {
       watch = true;
@@ -214,6 +215,10 @@ export function parseArgs(argv) {
     }
     if (argv[i] === '--wait-once') {
       waitOnce = true;
+      continue;
+    }
+    if (argv[i] === '--settle') {
+      settle = true;
       continue;
     }
     if (argv[i] === '--legacy-filter') {
@@ -263,7 +268,7 @@ export function parseArgs(argv) {
   if (watch && waitOnce) {
     throw new Error('--watch and --wait-once are mutually exclusive');
   }
-  return { filterReplyTo, offsetFile, offsetFileProvided, convo, legacyFilter, watch, waitOnce };
+  return { filterReplyTo, offsetFile, offsetFileProvided, convo, legacyFilter, watch, waitOnce, settle };
 }
 
 // extractBotId is imported from send-telegram.mjs (single source of truth).
@@ -705,6 +710,46 @@ export function stripDmControlPrefix(text) {
   const inner = (m[1] ?? '').trim();
   if (!inner) return null;
   return inner.startsWith('/') ? inner : `/${inner}`;
+}
+
+export const DEFAULT_SETTLE_MS = 12_000;          // lone message: wide grace, we don't yet know if more are coming
+export const DEFAULT_SETTLE_FOLLOWUP_MS = 8_000;  // burst confirmed (>=2 msgs): tighter, intra-burst cadence is faster
+
+/**
+ * Effective settle window for a batch: a lone message gets the wide `firstMs`
+ * grace (we can't yet tell if it's the start of a burst); once a burst is
+ * confirmed (>= 2 messages) we switch to the tighter `followupMs`, because
+ * within a burst the human's typing cadence is faster, so a shorter quiet
+ * period already means "done". Exported for the log line + tests.
+ */
+export function settleWindowFor(count, firstMs = DEFAULT_SETTLE_MS, followupMs = DEFAULT_SETTLE_FOLLOWUP_MS) {
+  return count >= 2 ? followupMs : firstMs;
+}
+
+/**
+ * Burst-settle (debounce) decision. A user often types one task across several
+ * Telegram bubbles; acting on the first bubble alone builds an incomplete
+ * prompt and forces a wasteful second pass. Return true to DEFER the batch —
+ * hold it until the newest message has been quiet for the effective window, so
+ * consecutive bubbles coalesce into one combined prompt. Every new bubble lifts
+ * `newest` (resetting the window) AND grows the count (which, past the first,
+ * narrows the window from `firstMs` to `followupMs`).
+ *
+ * Pure + total so it is unit-testable in isolation from main()'s process.exit:
+ * - Empty batch → never defer (nothing to hold).
+ * - effective window <= 0 / non-finite → that tier's debounce disabled → never defer.
+ * - A message dated in the FUTURE vs `now` (age < 0) is clock skew on a
+ *   mis-synced host → do NOT defer (degrade to immediate release rather than
+ *   risk deferring forever). Only a batch whose newest message is younger than
+ *   the window (0 <= age < window) defers.
+ */
+export function shouldSettleBatch(toProcess, now = Date.now(), firstMs = DEFAULT_SETTLE_MS, followupMs = DEFAULT_SETTLE_FOLLOWUP_MS) {
+  if (!Array.isArray(toProcess) || toProcess.length === 0) return false;
+  const windowMs = settleWindowFor(toProcess.length, firstMs, followupMs);
+  if (!Number.isFinite(windowMs) || windowMs <= 0) return false;
+  const newestMs = Math.max(...toProcess.map((m) => (m.msg?.date ?? 0) * 1000));
+  const age = now - newestMs;
+  return age >= 0 && age < windowMs;
 }
 
 export function collectMessagesToProcess(updates, adminIds, filterReplyTo, mode = 'legacy', threadByChat = null) {
@@ -1511,7 +1556,7 @@ async function main() {
     console.error(`[tele-listen] ${e instanceof Error ? e.message : String(e)}`);
     process.exit(1);
   }
-  let { filterReplyTo, offsetFile, offsetFileProvided, convo, legacyFilter } = args;
+  let { filterReplyTo, offsetFile, offsetFileProvided, convo, legacyFilter, settle } = args;
 
   // Env resolution.
   // - No --convo / --filter-reply-to → consult env.
@@ -1837,6 +1882,69 @@ async function main() {
     advanceLoopOffset();
     // (Heartbeat auto-reminders moved to daemon.mjs.)
     process.exit(2);
+  }
+
+  // ── Burst settle (debounce) — OPT-IN via --settle ─────────────────────────
+  // A user often sends ONE task across several Telegram bubbles. Acting on the
+  // first bubble builds an incomplete prompt; the trailing bubbles then force a
+  // wasteful second pass. Hold the batch until the NEWEST message has been quiet
+  // for TELE_SETTLE_MS, so consecutive bubbles coalesce into one combined prompt
+  // (buildCombinedPromptData already merges them). Stateless: "defer" = exit(2)
+  // WITHOUT advancing the per-loop offset, so the messages stay in cache and
+  // replay on the next poll; every new bubble resets the window by lifting
+  // `newest`. exit(2) is the supervisors' "no match" code — it resets their
+  // failure budget (never trips the give-up breaker) and re-polls after ~5s.
+  //
+  // OPT-IN (not default): only the LISTEN loops pass --settle (the Monitor
+  // `until` command and `--wait-once`). The bare `--convo` DRAIN before a
+  // critical action (telegram-guide §"re-poll before critical actions") must
+  // NOT settle — it needs to see any pending message NOW and map exit 0/2 to
+  // "pending / none". Settling there would let a fresh bubble defer the whole
+  // batch (see batch-caveat below), report "none", and let the destructive
+  // action proceed past a just-sent correction. Making settle opt-in keeps the
+  // drain's safety contract intact by default; the failure mode of forgetting
+  // the flag is "no debounce" (safe), not "drain swallows corrections".
+  //
+  // A message dated in the FUTURE vs the local clock (age < 0) is clock skew —
+  // release rather than risk deferring forever on a mis-synced host. See
+  // shouldSettleBatch for the full decision rules.
+  //
+  // Batch caveat (why the drain must not settle): the gate is a SINGLE
+  // Math.max(date) over the whole `toProcess` array, deferred all-or-nothing.
+  // So one fresh bubble lifts `newest` for the ENTIRE batch — an old backlog
+  // riding alongside a just-arrived bubble is held too, not released. A backlog
+  // with NO fresh bubble (newest already older than the window) does release
+  // immediately; a backlog WITH one does not.
+  //
+  // Known bound (accepted): deferring holds a MATCHED message unprocessed in the
+  // shared cache for up to ~window (~2-3 polls) instead of consuming it on first
+  // sight. The cache is shared per BOT TOKEN (not per project — projects on
+  // different bot tokens have separate caches). If >500 updates land on that bot
+  // within the window, pruneCache (keep-last-500) can evict the deferred message;
+  // the same flood keeps the cache read non-empty, so advanceLoopOffset then
+  // jumps past it (permanent loss — the global getUpdates offset already advanced
+  // at fetch, and eviction removes the only cached copy). That needs ~40+ msg/s
+  // sustained on one bot — implausible for human-driven teleport traffic — and
+  // only widens the pre-existing cache-bounded-replay window (see
+  // resolveStartOffset) from ~0 to ~window. Raise the pruneCache cap if a bot
+  // ever carries machine-rate volume.
+  // TELE_SETTLE_MS overrides the 12s lone-message default; TELE_SETTLE_FOLLOWUP_MS
+  // the 8s once-a-burst-is-confirmed default (set either to 0 to disable that tier).
+  const firstMs = process.env.TELE_SETTLE_MS != null ? Number(process.env.TELE_SETTLE_MS) : DEFAULT_SETTLE_MS;
+  const followupMs = process.env.TELE_SETTLE_FOLLOWUP_MS != null ? Number(process.env.TELE_SETTLE_FOLLOWUP_MS) : DEFAULT_SETTLE_FOLLOWUP_MS;
+  if (settle && shouldSettleBatch(toProcess, Date.now(), firstMs, followupMs)) {
+    // Acknowledge NOW so the burst never feels like a hang: 👍 every bubble
+    // currently in the batch. setMessageReaction is idempotent, so re-reacting
+    // an already-👍'd bubble on a later deferred poll is a harmless no-op;
+    // newly arrived bubbles get their 👍 on the poll they first appear.
+    // Best-effort — reaction failure must not block the eventual prompt.
+    await reactToMessages(token, toProcess);
+    const windowMs = settleWindowFor(toProcess.length, firstMs, followupMs);
+    console.log(
+      `[tele-listen] burst settling: newest msg quiet < ${Math.round(windowMs / 1000)}s ` +
+      `— acked + deferring ${toProcess.length} msg(s)`,
+    );
+    process.exit(2); // per-loop offset NOT advanced → replays next poll
   }
 
   // Passive roster harvest (best-effort): record each human sender's id/username
@@ -2318,6 +2426,10 @@ export async function waitOnceSupervisor(argv, deps = {}) {
     // prompt they already consumed, while --watch can keep its own loop state.
     : path.join(DEFAULT_TMP_DIR, `convo-${args.convo}-wait-once-offset.txt`);
   childArgs.push('--offset-file', childOffsetFile);
+  // Propagate --settle to the child (bare `--convo` main()) so the LISTEN loop
+  // debounces bursts. --watch forwards argv verbatim; --wait-once rebuilds
+  // childArgs, so thread it explicitly here.
+  if (args.settle) childArgs.push('--settle');
 
   logFn(`[tele-wait-once] waiting for one reply in convo ${args.convo}`);
   while (true) {

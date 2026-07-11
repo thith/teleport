@@ -190,19 +190,34 @@ export function readSentRegistry(registryFile = SENT_REGISTRY_FILE) {
   return results;
 }
 
+// Bound the reaction call: a bare fetch has no default connect-stall timeout
+// (undici only caps headers/body at ~300s), so a hung setMessageReaction could
+// otherwise wedge a caller for minutes — most acutely the listener's burst-settle
+// path, which awaits this before deferring a batch. Abort at 10s so a stall
+// surfaces as a normal rejection the caller can retry, matching the
+// AbortController pattern already used for attachment downloads. Best-effort:
+// callers treat a failed reaction as non-fatal.
+const REACTION_TIMEOUT_MS = 10_000;
 export async function postReaction(token, chatId, messageId, emoji = '👍') {
   const payload = {
     chat_id: chatId,
     message_id: messageId,
     reaction: [{ type: 'emoji', emoji }],
   };
-  const res = await fetch(`${TELEGRAM_API}${token}/setMessageReaction`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
-  });
-  const body = await res.json().catch(() => ({}));
-  return { ok: res.ok && body?.ok !== false, description: body?.description };
+  const ac = new AbortController();
+  const t = setTimeout(() => ac.abort(), REACTION_TIMEOUT_MS);
+  try {
+    const res = await fetch(`${TELEGRAM_API}${token}/setMessageReaction`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+      signal: ac.signal,
+    });
+    const body = await res.json().catch(() => ({}));
+    return { ok: res.ok && body?.ok !== false, description: body?.description };
+  } finally {
+    clearTimeout(t);
+  }
 }
 
 export function parseArgs(argv) {
