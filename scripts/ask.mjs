@@ -239,14 +239,17 @@ async function main() {
     if (e && e.code === 'EEXIST') {
       // Not a hard failure: the target's mailbox is momentarily full. Emit a
       // self-retry directive the calling agent can act on (re-run this same ask
-      // after a short wait) instead of giving up.
-      err(`[ask] ⏳ RETRY-LATER: đã thử ${RETRY.attempts} lần nhưng #${plan.match.hashtag} vẫn bận (agent đó còn prompt chưa xử lý). Đây KHÔNG phải lỗi cứng — hãy TỰ THỬ LẠI sau ~${RETRY_LATER_MIN} phút bằng đúng lệnh ask này.`);
+      // after a short wait) instead of giving up. On STDOUT (not stderr): this
+      // is an agent-actionable directive, not a diagnostic — some runtimes only
+      // surface a tool's stdout, so a stderr-only directive could be missed.
+      log(`[ask] ⏳ RETRY-LATER: đã thử ${RETRY.attempts} lần nhưng #${plan.match.hashtag} vẫn bận (agent đó còn prompt chưa xử lý). Đây KHÔNG phải lỗi cứng — hãy TỰ THỬ LẠI sau ~${RETRY_LATER_MIN} phút bằng đúng lệnh ask này.`);
       // Fold T2 into the busy path: a busy-AND-inactive target likely hung, so
-      // the retry-later may never clear — surface that so the caller can nudge.
+      // the retry-later may never clear — surface that (also stdout) so the
+      // caller can nudge.
       const last = getLastAliveMs(plan.match.convoId);
       if (last == null || Date.now() - last > ALIVE_FRESH_MS) {
         const stale = last == null ? 'không thấy listener nào đang chạy' : `listener im ~${Math.max(1, Math.round((Date.now() - last) / 60000))} phút`;
-        err(`[ask] (lưu ý: #${plan.match.hashtag} có vẻ không active — ${stale}; nếu thử lại vài lần vẫn bận, có thể agent đã treo — cân nhắc nhờ bật lại listener.)`);
+        log(`[ask] (lưu ý: #${plan.match.hashtag} có vẻ không active — ${stale}; nếu thử lại vài lần vẫn bận, có thể agent đã treo — cân nhắc nhờ bật lại listener.)`);
       }
       process.exit(EXIT.BUSY);
     }
