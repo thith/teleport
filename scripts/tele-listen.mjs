@@ -737,42 +737,69 @@ export function stripDmControlPrefix(text) {
   return inner.startsWith('/') ? inner : `/${inner}`;
 }
 
-export const DEFAULT_SETTLE_MS = 12_000;          // lone message: wide grace, we don't yet know if more are coming
-export const DEFAULT_SETTLE_FOLLOWUP_MS = 8_000;  // burst confirmed (>=2 msgs): tighter, intra-burst cadence is faster
+// Adaptive settle windows (per maintainer): the fixed 12s/8s was too short for
+// phone typing — observed inter-bubble gaps were ~9–27s, so short windows split
+// one thought into several prompts. Three tiers keyed to how likely MORE is
+// still coming (more signals → wider quiet window before we deliver):
+export const SETTLE_MS_A = 30_000; // both "more-coming" signals
+export const SETTLE_MS_B = 20_000; // exactly one signal
+export const SETTLE_MS_C = 10_000; // neither → looks like a complete thought
+export const SETTLE_TIERS = { a: SETTLE_MS_A, b: SETTLE_MS_B, c: SETTLE_MS_C };
+
+// Back-compat: some callers/tests imported these. Anchor them to the widest (A)
+// and narrowest (C) so nothing references an undefined symbol.
+export const DEFAULT_SETTLE_MS = SETTLE_MS_A;
+export const DEFAULT_SETTLE_FOLLOWUP_MS = SETTLE_MS_C;
 
 /**
- * Effective settle window for a batch: a lone message gets the wide `firstMs`
- * grace (we can't yet tell if it's the start of a burst); once a burst is
- * confirmed (>= 2 messages) we switch to the tighter `followupMs`, because
- * within a burst the human's typing cadence is faster, so a shorter quiet
- * period already means "done". Exported for the log line + tests.
+ * Count the "more is still coming" signals on the NEWEST message of a batch (0–2):
+ *  - single: the batch is a lone message (nothing coalesced yet) — likely the
+ *    START of a multi-bubble input, so wait longer for the rest.
+ *  - fragment: the newest message is forwarded, carries a photo, or its text is
+ *    shorter than 20 chars — an incomplete piece; the human is probably still
+ *    adding context.
  */
-export function settleWindowFor(count, firstMs = DEFAULT_SETTLE_MS, followupMs = DEFAULT_SETTLE_FOLLOWUP_MS) {
-  return count >= 2 ? followupMs : firstMs;
+export function settleSignals(newestMsg, count) {
+  const single = count === 1 ? 1 : 0;  // exactly one message (a lone bubble = the "first", nothing coalesced yet)
+  const text = (newestMsg?.text ?? newestMsg?.caption ?? '');
+  const forwarded = !!(newestMsg?.forward_origin || newestMsg?.forward_from || newestMsg?.forward_date);
+  const hasPhoto = Array.isArray(newestMsg?.photo) && newestMsg.photo.length > 0;
+  const fragment = forwarded || hasPhoto || text.length < 20;
+  return single + (fragment ? 1 : 0);
+}
+
+/**
+ * Adaptive settle window for a batch, keyed to settleSignals: 2→A, 1→B, 0→C.
+ * Tier values are env-overridable (TELE_SETTLE_A_MS/_B_MS/_C_MS at the call site).
+ * Exported for tests.
+ */
+export function settleWindowFor(newestMsg, count, tiers = SETTLE_TIERS) {
+  const met = settleSignals(newestMsg, count);
+  return met >= 2 ? tiers.a : met === 1 ? tiers.b : tiers.c;
 }
 
 /**
  * Burst-settle (debounce) decision. A user often types one task across several
  * Telegram bubbles; acting on the first bubble alone builds an incomplete
  * prompt and forces a wasteful second pass. Return true to DEFER the batch —
- * hold it until the newest message has been quiet for the effective window, so
- * consecutive bubbles coalesce into one combined prompt. Every new bubble lifts
- * `newest` (resetting the window) AND grows the count (which, past the first,
- * narrows the window from `firstMs` to `followupMs`).
+ * hold it until the newest message has been quiet for the adaptive window (see
+ * settleWindowFor), so consecutive bubbles coalesce into one combined prompt.
  *
  * Pure + total so it is unit-testable in isolation from main()'s process.exit:
  * - Empty batch → never defer (nothing to hold).
- * - effective window <= 0 / non-finite → that tier's debounce disabled → never defer.
+ * - effective window <= 0 / non-finite → debounce disabled → never defer.
  * - A message dated in the FUTURE vs `now` (age < 0) is clock skew on a
  *   mis-synced host → do NOT defer (degrade to immediate release rather than
  *   risk deferring forever). Only a batch whose newest message is younger than
  *   the window (0 <= age < window) defers.
  */
-export function shouldSettleBatch(toProcess, now = Date.now(), firstMs = DEFAULT_SETTLE_MS, followupMs = DEFAULT_SETTLE_FOLLOWUP_MS) {
+export function shouldSettleBatch(toProcess, now = Date.now(), tiers = SETTLE_TIERS) {
   if (!Array.isArray(toProcess) || toProcess.length === 0) return false;
-  const windowMs = settleWindowFor(toProcess.length, firstMs, followupMs);
+  // The newest message drives both the age check and the signal-based window.
+  const newestEntry = toProcess.reduce((a, b) => ((b.msg?.date ?? 0) >= (a.msg?.date ?? 0) ? b : a));
+  const windowMs = settleWindowFor(newestEntry.msg, toProcess.length, tiers);
   if (!Number.isFinite(windowMs) || windowMs <= 0) return false;
-  const newestMs = Math.max(...toProcess.map((m) => (m.msg?.date ?? 0) * 1000));
+  const newestMs = (newestEntry.msg?.date ?? 0) * 1000;
   const age = now - newestMs;
   return age >= 0 && age < windowMs;
 }
@@ -1953,11 +1980,14 @@ async function main() {
   // only widens the pre-existing cache-bounded-replay window (see
   // resolveStartOffset) from ~0 to ~window. Raise the pruneCache cap if a bot
   // ever carries machine-rate volume.
-  // TELE_SETTLE_MS overrides the 12s lone-message default; TELE_SETTLE_FOLLOWUP_MS
-  // the 8s once-a-burst-is-confirmed default (set either to 0 to disable that tier).
-  const firstMs = process.env.TELE_SETTLE_MS != null ? Number(process.env.TELE_SETTLE_MS) : DEFAULT_SETTLE_MS;
-  const followupMs = process.env.TELE_SETTLE_FOLLOWUP_MS != null ? Number(process.env.TELE_SETTLE_FOLLOWUP_MS) : DEFAULT_SETTLE_FOLLOWUP_MS;
-  if (settle && shouldSettleBatch(toProcess, Date.now(), firstMs, followupMs)) {
+  // Adaptive settle tiers (see settleWindowFor). Each is env-overridable;
+  // set a tier to 0 to disable debounce when that tier applies.
+  const tiers = {
+    a: process.env.TELE_SETTLE_A_MS != null ? Number(process.env.TELE_SETTLE_A_MS) : SETTLE_MS_A,
+    b: process.env.TELE_SETTLE_B_MS != null ? Number(process.env.TELE_SETTLE_B_MS) : SETTLE_MS_B,
+    c: process.env.TELE_SETTLE_C_MS != null ? Number(process.env.TELE_SETTLE_C_MS) : SETTLE_MS_C,
+  };
+  if (settle && shouldSettleBatch(toProcess, Date.now(), tiers)) {
     // Acknowledge NOW so the burst never feels like a hang: 👍 every bubble
     // currently in the batch. setMessageReaction is idempotent, so re-reacting
     // an already-👍'd bubble on a later deferred poll is a harmless no-op;

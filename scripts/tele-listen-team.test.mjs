@@ -60,59 +60,63 @@ test('empty/null thread map: falls back to legacy reply-to matching', () => {
 // ── RFC 08: daemon-control prefix `/dm <cmd>` ─────────────────────────────────
 import {
   isDmControlMessage, stripDmControlPrefix, collectMessagesToProcess, DM_CONTROL_PREFIX,
-  shouldSettleBatch, settleWindowFor, DEFAULT_SETTLE_MS, DEFAULT_SETTLE_FOLLOWUP_MS,
+  shouldSettleBatch, settleWindowFor, settleSignals,
+  SETTLE_MS_A, SETTLE_MS_B, SETTLE_MS_C, DEFAULT_SETTLE_MS, DEFAULT_SETTLE_FOLLOWUP_MS,
 } from './tele-listen.mjs';
 
-// Build a minimal batch entry ({ msg }) with a Telegram `date` (seconds).
-const batchAt = (...dateSecs) => dateSecs.map((d) => ({ msg: { date: d } }));
-const F = 12_000; // firstMs (lone message)
-const U = 8_000;  // followupMs (burst confirmed)
+// Build a batch entry with a Telegram `date` (seconds) + optional signal fields.
+// Default text is long (>=20 chars) so a message is NOT a "fragment" unless told.
+const LONG = 'a full and complete sentence here';
+const mk = (dateSec, extra = {}) => ({ msg: { date: dateSec, text: LONG, ...extra } });
 
-test('settleWindowFor: lone message → firstMs; >=2 messages → followupMs', () => {
-  assert.equal(settleWindowFor(1, F, U), F);
-  assert.equal(settleWindowFor(2, F, U), U);
-  assert.equal(settleWindowFor(4, F, U), U);
-  assert.equal(DEFAULT_SETTLE_MS, 12_000);
-  assert.equal(DEFAULT_SETTLE_FOLLOWUP_MS, 8_000);
+// Adaptive tiers (RFC 02 tuning): signals on the NEWEST message → window.
+//   single (lone batch) + fragment (forwarded / photo / text<20) → 0,1,2.
+test('settleSignals: single + fragment → 2, one → 1, neither → 0', () => {
+  assert.equal(settleSignals({ text: 'hi' }, 1), 2);                       // single + short
+  assert.equal(settleSignals({ text: LONG }, 1), 1);                       // single only
+  assert.equal(settleSignals({ text: LONG }, 3), 0);                       // neither (batched + long)
+  assert.equal(settleSignals({ text: 'hi' }, 3), 1);                       // fragment only (short)
+  assert.equal(settleSignals({ text: LONG, forward_origin: {} }, 3), 1);   // forwarded
+  assert.equal(settleSignals({ text: LONG, photo: [{}] }, 3), 1);          // photo
+  assert.equal(settleSignals({ text: 'hi' }, 0), 1);                       // count 0 → NOT single (=== 1, not <=1); only the fragment signal
 });
 
-test('shouldSettleBatch: lone message uses the 12s window', () => {
-  // one message, age 10s < 12s → defer.
-  assert.equal(shouldSettleBatch(batchAt(90), 100_000, F, U), true);
-  // one message, age 13s >= 12s → release.
-  assert.equal(shouldSettleBatch(batchAt(87), 100_000, F, U), false);
+test('settleWindowFor: 2 signals→A(30s), 1→B(20s), 0→C(10s); back-compat consts', () => {
+  assert.equal(settleWindowFor({ text: 'hi' }, 1), SETTLE_MS_A);           // single + short
+  assert.equal(settleWindowFor({ text: LONG }, 1), SETTLE_MS_B);           // single only
+  assert.equal(settleWindowFor({ text: LONG }, 3), SETTLE_MS_C);           // neither
+  assert.equal(SETTLE_MS_A, 30_000);
+  assert.equal(SETTLE_MS_B, 20_000);
+  assert.equal(SETTLE_MS_C, 10_000);
+  assert.equal(DEFAULT_SETTLE_MS, SETTLE_MS_A);
+  assert.equal(DEFAULT_SETTLE_FOLLOWUP_MS, SETTLE_MS_C);
 });
 
-test('shouldSettleBatch: a burst (>=2) uses the tighter 8s window', () => {
-  // two messages, newest age 7s < 8s → defer.
-  assert.equal(shouldSettleBatch(batchAt(90, 93), 100_000, F, U), true);
-  // two messages, newest age 9s >= 8s → release (would still be settling under the 12s tier).
-  assert.equal(shouldSettleBatch(batchAt(80, 91), 100_000, F, U), false);
+test('shouldSettleBatch: lone short msg uses the 30s (A) window', () => {
+  assert.equal(shouldSettleBatch([mk(75, { text: 'hi' })], 100_000), true);   // age 25s < 30s → defer
+  assert.equal(shouldSettleBatch([mk(69, { text: 'hi' })], 100_000), false);  // age 31s >= 30s → release
 });
 
-test('shouldSettleBatch: 4 msgs 5s apart — resets window, releases at ~8s after the last', () => {
-  // msgs at t=0,5,10,15s. At t=20s the newest (15s) is only 5s old → defer (8s tier).
-  assert.equal(shouldSettleBatch(batchAt(0, 5, 10, 15), 20_000, F, U), true);
-  // At t=23s the newest is 8s old → release the whole batch (vs 27s under a flat 12s).
-  assert.equal(shouldSettleBatch(batchAt(0, 5, 10, 15), 23_000, F, U), false);
+test('shouldSettleBatch: lone complete msg uses the 20s (B) window', () => {
+  assert.equal(shouldSettleBatch([mk(85)], 100_000), true);   // age 15s < 20s → defer
+  assert.equal(shouldSettleBatch([mk(79)], 100_000), false);  // age 21s >= 20s → release
 });
 
-test('shouldSettleBatch: pre-existing OLD backlog releases immediately (age-based, not count)', () => {
-  // Listener resumes after a long turn: now=100s, 4 messages whose NEWEST was
-  // sent at t=80s → age 20s, far past any window → NOT held, processed at once.
-  assert.equal(shouldSettleBatch(batchAt(20, 40, 60, 80), 100_000, F, U), false);
+test('shouldSettleBatch: batch of complete msgs uses the tighter 10s (C) window', () => {
+  assert.equal(shouldSettleBatch([mk(85), mk(92)], 100_000), true);   // newest age 8s < 10s → defer
+  assert.equal(shouldSettleBatch([mk(85), mk(89)], 100_000), false);  // newest age 11s >= 10s → release
 });
 
-test('shouldSettleBatch: future-dated message (clock skew) does not defer', () => {
-  // newest dated 5s in the future vs now → age < 0 → release, never hang.
-  assert.equal(shouldSettleBatch(batchAt(105), 100_000, F, U), false);
+test('shouldSettleBatch: OLD backlog releases immediately (age-based)', () => {
+  // newest at t=80s, now=100s → age 20s ≥ any tier → not held.
+  assert.equal(shouldSettleBatch([mk(20), mk(40), mk(60), mk(80)], 100_000), false);
 });
 
-test('shouldSettleBatch: empty batch and disabled tiers never defer', () => {
-  assert.equal(shouldSettleBatch([], 100_000, F, U), false);
-  assert.equal(shouldSettleBatch(batchAt(99), 100_000, 0, U), false);      // lone tier disabled
-  assert.equal(shouldSettleBatch(batchAt(99, 99), 100_000, F, 0), false);  // followup tier disabled
-  assert.equal(shouldSettleBatch(batchAt(99), 100_000, NaN, U), false);
+test('shouldSettleBatch: empty / future-dated / disabled-tier never defer', () => {
+  assert.equal(shouldSettleBatch([], 100_000), false);
+  assert.equal(shouldSettleBatch([mk(105, { text: 'hi' })], 100_000), false);                 // future (age<0)
+  assert.equal(shouldSettleBatch([mk(90, { text: 'hi' })], 100_000, { a: 0, b: 20_000, c: 10_000 }), false); // A disabled
+  assert.equal(shouldSettleBatch([mk(90, { text: 'hi' })], 100_000, { a: NaN, b: 20_000, c: 10_000 }), false);
 });
 
 test('isDmControlMessage: matches /dm forms (case-insensitive, @botname, bare), rejects others', () => {
