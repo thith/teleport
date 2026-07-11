@@ -760,7 +760,7 @@ export const DEFAULT_SETTLE_FOLLOWUP_MS = SETTLE_MS_C;
  *    adding context.
  */
 export function settleSignals(newestMsg, count) {
-  const single = (count ?? 0) <= 1 ? 1 : 0;
+  const single = count === 1 ? 1 : 0;  // exactly one message (a lone bubble = the "first", nothing coalesced yet)
   const text = (newestMsg?.text ?? newestMsg?.caption ?? '');
   const forwarded = !!(newestMsg?.forward_origin || newestMsg?.forward_from || newestMsg?.forward_date);
   const hasPhoto = Array.isArray(newestMsg?.photo) && newestMsg.photo.length > 0;

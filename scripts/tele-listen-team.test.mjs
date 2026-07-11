@@ -78,6 +78,7 @@ test('settleSignals: single + fragment → 2, one → 1, neither → 0', () => {
   assert.equal(settleSignals({ text: 'hi' }, 3), 1);                       // fragment only (short)
   assert.equal(settleSignals({ text: LONG, forward_origin: {} }, 3), 1);   // forwarded
   assert.equal(settleSignals({ text: LONG, photo: [{}] }, 3), 1);          // photo
+  assert.equal(settleSignals({ text: 'hi' }, 0), 1);                       // count 0 → NOT single (=== 1, not <=1); only the fragment signal
 });
 
 test('settleWindowFor: 2 signals→A(30s), 1→B(20s), 0→C(10s); back-compat consts', () => {
