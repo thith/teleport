@@ -209,6 +209,7 @@ export function parseArgs(argv) {
   let settle = false;
   let loop = false;
   let append = false;
+  let announcePreexisting = false;
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === '--wait-once') {
       waitOnce = true;
@@ -234,6 +235,16 @@ export function parseArgs(argv) {
     // → single-slot behaviour, so Gemini/Codex (`--wait-once`) are unchanged.
     if (argv[i] === '--append') {
       append = true;
+      continue;
+    }
+    // --announce-preexisting (RFC 03 §5.2): OPT-IN, requires --append. Makes the
+    // listener CLAIM + announce a pre-existing UNCLAIMED prompt (a side-message
+    // injected by ask/handover/steer, or one that survived the agent's death) that
+    // it did not just write from Telegram — closing the Claude drainer gap (G3) and
+    // survive-rebirth (G2). Default OFF → byte-identical, so production is untouched
+    // until the canonical Monitor command opts in (staged flip after live smoke).
+    if (argv[i] === '--announce-preexisting') {
+      announcePreexisting = true;
       continue;
     }
     if (argv[i] === '--legacy-filter') {
@@ -277,7 +288,10 @@ export function parseArgs(argv) {
   if (waitOnce && filterReplyTo != null) {
     throw new Error('--wait-once is convo-mode only; --filter-reply-to not supported in wait-once mode');
   }
-  return { filterReplyTo, offsetFile, offsetFileProvided, convo, legacyFilter, waitOnce, settle, loop, append };
+  if (announcePreexisting && !append) {
+    throw new Error('--announce-preexisting requires --append (RFC 03 §5.2 — it claims+announces a pending prompt on the append/coalesce path)');
+  }
+  return { filterReplyTo, offsetFile, offsetFileProvided, convo, legacyFilter, waitOnce, settle, loop, append, announcePreexisting };
 }
 
 // extractBotId is imported from send-telegram.mjs (single source of truth).
@@ -1697,6 +1711,43 @@ export function sweepOrphanSnapshots(convo, tmpDir = DEFAULT_TMP_DIR) {
   }
 }
 
+// RFC 03 §5.2 — claim a pre-existing UNCLAIMED prompt so the caller can announce it
+// without re-announcing every poll (the RFC 02 flood). Atomic rename (prompt →
+// .processing) is the linearization point: after it, the open prompt is gone, so
+// subsequent polls find nothing to claim and stay silent until the agent consumes
+// it (or reclaimStaleProcessing folds it back on death). Returns true if WE claimed
+// it (caller should announce + exit 0), false if there is nothing to claim.
+//
+// No-clobber (reviewer BLOCKER, RFC 03 §5.5): `renameSync` OVERWRITES its target, so
+// a bare check-then-rename could clobber a `.processing` that appears in the TOCTOU
+// window. We close this by holding the per-convo prompt-write lock and RE-CHECKING
+// under it before the rename. Combined with the source invariant (`.processing` is
+// only ever created by MOVING `prompt` away — agent `mv`, another listener's claim,
+// or this fn — which removes the rename source → ENOENT, never a clobber), the claim
+// cannot destroy an in-flight batch. `writeLockFile` may be null in tests/callers
+// that don't need cross-process serialization. `touch` makes the stale-reclaim TTL
+// count from the claim, matching the agent-side claim protocol.
+export function claimPreexistingPrompt(promptFile, processingFile, writeLockFile = null) {
+  if (fs.existsSync(processingFile)) return false;   // agent handling a batch → don't pre-empt
+  if (!fs.existsSync(promptFile)) return false;      // nothing pending
+  const locked = writeLockFile ? acquirePollLock(writeLockFile) : true;
+  if (!locked) return false;                         // another writer active → announce next poll
+  try {
+    // Re-check under the lock: a peer may have claimed/consumed in the window.
+    if (fs.existsSync(processingFile)) return false;
+    if (!fs.existsSync(promptFile)) return false;
+    fs.renameSync(promptFile, processingFile);       // source consumed → no clobber (see above)
+    const now = new Date();
+    try { fs.utimesSync(processingFile, now, now); } catch { /* best-effort touch */ }
+    return true;
+  } catch (e) {
+    if (e.code === 'ENOENT') return false;           // source vanished in the race → no-op
+    throw e;
+  } finally {
+    if (writeLockFile) releasePollLock(writeLockFile);
+  }
+}
+
 // Read every prompt*.json sibling and collect a Set of `${botId}:${updateId}`
 // pairs so the prune sweep below skips any dir still pointed at by an
 // unconsumed prompt — even one that has sat idle for hours. The set is keyed
@@ -1806,7 +1857,7 @@ async function main() {
     console.error(`[tele-listen] ${e instanceof Error ? e.message : String(e)}`);
     process.exit(1);
   }
-  let { filterReplyTo, offsetFile, offsetFileProvided, convo, legacyFilter, settle, loop, append } = args;
+  let { filterReplyTo, offsetFile, offsetFileProvided, convo, legacyFilter, settle, loop, append, announcePreexisting } = args;
 
   // Env resolution.
   // - No --convo / --filter-reply-to → consult env.
@@ -2014,6 +2065,34 @@ async function main() {
     // Follow-up #1: adopt any orphaned .stale.*/.appending.* snapshots left by a
     // reclaim/append that died after its atomic rename but before writing back.
     if (convo != null) sweepOrphanSnapshots(convo, DEFAULT_TMP_DIR);
+    // RFC 03 §5.2 — CLAIM-before-ANNOUNCE: surface a pre-existing UNCLAIMED prompt
+    // that this poll did NOT just write from Telegram — a side-message injected by
+    // ask/handover/steer/broadcast, a batch resurfaced by reclaim/sweep above, or a
+    // prompt that survived the agent's death and is being picked up by a reborn
+    // listener. Without this, Claude's Monitor only ever emits "prompt written" from
+    // the Telegram-fetch path below, so such a prompt sits unannounced (the G3 gap).
+    //
+    // We CLAIM (atomic rename → .processing) BEFORE announcing. This is what stops
+    // the RFC 02 announce-flood: after the rename the open prompt is GONE, so every
+    // later poll sees no open prompt (and a fresh .processing) and stays silent
+    // until the agent consumes it — or, if the agent dies mid-handling, until
+    // reclaimStaleProcessing folds it back after PROCESSING_TTL_MS and a later poll
+    // re-claims + re-announces. A marker file was rejected (it introduces a
+    // permanent-deaf failure mode); the claim reuses the durable .processing
+    // lifecycle RFC 02 already built. Guarded on NO .processing existing — an
+    // existing claim means the agent is handling a batch; never pre-empt it.
+    //
+    // v1 scope (RFC 03 §5.2): the Telegram write-path below is left as-is, so a
+    // just-written prompt the agent is slow (>~2s) to claim may get ONE extra
+    // announce here before we claim it for the agent (its own `mv` then ENOENTs and
+    // it reads the .processing we made). One dup, at-least-once — acceptable.
+    if (announcePreexisting && convo != null) {
+      const writeLock = path.join(DEFAULT_TMP_DIR, `prompt-write-${convo}.lock`);
+      if (claimPreexistingPrompt(promptFile, processingFile, writeLock)) {
+        console.log(`[tele-listen] prompt ready: ${promptFile} (pre-existing — claimed by listener)`);
+        process.exit(0);
+      }
+    }
   } else {
     // Legacy single-slot: block while a batch is pending or being processed.
     if (fs.existsSync(processingFile)) {
