@@ -81,8 +81,25 @@ test('attributionLabelFromData: builds label from stored fields; total on gaps',
   assert.equal(attributionLabelFromData(null), 'user ? (member)');
 });
 
-test('PROCESSING_TTL_MS is a sane 5 minutes', () => {
-  assert.equal(PROCESSING_TTL_MS, 5 * 60 * 1000);
+test('PROCESSING_TTL_MS is a sane 30 minutes (raised from 5 — --first-run handles restart; TTL is a churn-averse backstop)', () => {
+  assert.equal(PROCESSING_TTL_MS, 30 * 60 * 1000);
+});
+
+test('reclaimStaleProcessing: CORRUPT .processing is QUARANTINED (.corrupt), never deleted (zero-loss)', () => {
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), 'reclaim-corrupt-'));
+  const proc = path.join(d, 'prompt-convo-3.processing.json');
+  const open = path.join(d, 'prompt-convo-3.json');
+  fs.writeFileSync(proc, '{ this is not valid json');
+  reclaimStaleProcessing(proc, open);
+  assert.equal(fs.existsSync(proc), false);                        // consumed (renamed to snapshot)
+  assert.equal(fs.existsSync(proc + '.corrupt'), true);            // PARKED, not deleted
+  assert.equal(fs.readFileSync(proc + '.corrupt', 'utf8'), '{ this is not valid json'); // content intact
+  assert.equal(fs.existsSync(open), false);                        // no bogus open prompt written
+  // a second corruption doesn't overwrite the first (non-overwriting counter)
+  fs.writeFileSync(proc, 'also broken');
+  reclaimStaleProcessing(proc, open);
+  assert.equal(fs.existsSync(proc + '.corrupt.1'), true);
+  fs.rmSync(d, { recursive: true, force: true });
 });
 
 test('reclaimStaleProcessing: no open prompt → stale becomes the open prompt (with warning)', () => {

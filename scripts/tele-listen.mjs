@@ -1561,8 +1561,15 @@ export function writePromptAtomic(data, promptFile = DEFAULT_PROMPT_FILE) {
   fs.renameSync(tmp, promptFile);
 }
 
-// RFC 02 P3: stale-claim reclaim window.
-export const PROCESSING_TTL_MS = 5 * 60 * 1000;
+// RFC 02 P3: stale-claim reclaim window. Raised 5→30 min (RFC 03 follow-up):
+// with `--first-run` re-announcing an orphan claim IMMEDIATELY on the listener's
+// restart, this TTL reclaim only ever fires while the AGENT IS ALIVE (the
+// listener polls only as the agent's child) — so its dominant effect became
+// CHURN on long turns (a live agent working >TTL got its own claim folded back +
+// re-announced every window, stacking the ⚠️ recovery prefix). 30 min lets most
+// long tasks finish inside one window; it stays a backstop for the rare
+// dropped-Monitor-event case. Restart recovery is `--first-run`'s job, not this.
+export const PROCESSING_TTL_MS = 30 * 60 * 1000;
 
 // RFC 02 P3: merge an INCOMING coalesced batch into an OPEN (unclaimed) prompt —
 // so a message arriving while a prompt is pending is APPENDED, not blocked/lost.
@@ -1638,7 +1645,19 @@ export function reclaimStaleProcessing(processingFile, promptFile) {
     catch { return; } // already consumed/reclaimed by a peer → nothing to do
     let claimed;
     try { claimed = JSON.parse(fs.readFileSync(staleFile, 'utf8')); }
-    catch { fs.rmSync(staleFile, { force: true }); return; }
+    catch (e) {
+      // Corrupt/torn snapshot: do NOT delete it (that silently LOSES the batch).
+      // QUARANTINE it — same non-overwriting `.corrupt[.<n>]` scheme sweepOrphan-
+      // Snapshots uses — for manual inspection/recovery, and surface loudly.
+      // sweepOrphanSnapshots only adopts `.stale`/`.appending`, so a `.corrupt.*`
+      // is left untouched (it can't be parsed to re-fold anyway).
+      let dest = `${processingFile}.corrupt`;
+      for (let n = 1; fs.existsSync(dest); n++) dest = `${processingFile}.corrupt.${n}`;
+      try { fs.renameSync(staleFile, dest); }
+      catch { try { fs.rmSync(staleFile, { force: true }); } catch {} }
+      console.error(`[tele-listen] reclaim: ${path.basename(processingFile)} is CORRUPT (${e instanceof Error ? e.message : String(e)}) — quarantined as ${path.basename(dest)} (NOT deleted); inspect/recover manually`);
+      return;
+    }
     claimed.text = `⚠️ (khôi phục lô bị treo — agent trước đã claim rồi dừng giữa chừng)\n\n${claimed.text ?? ''}`;
     if (fs.existsSync(promptFile)) {
       let open = null;
