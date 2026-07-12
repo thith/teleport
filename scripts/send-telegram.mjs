@@ -67,6 +67,19 @@ export function autoConsumeClaimedPrompt(convoId, tmpDir = TELE_REPLY_DIR) {
   return false;
 }
 
+// RFC 13 — kind-aware reply routing. Peek (read WITHOUT consuming) a convo's
+// CLAIMED prompt so the send path can inspect its kind-flags before replying.
+// Returns the parsed prompt object, or null if none/unreadable. Consumption
+// stays with autoConsumeClaimedPrompt after a successful send.
+export function peekClaimedPrompt(convoId, tmpDir = TELE_REPLY_DIR) {
+  if (convoId == null) return null;
+  const processingFile = path.join(tmpDir, `prompt-convo-${convoId}.processing.json`);
+  try {
+    if (!fs.existsSync(processingFile)) return null;
+    return JSON.parse(fs.readFileSync(processingFile, 'utf8'));
+  } catch { return null; }
+}
+
 export function extractBotId(token) {
   if (!token || typeof token !== 'string') return null;
   const head = token.split(':')[0];
@@ -1533,6 +1546,89 @@ async function main() {
       process.exit(1);
     }
     return;
+  }
+
+  // RFC 13 — kind-aware reply routing. When this reply answers a CLAIMED
+  // `instruct`/`whisper` prompt (a private steer the daemon injected), the reply
+  // belongs in the SENDER's DM, never the group topic — script-enforced so the
+  // agent can't leak a private steer into the shared thread (soft discipline
+  // proved unreliable). We DM the original sender (`fromUserId` = their private
+  // chat id), thread it under their command message (`replyToMessageId`),
+  // consume the claim, and exit. Only fires for a MESSAGE/FILE send into a
+  // resolved convo whose claimed prompt carries the flag; ask/handover (agent↔
+  // agent, reply via `ask --reply`) and plain topic messages fall through
+  // untouched. FAIL-CLOSED: the flag alone triggers the redirect — a private
+  // steer must NEVER hit the topic — so if the DM target is missing (e.g. a
+  // merge clobbered `fromUserId`) we fall back to the OWNER's DM rather than
+  // leak. `--react`/`--gc-topics`/`--close-topic` are unrelated ops (no reply
+  // body) → excluded so they aren't hijacked.
+  if (args.react == null && !args.gcTopics && !args.closeTopic) {
+    // Convo to inspect: env/--convo (preResolved) or, for an env-less caller,
+    // infer it from --reply-to via the SAME resolver the normal path uses — so a
+    // steer claimed under a --reply-to send is caught too (no fail-closed hole).
+    let redirectConvo = preResolved;
+    if (redirectConvo == null && args.replyTo != null) {
+      for (const chatId of effectiveAdminIds) {
+        const c = resolveConvoIdPreSend({ preResolved: null, replyTo: args.replyTo, chatId, botId });
+        if (c != null) { redirectConvo = c; break; }
+      }
+    }
+    const claimed = peekClaimedPrompt(redirectConvo);
+    if (redirectConvo != null && claimed && (claimed.instruct || claimed.whisper)) {
+      const kind = claimed.instruct ? 'instruct' : 'whisper';
+      // Prefer the real sender; fail-closed to the owner's DM if it's absent.
+      const ownerDm = resolveDaemonUserId(projectsConfig, { env: process.env, envFile: envFromFile });
+      const dmChatId = claimed.fromUserId != null ? String(claimed.fromUserId) : (ownerDm ? String(ownerDm) : null);
+      if (!dmChatId) {
+        console.error(`[send-telegram] ${kind} reply: no DM target (prompt.fromUserId missing and no _config.daemonUserId) — refusing to post a private steer to the topic.`);
+        process.exit(1);
+      }
+      try {
+        assertChatIdKind(dmChatId, 'private', claimed.fromUserId != null ? 'prompt.fromUserId' : '_config.daemonUserId');
+      } catch (e) {
+        console.error(`[send-telegram] ${kind} reply: bad DM target ${dmChatId}: ${e instanceof Error ? e.message : String(e)}`);
+        process.exit(1);
+      }
+      const replyToId = claimed.replyToMessageId != null ? claimed.replyToMessageId : null;
+      // messageThreadId: null → lands in the sender's private chat root.
+      const dmOpts = { raw: args.raw, plain: args.plain, replyTo: replyToId, messageThreadId: null };
+      // Sign with this convo's identity tag (as --dm does) so the sender can
+      // reply-to and steer the session back.
+      const signDm = (body) => buildDmSignedBody(body, redirectConvo, { raw: args.raw });
+      try {
+        let messageId;
+        if (args.filePath) {
+          if (!fs.existsSync(args.filePath)) {
+            console.error(`[send-telegram] file not found: ${args.filePath}`);
+            process.exit(1);
+          }
+          const caption = args.positional.join('\n').trim() || readStdinIfPiped().trim() || '';
+          ({ messageId } = await sendDocumentToAdmin(token, dmChatId, args.filePath, signDm(caption), dmOpts));
+        } else {
+          const text = (args.positional.join(' ').trim() || readStdinIfPiped()).trim();
+          if (!text) {
+            console.error(`[send-telegram] ${kind} reply requires message text (positional or stdin) or --file <path>`);
+            process.exit(1);
+          }
+          ({ messageId } = await sendTextToAdmin(token, dmChatId, signDm(text), dmOpts));
+        }
+        console.log(`[send-telegram] ${kind} reply → routed to sender DM ${dmChatId}${replyToId ? ` (reply-to ${replyToId})` : ''}${messageId ? ` (messageId: ${messageId})` : ''}`);
+      } catch (error) {
+        const scrubbed = scrubToken(error instanceof Error ? error.message : String(error), token);
+        if (isDmUnreachableError(scrubbed)) {
+          console.error(`[send-telegram] ${kind} reply DM to ${dmChatId} failed: ${scrubbed}\n  → The sender must open a private chat with the bot and press /start first (a bot cannot initiate a DM).`);
+        } else {
+          console.error(`[send-telegram] ${kind} reply DM to ${dmChatId} failed: ${scrubbed}`);
+        }
+        process.exit(1);
+      }
+      // Consume the claim (no manual rm; later topic sends for this convo won't
+      // be re-routed).
+      if (autoConsumeClaimedPrompt(redirectConvo)) {
+        console.log(`[send-telegram] consumed prompt-convo-${redirectConvo}.processing.json`);
+      }
+      return;
+    }
   }
 
   // Fail-fast: every target chat MUST be a forum supergroup. Bail BEFORE any

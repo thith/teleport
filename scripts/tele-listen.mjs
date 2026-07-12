@@ -1589,6 +1589,20 @@ export function mergePromptData(existing, incoming) {
   for (const k of KIND_FLAGS) {
     if (existing[k] !== undefined && merged[k] === undefined) merged[k] = existing[k];
   }
+  // A preserved STEER (whisper/instruct) must keep its ROUTING IDENTITY too, not
+  // just its flag. `{ ...incoming }` takes fromUserId/replyToMessageId from the
+  // NEWER side; if a whisper/instruct (older) coalesces under a later PLAIN group
+  // message, the batch would keep `instruct:true` but adopt the group sender's
+  // fromUserId — so kind-aware reply routing (send-telegram) would DM the private
+  // steer to the WRONG person (a group member) or fail. When the steer flag is
+  // carried from `existing` and `incoming` is NOT itself a steer, restore the
+  // steer side's DM target so the reply routes to the real instructor.
+  const incomingIsSteer = incoming.instruct || incoming.whisper;
+  const existingIsSteer = existing.instruct || existing.whisper;
+  if (existingIsSteer && !incomingIsSteer) {
+    merged.fromUserId = existing.fromUserId ?? null;
+    merged.replyToMessageId = existing.replyToMessageId ?? null;
+  }
   return merged;
 }
 

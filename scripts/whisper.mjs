@@ -25,7 +25,7 @@ export const doWhisper = (argv, opts = {}) => doSteer(argv, {
 }, opts);
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1])) {
-  const from = { id: process.env.TELE_FROM_ID, role: process.env.TELE_FROM_ROLE, name: process.env.TELE_FROM_NAME };
+  const from = { id: process.env.TELE_FROM_ID, role: process.env.TELE_FROM_ROLE, name: process.env.TELE_FROM_NAME, messageId: process.env.TELE_MESSAGE_ID };
   const res = await doWhisper(process.argv.slice(2), { from }); // replyText from TELE_REPLY_TEXT
   process.stdout.write((res.message || '') + '\n');
   process.exit(res.ok ? 0 : 1);
