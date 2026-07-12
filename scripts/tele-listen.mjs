@@ -751,6 +751,23 @@ export const SETTLE_TIERS = { a: SETTLE_MS_A, b: SETTLE_MS_B, c: SETTLE_MS_C };
 export const DEFAULT_SETTLE_MS = SETTLE_MS_A;
 export const DEFAULT_SETTLE_FOLLOWUP_MS = SETTLE_MS_C;
 
+export const WAIT_SIGNAL_MS = 60_000; // explicit "wait for the next bubble" (ends with a comma)
+
+// Explicit, user-typed OVERRIDE of the settle window, read from how the NEWEST
+// message ENDS (maintainer request). Beats the adaptive heuristic:
+//  - ends with EXACTLY ".." (two dots — NOT an ellipsis "...") → 0 = deliver NOW,
+//    no debounce ("I'm done").
+//  - ends with a comma (","/",,"/… any count) → WAIT_SIGNAL_MS grace for the next
+//    bubble ("I'm still typing").
+//  - otherwise → null → fall through to the adaptive tier.
+// Trailing whitespace is ignored. Returns the override window (ms) or null.
+export function settleOverride(newestMsg) {
+  const t = (newestMsg?.text ?? newestMsg?.caption ?? '').trimEnd();
+  if (t.endsWith('..') && !t.endsWith('...')) return 0;   // exactly two trailing dots
+  if (t.endsWith(',')) return WAIT_SIGNAL_MS;             // any number of trailing commas
+  return null;
+}
+
 /**
  * Count the "more is still coming" signals on the NEWEST message of a batch (0–2):
  *  - single: the batch is a lone message (nothing coalesced yet) — likely the
@@ -774,6 +791,8 @@ export function settleSignals(newestMsg, count) {
  * Exported for tests.
  */
 export function settleWindowFor(newestMsg, count, tiers = SETTLE_TIERS) {
+  const override = settleOverride(newestMsg);
+  if (override !== null) return override;  // ".." → 0 (now), "," → 60s; else adaptive
   const met = settleSignals(newestMsg, count);
   return met >= 2 ? tiers.a : met === 1 ? tiers.b : tiers.c;
 }
