@@ -436,7 +436,7 @@ Two cases. `send-telegram.mjs` prints the matching hint on stdout.
 **Claude (Monitor tool):** a persistent **self-re-arming** `while` loop (RFC 02). The listener **survives each delivery** — you start it **ONCE per convo and never re-arm**. Start it once:
 ```
 Monitor({
-  command: "while :; do node ../teleport/scripts/tele-listen.mjs --convo $CONVO_ID --settle --loop --append; case $? in 3) break;; 1) sleep 30;; esac; sleep 2; done",
+  command: "while :; do node ../teleport/scripts/tele-listen.mjs --convo $CONVO_ID --settle --loop --append --announce-preexisting; case $? in 3) break;; 1) sleep 30;; esac; sleep 2; done",
   timeout_ms: 3600000,
   persistent: true,
   description: "Telegram reply to convo <CONVO_ID>"
