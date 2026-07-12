@@ -67,6 +67,15 @@ Chọn (1) vì: **daemon không luôn sống**; durability không được phụ
 - Cons: nhiễu topic (mỗi ask/whisper thành một tin hiển thị); độ trễ; lo persona/impersonation (ai đứng tên gửi?); phí API.
 - **Không chọn:** kho file nội bộ gọn + kín hơn cho tin máy-với-máy.
 
+### 4.4 Alternative D (Reviewer 3 — "GO-SIMPLER"): single-slot merge + Claude pre-existing-prompt announce
+Đề xuất của R3 trong debate: **KHÔNG xây kho riêng.** Đóng đúng 2 gap thật (bận-đuổi + Claude-rảnh-ko-drain) bằng thay đổi nhỏ hơn nhiều, tái dùng máy RFC 02 sẵn có:
+1. **Sender đổi `writePromptExclusive` → atomic-take merge** (đã có ở `tele-listen.mjs:2285-2295`, dưới `acquirePollLock`): bận không còn `EEXIST`-đuổi; nhiều side-message coalesce qua `mergePromptData`; busy-vì-đã-claim thì đi đường "spool fresh" sẵn có. Xoá `ask` retry/give-up + handover/steer give-up.
+2. **Claude Monitor announce prompt CÓ-SẴN** y như `waitOnceSupervisor` đã làm (`:2475`) → đóng CẢ G2 (sống qua tái sinh — file prompt vốn nằm trên đĩa) LẪN G3 (drainer Claude) bằng ~1 nhánh.
+3. Payload hygiene chống-spoof (blocker #4) — độc lập storage, làm ở cả hai hướng.
+- **Ưu:** đóng gap với ~nửa code; **loại bỏ** 2/4 blocker (#2 trùng-giao, #3 sender-atomic **không tồn tại** khi chỉ có 1 store), + wait-once-drainer + inbox-GC + TTL + dual-read — tất cả là chi phí do store thứ hai đẻ ra. Đúng tinh thần RFC02-NG3 (hoãn durable-queue tới khi nhu cầu ĐO ĐƯỢC).
+- **Nhược (mất thật):** không có hàng đợi sâu mà không phình prompt; không tách concern Telegram-vs-side; không có lifecycle per-message (dedup/priority) — nhưng NG2/NG3 đã hoãn mấy cái đó ở v1.
+- **Khi nào chọn kho đầy đủ (§5) thay vì D:** khi traffic máy-với-máy lên cao đo được (broadcast nhiều agent, hàng chục ask xếp hàng) làm merge-1-prompt phình rõ, hoặc lẫn-concern gây bug thật.
+
 ## 5. Proposed Design
 
 ### 5.1 Kho: `prompt-convo-<N>.inbox/` — thư mục FIFO đa-khe
@@ -139,3 +148,4 @@ Trong `main()` (áp cho path Claude; cân nhắc cho `--wait-once` để đối 
 4. **Reply-via chuẩn hoá:** enum `replyVia` đủ chưa (ask/DM/topic/none) cho mọi kind?
 5. **Migration:** giữ song song exclusive-write + inbox bao lâu; có cần đọc cả hai trong giai đoạn chuyển?
 6. **broadcast fan-out** vào N inbox — có cần cùng `id` để dedup xuyên topic không?
+- 2026-07-12 (**3-reviewer debate**): **R1 (Codex) + R2 (Gemini) → SOUND-WITH-CHANGES** — build the inbox, fixing 4 blockers: (1) prompt/claim race → reuse RFC 02 atomic-take on the shared prompt; (2) duplicate delivery → bounded delivered-id tombstones, at-least-once; (3) sender atomicity → temp-write + atomic rename, listener ignores partials; (4) authority spoofing → system-derived `fromConvoId/fromRole`, structured `replyVia`, never free text. Positions (§10): wait-once must drain; fold into text + structured field; cap count&bytes; structured `replyVia` object; dual-read migration; `broadcastId` + per-recipient ids. R2 added: side-message TTL/expiry, sender-hang-on-quarantine (surface to admin), inbox-GC on convo GC. **R3 (Claude) → GO-SIMPLER (dissent, §4.4)** — showed blockers #2/#3 + wait-once-drainer + inbox-GC + TTL + dual-read are all overhead the second store *creates*; both real gaps close with single-slot-merge (reuse `tele-listen.mjs:2285-2295`) + Claude pre-existing-prompt announce (copy `:2475`) + payload hygiene, deferring the durable inbox per RFC02-NG3 until measured volume justifies it. **Author leans GO-SIMPLER.** DECISION PENDING (Thi): **A** = GO-SIMPLER now, **B** = full inbox (R1/R2 change-list). Blocker #4 (spoofing hygiene) applies to both.
