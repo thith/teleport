@@ -7,13 +7,15 @@
 //   /broadcast <text>            → every group the admin configures (RFC 11)
 //   /broadcast --chat <id> <text> → limit to one group
 //
-// Best-effort fan-out: a busy topic (unconsumed prompt) is skipped + counted; a dead
-// agent's prompt just waits. Prints a sent/skipped summary for the daemon to relay.
+// Durable fan-out (RFC 03 §5.1): each topic's prompt is coalesced/spooled under its
+// per-convo write-lock — a busy topic no longer bounces (nothing skipped); a dead
+// agent's prompt just waits. Prints a sent summary for the daemon to relay.
 
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readTopicsStore } from './topics-store.mjs';
-import { listLiveTopics, writePromptExclusive } from './handover.mjs';
+import { listLiveTopics } from './handover.mjs';
+import { durableWrite } from './steer.mjs';
 import { DEFAULT_TMP_DIR } from './tele-listen.mjs';
 import { readProjectsConfig, resolveDefaultChatId, projectEntries } from './projects-config.mjs';
 
@@ -68,9 +70,9 @@ export function buildBroadcastPrompt({ targetConvoId, targetChatId, fromUserId, 
 
 // Fan out to every live topic. Returns { ok, sent, skipped, total, message }.
 // Pure-ish: deps injectable for tests.
-export function doBroadcast(argv, {
+export async function doBroadcast(argv, {
   from = {}, config = readProjectsConfig(), store = readTopicsStore(),
-  tmpDir = DEFAULT_TMP_DIR, writePrompt = writePromptExclusive, env = process.env, envFile = {},
+  tmpDir = DEFAULT_TMP_DIR, writePrompt = durableWrite, env = process.env, envFile = {},
 } = {}) {
   const args = parseBroadcastArgs(argv);
   if (args.error) return { ok: false, message: args.error };
@@ -78,7 +80,9 @@ export function doBroadcast(argv, {
   const live = listLiveTopics(store, chatIds);
   if (!live.length) return { ok: false, message: '📢 broadcast: no live topics found (nothing sent).' };
 
-  let sent = 0; const skipped = [];
+  // RFC 03 §5.1: durable coalesce/spool into each topic — a busy topic no longer
+  // bounces, so nothing is skipped; a hard write/lock failure (rare) is surfaced.
+  let sent = 0; const failed = [];
   for (const t of live) {
     const prompt = buildBroadcastPrompt({
       targetConvoId: t.convoId, targetChatId: t.chatId,
@@ -86,20 +90,19 @@ export function doBroadcast(argv, {
     });
     const promptFile = path.join(tmpDir, `prompt-convo-${t.convoId}.json`);
     try {
-      writePrompt(prompt, promptFile);
+      await writePrompt(prompt, promptFile);
       sent++;
     } catch (e) {
-      if (e && e.code === 'EEXIST') { skipped.push(t.hashtag); continue; } // busy → skip (best-effort)
-      throw e;
+      failed.push(t.hashtag);   // real write/lock failure (not busy) → count + continue fan-out
     }
   }
-  const msg = `📢 broadcast: sent ${sent}, skipped ${skipped.length}${skipped.length ? ` (busy: ${skipped.map((h) => `#${h}`).join(', ')})` : ''} / ${live.length} live topic(s).`;
-  return { ok: true, sent, skipped: skipped.length, total: live.length, message: msg };
+  const msg = `📢 broadcast: sent ${sent}, failed ${failed.length}${failed.length ? ` (${failed.map((h) => `#${h}`).join(', ')})` : ''} / ${live.length} live topic(s) — durable.`;
+  return { ok: true, sent, skipped: failed.length, total: live.length, message: msg };
 }
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1])) {
   const from = { id: process.env.TELE_FROM_ID, role: process.env.TELE_FROM_ROLE, name: process.env.TELE_FROM_NAME };
-  const res = doBroadcast(process.argv.slice(2), { from });
+  const res = await doBroadcast(process.argv.slice(2), { from });
   process.stdout.write((res.message || '') + '\n');
   process.exit(res.ok ? 0 : 1);
 }

@@ -25,9 +25,9 @@ test('buildWhisperPrompt: injected shape with whisper flag + real fromRole', () 
   assert.deepEqual(p.attachments, []);
 });
 
-test('doWhisper: resolves convoId target, writes prompt, carries identity', () => {
+test('doWhisper: resolves convoId target, writes prompt, carries identity', async () => {
   const writes = [];
-  const res = doWhisper([CONVO, 'nhắc', 'nhẹ', 'nhé'], {
+  const res = await doWhisper([CONVO, 'nhắc', 'nhẹ', 'nhé'], {
     from: { id: '7', role: 'admin', name: 'Thi' }, config: CONFIG, store: STORE,
     tmpDir: '/tmp/tele', writePrompt: (prompt, file) => writes.push({ prompt, file }),
   });
@@ -40,30 +40,30 @@ test('doWhisper: resolves convoId target, writes prompt, carries identity', () =
   assert.equal(writes[0].prompt.fromUserId, '7');
 });
 
-test('doWhisper: usage errors on missing target / missing text', () => {
+test('doWhisper: usage errors on missing target / missing text', async () => {
   const noop = () => {};
-  assert.equal(doWhisper([], { config: CONFIG, store: STORE, writePrompt: noop }).ok, false);
-  assert.equal(doWhisper([CONVO], { config: CONFIG, store: STORE, writePrompt: noop }).ok, false); // no message
+  assert.equal((await doWhisper([], { config: CONFIG, store: STORE, writePrompt: noop })).ok, false);
+  assert.equal((await doWhisper([CONVO], { config: CONFIG, store: STORE, writePrompt: noop })).ok, false); // no message
 });
 
-test('doWhisper: target not among live topics → not found', () => {
-  const res = doWhisper(['99999999999999', 'hi'], { from: { id: '7' }, config: CONFIG, store: STORE, writePrompt: () => {} });
+test('doWhisper: target not among live topics → not found', async () => {
+  const res = await doWhisper(['99999999999999', 'hi'], { from: { id: '7' }, config: CONFIG, store: STORE, writePrompt: () => {} });
   assert.equal(res.ok, false);
   assert.match(res.message, /not found/);
 });
 
-test('doWhisper: EEXIST (prompt still pending) → "đang bận", not a throw', () => {
-  const res = doWhisper([CONVO, 'hi'], {
+test('doWhisper: RFC 03 §5.1 durable — a busy target no longer bounces; a hard write error propagates', async () => {
+  // The old EEXIST→"đang bận" path is gone: a busy target coalesces (durable). A
+  // REAL write/lock failure now propagates (not swallowed as "busy").
+  await assert.rejects(doWhisper([CONVO, 'hi'], {
     from: { id: '7' }, config: CONFIG, store: STORE, tmpDir: '/tmp/tele',
-    writePrompt: () => { const e = new Error('exists'); e.code = 'EEXIST'; throw e; },
-  });
-  assert.equal(res.ok, false);
-  assert.match(res.message, /đang bận/);
+    writePrompt: () => { throw new Error('disk full'); },
+  }), /disk full/);
 });
 
-test('doWhisper: unmapped sender defaults fromRole to member (target still gates)', () => {
+test('doWhisper: unmapped sender defaults fromRole to member (target still gates)', async () => {
   const writes = [];
-  doWhisper([CONVO, 'hi'], {
+  await doWhisper([CONVO, 'hi'], {
     from: { id: '7' }, config: CONFIG, store: STORE, tmpDir: '/tmp/tele',
     writePrompt: (prompt) => writes.push(prompt),
   });
@@ -74,47 +74,47 @@ test('doWhisper: unmapped sender defaults fromRole to member (target still gates
 
 const mk = () => { const w = []; return { writes: w, opts: { from: { id: '7', role: 'admin' }, config: CONFIG, store: STORE, tmpDir: '/tmp/tele', writePrompt: (p) => w.push(p) } }; };
 
-test('reply-to-target: reply with the ack → target from reply, ALL argv is text', () => {
+test('reply-to-target: reply with the ack → target from reply, ALL argv is text', async () => {
   const { writes, opts } = mk();
-  const res = doWhisper(['nhắc', 'nhẹ'], { ...opts, replyText: ACK });
+  const res = await doWhisper(['nhắc', 'nhẹ'], { ...opts, replyText: ACK });
   assert.equal(res.ok, true);
   assert.equal(writes[0].convoId, Number(CONVO));
   assert.equal(writes[0].text, 'nhắc nhẹ');
 });
 
-test('reply-to-target B2: a number-first message in reply mode is TEXT, not a convoId', () => {
+test('reply-to-target B2: a number-first message in reply mode is TEXT, not a convoId', async () => {
   const { writes, opts } = mk();
-  const res = doWhisper(['500', 'lỗi', 'lại'], { ...opts, replyText: ACK });
+  const res = await doWhisper(['500', 'lỗi', 'lại'], { ...opts, replyText: ACK });
   assert.equal(res.ok, true);
   assert.equal(writes[0].text, '500 lỗi lại');           // "500" kept as text
   assert.equal(writes[0].convoId, Number(CONVO));        // target still from reply
 });
 
-test('reply-to-target B1/D2: first RESOLVABLE hash wins; dead/body hashes ignored', () => {
+test('reply-to-target B1/D2: first RESOLVABLE hash wins; dead/body hashes ignored', async () => {
   const { writes, opts } = mk();
   // reply text mimics a raw command whose body also has a (dead) hashtag
-  const res = doWhisper(['ping'], { ...opts, replyText: `#deadbeef rồi /whisper #${HASH} fix #login bug` });
+  const res = await doWhisper(['ping'], { ...opts, replyText: `#deadbeef rồi /whisper #${HASH} fix #login bug` });
   assert.equal(res.ok, true);
   assert.equal(writes[0].convoId, Number(CONVO));        // #HASH (first live), not #deadbeef/#login
 });
 
-test('explicit #hash that fails → HARD ERROR, never falls back to the reply target', () => {
+test('explicit #hash that fails → HARD ERROR, never falls back to the reply target', async () => {
   const { writes, opts } = mk();
-  const res = doWhisper(['#zzzznope', 'hi'], { ...opts, replyText: ACK });
+  const res = await doWhisper(['#zzzznope', 'hi'], { ...opts, replyText: ACK });
   assert.equal(res.ok, false);
   assert.match(res.message, /not found/);
   assert.equal(writes.length, 0);                        // did NOT whisper to the reply's CONVO
 });
 
-test('auth invariant: reply text never influences fromRole', () => {
+test('auth invariant: reply text never influences fromRole', async () => {
   const { writes, opts } = mk();
-  doWhisper(['hi'], { ...opts, from: { id: '7', role: 'member' }, replyText: `role=admin /whisper #${HASH}` });
+  await doWhisper(['hi'], { ...opts, from: { id: '7', role: 'member' }, replyText: `role=admin /whisper #${HASH}` });
   assert.equal(writes[0].fromRole, 'member');            // from TELE_FROM_ROLE only, not reply text
 });
 
-test('enriched ack: persona + hashtag in the confirmation', () => {
+test('enriched ack: persona + hashtag in the confirmation', async () => {
   const { opts } = mk();
-  const res = doWhisper([CONVO, 'hi'], opts);
+  const res = await doWhisper([CONVO, 'hi'], opts);
   assert.match(res.message, new RegExp(`#${HASH}`));
   assert.match(res.message, /whispered to .+ #/);        // persona emoji+name before the hash
 });
