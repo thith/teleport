@@ -430,16 +430,22 @@ Capture `<N>` once; pass to the listener as `--convo <N>`.
 
 Two cases. `send-telegram.mjs` prints the matching hint on stdout.
 
-**Claude (Monitor tool):** a persistent **self-re-arming** `while` loop (RFC 02). The listener **survives each delivery** — you start it **ONCE per convo and never re-arm**; per message you only read the prompt → reply → delete it. Start it once:
+**Claude (Monitor tool):** a persistent **self-re-arming** `while` loop (RFC 02). The listener **survives each delivery** — you start it **ONCE per convo and never re-arm**. Start it once:
 ```
 Monitor({
-  command: "while :; do node ../teleport/scripts/tele-listen.mjs --convo $CONVO_ID --settle --loop; case $? in 3) break;; 1) sleep 30;; esac; sleep 2; done",
+  command: "while :; do node ../teleport/scripts/tele-listen.mjs --convo $CONVO_ID --settle --loop --append; case $? in 3) break;; 1) sleep 30;; esac; sleep 2; done",
   timeout_ms: 3600000,
   persistent: true,
   description: "Telegram reply to convo <CONVO_ID>"
 })
 ```
 `--loop` makes a **superseded** listener exit `3` so the wrapper `break`s (stands down) instead of re-arming forever; a **delivery** (`0`) or **idle** poll (`2`) keeps the loop alive (no re-arm); a **fatal** error (`1`, e.g. bad token/convo) sleeps 30s to avoid a tight loop. If you accidentally start a second Monitor for the same convo, the older listener self-supersedes (exits `3` → its wrapper breaks) — but still prefer one per convo. On wind-down, `TaskStop` it.
+
+> **RFC 02 P3 — `--append` + CLAIM protocol (MUST, Claude only).** `--append` makes the listener **coalesce** a message that arrives while a prompt is pending (instead of blocking), and **spool** a fresh prompt when one is already claimed — so a mid-task correction is never lost. Because the listener may append to the open prompt at any time, you MUST **CLAIM** before reading, not read-in-place:
+> 1. **Claim:** `mv prompt-convo-$CONVO_ID.json prompt-convo-$CONVO_ID.processing.json && touch prompt-convo-$CONVO_ID.processing.json` (atomic rename snapshots the batch; `touch` makes the 5-min stale-reclaim TTL count from the claim). If the `mv` fails (`ENOENT`), it was already consumed/claimed — skip.
+> 2. **Read** the `.processing.json`.
+> 3. **Reply** via `send-telegram --convo $CONVO_ID` — it **auto-deletes** the `.processing.json` (P1). **Do NOT `rm` anything by hand.** A new `prompt-convo-$CONVO_ID.json` may appear (a correction spooled while you worked) → the listener delivers it as the next event; claim + handle it after.
+> Gemini/Codex (`--wait-once`, no `--append`) keep the old read→reply→`rm` flow — this claim protocol is Claude-only.
 
 > **⚠️ RFC 02 override (self-re-arm active).** Với lệnh `while … --loop` ở trên, listener **tự sống qua mỗi lần giao tin** nên:
 > - **KHÔNG re-arm sau mỗi send** — start MỘT lần/convo, mỗi tin chỉ đọc→đáp→xoá. (Bỏ qua "flow chuẩn sau mỗi send là TaskStop+Monitor mới" bên dưới — đó là của model `until` cũ.)
