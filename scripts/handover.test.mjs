@@ -418,21 +418,25 @@ test('CLI: --to no live topic in scoped chat → NOT_FOUND(4)', () => {
   assert.equal(runCli(['--to', '#zzzz9999', '--from-convo', '123', '--chat-id', '-100000000001'], 'notes'), EXIT.NOT_FOUND);
 });
 
-test('CLI: --ack with no note → OK(0), no empty-notes error (note is optional for ack); writes real prompt file, then BUSY(3) on retry', () => {
+test('CLI: --ack with no note → OK(0); writes real prompt; a second ack COALESCES (RFC 03, no more BUSY)', () => {
   // A fresh convoId so this run can't collide with a leftover file from a
   // prior run; clean up afterward — DEFAULT_TMP_DIR is the REAL prompt queue
   // dir (scripts/tmp/tele-reply), not an isolated test tmpdir.
   const convo = String(9000000000000000n + BigInt(process.pid));
   const file = path.join(DEFAULT_TMP_DIR, `prompt-convo-${convo}.json`);
+  const lock = path.join(DEFAULT_TMP_DIR, `prompt-write-${convo}.lock`);
   try {
     assert.equal(runCli(['--ack', convo, '--from-convo', SOURCE_CONVO], ''), EXIT.OK);
     const onDisk = JSON.parse(fs.readFileSync(file, 'utf8'));
     assert.equal(onDisk.fromRole, 'handover-ack');
     assert.equal(onDisk.handoverAck.from.convoId, SOURCE_CONVO);
-    // Same target still unconsumed → BUSY, not a silent overwrite.
-    assert.equal(runCli(['--ack', convo, '--from-convo', SOURCE_CONVO], 'second'), EXIT.BUSY);
+    // RFC 03 §5.1: a busy target no longer bounces BUSY — the second ack COALESCES
+    // into the pending prompt (durable), never a silent overwrite.
+    assert.equal(runCli(['--ack', convo, '--from-convo', SOURCE_CONVO], 'second'), EXIT.OK);
+    assert.equal(fs.existsSync(file), true, 'prompt still present after coalesce');
   } finally {
     fs.rmSync(file, { force: true });
+    fs.rmSync(lock, { force: true });
   }
 });
 
