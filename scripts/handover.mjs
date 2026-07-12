@@ -356,19 +356,10 @@ export function buildAckPrompt({ targetConvoId, targetChatId, sourceConvoId, not
   return base;
 }
 
-/**
- * Write the prompt file with EXCLUSIVE create (`wx`) so we NEVER overwrite an
- * unconsumed prompt (RFC 05 §2.2 — closes both the data-loss and the
- * check-then-write race). Returns true on success; throws EEXIST when a prompt
- * already exists (caller maps to EXIT.BUSY). `flagOverride` injectable for tests.
- */
-export function writePromptExclusive(promptObj, promptFile, deps = {}) {
-  const writeFn = deps.writeFileSync ?? fs.writeFileSync;
-  const mkdirFn = deps.mkdirSync ?? fs.mkdirSync;
-  mkdirFn(path.dirname(promptFile), { recursive: true });
-  writeFn(promptFile, JSON.stringify(promptObj, null, 2), { encoding: 'utf8', flag: 'wx' });
-  return true;
-}
+// RFC 03 §5.1: writePromptExclusive (O_EXCL single-slot write) was RETIRED once all
+// senders (ask/handover/whisper/instruct/broadcast) moved to the durable
+// mergeOrSpoolPrompt (coalesce/spool under the per-convo write-lock) — a busy target
+// no longer bounces EEXIST. Removed to avoid a dead, misleading primitive.
 
 /** Seed prompt for a freshly-spawned agent (--new). It must open its own
  * Telegram channel so the user can follow up, then await instructions. */

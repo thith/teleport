@@ -29,7 +29,6 @@ import {
   buildHandoverPrompt,
   buildAckPrompt,
   resolveConvoChatId,
-  writePromptExclusive,
   buildSeedPrompt,
   resolveChatIds,
   isPrivilegedRole,
@@ -286,57 +285,23 @@ test('buildAckPrompt: empty note still produces a well-formed ack', () => {
   assert.equal(p.chatId, 'null'); // buildCombinedPromptData stringifies chat.id verbatim
 });
 
-// --- writePromptExclusive (atomic, no-overwrite) ---------------------------
+// --- buildHandoverPrompt shape --------------------------------------------
+// (writePromptExclusive was retired in RFC 03 §5.1 — all senders now use the
+//  durable mergeOrSpoolPrompt; the write itself is covered by p3-append.test.mjs.)
 
-test('writePromptExclusive: writes once, refuses to overwrite (EEXIST → busy)', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'handover-test-'));
-  const file = path.join(dir, 'prompt-convo-X.json');
-  try {
-    assert.equal(writePromptExclusive({ a: 1 }, file), true);
-    assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')), { a: 1 });
-    // Second write to the same (unconsumed) file MUST throw EEXIST, not clobber.
-    let err = null;
-    try { writePromptExclusive({ a: 2 }, file); } catch (e) { err = e; }
-    assert.ok(err, 'expected an error on second write');
-    assert.equal(err.code, 'EEXIST');
-    // Original content preserved (no data loss).
-    assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')), { a: 1 });
-  } finally {
-    fs.rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-// --- inject path integration (build + exclusive write, isolated dir) --------
-
-test('inject path: writes a well-formed prompt, then refuses overwrite (busy)', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'handover-inject-'));
-  const file = path.join(dir, `prompt-convo-${TARGET_CONVO}.json`);
-  try {
-    const prompt = buildHandoverPrompt({
-      targetConvoId: TARGET_CONVO,
-      targetChatId: '-100123',
-      sourceConvoId: SOURCE_CONVO,
-      notes: 'State: branch wip. Làm tiếp: chạy test.',
-      roles: null,
-      nowSec: 1700000000,
-    });
-    // success injection
-    assert.equal(writePromptExclusive(prompt, file), true);
-    const onDisk = JSON.parse(fs.readFileSync(file, 'utf8'));
-    assert.equal(onDisk.fromRole, 'handover');
-    assert.equal(onDisk.convoId, TARGET_CONVO);
-    assert.deepEqual(onDisk.attachments, []);
-    assert.equal(onDisk.handover.from.convoId, SOURCE_CONVO);
-    // a second handover while the first is unconsumed → EEXIST (maps to BUSY/3),
-    // original preserved (no lost instruction)
-    let code = null;
-    try { writePromptExclusive(buildHandoverPrompt({ targetConvoId: TARGET_CONVO, targetChatId: '-100123', sourceConvoId: SOURCE_CONVO, notes: 'second', nowSec: 1700000001 }), file); }
-    catch (e) { code = e.code; }
-    assert.equal(code, 'EEXIST');
-    assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).text, onDisk.text);
-  } finally {
-    fs.rmSync(dir, { recursive: true, force: true });
-  }
+test('buildHandoverPrompt: well-formed prompt (role/convo/attachments/from)', () => {
+  const prompt = buildHandoverPrompt({
+    targetConvoId: TARGET_CONVO,
+    targetChatId: '-100123',
+    sourceConvoId: SOURCE_CONVO,
+    notes: 'State: branch wip. Làm tiếp: chạy test.',
+    roles: null,
+    nowSec: 1700000000,
+  });
+  assert.equal(prompt.fromRole, 'handover');       // non-privileged (context, not authority)
+  assert.equal(prompt.convoId, TARGET_CONVO);
+  assert.deepEqual(prompt.attachments, []);
+  assert.equal(prompt.handover.from.convoId, SOURCE_CONVO);
 });
 
 // --- buildSeedPrompt (--new) ----------------------------------------------
