@@ -2159,14 +2159,27 @@ async function main() {
   }
   // P3 (--append): coalesce into the OPEN (unclaimed) prompt rather than clobber
   // it; if only a CLAIMED (.processing.json) batch exists, promptFile is absent
-  // here so this writes a FRESH prompt (spool alongside the claimed one).
+  // so this writes a FRESH prompt (spool alongside the claimed one).
+  //
+  // Dedupe race fix (#1): atomically TAKE the open prompt (rename → private
+  // `.appending.<pid>`) BEFORE merging. The rename is the linearization point vs
+  // the agent's claim (rename prompt → .processing.json): only one wins. If WE
+  // win, the agent's claim ENOENTs and retries; if the AGENT claimed first, our
+  // rename ENOENTs → `existing` stays null → we spool the new batch to a fresh
+  // prompt. Either way the same batch never lands in both files (no duplication).
   let toWrite = data;
-  if (append && fs.existsSync(promptFile)) {
+  let takenFile = null;
+  if (append) {
+    const t = `${promptFile}.appending.${process.pid}`;
     let existing = null;
-    try { existing = JSON.parse(fs.readFileSync(promptFile, 'utf8')); } catch {}
+    try { fs.renameSync(promptFile, t); takenFile = t; } catch { /* no open prompt, or agent claimed first → spool fresh */ }
+    if (takenFile) { try { existing = JSON.parse(fs.readFileSync(takenFile, 'utf8')); } catch {} }
     if (existing) toWrite = mergePromptData(existing, data);
   }
   writePromptAtomic(toWrite, promptFile);
+  // Remove the taken snapshot only AFTER the write lands (so a write failure
+  // parks the old batch in `.appending.<pid>` rather than losing it).
+  if (takenFile) { try { fs.rmSync(takenFile, { force: true }); } catch {} }
   // React 👍 AFTER successful prompt write to avoid false ack on failure.
   await reactToMessages(token, toProcess);
   advanceLoopOffset();
