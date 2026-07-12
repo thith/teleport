@@ -1596,12 +1596,104 @@ export function reclaimStaleProcessing(processingFile, promptFile) {
     }
   } catch (e) {
     // Honest failure mode (subagent review): after the rename-to-.stale, a
-    // write failure (e.g. ENOSPC) leaves the batch parked in `.stale.<pid>`,
-    // which NO later poll scans — so surface it loudly instead of claiming
-    // "a later poll retries". (Follow-up hardening: a poll sweep that adopts
-    // orphan `.stale.*` snapshots.) We do NOT rename it back to processingFile:
-    // a concurrent agent claim may have created a fresh one there.
-    console.error(`[tele-listen] reclaim of ${path.basename(processingFile)} failed: ${e instanceof Error ? e.message : String(e)} — batch parked in a .stale snapshot (manual recovery may be needed)`);
+    // write failure (e.g. ENOSPC) leaves the batch parked in `.stale.<pid>`.
+    // sweepOrphanSnapshots (below) adopts such orphans on a later poll, but we
+    // still surface it loudly. We do NOT rename it back to processingFile: a
+    // concurrent agent claim may have created a fresh one there.
+    console.error(`[tele-listen] reclaim of ${path.basename(processingFile)} failed: ${e instanceof Error ? e.message : String(e)} — batch parked in a .stale snapshot (orphan-sweep will adopt it)`);
+  }
+}
+
+// RFC 02 P3 follow-up #1: adopt ORPHANED snapshot files. reclaimStaleProcessing
+// (`<prompt>.processing.json.stale.<pid>`) and the append atomic-take
+// (`<prompt>.json.appending.<pid>`) both atomic-rename a batch to a private
+// snapshot BEFORE writing the result back. If the process dies (or a write fails,
+// e.g. ENOSPC) in that window, the snapshot holds the ONLY copy of those messages
+// and nothing else scans it → parked forever. This poll-time sweep folds such an
+// orphan back into the OPEN prompt so no message is lost.
+//
+// Adopt ONLY when the owner pid is PROVABLY DEAD. A live owner is either mid-op or
+// about to clean up — never race it. This is safe because every poll runs in a
+// FRESH short-lived process: a batch's owner (the poll that created it) is dead by
+// the very next poll. We deliberately do NOT add an age/mtime fallback for a live
+// owner — that could steal a snapshot from a paused-but-alive op which then
+// resumes and clobbers (reviewer BLOCKER). Residual: if a dead owner's pid is
+// REUSED by an unrelated live process, its orphan stays PARKED (not lost) until
+// that process exits — rare and self-healing.
+//
+// Adoption reads a snapshot → merges into the open prompt → writes → deletes the
+// snapshot LAST (a crash between write and delete re-adopts as a harmless dup next
+// sweep, never a loss). The read-modify-write of the shared open prompt is
+// serialized ACROSS processes by a per-convo sweep lock: two listeners overlapping
+// during a supersede can't both adopt DIFFERENT orphans against the same stale
+// `open` snapshot and clobber each other (reviewer BLOCKER) — the loser simply
+// skips this poll and sweeps on the next. Best-effort + total: never throws into
+// the poll loop.
+export function sweepOrphanSnapshots(convo, tmpDir = DEFAULT_TMP_DIR) {
+  const promptFile = path.join(tmpDir, `prompt-convo-${convo}.json`);
+  const staleBase = `prompt-convo-${convo}.processing.json.stale.`;
+  const appendBase = `prompt-convo-${convo}.json.appending.`;
+  const sweepLock = path.join(tmpDir, `sweep-convo-${convo}.lock`);
+  let entries;
+  try { entries = fs.readdirSync(tmpDir); } catch { return; }
+  // Cheap pre-filter: only pay for the lock if there's actually a candidate.
+  if (!entries.some((n) => n.startsWith(staleBase) || n.startsWith(appendBase))) return;
+  if (!acquirePollLock(sweepLock)) return;            // another sweeper is adopting → skip this poll
+  try {
+    for (const name of entries) {
+      let kindBase = null;
+      if (name.startsWith(staleBase)) kindBase = staleBase;
+      else if (name.startsWith(appendBase)) kindBase = appendBase;
+      else continue;
+      const pidStr = name.slice(kindBase.length);
+      if (!/^\d+$/.test(pidStr)) continue;            // only our `.<pid>` snapshots
+      const pid = Number(pidStr);
+      if (pid > 1 && isProcessAlive(pid)) continue;   // live owner (incl. ourself) → leave it
+      const full = path.join(tmpDir, name);
+      let raw;
+      try { raw = fs.readFileSync(full, 'utf8'); }
+      catch { continue; }                             // vanished mid-scan → skip
+      let data;
+      try { data = JSON.parse(raw); }
+      catch {
+        // Unparseable dead-owner snapshot: do NOT delete (that would destroy the
+        // only copy). Quarantine to a non-overwriting `<name>.corrupt[.<n>]` —
+        // still prefix-matched but the non-numeric suffix makes later sweeps skip
+        // it — and log ONCE (the rename guarantees no re-log every poll).
+        try {
+          let dest = `${full}.corrupt`;
+          for (let n = 1; fs.existsSync(dest); n++) dest = `${full}.corrupt.${n}`;
+          fs.renameSync(full, dest);
+          console.error(`[tele-listen] orphan-sweep: ${name} is unreadable — quarantined to ${path.basename(dest)} for manual recovery`);
+        } catch { /* raced away or rename failed → leave it */ }
+        continue;
+      }
+      try {
+        let open = null;
+        if (fs.existsSync(promptFile)) {
+          try { open = JSON.parse(fs.readFileSync(promptFile, 'utf8')); } catch {}
+        }
+        // Orphan is the OLDER content; a present open prompt is newer → orphan is
+        // the `existing` (earlier) side so mergePromptData keeps newest metadata +
+        // per-segment attribution (no impersonation on adopt).
+        writePromptAtomic(open ? mergePromptData(data, open) : data, promptFile);
+        fs.rmSync(full, { force: true });             // delete LAST (crash → dup, not loss)
+        fs.rmSync(`${full}.warned`, { force: true }); // clear any prior write-fail marker
+      } catch (e) {
+        // A persistent write failure (e.g. ENOSPC) recurs every poll — but each
+        // poll is a fresh process, so guard the log with a `.warned` marker to
+        // surface it ONCE, not on every ~2s poll (this codebase regressed once on
+        // per-poll logging → Monitor auto-stop). The batch stays parked and is
+        // retried when the write can succeed.
+        const warned = `${full}.warned`;
+        if (!fs.existsSync(warned)) {
+          console.error(`[tele-listen] orphan-sweep: failed to adopt ${name} → ${path.basename(promptFile)}: ${e instanceof Error ? e.message : String(e)} (left parked, retried next sweep)`);
+          try { fs.writeFileSync(warned, String(Date.now())); } catch {}
+        }
+      }
+    }
+  } finally {
+    releasePollLock(sweepLock);
   }
 }
 
@@ -1919,6 +2011,9 @@ async function main() {
       try { stale = Date.now() - fs.statSync(processingFile).mtimeMs > PROCESSING_TTL_MS; } catch {}
       if (stale) reclaimStaleProcessing(processingFile, promptFile);
     }
+    // Follow-up #1: adopt any orphaned .stale.*/.appending.* snapshots left by a
+    // reclaim/append that died after its atomic rename but before writing back.
+    if (convo != null) sweepOrphanSnapshots(convo, DEFAULT_TMP_DIR);
   } else {
     // Legacy single-slot: block while a batch is pending or being processed.
     if (fs.existsSync(processingFile)) {
