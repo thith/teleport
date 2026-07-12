@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { parseArgs, mergePromptData, PROCESSING_TTL_MS, reclaimStaleProcessing, attributionLabelFromData } from './tele-listen.mjs';
+import { spawn } from 'node:child_process';
+import { parseArgs, mergePromptData, PROCESSING_TTL_MS, reclaimStaleProcessing, attributionLabelFromData, sweepOrphanSnapshots } from './tele-listen.mjs';
 import { autoConsumeClaimedPrompt } from './send-telegram.mjs';
 
 // RFC 02 P3 — append-until-claimed + P1 auto-consume. Pure helpers here; the
@@ -125,5 +126,130 @@ test('autoConsumeClaimedPrompt: deletes ONLY .processing.json — OPEN inbox unt
   assert.equal(fs.existsSync(open), true);                 // OPEN prompt untouched (never dropped)
   assert.equal(autoConsumeClaimedPrompt(9, d), false);     // no-op the second time
   assert.equal(autoConsumeClaimedPrompt(null, d), false);  // null convo → no-op
+  fs.rmSync(d, { recursive: true, force: true });
+});
+
+// RFC 02 P3 follow-up #1: sweepOrphanSnapshots — adopt snapshots orphaned when a
+// reclaim/append process died after its atomic rename but before writing back.
+const DEAD_PID = 2147483646; // vanishingly unlikely to be a live process
+
+test('sweepOrphanSnapshots: dead-owner .stale orphan, no open prompt → resurfaced as the open prompt', () => {
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), 'sweep-'));
+  const orphan = path.join(d, `prompt-convo-7.processing.json.stale.${DEAD_PID}`);
+  fs.writeFileSync(orphan, JSON.stringify({ text: 'lô mồ côi', textAttributed: false, fromName: 'An', fromRole: 'admin', fromUserId: '1', messageId: 5 }));
+  sweepOrphanSnapshots(7, d);
+  assert.equal(fs.existsSync(orphan), false);                           // adopted
+  const open = JSON.parse(fs.readFileSync(path.join(d, 'prompt-convo-7.json'), 'utf8'));
+  assert.match(open.text, /lô mồ côi/);                                 // content preserved
+  fs.rmSync(d, { recursive: true, force: true });
+});
+
+test('sweepOrphanSnapshots: dead-owner .appending orphan folds INTO the open prompt (orphan is the older side, no impersonation)', () => {
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), 'sweep2-'));
+  const orphan = path.join(d, `prompt-convo-7.json.appending.${DEAD_PID}`);
+  fs.writeFileSync(orphan, JSON.stringify({ text: 'lời của An', textAttributed: false, fromName: 'An', fromRole: 'admin', fromUserId: '1', messageId: 5 }));
+  fs.writeFileSync(path.join(d, 'prompt-convo-7.json'), JSON.stringify({ text: 'lời của Ba', textAttributed: false, fromName: 'Ba', fromRole: 'member', fromUserId: '2', messageId: 9 }));
+  sweepOrphanSnapshots(7, d);
+  assert.equal(fs.existsSync(orphan), false);
+  const open = JSON.parse(fs.readFileSync(path.join(d, 'prompt-convo-7.json'), 'utf8'));
+  assert.equal(open.text, 'An (admin): lời của An\n\nBa (member): lời của Ba'); // each attributed → no impersonation
+  assert.equal(open.messageId, 9);                                      // newest metadata kept
+  fs.rmSync(d, { recursive: true, force: true });
+});
+
+test('sweepOrphanSnapshots: a snapshot owned by a LIVE process (incl. ourself) is left alone — never stolen mid-op', () => {
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), 'sweep3-'));
+  // Our own pid is alive → the liveness guard must skip it.
+  const mine = path.join(d, `prompt-convo-7.processing.json.stale.${process.pid}`);
+  fs.writeFileSync(mine, JSON.stringify({ text: 'đang xử' }));
+  sweepOrphanSnapshots(7, d);
+  assert.equal(fs.existsSync(mine), true);                              // untouched
+  assert.equal(fs.existsSync(path.join(d, 'prompt-convo-7.json')), false);
+  fs.rmSync(d, { recursive: true, force: true });
+});
+
+test('sweepOrphanSnapshots: ignores unrelated files + other convos + non-pid suffixes', () => {
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), 'sweep4-'));
+  const keep = [
+    'prompt-convo-7.json',                                   // the real open prompt (not a snapshot)
+    'prompt-convo-8.processing.json.stale.' + DEAD_PID,      // different convo
+    'prompt-convo-7.processing.json.stale.notapid',          // non-numeric suffix
+    'random.txt',
+  ];
+  for (const f of keep) fs.writeFileSync(path.join(d, f), '{}');
+  sweepOrphanSnapshots(7, d);
+  for (const f of keep) assert.equal(fs.existsSync(path.join(d, f)), true, `${f} must be untouched`);
+  fs.rmSync(d, { recursive: true, force: true });
+});
+
+test('sweepOrphanSnapshots: corrupt orphan (bad JSON) with dead owner → QUARANTINED, not deleted (zero-loss)', () => {
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), 'sweep5-'));
+  const orphan = path.join(d, `prompt-convo-7.processing.json.stale.${DEAD_PID}`);
+  fs.writeFileSync(orphan, '{ this is not json');
+  sweepOrphanSnapshots(7, d);
+  assert.equal(fs.existsSync(orphan), false);                           // moved aside
+  assert.equal(fs.existsSync(orphan + '.corrupt'), true);               // preserved for manual recovery
+  assert.equal(fs.readFileSync(orphan + '.corrupt', 'utf8'), '{ this is not json'); // content intact
+  assert.equal(fs.existsSync(path.join(d, 'prompt-convo-7.json')), false); // nothing bogus resurfaced
+  // Idempotent: a second sweep must NOT re-process the quarantined file.
+  sweepOrphanSnapshots(7, d);
+  assert.equal(fs.readdirSync(d).filter((f) => f.endsWith('.corrupt')).length, 1);
+  fs.rmSync(d, { recursive: true, force: true });
+});
+
+test('sweepOrphanSnapshots: a LIVE owner is NEVER adopted, even for an old snapshot (no live-steal race)', () => {
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), 'sweep6-'));
+  const child = spawn('sleep', ['30'], { stdio: 'ignore' });
+  try {
+    const orphan = path.join(d, `prompt-convo-7.processing.json.stale.${child.pid}`);
+    fs.writeFileSync(orphan, JSON.stringify({ text: 'held by a live op' }));
+    // Even an OLD mtime must not adopt while the owner is alive — a paused-but-
+    // alive op could resume and clobber. Ownership is the only signal.
+    const old = (Date.now() - 60 * 60 * 1000) / 1000; // 1h old
+    fs.utimesSync(orphan, old, old);
+    sweepOrphanSnapshots(7, d);
+    assert.equal(fs.existsSync(orphan), true, 'live-owner snapshot must never be stolen');
+    assert.equal(fs.existsSync(path.join(d, 'prompt-convo-7.json')), false);
+  } finally {
+    child.kill('SIGKILL');
+    fs.rmSync(d, { recursive: true, force: true });
+  }
+});
+
+// The collision the reviewer flagged: this process's own reclaim left a parked
+// `.stale.<ourpid>` (write-failed), AND a separate dead-owner orphan exists. The
+// dead orphan must be adopted WITHOUT clobbering our own parked snapshot.
+test('sweepOrphanSnapshots: adopting a dead orphan never clobbers our own parked snapshot', () => {
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), 'sweep7-'));
+  const mineParked = path.join(d, `prompt-convo-7.processing.json.stale.${process.pid}`);
+  const deadOrphan = path.join(d, `prompt-convo-7.processing.json.stale.${DEAD_PID}`);
+  fs.writeFileSync(mineParked, JSON.stringify({ text: 'MY parked batch' }));
+  fs.writeFileSync(deadOrphan, JSON.stringify({ text: 'dead orphan batch', textAttributed: false, fromName: 'An', fromRole: 'admin', fromUserId: '1' }));
+  sweepOrphanSnapshots(7, d);
+  assert.equal(fs.existsSync(mineParked), true, 'our own parked snapshot must survive');
+  assert.equal(JSON.parse(fs.readFileSync(mineParked, 'utf8')).text, 'MY parked batch'); // uncorrupted
+  assert.equal(fs.existsSync(deadOrphan), false);                        // dead orphan adopted
+  assert.match(JSON.parse(fs.readFileSync(path.join(d, 'prompt-convo-7.json'), 'utf8')).text, /dead orphan batch/);
+  fs.rmSync(d, { recursive: true, force: true });
+});
+
+test('sweepOrphanSnapshots: persistent write failure parks the batch + warns ONCE (no per-poll log flood)', () => {
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), 'sweep8-'));
+  // Force writePromptAtomic to fail deterministically: the prompt path is a
+  // NON-EMPTY directory, so the temp→prompt rename can't succeed.
+  const promptDir = path.join(d, 'prompt-convo-7.json');
+  fs.mkdirSync(promptDir);
+  fs.writeFileSync(path.join(promptDir, 'x'), '1');
+  const orphan = path.join(d, `prompt-convo-7.processing.json.stale.${DEAD_PID}`);
+  fs.writeFileSync(orphan, JSON.stringify({ text: 'batch that cannot land' }));
+
+  sweepOrphanSnapshots(7, d);
+  assert.equal(fs.existsSync(orphan), true, 'orphan stays PARKED on write failure — never lost');
+  assert.equal(fs.existsSync(orphan + '.warned'), true, 'a one-shot warn marker is dropped');
+
+  // A second poll (fresh process in prod) must NOT re-warn — the marker suppresses it.
+  sweepOrphanSnapshots(7, d);
+  assert.equal(fs.existsSync(orphan), true);
+  assert.equal(fs.readdirSync(d).filter((f) => f.endsWith('.warned')).length, 1, 'warned once, not per poll');
   fs.rmSync(d, { recursive: true, force: true });
 });
