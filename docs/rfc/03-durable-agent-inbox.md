@@ -1,6 +1,6 @@
 # RFC 03: Durable, non-blocking side-message delivery
 
-> **Status:** Draft v2 / In Review (RFC-first — viết TRƯỚC code. v2 = viết lại sau debate lần 1: đổi thiết kế chính sang GO-SIMPLER, xem §11.)
+> **Status:** Accepted (GO-SIMPLER) — qua 2 vòng debate 3 reviewer, cả 3 hội tụ GO. Sẵn sàng implement theo §7 rollout + change-list §11.
 > **Author:** Claude (🐸 Ếch 2) + Thi
 > **Created:** 2026-07-12
 > **Last Updated:** 2026-07-12
@@ -70,18 +70,29 @@ Ba mảnh, tất cả **tái dùng máy RFC 02**; không hạ tầng mới.
 4. Nếu trống → ghi thẳng (như cũ).
 → Bận **không còn** `EEXIST`-đuổi; nhiều side-msg **tự gộp**; luôn thành công. **Xoá** `ask.writePromptWithRetry`+hint "thử lại 3'" và các nhánh give-up của handover/steer. Sender trả **async**: "đã xếp hàng (bền trên đĩa), sẽ giao".
 
-### 5.2 Claude Monitor: ANNOUNCE prompt có-sẵn (drainer) — **G2 + G3**
-Thêm nhánh đầu `main()` (path Claude, không `--wait-once`): nếu tồn tại `prompt-convo-N.json` **chưa-claim** mà **không phải do lần chạy này vừa ghi** → phát event "prompt written/ready" + `exit 0` để Monitor dâng cho agent (y `waitOnceSupervisor:2475`).
-- Đóng **G3** (side-msg cho Claude rảnh được xướng) và **G2** (prompt sống sót qua cái chết → listener kiếp mới xướng ở poll đầu — file vốn nằm đĩa = đã bền).
-- **Chống double-announce/loop:** dùng đúng giao thức claim RFC 02 — nếu `.processing.json` tồn tại (agent đang xử) thì KHÔNG xướng; chỉ xướng open-prompt **chưa** claim. Agent claim (rename→`.processing`) trước khi đọc → poll sau thấy `.processing` → im.
+### 5.2 Claude Monitor: CLAIM-before-ANNOUNCE prompt có-sẵn (drainer) — **G2 + G3**
+Thêm nhánh **đầu poll** (trước fetch; path Claude/`--append`, không `--wait-once`): nếu tồn tại `prompt-convo-N.json` → **listener TỰ CLAIM rồi mới xướng** (chốt lại từ debate lần 2 — xem §11):
+```
+if append && exists(promptFile):
+    acquire prompt-write-<N>.lock          // §5.5, dùng acquireLockWithRetry (:1401)
+    try: renameSync(promptFile → processingFile)   // atomic claim = điểm tuyến-tính-hoá
+    catch ENOENT: release + fall-through-fetch      // đứa khác đã claim/merge → KHÔNG xướng
+    utimesSync(processingFile, now)         // touch: TTL đếm từ lúc claim (khớp guide:445)
+    release lock
+    console.log("prompt ready"); exit 0     // XƯỚNG SAU KHI claim
+```
+- Đóng **G3** (side-msg cho Claude rảnh được xướng) và **G2** (prompt sống sót qua cái chết → listener kiếp mới claim+xướng ở poll đầu — file vốn nằm đĩa = đã bền).
+- **Vì sao claim-before-announce, KHÔNG dùng marker:** sau rename, `promptFile` biến mất → điều kiện nhánh SAI ở mọi poll sau tới khi tiêu/reclaim → **không thể flood** (đúng bug RFC 02 sinh ra để diệt). **Không điếc-âm-thầm:** batch đã claim nằm trong `.processing.json` bền; agent chết trước khi đọc → `reclaimStaleProcessing` (TTL 5') fold về open prompt → poll sau re-claim + re-xướng — **tự lành bằng máy RFC 02 đã có**. Marker (`.announced`) bị bác: nó đẻ ra ca **mất-vĩnh-viễn** (agent chết ôm prompt + marker cũ → skip mãi) + cần 5 hook clear. Dup tối đa = at-least-once (crash giữa claim-và-đọc → reclaim → dup, không mất).
+- **Không phá:** sweep chỉ nhận `.stale`/`.appending` của pid **đã chết** (`:1651`), không đụng `.processing` sống; `--wait-once` (Gemini/Codex) là hàm riêng, không sờ; agent-side claim `mv` thành fallback vô hại (nếu listener claim trước, agent chỉ việc đọc `.processing`).
+- **Scope v1:** chỉ thêm nhánh claim-before-announce đầu poll; **giữ nguyên** Telegram write-path (`:2292-2304`). Tối đa 1 announce thừa/batch (dup, chấp nhận). Hợp-nhất write-path qua cùng claim-before-announce = bước sau, gate riêng.
 
 ### 5.3 Anti-spoof + thẻ reply (payload hygiene) — **G4 + G5**
 - `from`/`role` **hệ-thống-sinh**: sender resolve danh tính THẬT của mình (fromConvoId từ env, role từ `roles` config) — agent không tự khai `from:admin`. Listener render nhãn attribution từ field tin cậy (tái dùng guard chống-impersonate của RFC 02).
-- Mỗi side-msg mang thẻ **có cấu trúc** trong payload: `kind` (ask/handover/whisper/instruct/broadcast), `from`, `replyVia` (object: `{kind:"ask"|"dm"|"topic"|"none", targetConvoId?, chatId?}` — **không** phải shell-string), `priority`. Khối render vào `text` (agent chắc thấy) + giữ mảng cấu trúc để test/tooling.
+- Mỗi side-msg mang thẻ **có cấu trúc** trong payload: `kind` (ask/handover/whisper/instruct/broadcast), `from`, `replyVia` (object: `{kind:"ask"|"dm"|"topic"|"none", targetConvoId?, chatId?}` — **không** phải shell-string). **KHÔNG có `priority` ở v1** (chốt debate lần 2 §11): merge một-khe **không có thứ tự giao** — mọi tin fold vào 1 prompt đọc 1 lượt, nên `priority` chỉ đổi được text-framing, mà framing đã suy ra từ `kind` (§5.4). Priority thật chỉ có nghĩa khi kí túc xá đa-khe (§4.4) được kích hoạt. Khối render vào `text` (agent chắc thấy) + giữ mảng cấu trúc để test/tooling.
 
 ### 5.4 Fold-lô: routing + framing (điểm debate)
 - **Reply routing khi lô gộp lẫn tin Telegram:** prompt ghi rõ khối Telegram-origin reply về **topic**, mỗi khối side-msg reply theo **`replyVia`** của nó. (Vấn đề này có ở MỌI thiết kế fold, không riêng gì kí túc xá.)
-- **Framing subordinate:** side-msg `priority != high` render dạng **phụ** ("FYI — sau khi xong việc đang làm:") để một `whisper` chen vào không cướp attention của task đang chạy.
+- **Framing subordinate suy từ `kind`:** `whisper`/`broadcast` render dạng **phụ** ("FYI — sau khi xong việc đang làm:") để không cướp attention của task đang chạy; `ask`/`handover`/`instruct` render bình thường (cần agent xử + reply).
 
 ## 6. Interplay với RFC 01/02
 - **claim/append/reclaim/sweep:** GO-SIMPLER **là** append — sender dùng chính atomic-take + `mergePromptData` + lock + spool. Không thêm đường mới. `reclaimStaleProcessing`/`sweepOrphanSnapshots` vẫn xử `.processing`/`.stale`/`.appending` như cũ.
@@ -94,8 +105,11 @@ Thêm nhánh đầu `main()` (path Claude, không `--wait-once`): nếu tồn t�
 3. **③ anti-spoof** xuyên suốt.
 Mỗi bước: worktree → test → tri-runtime smoke → review → merge. Không bật đồng loạt.
 
+### 5.5 Write-lock: một lock per-convo cho MỌI writer của `prompt-convo-N.json`
+Nay sender cũng RMW `prompt-convo-N.json` (trước chỉ listener) → cần **lock RIÊNG per-convo** `prompt-write-<N>.lock` (KHÔNG dùng `POLL_LOCK_FILE` — đó là lock fetch/long-poll 25s, release TRƯỚC đoạn ghi prompt → không serialize gì; category error). Dùng `acquireLockWithRetry` (`:1401`, bounded ~50×20ms). **Lock này phải bọc MỌI writer của `prompt-convo-N.json`:** listener-append (`:2285-2295`), tất cả sender, `reclaimStaleProcessing` (`:1589,1594`) VÀ `sweepOrphanSnapshots` (`:1679`) — nếu bỏ sót reclaim/sweep thì race sender-vs-sweep tái xuất một tầng trên. Thứ tự lock nhất quán **sweepLock ⊐ write-lock** (không cycle → không deadlock; sender không đụng fetch-lock nên không kẹt sau long-poll). **Ghi bền XONG mới trả "queued"**; hết lock-retry thì **fail to ầm ĩ**, không lẳng lặng báo "queued". Trích helper chung `mergeOrSpoolPrompt(promptFile, processingFile, data)` tái tạo `:2285-2295` **nguyên văn** (giữ bất biến "write-fail parks in `.appending.<pid>`, rm-last") + bọc lock; listener và sender cùng gọi.
+
 ## 8. Risks / edge cases
-- **(R1) Sender ghi chung file → race:** hai sender, hoặc sender-vs-listener, cùng rename+write `prompt-convo-N.json`. **Bắt buộc** cầm `acquirePollLock` per-convo quanh merge (lock đã có). Đây là chi phí GO-SIMPLER (kí túc xá tránh được vì sender ghi file riêng) — nhưng rẻ.
+- **(R1) Sender ghi chung file → race:** đã giải bằng §5.5 (write-lock per-convo bọc mọi writer). Đây là chi phí GO-SIMPLER (kí túc xá tránh được vì sender ghi file riêng) — nhưng rẻ (hold ~micro giây, không network).
 - **Prompt phình / lệch task:** nhiều side-msg + Telegram gộp một prompt to; whisper chen làm nhiễu. Giảm bằng §5.4 framing subordinate + (sau) `priority`. Nếu phình thành vấn đề đo được → kích hoạt kí túc xá (§4.4).
 - **Announce loop:** §5.2 phải chặt — chỉ xướng open-prompt chưa-claim, im khi `.processing` tồn tại. Cần test kỹ (đây là chỗ dễ gây flood/loop → điếc, đúng bài học RFC 02).
 - **at-least-once:** crash sau announce trước claim → poll sau xướng lại = agent thấy lại (dup, không mất). Chấp nhận (nhất quán triết lý).
@@ -119,3 +133,11 @@ Mỗi bước: worktree → test → tri-runtime smoke → review → merge. Kh�
 - 2026-07-12 (draft v1): thảo luận ẩn dụ "cung/kí túc xá/thái giám" với Thi → nháp đầu chọn "kí túc xá" (store riêng).
 - 2026-07-12 (**debate lần 1**): **R1 Codex + R2 Gemini → SOUND-WITH-CHANGES** cho kí túc xá, 4 blocker (prompt/claim race → atomic-take; trùng-giao → tombstone; sender-atomic temp+rename; anti-spoof field hệ-thống-sinh) + R2 thêm TTL/sender-hang/inbox-GC. **R3 Claude → GO-SIMPLER (dissent)**: 2/4 blocker + wait-once-drainer + inbox-GC + TTL + dual-read đều là chi phí do store thứ hai đẻ; đóng 2 gap thật bằng single-slot-merge (reuse `2285-2295`) + Claude announce (copy `2475`) + anti-spoof. Author lean GO-SIMPLER.
 - 2026-07-12 (**Thi chốt hướng**): viết lại RFC lấy **GO-SIMPLER làm thiết kế chính** (§5), kí túc xá → §4.4 hoãn kèm điều kiện kích hoạt; debate lại trên bản v2. Anti-spoof (blocker #4) giữ vì độc lập storage.
+- 2026-07-12 (**debate lần 2** trên v2, cả 3 → **GO**): R1 Codex + R2 Gemini + R3 Claude hội tụ GO-SIMPLER. **Change-list v1 chốt:**
+  1. **Write-lock:** `prompt-write-<N>.lock` per-convo (KHÔNG dùng `POLL_LOCK_FILE`) qua `acquireLockWithRetry`; bọc helper chung `mergeOrSpoolPrompt()` tái tạo `:2285-2295` nguyên văn. **Guard MỌI writer** của `prompt-convo-N.json`: listener-append, mọi sender, `reclaimStaleProcessing`, `sweepOrphanSnapshots`. Thứ tự sweepLock ⊐ write-lock. Ghi bền xong mới trả "queued"; fail ầm ĩ khi hết lock.
+  2. **Announce:** **claim-before-announce** (đầu poll, Claude/append): write-lock → `rename promptFile→processingFile` → touch → announce/exit-0. **Bác marker** (đẻ ca mất-vĩnh-viễn). Tự lành qua reclaim TTL. Giữ nguyên Telegram write-path ở v1 (tối đa 1 dup/batch); hợp-nhất là bước sau.
+  3. **Anti-spoof:** role = f(danh tính Telegram resolve tại biên daemon/trust); sender từ chối `role`/`from` từ argv/env. Test direct-script spoof.
+  4. **Q4 → bỏ `priority`** (merge một-khe không có thứ-tự-giao; framing suy từ `kind`).
+  5. **Tests/wording:** concurrent empty-slot senders; `--settle` = fetch-only (ghi rõ); reclaim/sweep nay sau write-lock.
+  6. **Rollout §7 giữ nguyên:** ② announce-drainer TRƯỚC → ① sender merge opt-in (`ask` đầu) → ③ anti-spoof. Mỗi bước worktree+test+tri-runtime+review+merge.
+  Dormitory (§4.4) vẫn hoãn; Q6 threshold không đổi. R3 nhấn: mọi fix vòng-2 đều tái dùng máy RFC 02, **zero new durable state** → GO-SIMPLER nới rộng khoảng cách so với inbox.
