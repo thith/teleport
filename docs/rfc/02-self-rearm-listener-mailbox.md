@@ -1,6 +1,6 @@
 # RFC 02: Listener tự re-arm + mailbox không chặn cho agent Telegram
 
-> **Status:** In Review (đã qua debate 3 reviewer tuần tự — verdict **GO-WITH-CHANGES**, xem §10)
+> **Status:** Accepted / Shipped — P0+P1+P2+P3 activated on `main` (2026-07-12). Remaining follow-ups: orphan `.stale.*` sweep (rare, ENOSPC only) + per-sender attribution when appending a bare single message (cosmetic). See §9.
 > **Author:** Claude (🐸 Ếch 2) + Thi
 > **Created:** 2026-07-11
 > **Last Updated:** 2026-07-12
@@ -154,3 +154,4 @@ Reviewer 1 **Codex** → Reviewer 2 **Gemini** (thấy Codex) → Reviewer 3 **C
 - `sleep` đổi nghĩa: dưới `while`+long-poll nó chỉ còn là **crash-guard**; `while true; …; sleep 2` sẽ **re-arm vĩnh viễn một listener fatal** (bot/convo sai) → `case $?` là **bắt buộc**, không phải trang trí.
 
 **Verdict: GO-WITH-CHANGES.** Hướng lõi (`until`→`while`, `--wait-once` nguyên) đúng & an toàn. KHÔNG ship-as-written: **P0** cần exit-code + `case` wrapper trước; **P1/P3 khoá** tới khi rào-`.processing.json` + claim protocol smoke-test xanh trên cả Claude/Gemini/Codex.
+- 2026-07-12 (**SHIPPED**): P0 (self-re-arm `--loop`) + P2 (attribution) + adaptive-settle + `..`/`,` override + P1 (auto-consume) + P3 (`--append` claim/spool/TTL-reclaim) all merged to `main` and activated (Claude guide flipped to `--loop --append` + CLAIM protocol). Reviews: RFC 3-reviewer debate; per-branch 3-reviewer (+ deep subagent for P3). Gemini's reclaim data-loss race + the append-vs-claim duplication race (#1, atomic-take) fixed. Live smoke: claim / P1 auto-consume / coalesce / spool / self-re-arm / override all pass. Suite 640/640; default (no `--append`, `--wait-once`) byte-identical → Gemini/Codex unchanged. **Open follow-ups (mine):** (#2) a poll sweep to adopt orphan `.stale.*` snapshots on the rare post-rename write failure; (#3-cosmetic) attribute a bare single message when it's appended onto a batch; (guide) prune the now-legacy self-heal/heartbeat sections.
