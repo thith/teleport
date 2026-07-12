@@ -215,7 +215,7 @@ Primitive inter-agent **thứ 3** (sau whisper, handover): **2 agent LIVE hỏi-
 echo "<câu hỏi>" | node ../teleport/scripts/ask.mjs --to "<persona|#hashtag|convoId>"
 ```
 - **Scope = cùng `chatId`** (cùng group). Cross-group **bị cấm** (script tự chặn → exit NOT_FOUND) — *"như gọi hồn, members bất an"*. Muốn cross-group phải xin **admin** (ngoài luồng này).
-- Xử exit như handover: `OK` (đã gửi) · `BUSY` (target đang bận → báo user "thử lại sau") · `NOT_FOUND` (không thấy trong group → báo + gợi ý) · `AMBIGUOUS` (trùng tên → hỏi user chọn `#hashtag`).
+- Xử exit: `OK` (đã xếp hàng **bền** — target bận thì coalesce, không còn `BUSY` bounce; RFC 03 §5.1) · `NOT_FOUND` (không thấy trong group → báo + gợi ý) · `AMBIGUOUS` (trùng tên → hỏi user chọn `#hashtag`) · `ERROR` (lỗi ghi/lock thật). *(ask không còn trả `BUSY`/RETRY-LATER — tin luôn được giao khi target xử prompt.)*
 - Sau khi gửi: **giữ listen**, đợi prompt có field `askReply` (câu trả lời về). Báo user "đang chờ <persona>" nếu lâu.
 
 **Khi bạn NHẬN câu hỏi (prompt có field `ask`):** đây là câu hỏi hợp lệ từ agent khác — **KHÔNG flag misrouted**.

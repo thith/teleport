@@ -2395,9 +2395,27 @@ async function main() {
   if (append) {
     const writeLock = convo != null ? path.join(DEFAULT_TMP_DIR, `prompt-write-${convo}.lock`) : null;
     await mergeOrSpoolPrompt(promptFile, data, writeLock);
+  } else if (convo != null) {
+    // Non-append single-slot (--wait-once child): the exit-2 guard earlier blocked
+    // when a prompt existed, but a SENDER (ask/…, RFC 03 §5.1) may have spooled one
+    // into the slot SINCE. Take the SAME per-convo write-lock and re-check under it:
+    // if a prompt/claim now exists, DEFER (exit 2) rather than clobber the sender's
+    // batch (wait-once announces the existing prompt); else write. Non-append never
+    // coalesces — single-slot semantics preserved. (Guards the sender-vs-writer race
+    // Codex flagged; without the lock writePromptAtomic could overwrite ask's prompt.)
+    const writeLock = path.join(DEFAULT_TMP_DIR, `prompt-write-${convo}.lock`);
+    const acquired = await acquireLockWithRetry(writeLock);
+    let defer = false;
+    try {
+      if (!acquired) defer = true;                 // couldn't lock → skip, don't risk an unlocked write
+      else if (fs.existsSync(promptFile) || fs.existsSync(processingFile)) defer = true; // sender wrote → don't clobber
+      else writePromptAtomic(data, promptFile);
+    } finally {
+      if (acquired) releasePollLock(writeLock);
+    }
+    if (defer) process.exit(2);                    // messages stay in cache → retried next poll
   } else {
-    // Non-append (legacy single-slot / drain): the exit-2 guard above already
-    // blocked when a prompt existed, so there is nothing to coalesce — write direct.
+    // Legacy filter-mode (no convo): no sender writes this path → direct write.
     writePromptAtomic(data, promptFile);
   }
   // React 👍 AFTER successful prompt write to avoid false ack on failure.

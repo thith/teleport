@@ -29,12 +29,12 @@ import { peekPersona } from './persona-store.mjs';
 import { shortConvoHash } from './convo-hash.mjs';
 import { readTopicsStore } from './topics-store.mjs';
 import { resolveConvoIdFromEnv } from './convo-registry.mjs';
-import { buildCombinedPromptData, DEFAULT_TMP_DIR } from './tele-listen.mjs';
+import { buildCombinedPromptData, DEFAULT_TMP_DIR, mergeOrSpoolPrompt } from './tele-listen.mjs';
 import { loadEnvFromFile } from './send-telegram.mjs';
 import { getLastAliveMs, DEFAULT_FRESH_MS as ALIVE_FRESH_MS } from './listener-alive.mjs';
 import {
   normalizeTarget, listLiveTopics, matchTarget, formatTopicList,
-  writePromptExclusive, resolveChatIds, EXIT,
+  resolveChatIds, EXIT,
 } from './handover.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -153,45 +153,12 @@ export function planAsk({ args, sourceConvoId, text, envFile = {}, nowSec, deps 
   return { code: EXIT.OK, match, promptFile, promptObj, shadowed: m.shadowed };
 }
 
-// ── T1: auto-retry the exclusive write on a transient-busy mailbox ─────────────
-//
-// The target's mailbox holds at most ONE unconsumed prompt (`wx` flag). A busy
-// target throws EEXIST, but "busy" is almost always momentary — the target
-// drains the prior prompt within seconds and the slot frees. Rather than bounce
-// EXIT.BUSY straight back to the caller (who then has to notice and re-run), we
-// retry a few times with exponential backoff, so most contention resolves
-// silently. Backoff caps at `maxMs`; total wall time for the defaults is ~6s
-// (400+800+1600+3200) across 5 attempts before we finally surface BUSY.
-export const RETRY = { attempts: 5, baseMs: 400, maxMs: 8000 };
+// RFC 03 §5.1: the target mailbox is no longer a single O_EXCL slot that bounces
+// `EEXIST` when busy. The old T1 auto-retry + T3 "RETRY-LATER give-up" path
+// (writePromptWithRetry / RETRY / RETRY_LATER_MIN) is removed — a busy target now
+// COALESCES via mergeOrSpoolPrompt (durable), so there is nothing to retry.
 
-// When even the retries are exhausted, tell the CALLER (an agent reading stdout)
-// this is NOT a hard failure — it should re-run the same ask itself after a
-// short wait. This delay is that suggested wait.
-export const RETRY_LATER_MIN = 3;
-
-const defaultSleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
-// Write with bounded exponential backoff on EEXIST. Non-EEXIST errors (real
-// infra failures) throw immediately — no point retrying those. Returns the
-// attempt count on success so the CLI can note when a retry was needed.
-export async function writePromptWithRetry({ promptObj, promptFile, retry = RETRY, deps = {} }) {
-  const writeFn = deps.writePromptExclusive ?? writePromptExclusive;
-  const sleep = deps.sleep ?? defaultSleep;
-  for (let attempt = 1; ; attempt++) {
-    try {
-      writeFn(promptObj, promptFile);
-      return { attempts: attempt };
-    } catch (e) {
-      if (e && e.code === 'EEXIST' && attempt < retry.attempts) {
-        await sleep(Math.min(retry.baseMs * 2 ** (attempt - 1), retry.maxMs));
-        continue;
-      }
-      throw e;
-    }
-  }
-}
-
-// ── T2: non-gating liveness advisory ──────────────────────────────────────────
+// ── T2: non-gating liveness advisory (kept) ───────────────────────────────────
 //
 // The prompt is ALWAYS written (a dead target's prompt just waits harmlessly).
 // But if the target's listener heartbeat is stale (or absent), nobody is
@@ -232,33 +199,25 @@ async function main() {
   const plan = planAsk({ args, sourceConvoId, text, envFile, nowSec: Math.floor(Date.now() / 1000) });
   if (plan.code !== EXIT.OK) { log(`[ask] ${plan.message}`); process.exit(plan.code); }
 
-  let attempts = 1;
+  // RFC 03 §5.1 — DURABLE, non-blocking inject: coalesce into the target's OPEN
+  // prompt (or spool a fresh one alongside a claimed batch) via the shared
+  // mergeOrSpoolPrompt, serialized against the target's listener by the per-convo
+  // write-lock. Replaces the old O_EXCL writePromptWithRetry: a BUSY target no
+  // longer bounces (EEXIST → retry → RETRY-LATER give-up) — the message is queued
+  // durably and delivered when the target processes its prompt.
+  let outcome;
   try {
-    ({ attempts } = await writePromptWithRetry({ promptObj: plan.promptObj, promptFile: plan.promptFile }));
+    const writeLock = path.join(DEFAULT_TMP_DIR, `prompt-write-${plan.match.convoId}.lock`);
+    outcome = await mergeOrSpoolPrompt(plan.promptFile, plan.promptObj, writeLock);
   } catch (e) {
-    if (e && e.code === 'EEXIST') {
-      // Not a hard failure: the target's mailbox is momentarily full. Emit a
-      // self-retry directive the calling agent can act on (re-run this same ask
-      // after a short wait) instead of giving up. On STDOUT (not stderr): this
-      // is an agent-actionable directive, not a diagnostic — some runtimes only
-      // surface a tool's stdout, so a stderr-only directive could be missed.
-      log(`[ask] ⏳ RETRY-LATER: đã thử ${RETRY.attempts} lần nhưng #${plan.match.hashtag} vẫn bận (agent đó còn prompt chưa xử lý). Đây KHÔNG phải lỗi cứng — hãy TỰ THỬ LẠI sau ~${RETRY_LATER_MIN} phút bằng đúng lệnh ask này.`);
-      // Fold T2 into the busy path: a busy-AND-inactive target likely hung, so
-      // the retry-later may never clear — surface that (also stdout) so the
-      // caller can nudge.
-      const last = getLastAliveMs(plan.match.convoId);
-      if (last == null || Date.now() - last > ALIVE_FRESH_MS) {
-        const stale = last == null ? 'không thấy listener nào đang chạy' : `listener im ~${Math.max(1, Math.round((Date.now() - last) / 60000))} phút`;
-        log(`[ask] (lưu ý: #${plan.match.hashtag} có vẻ không active — ${stale}; nếu thử lại vài lần vẫn bận, có thể agent đã treo — cân nhắc nhờ bật lại listener.)`);
-      }
-      process.exit(EXIT.BUSY);
-    }
+    // Only a real write/lock failure reaches here now (disk, lock exhaustion) —
+    // durable delivery was NOT achieved, so this is a hard error (never report queued).
     err(`[ask] write failed: ${e.message}`);
     process.exit(EXIT.ERROR);
   }
   const verb = args.reply ? 'reply' : 'ask';
-  const retried = attempts > 1 ? ` (after ${attempts} tries)` : '';
-  log(`[ask] ${verb} injected → convo ${plan.match.convoId} #${plan.match.hashtag}${retried}`);
+  const how = outcome === 'merged' ? 'coalesced into pending prompt' : 'queued';
+  log(`[ask] ${verb} injected → convo ${plan.match.convoId} #${plan.match.hashtag} (${how}, durable — will be delivered)`);
   if (plan.shadowed && plan.shadowed.length) {
     log(`[ask] note: ${plan.shadowed.length} older topic(s) share that persona name — picked the most recent; redirect with --to "#${plan.match.hashtag}"`);
   }
