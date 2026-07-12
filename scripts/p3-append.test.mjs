@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { parseArgs, mergePromptData, PROCESSING_TTL_MS, reclaimStaleProcessing } from './tele-listen.mjs';
+import { parseArgs, mergePromptData, PROCESSING_TTL_MS, reclaimStaleProcessing, attributionLabelFromData } from './tele-listen.mjs';
 import { autoConsumeClaimedPrompt } from './send-telegram.mjs';
 
 // RFC 02 P3 — append-until-claimed + P1 auto-consume. Pure helpers here; the
@@ -38,6 +38,41 @@ test('mergePromptData: null-safe (missing side / missing attachment fields)', ()
   assert.deepEqual(m.attachments, []);
 });
 
+// RFC 02 P3 impersonation guard: two BARE singles from different senders must NOT
+// be merged into one identity — each is labeled with its own sender at merge time.
+test('mergePromptData: bare singles from different senders are each attributed (no impersonation)', () => {
+  const a = { text: 'lời của A', textAttributed: false, fromName: 'An', fromRole: 'admin', fromUserId: '1', messageId: 10 };
+  const b = { text: 'lời của B', textAttributed: false, fromName: 'Ba', fromRole: 'member', fromUserId: '2', messageId: 11 };
+  const m = mergePromptData(a, b);
+  assert.equal(m.text, 'An (admin): lời của A\n\nBa (member): lời của B');
+  assert.equal(m.textAttributed, true);   // result is now labeled
+  assert.equal(m.fromName, 'Ba');          // reply still goes to the NEWEST sender
+  assert.equal(m.messageId, 11);
+});
+
+test('mergePromptData: an already-labeled batch is NOT double-labeled', () => {
+  const batch = { text: 'An (admin): x\n\nBa (member): y', textAttributed: true, fromName: 'Ba', fromRole: 'member', fromUserId: '2' };
+  const c = { text: 'z', textAttributed: false, fromName: 'Ce', fromRole: 'member', fromUserId: '3' };
+  const m = mergePromptData(batch, c);
+  assert.equal(m.text, 'An (admin): x\n\nBa (member): y\n\nCe (member): z'); // batch untouched, only new seg labeled
+  assert.equal(m.textAttributed, true);
+});
+
+test('mergePromptData: legacy prompt (no textAttributed) is treated as attributed — old batch not mangled', () => {
+  const legacyBatch = { text: 'An (admin): x\n\nBa (member): y', fromName: 'Ba' }; // no textAttributed field
+  const c = { text: 'z', textAttributed: false, fromName: 'Ce', fromRole: 'member', fromUserId: '3' };
+  const m = mergePromptData(legacyBatch, c);
+  assert.equal(m.text, 'An (admin): x\n\nBa (member): y\n\nCe (member): z'); // legacy side left bare, not prefixed
+});
+
+test('attributionLabelFromData: builds label from stored fields; total on gaps', () => {
+  assert.equal(attributionLabelFromData({ fromName: 'An', fromRole: 'admin' }), 'An (admin)');
+  assert.equal(attributionLabelFromData({ fromName: 'An' }), 'An (member)');           // role default
+  assert.equal(attributionLabelFromData({ fromUserId: '7' }), 'user 7 (member)');      // name fallback
+  assert.equal(attributionLabelFromData({}), 'user ? (member)');
+  assert.equal(attributionLabelFromData(null), 'user ? (member)');
+});
+
 test('PROCESSING_TTL_MS is a sane 5 minutes', () => {
   assert.equal(PROCESSING_TTL_MS, 5 * 60 * 1000);
 });
@@ -65,6 +100,7 @@ test('reclaimStaleProcessing: open prompt exists → stale folded IN, both prese
   reclaimStaleProcessing(proc, open);
   assert.equal(fs.existsSync(proc), false);
   const merged = JSON.parse(fs.readFileSync(open, 'utf8'));
+  assert.match(merged.text, /khôi phục lô bị treo/);        // warning survives the merge branch too
   assert.match(merged.text, /orphan/);                      // stale preserved
   assert.match(merged.text, /newer spooled/);               // spooled preserved
   assert.equal(merged.messageId, 9);                        // newest metadata
