@@ -38,7 +38,7 @@ import { resolveConvoIdFromEnv, validateConvoIdString } from './convo-registry.m
 function isWatchableConvoId(s) {
   try { validateConvoIdString(String(s)); return true; } catch { return false; }
 }
-import { buildCombinedPromptData, DEFAULT_TMP_DIR } from './tele-listen.mjs';
+import { buildCombinedPromptData, DEFAULT_TMP_DIR, mergeOrSpoolPrompt } from './tele-listen.mjs';
 import { loadEnvFromFile, parseAdminChatIds } from './send-telegram.mjs';
 import { buildSpawnPlan, runSpawn, genSessionSeed, listSpawnSessions, hasBinary } from './spawn.mjs';
 
@@ -443,17 +443,16 @@ async function main() {
       nowSec: Math.floor(Date.now() / 1000),
     });
     const promptFile = path.join(DEFAULT_TMP_DIR, `prompt-convo-${args.ack}.json`);
+    // RFC 03 §5.1 — durable non-blocking inject (coalesce/spool under the per-convo
+    // write-lock) instead of O_EXCL: a busy target no longer bounces BUSY.
     try {
-      writePromptExclusive(promptObj, promptFile);
+      const writeLock = path.join(DEFAULT_TMP_DIR, `prompt-write-${args.ack}.lock`);
+      await mergeOrSpoolPrompt(promptFile, promptObj, writeLock);
     } catch (e) {
-      if (e && e.code === 'EEXIST') {
-        err(`[handover] ack target convo ${args.ack} has an unconsumed prompt — busy, retry shortly`);
-        process.exit(EXIT.BUSY);
-      }
       err(`[handover] ack write failed: ${e.message}`);
       process.exit(EXIT.ERROR);
     }
-    log(`[handover] ack injected → convo ${args.ack}`);
+    log(`[handover] ack injected → convo ${args.ack} (durable — will be delivered)`);
     process.exit(EXIT.OK);
   }
 
@@ -514,17 +513,16 @@ async function main() {
     notes,
     nowSec: Math.floor(Date.now() / 1000),
   });
+  // RFC 03 §5.1 — durable non-blocking inject (coalesce/spool under the per-convo
+  // write-lock) instead of O_EXCL: a busy target no longer bounces BUSY.
   try {
-    writePromptExclusive(promptObj, promptFile);
+    const writeLock = path.join(DEFAULT_TMP_DIR, `prompt-write-${match.convoId}.lock`);
+    await mergeOrSpoolPrompt(promptFile, promptObj, writeLock);
   } catch (e) {
-    if (e && e.code === 'EEXIST') {
-      err(`[handover] target #${match.hashtag} has an unconsumed prompt — busy, retry after it's handled`);
-      process.exit(EXIT.BUSY);
-    }
     err(`[handover] write failed: ${e.message}`);
     process.exit(EXIT.ERROR);
   }
-  log(`[handover] injected → convo ${match.convoId} #${match.hashtag}`);
+  log(`[handover] injected → convo ${match.convoId} #${match.hashtag} (durable — will be delivered)`);
   if (m.shadowed && m.shadowed.length) {
     log(`[handover] note: ${m.shadowed.length} older topic(s) share that persona name — picked the most recent; redirect with --to "#${match.hashtag}" or another: ${formatTopicList(m.shadowed)}`);
   }

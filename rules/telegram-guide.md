@@ -110,7 +110,8 @@ chọn **topic active gần nhất** trùng tên và báo các topic cũ bị sh
 |---|---|---|
 | 0 | injected / spawned | báo user kết quả + hashtag (+ shadowed nếu có) — xem lưu ý **ack** bên dưới, `injected` ≠ "đã nhận" |
 | 2 | usage (thiếu notes / `--to`+`--new` / thiếu source convo) | sửa lệnh |
-| 3 | target có prompt chưa xử lý (busy) | báo "target đang bận, thử lại sau khi nó xử xong — handover KHÔNG mất" |
+| 1 | lỗi ghi/lock thật (hiếm) | báo lỗi, thử lại |
+| ~~3~~ | ~~busy~~ | **RFC 03 §5.1: handover KHÔNG còn trả `BUSY`** — target bận thì coalesce vào prompt đang chờ (bền), luôn giao được |
 | 4 | `--to` không thấy topic sống | báo "không thấy X; đang sống: …" (stdout có list) |
 | 5 | trùng tên + hoà recency | đọc list ở stdout, hỏi user chọn theo hashtag → gọi lại `--to "#…"` |
 | 6 | `--new` nhưng role không đủ | báo cần admin/maintainer xác nhận |
