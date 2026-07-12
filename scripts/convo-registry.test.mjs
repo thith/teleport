@@ -226,28 +226,18 @@ test('parseArgs (tele-listen) — --convo validation', () => {
 test('parseArgs (tele-listen) — --wait-once is convo-mode only', () => {
   const ok = parseListenArgs(['--wait-once', '--convo', '100']);
   assert.strictEqual(ok.waitOnce, true);
-  assert.strictEqual(ok.watch, false);
   assert.strictEqual(ok.convo, 100);
   assert.strictEqual(ok.filterReplyTo, null);
   assert.strictEqual(ok.offsetFileProvided, false);
   assert.throws(() => parseListenArgs(['--wait-once', '--filter-reply-to', '5']));
-  assert.throws(() => parseListenArgs(['--wait-once', '--watch', '--convo', '100']));
-});
-
-test('parseArgs (tele-listen) — legacy --watch remains parseable', () => {
-  const ok = parseListenArgs(['--watch', '--convo', '100']);
-  assert.strictEqual(ok.watch, true);
-  assert.strictEqual(ok.waitOnce, false);
-  assert.strictEqual(ok.convo, 100);
+  // --watch was removed (RFC 02 G5 cleanup); it is now an unknown flag.
+  assert.throws(() => parseListenArgs(['--watch', '--convo', '100']));
 });
 
 test('parseArgs (tele-listen) — --settle opt-in (default off; combines with listen modes + bare drain)', () => {
   assert.strictEqual(parseListenArgs(['--convo', '100']).settle, false);            // bare drain: no settle
   assert.strictEqual(parseListenArgs(['--convo', '100', '--settle']).settle, true); // child of a listen loop
   assert.strictEqual(parseListenArgs(['--wait-once', '--convo', '100', '--settle']).settle, true);
-  const watch = parseListenArgs(['--watch', '--convo', '100', '--settle']);
-  assert.strictEqual(watch.settle, true);
-  assert.strictEqual(watch.watch, true);
 });
 
 test('parseArgs (send-telegram) — --convo accepts a positive integer', () => {
@@ -449,11 +439,15 @@ test('listenerHintForCurrentAgent — non-Claude agents use wait-once', () => {
   assert.doesNotMatch(other, /--watch/);
 });
 
-test('listenerHintForCurrentAgent — Claude uses Monitor', () => {
+test('listenerHintForCurrentAgent — Claude uses Monitor with the self-re-arm loop', () => {
   const hint = listenerHintForCurrentAgent(123, { CLAUDE_CODE_SESSION_ID: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee' });
   assert.match(hint, /Monitor/);
   assert.match(hint, /tele-listen\.mjs --convo 123/);
+  // RFC 02: self-re-arm command, not the retired `until … do sleep 12` one-shot.
+  assert.match(hint, /--loop/);
+  assert.match(hint, /--append/);
   assert.doesNotMatch(hint, /--wait-once/);
+  assert.doesNotMatch(hint, /until node/);
 });
 
 test('findOrphanMessages — phantom topic-creation reply is treated as orphan (not user reply)', () => {

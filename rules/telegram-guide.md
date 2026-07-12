@@ -447,26 +447,13 @@ Monitor({
 > 3. **Reply** via `send-telegram --convo $CONVO_ID` — it **auto-deletes** the `.processing.json` (P1). **Do NOT `rm` anything by hand.** A new `prompt-convo-$CONVO_ID.json` may appear (a correction spooled while you worked) → the listener delivers it as the next event; claim + handle it after.
 > Gemini/Codex (`--wait-once`, no `--append`) keep the old read→reply→`rm` flow — this claim protocol is Claude-only.
 
-> **⚠️ RFC 02 override (self-re-arm active).** Với lệnh `while … --loop` ở trên, listener **tự sống qua mỗi lần giao tin** nên:
-> - **KHÔNG re-arm sau mỗi send** — start MỘT lần/convo, mỗi tin chỉ đọc→đáp→xoá. (Bỏ qua "flow chuẩn sau mỗi send là TaskStop+Monitor mới" bên dưới — đó là của model `until` cũ.)
-> - **`superseded` → ĐỨNG XUỐNG (stand down):** `--loop` cho tele-listen exit `3`, wrapper `break`. Vì bạn không re-arm nên supersede = listener khác thật sự tiếp quản → nhường là đúng (self-cleaning nếu lỡ có 2 Monitor). *(Ghi đè điều "ignore same-convo supersede" bên dưới — điều đó chỉ đúng khi `until` re-arm-per-reply gây self-supersede giả.)*
+> **Monitor lifecycle — self-re-arm (RFC 02).** Lệnh `while … --loop --append` ở trên **tự sống qua mỗi lần giao tin**, nên vòng đời rất gọn:
+> - **Start MỘT lần/convo, KHÔNG re-arm sau mỗi send** — mỗi tin chỉ claim→đọc→đáp (prompt tự xoá qua P1). Không `TaskStop`+Monitor mới sau mỗi reply.
+> - **`superseded` (exit `3`) → ĐỨNG XUỐNG (stand down):** vì bạn không re-arm, một supersede nghĩa là có listener khác **thật sự tiếp quản** → nhường là đúng (tự dọn nếu lỡ có 2 Monitor cùng convo).
+> - **Nếu Monitor không start được** (lệnh lỗi / không trả `task_id`) **2 lần liên tiếp** → dừng và **báo user qua send-telegram** (user thường ở xa, không thấy CLI stdout); đừng âm thầm điếc.
+> - **Wind-down:** trước khi đóng topic, `TaskStop` listener. Không còn heartbeat để tắt.
 >
-> Phần self-heal/heartbeat chi tiết dưới đây là **legacy (chờ cleanup RFC 02)** — vẫn áp dụng cho runtime KHÔNG Monitor (`--wait-once`) và làm tham chiếu.
-
-**Claude Monitor resilience — self-heal + heartbeat (MUST).** Vòng `until … do sleep 12; done` chỉ retry *script bên trong* Monitor; nó KHÔNG cứu khi **task Monitor không sống** (lệnh Monitor lỗi/malformed, không trả `task_id`, exit ngay vì lỗi hạ tầng). Hệ quả: agent tưởng đang nghe nhưng thực ra điếc, reply user không được xử lý. (Runtime khác Monitor dùng `--wait-once` ở dưới.)
-
-- **Khi nào self-heal (đo được, KHÔNG chạy mỗi turn):** flow chuẩn sau mỗi send vẫn là `TaskStop(LAST_MONITOR_ID)` + `Monitor(...)` mới (mục trên). Self-heal là lớp PHÁT HIỆN HỎNG, chỉ kích hoạt khi: (a) lần gọi Monitor gần nhất **không trả `task_id`** (call lỗi/malformed), hoặc (b) heartbeat/đầu-turn thấy **không còn task Monitor sống** cho convo. KHÔNG tự drain+restart mỗi turn khi Monitor vẫn sống.
-- **Cách self-heal:** (1) `TaskStop(LAST_MONITOR_ID)` nếu từng có id (giữ bất biến "Two Monitors per convo"); (2) **bare `--convo` drain** `node ../teleport/scripts/tele-listen.mjs --convo <CONVO_ID>` (xử exit theo contract drain đã có: `0`=prompt mới, `2`=không có, khác=abort+báo); (3) khởi động lại Monitor. **Drain self-heal KHÔNG thay** việc đọc prompt-file mà Monitor đã giao — nếu đang có prompt-file chờ thì xử nó (đọc+đáp+xóa) TRƯỚC; drain chỉ để bắt tin đến *trong lúc Monitor chết*.
-- **`superseded` cùng `$CONVO_ID` = coi như CHÍNH BẠN, KHÔNG stand down:** theo mô hình singleton-per-convo, supersede trùng convo của bạn thường là chính bạn restart (self-heal, hoặc harness-timeout Anti-Loop restart) → **bỏ qua, tiếp tục**. CHỈ stand down khi có **bằng chứng độc lập** listener hợp lệ khác tiếp quản: handover exit 0, hoặc admin báo trong topic. **MUST NOT** suy ra "có agent khác" chỉ từ một event supersede (suy nhầm → tự dừng → điếc thật). *(Không đổi rule handover: sau handover exit 0 mà chưa đóng topic, source vẫn keep-listening + heartbeat bình thường.)*
-- **Chống death-loop:** "restart thất bại" = Monitor call lỗi / không `task_id` / task chết ngay vì lỗi hạ tầng (KHÔNG tính `tele-listen` exit `2`). **2 lần liên tiếp** thất bại → dừng, **báo user qua send-telegram** (user thường ở xa, CLI stdout họ không thấy) + log CLI, KHÔNG retry mỗi lượt.
-- **Heartbeat fallback:** `ScheduleWakeup` (~1200s) làm lưới CUỐI — khi không event nào, agent vẫn thức → self-heal → re-arm bằng cách gọi `ScheduleWakeup` lại. Đây là lưới an toàn độ-trễ-tới-~20-phút (Monitor `timeout_ms` + `until` đã lo phần nhanh); chỉ revive khi Monitor lỡ chết, KHÔNG thay Monitor.
-  ```
-  # mỗi lần thức / sau send: self-heal (ở trên), rồi re-arm:
-  ScheduleWakeup(delaySeconds: 1200, reason: "heartbeat: ensure Telegram listener alive", prompt: "<self-heal convo $CONVO_ID>")
-  ```
-- **Wind-down vô hiệu heartbeat (đồng bộ "Chào và đóng topic" bước 2):** trước khi đóng topic, đặt guard session `LISTENER_CLOSED=1` và **ngừng re-arm**; nếu một wake one-shot vẫn fire sau đó, handler thấy guard → exit ngay, KHÔNG drain/restart/gửi gì vào topic đã đóng.
-
-**Acceptance (self-test khi áp):** (b) 2 lần start-fail liên tiếp → dừng + báo qua Telegram, không retry tiếp; (c/d) supersede cùng convo → KHÔNG stand down, chỉ stand down khi có handover exit 0 / admin báo; (e) wind-down xong → không Monitor sống & không heartbeat fire vào topic.
+> *Recovery khi **cả tiến-trình-agent** chết hoặc bị chặn (hết token, đang hỏi câu hỏi) KHÔNG thuộc listener — đó là việc của daemon giám sát ([RFC 01](../docs/rfc/01-supervisor-daemon.md)). RFC 02 đã **bỏ hẳn** heartbeat `ScheduleWakeup` (tránh drain token cả đêm) và không thay bằng cơ chế nào trong listener.*
 
 **All other agents:** wait for one prompt at a time.
 ```bash
@@ -565,7 +552,7 @@ Treat your reply as a clarification turn, not a task completion. **MUST NOT** st
 
 Before any **action with non-trivial blast radius**, you **MUST** drain any pending admin messages. Treat as critical: `git commit`/`git push`/`git reset --hard`/`git rebase`, force flags on destructive commands (`push --force`, `rm -rf`, `chmod -R`), `git tag` / release publish / package publish, DB data deletion or schema migration against non-local DB, cloud/IaC apply, secret rotation, `docker compose down -v`, deploying, sending a billable API call, posting to Slack / GitHub / external chat, or anything else that's hard to reverse. Reading files, running tests, drafting a reply — not critical, no re-poll needed.
 
-How to drain — bare `--convo` one-shot (NOT `--wait-once`, NOT `--watch`, NOT `--settle` — the drain must see pending messages immediately, never debounce them):
+How to drain — bare `--convo` one-shot (NOT `--wait-once`, NOT `--settle` — the drain must see pending messages immediately, never debounce them):
 ```bash
 # Delete any prior unconsumed prompt first so a stale file from a previous
 # turn doesn't get re-read as "new" — your prior turn should already have
@@ -660,7 +647,7 @@ When the user says **"Chào và đóng topic"** (or any clear variant: "đóng t
 
 0. **PRESERVE first (MUST).** Run the **Bước PRESERVE** above (Folder structure & session archive) — write `session.md` + `HANDOVER.md`, append the decisions-log, promote any un-digested official output — so nothing produced this session is lost when the topic closes. Save is non-blocking; commit is opt-in (don't stall the close waiting on a silent user).
 1. **Post a closing summary** in the topic (`--convo <N>`): what was done, **state explicitly you will no longer listen here**, and **how to follow up** — open a *new topic* (a *different agent* may pick it up; say where the saved `session.md` + `HANDOVER.md`/artifacts are so whoever continues can resume without losing the thread). Address the people in the topic warmly.
-2. **Stop ALL listeners + scheduled wake-ups of this session.** `TaskStop` every Monitor/`tele-listen` task you started for this convo, and cancel/neutralise any scheduled nudge/auto-wake (e.g. a `ScheduleWakeup` loop) so nothing fires into the topic after you've said goodbye. Leaving a listener or nudge alive after "đóng topic" is a bug.
+2. **Stop ALL listeners of this session.** `TaskStop` every Monitor/`tele-listen` task you started for this convo. If you scheduled any nudge/auto-wake of your own, cancel it too, so nothing fires into the topic after you've said goodbye. Leaving a listener alive after "đóng topic" is a bug.
 3. **Close the topic** (reversible — Telegram keeps history, can be reopened):
    ```bash
    node ../teleport/scripts/send-telegram.mjs --close-topic --convo <N>

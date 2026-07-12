@@ -1764,13 +1764,12 @@ async function maybeRecordConvo({ convoId, messageId, chatId, botId }) {
  * - Claude (`CLAUDE_CODE_SESSION_ID` set) → Monitor tool.
  * - Other → synchronous `--wait-once` loop.
  *
- * `--wait-once` is the operational default for every non-Monitor runtime;
- * `--watch` remains available in source for manual use.
+ * `--wait-once` is the operational default for every non-Monitor runtime.
  */
 export function listenerHintForCurrentAgent(convoId, env = process.env) {
   const convoArg = convoId != null ? ` --convo ${convoId}` : '';
   if (env.CLAUDE_CODE_SESSION_ID) {
-    return `[send-telegram] ⚠️ Start a reply listener via Monitor: \`until node ../teleport/scripts/tele-listen.mjs${convoArg}; do sleep 12; done\``;
+    return `[send-telegram] ⚠️ Keep ONE self-re-arming reply listener alive via Monitor (start once per convo, don't re-arm per send): \`while :; do node ../teleport/scripts/tele-listen.mjs${convoArg} --settle --loop --append; case $? in 3) break;; 1) sleep 30;; esac; sleep 2; done\``;
   }
   const lines = [
     `[send-telegram] ⚠️ Start a one-reply listener: \`node ../teleport/scripts/tele-listen.mjs --wait-once${convoArg}\``,
