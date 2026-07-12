@@ -209,6 +209,7 @@ export function parseArgs(argv) {
   let waitOnce = false;
   let settle = false;
   let loop = false;
+  let append = false;
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === '--watch') {
       watch = true;
@@ -230,6 +231,14 @@ export function parseArgs(argv) {
     // its behavior — and every currently-running agent — is unchanged.
     if (argv[i] === '--loop') {
       loop = true;
+      continue;
+    }
+    // --append (RFC 02 P3): OPT-IN. Instead of blocking (exit 2) when a prompt
+    // is already pending/claimed, coalesce new messages into the OPEN prompt, or
+    // spool a fresh one alongside a CLAIMED (.processing.json) batch. Default OFF
+    // → single-slot behaviour, so Gemini/Codex (`--wait-once`) are unchanged.
+    if (argv[i] === '--append') {
+      append = true;
       continue;
     }
     if (argv[i] === '--legacy-filter') {
@@ -279,7 +288,7 @@ export function parseArgs(argv) {
   if (watch && waitOnce) {
     throw new Error('--watch and --wait-once are mutually exclusive');
   }
-  return { filterReplyTo, offsetFile, offsetFileProvided, convo, legacyFilter, watch, waitOnce, settle, loop };
+  return { filterReplyTo, offsetFile, offsetFileProvided, convo, legacyFilter, watch, waitOnce, settle, loop, append };
 }
 
 // extractBotId is imported from send-telegram.mjs (single source of truth).
@@ -1518,6 +1527,46 @@ export function writePromptAtomic(data, promptFile = DEFAULT_PROMPT_FILE) {
   fs.renameSync(tmp, promptFile);
 }
 
+// RFC 02 P3: stale-claim reclaim window.
+export const PROCESSING_TTL_MS = 5 * 60 * 1000;
+
+// RFC 02 P3: merge an INCOMING coalesced batch into an OPEN (unclaimed) prompt —
+// so a message arriving while a prompt is pending is APPENDED, not blocked/lost.
+// Text is concatenated (each side already carries per-sender attribution for
+// multi-message batches); metadata (messageId/chat/reply/quote/sender/timestamp
+// + persona/projectDescription) comes from the INCOMING/newest side so the agent
+// still replies to the right thread; attachments are unioned. Pure + total.
+export function mergePromptData(existing, incoming) {
+  if (!existing) return incoming;
+  if (!incoming) return existing;
+  return {
+    ...incoming,
+    text: `${existing.text ?? ''}\n\n${incoming.text ?? ''}`,
+    attachments: [...(existing.attachments ?? []), ...(incoming.attachments ?? [])],
+  };
+}
+
+// RFC 02 P3: an agent that CLAIMED a batch (rename prompt→.processing.json) but
+// died before consuming leaves an orphan. After PROCESSING_TTL_MS, fold it back
+// into the OPEN prompt (merging any batch spooled meanwhile) with a warning, so
+// the next agent re-handles it instead of the convo wedging. Best-effort.
+function reclaimStaleProcessing(processingFile, promptFile) {
+  try {
+    let claimed;
+    try { claimed = JSON.parse(fs.readFileSync(processingFile, 'utf8')); }
+    catch { fs.rmSync(processingFile, { force: true }); return; }
+    claimed.text = `⚠️ (khôi phục lô bị treo — agent trước đã claim rồi dừng giữa chừng)\n\n${claimed.text ?? ''}`;
+    if (fs.existsSync(promptFile)) {
+      let open = null;
+      try { open = JSON.parse(fs.readFileSync(promptFile, 'utf8')); } catch {}
+      writePromptAtomic(open ? mergePromptData(claimed, open) : claimed, promptFile);
+      fs.rmSync(processingFile, { force: true });
+    } else {
+      fs.renameSync(processingFile, promptFile);
+    }
+  } catch { /* best-effort; a later poll retries */ }
+}
+
 // Read every prompt*.json sibling and collect a Set of `${botId}:${updateId}`
 // pairs so the prune sweep below skips any dir still pointed at by an
 // unconsumed prompt — even one that has sat idle for hours. The set is keyed
@@ -1627,7 +1676,7 @@ async function main() {
     console.error(`[tele-listen] ${e instanceof Error ? e.message : String(e)}`);
     process.exit(1);
   }
-  let { filterReplyTo, offsetFile, offsetFileProvided, convo, legacyFilter, settle, loop } = args;
+  let { filterReplyTo, offsetFile, offsetFileProvided, convo, legacyFilter, settle, loop, append } = args;
 
   // Env resolution.
   // - No --convo / --filter-reply-to → consult env.
@@ -1819,12 +1868,22 @@ async function main() {
     ? path.join(DEFAULT_TMP_DIR, `prompt-convo-${convo}.processing.json`)
     : getProcessingFile(filterReplyTo);
 
-  if (fs.existsSync(processingFile)) {
-    process.exit(2); // still processing — skip silently (exit code is the signal)
-  }
-
-  if (fs.existsSync(promptFile)) {
-    process.exit(2); // prompt not yet consumed — skip silently (exit code is the signal)
+  if (append) {
+    // P3: do NOT block. Reclaim a stale claim (agent died mid-processing), then
+    // fall through to fetch + append-to-open / spool-fresh below.
+    if (fs.existsSync(processingFile)) {
+      let stale = false;
+      try { stale = Date.now() - fs.statSync(processingFile).mtimeMs > PROCESSING_TTL_MS; } catch {}
+      if (stale) reclaimStaleProcessing(processingFile, promptFile);
+    }
+  } else {
+    // Legacy single-slot: block while a batch is pending or being processed.
+    if (fs.existsSync(processingFile)) {
+      process.exit(2); // still processing — skip silently (exit code is the signal)
+    }
+    if (fs.existsSync(promptFile)) {
+      process.exit(2); // prompt not yet consumed — skip silently (exit code is the signal)
+    }
   }
 
   // Centralized fetch: acquire lock, fetch updates, cache locally.
@@ -2073,7 +2132,16 @@ async function main() {
       }
     }
   }
-  writePromptAtomic(data, promptFile);
+  // P3 (--append): coalesce into the OPEN (unclaimed) prompt rather than clobber
+  // it; if only a CLAIMED (.processing.json) batch exists, promptFile is absent
+  // here so this writes a FRESH prompt (spool alongside the claimed one).
+  let toWrite = data;
+  if (append && fs.existsSync(promptFile)) {
+    let existing = null;
+    try { existing = JSON.parse(fs.readFileSync(promptFile, 'utf8')); } catch {}
+    if (existing) toWrite = mergePromptData(existing, data);
+  }
+  writePromptAtomic(toWrite, promptFile);
   // React 👍 AFTER successful prompt write to avoid false ack on failure.
   await reactToMessages(token, toProcess);
   advanceLoopOffset();

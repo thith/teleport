@@ -49,6 +49,23 @@ const ROOT_DIR = path.resolve(__dirname, '..');
 const ENV_FILE = path.join(ROOT_DIR, '.env');
 const TELEGRAM_API = 'https://api.telegram.org/bot';
 const SENT_REGISTRY_FILE = path.join(__dirname, 'tmp', 'tele-reply', 'sent-registry.jsonl');
+const TELE_REPLY_DIR = path.join(__dirname, 'tmp', 'tele-reply');
+
+// RFC 02 P1: auto-consume. After a successful send into a convo, delete that
+// convo's CLAIMED prompt (`prompt-convo-N.processing.json`) so the agent never
+// manually `rm`. Deletes ONLY the `.processing.json` (a claimed batch), NEVER
+// the bare `prompt-convo-N.json` (the OPEN inbox — dropping it would lose
+// unhandled messages). No-op when the convo was not claimed (Gemini/Codex, or a
+// proactive/status send create no `.processing.json`) → those flows unchanged
+// (the G4 firewall). Best-effort; returns true if it consumed something.
+export function autoConsumeClaimedPrompt(convoId, tmpDir = TELE_REPLY_DIR) {
+  if (convoId == null) return false;
+  const processingFile = path.join(tmpDir, `prompt-convo-${convoId}.processing.json`);
+  try {
+    if (fs.existsSync(processingFile)) { fs.rmSync(processingFile, { force: true }); return true; }
+  } catch { /* best-effort */ }
+  return false;
+}
 
 export function extractBotId(token) {
   if (!token || typeof token !== 'string') return null;
@@ -1781,6 +1798,10 @@ function emitConvoLine({ convoId, messageId }) {
   // pinned this convo, so this just echoes that pin (no second assignment).
   const persona = peekPersona(convoId);
   if (persona != null) console.log(`[send-telegram] persona: ${formatPersona(persona)}`);
+  // RFC 02 P1: consume the claimed prompt for this convo (no-op if unclaimed).
+  if (autoConsumeClaimedPrompt(convoId)) {
+    console.log(`[send-telegram] consumed prompt-convo-${convoId}.processing.json`);
+  }
 }
 
 const isDirectRun = fileURLToPath(import.meta.url) === path.resolve(process.argv[1] ?? '');
