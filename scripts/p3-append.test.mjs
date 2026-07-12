@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { parseArgs, mergePromptData, PROCESSING_TTL_MS } from './tele-listen.mjs';
+import { parseArgs, mergePromptData, PROCESSING_TTL_MS, reclaimStaleProcessing } from './tele-listen.mjs';
 import { autoConsumeClaimedPrompt } from './send-telegram.mjs';
 
 // RFC 02 P3 — append-until-claimed + P1 auto-consume. Pure helpers here; the
@@ -40,6 +40,42 @@ test('mergePromptData: null-safe (missing side / missing attachment fields)', ()
 
 test('PROCESSING_TTL_MS is a sane 5 minutes', () => {
   assert.equal(PROCESSING_TTL_MS, 5 * 60 * 1000);
+});
+
+test('reclaimStaleProcessing: no open prompt → stale becomes the open prompt (with warning)', () => {
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), 'reclaim-'));
+  const proc = path.join(d, 'p.processing.json');
+  const open = path.join(d, 'p.json');
+  fs.writeFileSync(proc, JSON.stringify({ text: 'orphaned batch', messageId: 5 }));
+  reclaimStaleProcessing(proc, open);
+  assert.equal(fs.existsSync(proc), false);                 // stale consumed
+  assert.equal(fs.existsSync(open), true);                  // resurfaced as open
+  const back = JSON.parse(fs.readFileSync(open, 'utf8'));
+  assert.match(back.text, /khôi phục lô bị treo/);          // warning injected
+  assert.match(back.text, /orphaned batch/);
+  fs.rmSync(d, { recursive: true, force: true });
+});
+
+test('reclaimStaleProcessing: open prompt exists → stale folded IN, both preserved, no data loss', () => {
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), 'reclaim2-'));
+  const proc = path.join(d, 'p.processing.json');
+  const open = path.join(d, 'p.json');
+  fs.writeFileSync(proc, JSON.stringify({ text: 'orphan', messageId: 5 }));
+  fs.writeFileSync(open, JSON.stringify({ text: 'newer spooled', messageId: 9 }));
+  reclaimStaleProcessing(proc, open);
+  assert.equal(fs.existsSync(proc), false);
+  const merged = JSON.parse(fs.readFileSync(open, 'utf8'));
+  assert.match(merged.text, /orphan/);                      // stale preserved
+  assert.match(merged.text, /newer spooled/);               // spooled preserved
+  assert.equal(merged.messageId, 9);                        // newest metadata
+  fs.rmSync(d, { recursive: true, force: true });
+});
+
+test('reclaimStaleProcessing: no stale file → no-op (idempotent, never throws)', () => {
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), 'reclaim3-'));
+  reclaimStaleProcessing(path.join(d, 'nope.processing.json'), path.join(d, 'nope.json'));
+  assert.equal(fs.existsSync(path.join(d, 'nope.json')), false);
+  fs.rmSync(d, { recursive: true, force: true });
 });
 
 test('autoConsumeClaimedPrompt: deletes ONLY .processing.json — OPEN inbox untouched (G4)', () => {

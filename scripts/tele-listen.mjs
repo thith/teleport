@@ -1550,19 +1550,31 @@ export function mergePromptData(existing, incoming) {
 // died before consuming leaves an orphan. After PROCESSING_TTL_MS, fold it back
 // into the OPEN prompt (merging any batch spooled meanwhile) with a warning, so
 // the next agent re-handles it instead of the convo wedging. Best-effort.
-function reclaimStaleProcessing(processingFile, promptFile) {
+export function reclaimStaleProcessing(processingFile, promptFile) {
   try {
+    // Snapshot the stale claim FIRST via atomic rename. If an agent concurrently
+    // claims the open prompt (atomic rename promptFile → processingFile, which on
+    // POSIX would OVERWRITE the stale file), that claim now lands on a FRESH
+    // processingFile we never touch — so this reclaim can't delete the agent's
+    // just-claimed batch (that was a data-loss race, per 3-reviewer). We only
+    // ever operate on our private `.stale` snapshot.
+    const staleFile = `${processingFile}.stale.${process.pid}`;
+    try { fs.renameSync(processingFile, staleFile); }
+    catch { return; } // already consumed/reclaimed by a peer → nothing to do
     let claimed;
-    try { claimed = JSON.parse(fs.readFileSync(processingFile, 'utf8')); }
-    catch { fs.rmSync(processingFile, { force: true }); return; }
+    try { claimed = JSON.parse(fs.readFileSync(staleFile, 'utf8')); }
+    catch { fs.rmSync(staleFile, { force: true }); return; }
     claimed.text = `⚠️ (khôi phục lô bị treo — agent trước đã claim rồi dừng giữa chừng)\n\n${claimed.text ?? ''}`;
     if (fs.existsSync(promptFile)) {
       let open = null;
       try { open = JSON.parse(fs.readFileSync(promptFile, 'utf8')); } catch {}
       writePromptAtomic(open ? mergePromptData(claimed, open) : claimed, promptFile);
-      fs.rmSync(processingFile, { force: true });
+      fs.rmSync(staleFile, { force: true });
     } else {
-      fs.renameSync(processingFile, promptFile);
+      // Write the warning-annotated `claimed` (renaming the raw snapshot would
+      // drop the warning we injected in memory).
+      writePromptAtomic(claimed, promptFile);
+      fs.rmSync(staleFile, { force: true });
     }
   } catch { /* best-effort; a later poll retries */ }
 }
