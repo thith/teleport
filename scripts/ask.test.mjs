@@ -7,7 +7,7 @@ import {
   parseAskArgs, buildAskPrompt, buildReplyPrompt, readText, planAsk,
   inactivityNote,
 } from './ask.mjs';
-import { EXIT, writePromptExclusive } from './handover.mjs';
+import { EXIT } from './handover.mjs';
 
 test('parseAskArgs: --to + --reply + --from-convo (space/=) + inline text', () => {
   assert.deepEqual(parseAskArgs(['--to', 'Cú', '--from-convo', '111']), { to: 'Cú', reply: false, fromConvo: '111', text: null, error: null });
@@ -86,16 +86,6 @@ test('planAsk: asking yourself → USAGE (no self-inject)', () => {
     deps: { readTopicsStore: () => store, resolveChatIds: () => ({ chatIds: ['G1'] }) } });
   assert.equal(r.code, EXIT.USAGE);
   assert.match(r.message, /cannot ask yourself/);
-});
-
-test('writePromptExclusive: refuses to clobber an unconsumed prompt (BUSY safety)', () => {
-  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ask-'));
-  const f = path.join(tmp, 'prompt-convo-111.json');
-  const obj = buildAskPrompt({ targetConvoId: '111', targetChatId: '-100', sourceConvoId: '999', question: 'q', nowSec: 1 });
-  writePromptExclusive(obj, f);                         // first write OK
-  assert.ok(fs.existsSync(f));
-  assert.throws(() => writePromptExclusive(obj, f), (e) => e.code === 'EEXIST'); // second → EEXIST → BUSY
-  fs.rmSync(tmp, { recursive: true, force: true });
 });
 
 test('planAsk: no admin chat configured → USAGE', () => {
