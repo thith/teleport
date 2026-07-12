@@ -54,6 +54,15 @@ test('buildCombinedPromptData: single message text is bare — no attribution pr
   assert.equal(buildCombinedPromptData([mk(1, 'Thi')]).text, 'm1');
 });
 
+// RFC 02 P3: textAttributed flags whether `text` already carries per-segment
+// labels — false for a bare single (so mergePromptData attributes it at coalesce
+// time), true for a pre-labeled multi-message batch (so it is not double-labeled).
+test('buildCombinedPromptData: textAttributed is false for a lone message, true for a batch', () => {
+  const mk = (id, name) => ({ msg: { message_id: id, chat: { id: -100 }, from: { id, first_name: name }, text: `m${id}` } });
+  assert.equal(buildCombinedPromptData([mk(1, 'Thi')]).textAttributed, false);
+  assert.equal(buildCombinedPromptData([mk(1, 'Thi'), mk(2, 'Nam')]).textAttributed, true);
+});
+
 // Forum phantom-reply: Telegram sets reply_to_message → the topic-creation
 // service message for EVERY message in a topic. That is NOT a real reply, so it
 // must not surface as bogus reply context to the agent.

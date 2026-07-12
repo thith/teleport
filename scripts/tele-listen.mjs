@@ -610,6 +610,16 @@ export function attributionLabel(from, roles) {
   return `${name} (${role})`;
 }
 
+// Same "<name> (<role>)" label as attributionLabel, but built from an already-
+// assembled prompt-data object (which stores fromName/fromRole/fromUserId) rather
+// than a raw Telegram `from`. Used by mergePromptData to attribute a segment at
+// coalesce time. Total: falls back to a numeric id / 'member' on any gap.
+export function attributionLabelFromData(d) {
+  const name = (d && d.fromName) || `user ${d && d.fromUserId != null ? d.fromUserId : '?'}`;
+  const role = (d && d.fromRole) || 'member';
+  return `${name} (${role})`;
+}
+
 /**
  * Combine multiple admin messages into one prompt entry.
  * Single message → bare text (unchanged). Multi-message batch → each line is
@@ -637,6 +647,12 @@ export function buildCombinedPromptData(messages, botId = null, convoId = null, 
   
   const out = {
     text,
+    // RFC 02 P3: does `text` ALREADY carry per-segment `<name> (<role>):` labels?
+    // A multi-message batch is pre-labeled here; a lone message stays bare. This
+    // flag lets mergePromptData attribute an unlabeled segment at coalesce time
+    // (so a later message from a DIFFERENT sender can't be merged in under this
+    // one's identity) WITHOUT double-labeling an already-labeled batch.
+    textAttributed: rest.length > 0,
     messageId: last.message_id,
     chatId: String(last.chat.id),
     fromUserId: String(last.from?.id ?? last.chat.id),
@@ -1521,17 +1537,30 @@ export const PROCESSING_TTL_MS = 5 * 60 * 1000;
 
 // RFC 02 P3: merge an INCOMING coalesced batch into an OPEN (unclaimed) prompt —
 // so a message arriving while a prompt is pending is APPENDED, not blocked/lost.
-// Text is concatenated (each side already carries per-sender attribution for
-// multi-message batches); metadata (messageId/chat/reply/quote/sender/timestamp
-// + persona/projectDescription) comes from the INCOMING/newest side so the agent
-// still replies to the right thread; attachments are unioned. Pure + total.
+// Metadata (messageId/chat/reply/quote/sender/timestamp + persona/projectDescription)
+// comes from the INCOMING/newest side so the agent still replies to the right
+// thread; attachments are unioned. Pure + total.
+//
+// Attribution (impersonation guard): each side whose text is NOT already labeled
+// (`textAttributed === false`, i.e. a lone bare message) is prefixed with its own
+// `<name> (<role>):` here — otherwise a message from sender B, coalesced onto
+// sender A's bare prompt, would inherit B's `...incoming` identity and A's words
+// would read as B's. Already-labeled batches (`textAttributed === true`) are left
+// as-is (no double-labeling). A legacy prompt written before this flag existed
+// has `textAttributed === undefined` → treated as already-attributed (leave bare)
+// so we never mangle an old multi-message batch during the upgrade window.
 export function mergePromptData(existing, incoming) {
   if (!existing) return incoming;
   if (!incoming) return existing;
+  const seg = (d) => (d.textAttributed === false
+    ? `${attributionLabelFromData(d)}: ${d.text ?? ''}`
+    : (d.text ?? ''));
   return {
     ...incoming,
-    text: `${existing.text ?? ''}\n\n${incoming.text ?? ''}`,
+    text: `${seg(existing)}\n\n${seg(incoming)}`,
     attachments: [...(existing.attachments ?? []), ...(incoming.attachments ?? [])],
+    // The merged text now carries per-segment labels wherever a sender was known.
+    textAttributed: true,
   };
 }
 
