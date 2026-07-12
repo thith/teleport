@@ -253,3 +253,49 @@ test('sweepOrphanSnapshots: persistent write failure parks the batch + warns ONC
   assert.equal(fs.readdirSync(d).filter((f) => f.endsWith('.warned')).length, 1, 'warned once, not per poll');
   fs.rmSync(d, { recursive: true, force: true });
 });
+
+// RFC 03 §5.5 — mergeOrSpoolPrompt: the shared, write-locked take/merge/rm-last that
+// the listener-append AND senders use to write the OPEN prompt slot without clobber.
+import { mergeOrSpoolPrompt } from './tele-listen.mjs';
+
+test('mergeOrSpoolPrompt: empty slot → spools data as a fresh prompt', async () => {
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), 'mos-'));
+  const pf = path.join(d, 'prompt-convo-5.json');
+  const r = await mergeOrSpoolPrompt(pf, { text: 'hi', textAttributed: false, fromName: 'An', fromRole: 'admin', fromUserId: '1' });
+  assert.equal(r, 'spooled');
+  assert.equal(JSON.parse(fs.readFileSync(pf, 'utf8')).text, 'hi');
+  fs.rmSync(d, { recursive: true, force: true });
+});
+
+test('mergeOrSpoolPrompt: existing open prompt → merges (attribution preserved, no stray .appending)', async () => {
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), 'mos2-'));
+  const pf = path.join(d, 'prompt-convo-5.json');
+  fs.writeFileSync(pf, JSON.stringify({ text: 'lời của An', textAttributed: false, fromName: 'An', fromRole: 'admin', fromUserId: '1', messageId: 5 }));
+  const r = await mergeOrSpoolPrompt(pf, { text: 'lời của Ba', textAttributed: false, fromName: 'Ba', fromRole: 'member', fromUserId: '2', messageId: 9 });
+  assert.equal(r, 'merged');
+  const out = JSON.parse(fs.readFileSync(pf, 'utf8'));
+  assert.equal(out.text, 'An (admin): lời của An\n\nBa (member): lời của Ba'); // no impersonation
+  assert.equal(out.messageId, 9);                                              // newest metadata
+  assert.equal(fs.readdirSync(d).filter((f) => f.includes('.appending.')).length, 0); // snapshot cleaned
+  fs.rmSync(d, { recursive: true, force: true });
+});
+
+test('mergeOrSpoolPrompt: with write-lock → releases it after', async () => {
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), 'mos3-'));
+  const pf = path.join(d, 'prompt-convo-5.json');
+  const lock = path.join(d, 'prompt-write-5.lock');
+  await mergeOrSpoolPrompt(pf, { text: 'x' }, lock);
+  assert.equal(fs.existsSync(lock), false, 'write-lock released after write');
+  fs.rmSync(d, { recursive: true, force: true });
+});
+
+test('mergeOrSpoolPrompt: on lock exhaustion it THROWS (durable write must precede a "queued" report)', async () => {
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), 'mos4-'));
+  const pf = path.join(d, 'prompt-convo-5.json');
+  const lock = path.join(d, 'prompt-write-5.lock');
+  fs.writeFileSync(lock, String(Date.now())); // a fresh peer lock (not stale) → never acquirable
+  await assert.rejects(mergeOrSpoolPrompt(pf, { text: 'x' }, lock), /could not acquire/);
+  assert.equal(fs.existsSync(pf), false, 'nothing written when the write-lock could not be taken');
+  assert.equal(fs.existsSync(lock), true, "peer's lock left intact");
+  fs.rmSync(d, { recursive: true, force: true });
+});

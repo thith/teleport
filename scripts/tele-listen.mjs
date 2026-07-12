@@ -1748,6 +1748,43 @@ export function claimPreexistingPrompt(promptFile, processingFile, writeLockFile
   }
 }
 
+// RFC 03 §5.5 / RFC 02 P3 — write `data` into the OPEN prompt slot WITHOUT clobbering
+// a batch already there. Atomically TAKE the open prompt (rename → private
+// `.appending.<pid>`), merge `data` into it via mergePromptData, write the result
+// back, and delete the snapshot LAST (a write failure parks it in `.appending.<pid>`
+// for sweepOrphanSnapshots to adopt — never a loss). If there is no open prompt
+// (the agent claimed it, or the slot is empty), `data` becomes a FRESH prompt
+// (spool). This is the exact take/merge/rm-last the listener's --append has always
+// used, now shared so SENDERS (ask/handover/steer/broadcast, RFC 03 §5.1) can write
+// the same way instead of `writePromptExclusive` (which bounces EEXIST when busy).
+//
+// Serialized across writers by the per-convo `prompt-write-<N>.lock` (§5.5): the
+// listener-append, the pre-existing claim (§5.2), and every sender take it, so two
+// writers can't interleave their rename+read+write and clobber each other. On lock
+// exhaustion we THROW (the durable write must complete before a sender reports
+// "queued"); the hold is microseconds (no network) so exhaustion is effectively
+// impossible. `writeLockFile` may be null for callers that don't need cross-process
+// serialization (e.g. unit tests). Returns 'merged' | 'spooled'.
+export async function mergeOrSpoolPrompt(promptFile, data, writeLockFile = null) {
+  const acquired = writeLockFile ? await acquireLockWithRetry(writeLockFile) : true;
+  if (!acquired) {
+    throw new Error(`mergeOrSpoolPrompt: could not acquire ${path.basename(writeLockFile)} — prompt NOT written (do not report queued)`);
+  }
+  let takenFile = null;
+  try {
+    const t = `${promptFile}.appending.${process.pid}`;
+    let existing = null;
+    try { fs.renameSync(promptFile, t); takenFile = t; } catch { /* no open prompt → spool fresh */ }
+    if (takenFile) { try { existing = JSON.parse(fs.readFileSync(takenFile, 'utf8')); } catch { /* torn/corrupt → treat as none */ } }
+    const toWrite = existing ? mergePromptData(existing, data) : data;
+    writePromptAtomic(toWrite, promptFile);          // if this throws, takenFile stays parked (rm-last)
+    if (takenFile) { try { fs.rmSync(takenFile, { force: true }); } catch {} }
+    return existing ? 'merged' : 'spooled';
+  } finally {
+    if (writeLockFile) releasePollLock(writeLockFile);
+  }
+}
+
 // Read every prompt*.json sibling and collect a Set of `${botId}:${updateId}`
 // pairs so the prune sweep below skips any dir still pointed at by an
 // unconsumed prompt — even one that has sat idle for hours. The set is keyed
@@ -2350,28 +2387,19 @@ async function main() {
     }
   }
   // P3 (--append): coalesce into the OPEN (unclaimed) prompt rather than clobber
-  // it; if only a CLAIMED (.processing.json) batch exists, promptFile is absent
-  // so this writes a FRESH prompt (spool alongside the claimed one).
-  //
-  // Dedupe race fix (#1): atomically TAKE the open prompt (rename → private
-  // `.appending.<pid>`) BEFORE merging. The rename is the linearization point vs
-  // the agent's claim (rename prompt → .processing.json): only one wins. If WE
-  // win, the agent's claim ENOENTs and retries; if the AGENT claimed first, our
-  // rename ENOENTs → `existing` stays null → we spool the new batch to a fresh
-  // prompt. Either way the same batch never lands in both files (no duplication).
-  let toWrite = data;
-  let takenFile = null;
+  // it; if only a CLAIMED (.processing.json) batch exists, promptFile is absent so
+  // this writes a FRESH prompt (spool alongside the claimed one). The take/merge/
+  // rm-last + per-convo write-lock now live in the shared mergeOrSpoolPrompt (§5.5)
+  // so senders (RFC 03 §5.1) write the OPEN slot the exact same way — serialized
+  // against this listener-append and against the pre-existing claim (§5.2).
   if (append) {
-    const t = `${promptFile}.appending.${process.pid}`;
-    let existing = null;
-    try { fs.renameSync(promptFile, t); takenFile = t; } catch { /* no open prompt, or agent claimed first → spool fresh */ }
-    if (takenFile) { try { existing = JSON.parse(fs.readFileSync(takenFile, 'utf8')); } catch {} }
-    if (existing) toWrite = mergePromptData(existing, data);
+    const writeLock = convo != null ? path.join(DEFAULT_TMP_DIR, `prompt-write-${convo}.lock`) : null;
+    await mergeOrSpoolPrompt(promptFile, data, writeLock);
+  } else {
+    // Non-append (legacy single-slot / drain): the exit-2 guard above already
+    // blocked when a prompt existed, so there is nothing to coalesce — write direct.
+    writePromptAtomic(data, promptFile);
   }
-  writePromptAtomic(toWrite, promptFile);
-  // Remove the taken snapshot only AFTER the write lands (so a write failure
-  // parks the old batch in `.appending.<pid>` rather than losing it).
-  if (takenFile) { try { fs.rmSync(takenFile, { force: true }); } catch {} }
   // React 👍 AFTER successful prompt write to avoid false ack on failure.
   await reactToMessages(token, toProcess);
   advanceLoopOffset();
