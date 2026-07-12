@@ -57,7 +57,12 @@ export function targetFromReply(replyText, live) {
 
 // Build the injected prompt. `flag` ('whisper' | 'instruct') is set true to mark
 // the mode; `messageId:null` marks it injected (not a real Telegram message).
-export function buildSteerPrompt({ targetConvoId, targetChatId, fromUserId, fromName, fromRole, text, flag }) {
+export function buildSteerPrompt({ targetConvoId, targetChatId, fromUserId, fromName, fromRole, text, flag, replyToMessageId = null }) {
+  // `replyToMessageId` = the sender's original command message (their DM where
+  // they typed /instruct|/whisper). Lets kind-aware reply routing thread the
+  // agent's reply under it in the sender's DM. `messageId:null` still marks the
+  // prompt as injected (not itself a real inbound Telegram message).
+  const rtmid = replyToMessageId == null || replyToMessageId === '' ? null : Number(replyToMessageId);
   const prompt = {
     text,
     messageId: null,
@@ -66,7 +71,7 @@ export function buildSteerPrompt({ targetConvoId, targetChatId, fromUserId, from
     fromName: fromName || 'admin',
     fromRole: fromRole || 'member',
     fromMember: null,
-    replyToMessageId: null,
+    replyToMessageId: Number.isFinite(rtmid) ? rtmid : null,
     replyToText: null,
     quotedText: null,
     timestamp: Math.floor(Date.now() / 1000),
@@ -128,6 +133,7 @@ export async function doSteer(argv, { flag, usage, ack }, {
   const prompt = buildSteerPrompt({
     targetConvoId: convoId, targetChatId: chatId,
     fromUserId: from.id, fromName: from.name, fromRole: from.role || 'member', text: r.text, flag,
+    replyToMessageId: from.messageId,
   });
   const promptFile = path.join(tmpDir, `prompt-convo-${convoId}.json`);
   // RFC 03 §5.1: durable coalesce/spool — a busy target no longer bounces (no EEXIST).

@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { parseArgs, mergePromptData, PROCESSING_TTL_MS, reclaimStaleProcessing, attributionLabelFromData, sweepOrphanSnapshots } from './tele-listen.mjs';
-import { autoConsumeClaimedPrompt } from './send-telegram.mjs';
+import { autoConsumeClaimedPrompt, peekClaimedPrompt } from './send-telegram.mjs';
 
 // RFC 02 P3 — append-until-claimed + P1 auto-consume. Pure helpers here; the
 // flow wiring (append/spool/TTL-reclaim in main(), gated by --append) is
@@ -126,6 +126,21 @@ test('autoConsumeClaimedPrompt: deletes ONLY .processing.json — OPEN inbox unt
   assert.equal(fs.existsSync(open), true);                 // OPEN prompt untouched (never dropped)
   assert.equal(autoConsumeClaimedPrompt(9, d), false);     // no-op the second time
   assert.equal(autoConsumeClaimedPrompt(null, d), false);  // null convo → no-op
+  fs.rmSync(d, { recursive: true, force: true });
+});
+
+test('peekClaimedPrompt: reads .processing WITHOUT consuming (kind-aware reply routing)', () => {
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), 'peek-'));
+  const proc = path.join(d, 'prompt-convo-9.processing.json');
+  fs.writeFileSync(proc, JSON.stringify({ instruct: true, fromUserId: 555, replyToMessageId: 42 }));
+  const got = peekClaimedPrompt(9, d);
+  assert.equal(got.instruct, true);
+  assert.equal(got.fromUserId, 555);
+  assert.equal(fs.existsSync(proc), true);              // NOT consumed — peek only
+  assert.equal(peekClaimedPrompt(7, d), null);          // absent convo → null
+  assert.equal(peekClaimedPrompt(null, d), null);       // null convo → null
+  fs.writeFileSync(proc, 'not json');
+  assert.equal(peekClaimedPrompt(9, d), null);          // unreadable → null (best-effort)
   fs.rmSync(d, { recursive: true, force: true });
 });
 
@@ -320,6 +335,24 @@ test('mergePromptData: preserves kind-flags from the OLDER side (whisper/instruc
     assert.equal(m.fromName, 'Thi');
     assert.match(m.text, /kín/);
   }
+});
+
+// A preserved steer must keep its DM ROUTING IDENTITY, not just its flag — else
+// kind-aware reply routing would DM the private steer to the group sender who
+// coalesced under it (leak), or fail. (Codex/subagent review, Bug 1.)
+test('mergePromptData: a preserved steer keeps its fromUserId + replyToMessageId (no wrong-recipient leak)', () => {
+  const instruct = { text: 'kín', instruct: true, fromUserId: '555', replyToMessageId: 42, textAttributed: false, fromName: 'Owner', fromRole: 'admin' };
+  const groupMsg = { text: 'hi from group', fromUserId: '999', replyToMessageId: null, textAttributed: false, fromName: 'Rando', fromRole: 'member' };
+  // instruct is the OLDER side; a later group message coalesces under it.
+  const m = mergePromptData(instruct, groupMsg);
+  assert.equal(m.instruct, true);
+  assert.equal(m.fromUserId, '555');          // steer's DM target survives (NOT '999')
+  assert.equal(m.replyToMessageId, 42);       // steer's reply-to survives
+  // Reverse order: a real instruct arriving AFTER a plain message wins normally.
+  const m2 = mergePromptData(groupMsg, instruct);
+  assert.equal(m2.instruct, true);
+  assert.equal(m2.fromUserId, '555');
+  assert.equal(m2.replyToMessageId, 42);
 });
 
 test('mergePromptData: no spurious kind-flags when neither side has them; incoming wins on conflict', () => {

@@ -25,6 +25,22 @@ test('buildInstructPrompt: carries instruct flag (NOT whisper) + real fromRole',
   assert.deepEqual(p.attachments, []);
 });
 
+test('doInstruct: threads sender command message_id → replyToMessageId (kind-aware reply routing)', async () => {
+  const { writes, opts } = mk();
+  opts.from = { id: '7', role: 'admin', messageId: '42' };
+  const res = await doInstruct([CONVO, 'hello'], opts);
+  assert.equal(res.ok, true);
+  assert.equal(writes[0].replyToMessageId, 42);   // numeric, from the DM command
+  assert.equal(writes[0].fromUserId, '7');         // DM chat target for the reply
+  assert.equal(writes[0].instruct, true);
+});
+
+test('doInstruct: no message_id → replyToMessageId stays null', async () => {
+  const { writes, opts } = mk();
+  await doInstruct([CONVO, 'hello'], opts);
+  assert.equal(writes[0].replyToMessageId, null);
+});
+
 test('doInstruct: resolves convoId target, injects instruct prompt, carries identity', async () => {
   const { writes, opts } = mk();
   const res = await doInstruct([CONVO, 'deploy', 'nhánh', 'staging'], opts);

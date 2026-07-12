@@ -318,7 +318,7 @@ export function handleControlMessages(mine, ctx) {
     // auto-converted to a `.md` DOCUMENT whose text rides in `caption`, not `text`
     // — without this, replying to continue an instruct thread would find no #hash.
     const rt = msg.reply_to_message;
-    dispatchCommand(parsed, msg.from || {}, ctx, rt?.text ?? rt?.caption).catch((e) =>
+    dispatchCommand(parsed, msg.from || {}, ctx, rt?.text ?? rt?.caption, msg.message_id).catch((e) =>
       ctx.sendText(ctx.daemonUserId, `❌ /${parsed.cmd} failed: ${e instanceof Error ? e.message : e}`));
   }
 }
@@ -336,7 +336,7 @@ export function handleControlMessages(mine, ctx) {
 export async function dispatchCommand(parsed, from, {
   daemonUserId, projectsConfig, registry, sendText, secretEnvKeys = [],
   runner = execFileP, scriptsDir = __dirname, parentDir = PARENT_DIR,
-}, replyText = null) {
+}, replyText = null, messageId = null) {
   const spec = resolveCommand(parsed.cmd, registry);
   if (!spec) return; // not a known command → stay quiet
   const role = resolveSenderRole(projectsConfig, from && from.id);
@@ -366,6 +366,10 @@ export async function dispatchCommand(parsed, from, {
     // other children (esp. /run, which executes project scripts). NEVER a
     // privilege input.
     TELE_REPLY_TEXT: (spec.wantsReplyText && replyText) ? String(replyText).slice(0, 256) : '',
+    // The sender's command message id — only for reply-context commands
+    // (/whisper, /instruct). Lets kind-aware reply routing thread the agent's
+    // reply under the sender's command in their DM. Not a privilege input.
+    TELE_MESSAGE_ID: (spec.wantsReplyText && messageId != null) ? String(messageId) : '',
   });
   try {
     const { stdout, stderr } = await runner(process.execPath, argv, {

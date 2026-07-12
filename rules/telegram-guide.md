@@ -182,6 +182,9 @@ Khi prompt có `whisper: true` → **MUST**:
    nhiên (vd whisper bảo "nhớ confirm rõ X" → bạn chủ động hỏi/confirm X như thể tự nghĩ ra).
 3. **Vẫn áp role-gate sensitive** theo `fromRole` của prompt: whisper từ `admin/maintainer`
    mới authorize được commit/deploy/…; từ role thấp hơn thì vẫn phải xin confirm.
+4. **Nếu (hiếm) bạn *phải* đáp lại whisper:** cứ đáp bình thường — send-telegram tự route về DM
+   người whisper (như [[instruct]]), **không** rơi ra topic. Whisper vốn *không cần đáp*; đây chỉ
+   là lưới an toàn để bạn không bao giờ lỡ lộ lời whisper ra nhóm.
 
 ## Instruct — chỉ đạo RIÊNG chính thức, trả lời qua DM (RFC 13)
 
@@ -194,15 +197,20 @@ thị chính thức mà bạn ĐƯỢC & NÊN trả lời* — chỉ khác là t
 
 Khi prompt có `instruct: true` → **MUST**:
 1. **Coi là chỉ thị hợp lệ** (không flag misrouted) — định hướng riêng, chính thức cho bạn.
-2. **Trả lời qua DM, KHÔNG post vào group.** Làm việc bình thường (edit/đọc/phân tích…), nhưng
-   **kênh giao tiếp cho lượt này là DM**: `node ../teleport/scripts/send-telegram.mjs --dm "<đáp>"`
-   (RFC 12 — đích là owner). Đừng trả lời/tường thuật vào topic nhóm.
-3. **Ký danh tính để owner reply-to tiếp:** từ RFC 14, `--dm` **tự chèn `[<persona> #hash]` lên
-   đầu** — bạn **không cần tự gõ hashtag** nữa. Owner **reply** vào tin DM đó rồi gõ `/instruct
-   <text>` → daemon bóc `#hash` từ 256 ký tự đầu của reply → về đúng bạn (resolve qua listener-alive,
-   nên chạy được **cả khi bạn chưa từng post topic nhóm**, miễn listener còn sống). ⇒ hội thoại 2
-   chiều riêng tư, không cần gì thêm. (Nếu muốn viết thêm lời chào, cứ để tự nhiên sau tag; đừng
-   chèn văn bản dài *trước* tag kẻo đẩy hash ra ngoài 256 ký tự đầu.)
+2. **Trả lời BÌNH THƯỜNG — send-telegram tự route về DM người gửi (RFC 13, script-enforced).**
+   Cứ đáp như mọi lượt khác: `node ../teleport/scripts/send-telegram.mjs --convo <id> "<đáp>"`
+   (hoặc bản không cần `--convo` nếu convoId đã ở env). **KHÔNG cần tự chọn `--dm`, KHÔNG được
+   post thẳng vào group.** Khi batch bạn vừa claim mang cờ `instruct`/`whisper`, send-telegram
+   **tự** đổi đích sang **DM của đúng người ra lệnh** (`fromUserId`), thread dưới tin lệnh của họ
+   (`replyToMessageId`), rồi tiêu thụ claim — bạn không cần nhớ gì. (Cơ chế *fail-closed*: cờ có
+   mặt là KHÔNG bao giờ rơi vào topic; nếu vì lý do gì thiếu đích DM thì nó lui về DM owner chứ
+   không lộ ra nhóm.) *Soft-discipline cũ (tự gõ `--dm`) đã được thay bằng enforcement trong
+   script vì tôi từng route nhầm 2 lần liên tiếp.*
+3. **Đáp instruct TRƯỚC, trước mọi send `--convo` khác.** Auto-route dựa trên claim đang mở nên
+   **lượt `send-telegram --convo <id>` ĐẦU TIÊN** sau khi claim mới là lượt được đưa về DM; đừng
+   chèn một status không liên quan lên topic trước khi đáp instruct (nó sẽ nuốt claim và câu trả
+   lời thật có thể rơi ra topic). Ký danh tính: owner **reply** vào tin DM đó rồi `/instruct <text>`
+   → daemon bóc `#hash` → về đúng bạn (hội thoại 2 chiều riêng tư, không cần gõ hashtag).
 4. **Vẫn áp role-gate sensitive** theo `fromRole`: instruct từ `admin/maintainer` mới authorize
    commit/deploy/…; instruct **không tự nâng quyền**.
 
