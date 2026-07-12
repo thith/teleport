@@ -93,6 +93,7 @@ if append && exists(promptFile):
 ### 5.4 Fold-lô: routing + framing (điểm debate)
 - **Reply routing khi lô gộp lẫn tin Telegram:** prompt ghi rõ khối Telegram-origin reply về **topic**, mỗi khối side-msg reply theo **`replyVia`** của nó. (Vấn đề này có ở MỌI thiết kế fold, không riêng gì kí túc xá.)
 - **Framing subordinate suy từ `kind`:** `whisper`/`broadcast` render dạng **phụ** ("FYI — sau khi xong việc đang làm:") để không cướp attention của task đang chạy; `ask`/`handover`/`instruct` render bình thường (cần agent xử + reply).
+- **Giữ nguyên mô hình enforce whisper=kín/ask=kể (mềm, guide-driven):** hôm nay marker là **1 flag/prompt** (`buildSteerPrompt` set `prompt.whisper=true`/`prompt.instruct=true`, steer.mjs:70) + luật hành vi trong `telegram-guide.md` (whisper=giấu&không đáp dòng 207; instruct=đáp qua DM; ask=`ask --reply` dòng 17; broadcast=ack ngắn OK dòng 242; handover=adopt) — agent TỰ tuân, không ép cứng. Khi fold NHIỀU side-msg khác kind vào 1 prompt, **không thể** dùng 1 flag chung → phải mang **`kind` THEO TỪNG KHỐI** (đúng khối JSON §5.3) để agent áp đúng luật guide mỗi khối. Bất biến: **fold KHÔNG được nuốt mất `kind`/flag**. Không cần cơ chế enforce mới — chỉ chuyển 1-flag-prompt → per-block-kind.
 
 ## 6. Interplay với RFC 01/02
 - **claim/append/reclaim/sweep:** GO-SIMPLER **là** append — sender dùng chính atomic-take + `mergePromptData` + lock + spool. Không thêm đường mới. `reclaimStaleProcessing`/`sweepOrphanSnapshots` vẫn xử `.processing`/`.stale`/`.appending` như cũ.
