@@ -299,3 +299,34 @@ test('mergeOrSpoolPrompt: on lock exhaustion it THROWS (durable write must prece
   assert.equal(fs.existsSync(lock), true, "peer's lock left intact");
   fs.rmSync(d, { recursive: true, force: true });
 });
+
+// RFC 03 bug (caught by Thi's dogfood): mergePromptData did `{ ...incoming }`, so a
+// kind-flag on the OLDER (existing) side was DROPPED when a plain message coalesced
+// in — a whisper/instruct would look like a plain message → the agent could reply to
+// it PUBLICLY (leak). All 7 kind-flags must survive a merge (union, incoming wins).
+test('mergePromptData: preserves kind-flags from the OLDER side (whisper/instruct/broadcast/ask/handover — no silent downgrade)', () => {
+  const plain = { text: 'x', textAttributed: false, fromName: 'Thi', fromRole: 'admin', fromUserId: '1' };
+  const cases = {
+    whisper: true, instruct: true, broadcast: { from: { role: 'admin' } },
+    ask: { replyTo: '9' }, askReply: { answer: 'a' },
+    handover: { from: { convoId: '9' } }, handoverAck: { from: { convoId: '9' } },
+  };
+  for (const [flag, val] of Object.entries(cases)) {
+    const flagged = { text: 'kín', [flag]: val, textAttributed: false, fromName: 'B', fromRole: 'admin', fromUserId: '2' };
+    // flagged is the EXISTING (older) side — the exact loss case
+    const m = mergePromptData(flagged, plain);
+    assert.deepEqual(m[flag], val, `${flag} must survive when it is the older side`);
+    // reply still targets the newest (plain) sender; text carries both, attributed
+    assert.equal(m.fromName, 'Thi');
+    assert.match(m.text, /kín/);
+  }
+});
+
+test('mergePromptData: no spurious kind-flags when neither side has them; incoming wins on conflict', () => {
+  const a = { text: 'a', textAttributed: false, whisper: true, fromName: 'X', fromUserId: '1' };
+  const b = { text: 'b', textAttributed: false, fromName: 'Y', fromUserId: '2' };
+  assert.equal(mergePromptData(b, b).whisper, undefined);           // neither → none
+  // both have the flag → incoming's value wins (union, not duplicate)
+  const a2 = { ...a, whisper: 'old' }; const b2 = { ...b, whisper: 'new' };
+  assert.equal(mergePromptData(a2, b2).whisper, 'new');
+});

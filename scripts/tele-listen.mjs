@@ -1563,19 +1563,33 @@ export const PROCESSING_TTL_MS = 5 * 60 * 1000;
 // as-is (no double-labeling). A legacy prompt written before this flag existed
 // has `textAttributed === undefined` → treated as already-attributed (leave bare)
 // so we never mangle an old multi-message batch during the upgrade window.
+// Kind-flags that mark WHAT a prompt is (a daemon whisper/instruct, a broadcast, an
+// agent ask/reply, a handover/ack). They drive the receiver's handling — critically,
+// `whisper`/`instruct` mean "handle DISCREETLY". A merge must NOT silently drop them:
+// `{ ...incoming }` alone loses any flag the OLDER (`existing`) side carried, so a
+// whisper coalesced under a later plain message would look like a plain message and
+// the agent could reply to it PUBLICLY → leak. We union the flags from both sides
+// (incoming wins on conflict) so every kind present in the batch stays visible.
+const KIND_FLAGS = ['whisper', 'instruct', 'broadcast', 'ask', 'askReply', 'handover', 'handoverAck'];
+
 export function mergePromptData(existing, incoming) {
   if (!existing) return incoming;
   if (!incoming) return existing;
   const seg = (d) => (d.textAttributed === false
     ? `${attributionLabelFromData(d)}: ${d.text ?? ''}`
     : (d.text ?? ''));
-  return {
+  const merged = {
     ...incoming,
     text: `${seg(existing)}\n\n${seg(incoming)}`,
     attachments: [...(existing.attachments ?? []), ...(incoming.attachments ?? [])],
     // The merged text now carries per-segment labels wherever a sender was known.
     textAttributed: true,
   };
+  // Preserve any kind-flag the older side had that the newer side doesn't (union).
+  for (const k of KIND_FLAGS) {
+    if (existing[k] !== undefined && merged[k] === undefined) merged[k] = existing[k];
+  }
+  return merged;
 }
 
 // RFC 02 P3: an agent that CLAIMED a batch (rename prompt→.processing.json) but
