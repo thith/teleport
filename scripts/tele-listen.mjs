@@ -1576,7 +1576,15 @@ export function reclaimStaleProcessing(processingFile, promptFile) {
       writePromptAtomic(claimed, promptFile);
       fs.rmSync(staleFile, { force: true });
     }
-  } catch { /* best-effort; a later poll retries */ }
+  } catch (e) {
+    // Honest failure mode (subagent review): after the rename-to-.stale, a
+    // write failure (e.g. ENOSPC) leaves the batch parked in `.stale.<pid>`,
+    // which NO later poll scans — so surface it loudly instead of claiming
+    // "a later poll retries". (Follow-up hardening: a poll sweep that adopts
+    // orphan `.stale.*` snapshots.) We do NOT rename it back to processingFile:
+    // a concurrent agent claim may have created a fresh one there.
+    console.error(`[tele-listen] reclaim of ${path.basename(processingFile)} failed: ${e instanceof Error ? e.message : String(e)} — batch parked in a .stale snapshot (manual recovery may be needed)`);
+  }
 }
 
 // Read every prompt*.json sibling and collect a Set of `${botId}:${updateId}`
@@ -1884,6 +1892,11 @@ async function main() {
     // P3: do NOT block. Reclaim a stale claim (agent died mid-processing), then
     // fall through to fetch + append-to-open / spool-fresh below.
     if (fs.existsSync(processingFile)) {
+      // NOTE (subagent review): mtime here is the prompt's WRITE time (rename
+      // preserves it), not the CLAIM time — so a batch that sat unclaimed a
+      // while can be reclaimed sooner than PROCESSING_TTL_MS after the actual
+      // claim. Harmless pre-activation; the agent-side claim (ships with
+      // activation) MUST `touch` the file so TTL measures from claim.
       let stale = false;
       try { stale = Date.now() - fs.statSync(processingFile).mtimeMs > PROCESSING_TTL_MS; } catch {}
       if (stale) reclaimStaleProcessing(processingFile, promptFile);
