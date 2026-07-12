@@ -27,33 +27,34 @@ test('groupChatIds: distinct group ids from _default + dedicated projects', () =
   assert.deepEqual(new Set(ids), new Set(['-100', '-200']));   // deduped; empty skipped
 });
 
-// Fan-out: two live topics in the same group; one is busy (EEXIST) → skipped.
+// Fan-out: two live topics. RFC 03: a busy topic COALESCES (no skip); only a hard
+// write failure is counted (as `failed`, still surfaced via the `skipped` field).
 const STORE = { '-100': { '111': 5, '222': 6, _ts: {} } };
 const CFG = { _default: { chatId: '-100' }, _config: {} };
 
-test('doBroadcast: injects into every live topic, counts sent/skipped', () => {
+test('doBroadcast: durable fan-out — a hard write failure on one topic is counted, others still sent', async () => {
   const written = [];
-  const writePrompt = (obj, file) => {
-    if (file.includes('222')) { const e = new Error('exists'); e.code = 'EEXIST'; throw e; } // 222 busy
+  const writePrompt = async (obj, file) => {
+    if (file.includes('222')) throw new Error('disk full'); // 222 fails hard (NOT busy — busy coalesces)
     written.push(file);
   };
-  const r = doBroadcast(['reload', 'guide'], { from: { id: '144', role: 'admin', name: 'Thi' }, config: CFG, store: STORE, writePrompt, env: {}, envFile: {} });
+  const r = await doBroadcast(['reload', 'guide'], { from: { id: '144', role: 'admin', name: 'Thi' }, config: CFG, store: STORE, writePrompt, env: {}, envFile: {} });
   assert.equal(r.ok, true);
   assert.equal(r.sent, 1);
-  assert.equal(r.skipped, 1);
+  assert.equal(r.skipped, 1);   // 1 hard failure
   assert.equal(r.total, 2);
   assert.ok(written[0].includes('prompt-convo-111.json'));
-  assert.match(r.message, /sent 1, skipped 1/);
+  assert.match(r.message, /sent 1, failed 1/);
 });
 
-test('doBroadcast: --chat limits scope; no live topics → ok:false', () => {
-  const r = doBroadcast(['--chat', '-999', 'hi'], { from: {}, config: CFG, store: STORE, writePrompt: () => {}, env: {}, envFile: {} });
+test('doBroadcast: --chat limits scope; no live topics → ok:false', async () => {
+  const r = await doBroadcast(['--chat', '-999', 'hi'], { from: {}, config: CFG, store: STORE, writePrompt: () => {}, env: {}, envFile: {} });
   assert.equal(r.ok, false);
   assert.match(r.message, /no live topics/);
 });
 
-test('doBroadcast: empty text → usage error', () => {
-  const r = doBroadcast([], { config: CFG, store: STORE, writePrompt: () => {} });
+test('doBroadcast: empty text → usage error', async () => {
+  const r = await doBroadcast([], { config: CFG, store: STORE, writePrompt: () => {} });
   assert.equal(r.ok, false);
   assert.match(r.message, /usage/);
 });

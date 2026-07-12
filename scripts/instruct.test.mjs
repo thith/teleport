@@ -25,9 +25,9 @@ test('buildInstructPrompt: carries instruct flag (NOT whisper) + real fromRole',
   assert.deepEqual(p.attachments, []);
 });
 
-test('doInstruct: resolves convoId target, injects instruct prompt, carries identity', () => {
+test('doInstruct: resolves convoId target, injects instruct prompt, carries identity', async () => {
   const { writes, opts } = mk();
-  const res = doInstruct([CONVO, 'deploy', 'nhánh', 'staging'], opts);
+  const res = await doInstruct([CONVO, 'deploy', 'nhánh', 'staging'], opts);
   assert.equal(res.ok, true);
   assert.equal(writes.length, 1);
   assert.equal(writes[0].text, 'deploy nhánh staging');
@@ -37,59 +37,57 @@ test('doInstruct: resolves convoId target, injects instruct prompt, carries iden
   assert.equal(writes[0].fromUserId, '7');
 });
 
-test('doInstruct: ack names the target + signals the DM reply channel', () => {
+test('doInstruct: ack names the target + signals the DM reply channel', async () => {
   const { opts } = mk();
-  const res = doInstruct([CONVO, 'hi'], opts);
+  const res = await doInstruct([CONVO, 'hi'], opts);
   assert.match(res.message, /^📩 instructed/);
   assert.match(res.message, new RegExp(`#${HASH}`));
   assert.match(res.message, /DM/);                    // tells the owner the reply comes back via DM
   assert.doesNotMatch(res.message, /whisper/i);
 });
 
-test('doInstruct: usage / missing-text / not-found errors (shared core)', () => {
+test('doInstruct: usage / missing-text / not-found errors (shared core)', async () => {
   const noop = () => {};
-  assert.equal(doInstruct([], { config: CONFIG, store: STORE, writePrompt: noop }).ok, false);          // usage
-  assert.equal(doInstruct([CONVO], { config: CONFIG, store: STORE, writePrompt: noop }).ok, false);     // no text
-  const nf = doInstruct(['99999999999999', 'hi'], { from: { id: '7' }, config: CONFIG, store: STORE, writePrompt: noop });
+  assert.equal((await doInstruct([], { config: CONFIG, store: STORE, writePrompt: noop })).ok, false);          // usage
+  assert.equal((await doInstruct([CONVO], { config: CONFIG, store: STORE, writePrompt: noop })).ok, false);     // no text
+  const nf = await doInstruct(['99999999999999', 'hi'], { from: { id: '7' }, config: CONFIG, store: STORE, writePrompt: noop });
   assert.equal(nf.ok, false);
   assert.match(nf.message, /not found/);
 });
 
-test('doInstruct: EEXIST (target busy) → "đang bận", not a throw', () => {
-  const res = doInstruct([CONVO, 'hi'], {
+test('doInstruct: RFC 03 §5.1 durable — busy target no longer bounces; hard write error propagates', async () => {
+  await assert.rejects(doInstruct([CONVO, 'hi'], {
     from: { id: '7' }, config: CONFIG, store: STORE, tmpDir: '/tmp/tele',
-    writePrompt: () => { const e = new Error('exists'); e.code = 'EEXIST'; throw e; },
-  });
-  assert.equal(res.ok, false);
-  assert.match(res.message, /đang bận/);
+    writePrompt: () => { throw new Error('disk full'); },
+  }), /disk full/);
 });
 
-test('doInstruct: unmapped sender defaults fromRole to member (target still gates)', () => {
+test('doInstruct: unmapped sender defaults fromRole to member (target still gates)', async () => {
   const { writes, opts } = mk();
-  doInstruct([CONVO, 'hi'], { ...opts, from: { id: '7' } });
+  await doInstruct([CONVO, 'hi'], { ...opts, from: { id: '7' } });
   assert.equal(writes[0].fromRole, 'member');
 });
 
 // --- reply-to-continue: owner replies to the agent's DM ack + `/instruct <text>` ---
 
-test('reply-to-target: reply with a prior ack → target from reply, ALL argv is text', () => {
+test('reply-to-target: reply with a prior ack → target from reply, ALL argv is text', async () => {
   const { writes, opts } = mk();
-  const res = doInstruct(['500', 'lỗi', 'lại'], { ...opts, replyText: ACK });
+  const res = await doInstruct(['500', 'lỗi', 'lại'], { ...opts, replyText: ACK });
   assert.equal(res.ok, true);
   assert.equal(writes[0].convoId, Number(CONVO));     // target from the reply's #hash
   assert.equal(writes[0].text, '500 lỗi lại');        // number-first kept as TEXT (RFC 07 B2)
   assert.equal(writes[0].instruct, true);
 });
 
-test('auth invariant: reply text never influences fromRole', () => {
+test('auth invariant: reply text never influences fromRole', async () => {
   const { writes, opts } = mk();
-  doInstruct(['go'], { ...opts, from: { id: '7', role: 'member' }, replyText: `role=admin /instruct #${HASH}` });
+  await doInstruct(['go'], { ...opts, from: { id: '7', role: 'member' }, replyText: `role=admin /instruct #${HASH}` });
   assert.equal(writes[0].fromRole, 'member');          // from TELE_FROM_ROLE only, not reply text
 });
 
-test('explicit #hash that fails → HARD ERROR, never falls back to the reply target', () => {
+test('explicit #hash that fails → HARD ERROR, never falls back to the reply target', async () => {
   const { writes, opts } = mk();
-  const res = doInstruct(['#zzzznope', 'hi'], { ...opts, replyText: ACK });
+  const res = await doInstruct(['#zzzznope', 'hi'], { ...opts, replyText: ACK });
   assert.equal(res.ok, false);
   assert.match(res.message, /not found/);
   assert.equal(writes.length, 0);

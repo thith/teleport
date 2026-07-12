@@ -6,8 +6,17 @@
 // thin wrappers that pass `{ flag, usage, ack }`.
 import path from 'node:path';
 import { readTopicsStore } from './topics-store.mjs';
-import { listSteerableTargets, normalizeTarget, matchTarget, writePromptExclusive } from './handover.mjs';
-import { DEFAULT_TMP_DIR } from './tele-listen.mjs';
+import { listSteerableTargets, normalizeTarget, matchTarget } from './handover.mjs';
+import { DEFAULT_TMP_DIR, mergeOrSpoolPrompt } from './tele-listen.mjs';
+
+// RFC 03 §5.1 — default durable write: coalesce/spool into the target's OPEN prompt
+// under the per-convo write-lock (replaces O_EXCL writePromptExclusive). A busy
+// target no longer bounces EEXIST — the steer message is queued durably. Keeps the
+// (promptObj, promptFile) signature so injected test writers stay compatible.
+export async function durableWrite(promptObj, promptFile) {
+  const lock = path.join(path.dirname(promptFile), `prompt-write-${promptObj.convoId}.lock`);
+  await mergeOrSpoolPrompt(promptFile, promptObj, lock);
+}
 import { shortConvoHash } from './send-telegram.mjs';
 import { readProjectsConfig, resolveDefaultChatId, projectEntries } from './projects-config.mjs';
 import { personaForConvo } from './persona.mjs';
@@ -105,9 +114,9 @@ export function resolveSteerTarget(argv, { live, replyText, usage }) {
 // tests. `mode` = { flag, usage, ack } where `ack({ label, hash, convoId })`
 // returns the success string. `replyText` defaults to TELE_REPLY_TEXT (the
 // daemon injects the replied-to message text for `wantsReplyText` commands).
-export function doSteer(argv, { flag, usage, ack }, {
+export async function doSteer(argv, { flag, usage, ack }, {
   from = {}, config = readProjectsConfig(), store = readTopicsStore(),
-  tmpDir = DEFAULT_TMP_DIR, writePrompt = writePromptExclusive, replyText = process.env.TELE_REPLY_TEXT,
+  tmpDir = DEFAULT_TMP_DIR, writePrompt = durableWrite, replyText = process.env.TELE_REPLY_TEXT,
 } = {}) {
   // RFC 14: steerable = live topics ∪ live-but-topic-less convos (DM-only
   // sessions), so `/instruct #hash` reaches a session that only DM'd the owner.
@@ -121,12 +130,8 @@ export function doSteer(argv, { flag, usage, ack }, {
     fromUserId: from.id, fromName: from.name, fromRole: from.role || 'member', text: r.text, flag,
   });
   const promptFile = path.join(tmpDir, `prompt-convo-${convoId}.json`);
-  try {
-    writePrompt(prompt, promptFile);
-  } catch (e) {
-    if (e && e.code === 'EEXIST') return { ok: false, message: `#${shortConvoHash(convoId)} đang bận (prompt trước chưa xử lý) — thử lại sau.` };
-    throw e;
-  }
+  // RFC 03 §5.1: durable coalesce/spool — a busy target no longer bounces (no EEXIST).
+  await writePrompt(prompt, promptFile);
   // Enriched ack: persona (primary identity) + project (best-effort, omit if unsure).
   const persona = personaForConvo(convoId);
   const project = projectLabelForChat(chatId, config);
