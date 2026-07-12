@@ -64,7 +64,7 @@ Ba mảnh, tất cả **tái dùng máy RFC 02**; không hạ tầng mới.
 
 ### 5.1 Sender: `O_EXCL` → atomic-take MERGE (coalesce, không chặn) — **G1**
 `ask`/`handover`/`whisper`/`instruct`/`broadcast` thôi ghi độc quyền; chuyển sang **đúng cơ chế `--append`** của listener (`tele-listen.mjs:2285-2295`), trích thành helper dùng chung:
-1. Cầm **`acquirePollLock`** per-convo (bắt buộc — nay sender ghi CHUNG file với listener + sender khác; xem §8-R1).
+1. Cầm **write-lock per-convo** `prompt-write-<N>.lock` (§5.5) — bắt buộc, nay sender ghi CHUNG file với listener + sender khác. (KHÔNG dùng `POLL_LOCK_FILE`.)
 2. Nếu `prompt-convo-N.json` tồn tại: atomic-take rename → `.appending.<pid>`, đọc, `mergePromptData(existing, sideMsgData)`, `writePromptAtomic` ghi lại. Xoá snapshot **sau cùng** (crash → dup, không mất — triết lý RFC 02).
 3. Nếu chỉ có `.processing.json` (agent đã claim) và không có open prompt → **spool** `prompt-convo-N.json` mới (side-msg thành prompt kế) — đúng đường "spool fresh" sẵn có.
 4. Nếu trống → ghi thẳng (như cũ).
