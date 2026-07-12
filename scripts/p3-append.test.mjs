@@ -20,6 +20,13 @@ test('parseArgs: --append opt-in, default false, orthogonal to --loop/--settle',
   assert.equal(all.settle, true);
 });
 
+test('parseArgs: --first-run opt-in, default false, requires --append', () => {
+  assert.equal(parseArgs(['--convo', '1', '--append']).firstRun, false);
+  assert.equal(parseArgs(['--convo', '1', '--append', '--first-run']).firstRun, true);
+  // requires --append (it force-reclaims on the coalesce path)
+  assert.throws(() => parseArgs(['--convo', '1', '--first-run']), /--first-run requires --append/);
+});
+
 test('mergePromptData: concatenates text, unions attachments, takes NEWEST metadata', () => {
   const existing = { text: 'first', attachments: [{ a: 1 }], messageId: 10, fromName: 'Thi', persona: { name: 'X' } };
   const incoming = { text: 'second', attachments: [{ b: 2 }], messageId: 11, fromName: 'Nam', chatId: '-100' };
