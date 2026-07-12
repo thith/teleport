@@ -210,6 +210,7 @@ export function parseArgs(argv) {
   let loop = false;
   let append = false;
   let announcePreexisting = false;
+  let firstRun = false;
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === '--wait-once') {
       waitOnce = true;
@@ -245,6 +246,17 @@ export function parseArgs(argv) {
     // until the canonical Monitor command opts in (staged flip after live smoke).
     if (argv[i] === '--announce-preexisting') {
       announcePreexisting = true;
+      continue;
+    }
+    // --first-run (RFC 03 follow-up): OPT-IN, requires --append. Passed by the
+    // canonical loop ONLY on its FIRST iteration (`${first:+--first-run}`), i.e.
+    // the first poll since the agent (re)started its listener. On this poll an
+    // orphan `.processing` left by a PRIOR life is RE-ANNOUNCED as-is (so the
+    // reborn/resumed agent reads it now instead of waiting out PROCESSING_TTL_MS)
+    // — no fold, no merge (see the poll-loop comment for why folding would risk
+    // losing a spooled batch). Subsequent polls omit the flag → normal behaviour.
+    if (argv[i] === '--first-run') {
+      firstRun = true;
       continue;
     }
     if (argv[i] === '--legacy-filter') {
@@ -291,7 +303,10 @@ export function parseArgs(argv) {
   if (announcePreexisting && !append) {
     throw new Error('--announce-preexisting requires --append (RFC 03 §5.2 — it claims+announces a pending prompt on the append/coalesce path)');
   }
-  return { filterReplyTo, offsetFile, offsetFileProvided, convo, legacyFilter, waitOnce, settle, loop, append, announcePreexisting };
+  if (firstRun && !append) {
+    throw new Error('--first-run requires --append (it force-reclaims an orphan .processing on the coalesce path)');
+  }
+  return { filterReplyTo, offsetFile, offsetFileProvided, convo, legacyFilter, waitOnce, settle, loop, append, announcePreexisting, firstRun };
 }
 
 // extractBotId is imported from send-telegram.mjs (single source of truth).
@@ -1922,7 +1937,7 @@ async function main() {
     console.error(`[tele-listen] ${e instanceof Error ? e.message : String(e)}`);
     process.exit(1);
   }
-  let { filterReplyTo, offsetFile, offsetFileProvided, convo, legacyFilter, settle, loop, append, announcePreexisting } = args;
+  let { filterReplyTo, offsetFile, offsetFileProvided, convo, legacyFilter, settle, loop, append, announcePreexisting, firstRun } = args;
 
   // Env resolution.
   // - No --convo / --filter-reply-to → consult env.
@@ -2115,6 +2130,21 @@ async function main() {
     : getProcessingFile(filterReplyTo);
 
   if (append) {
+    // --first-run (RFC 03 follow-up): the loop's FIRST poll since the agent
+    // (re)started/resumed its listener. An orphan `.processing` left by a PRIOR
+    // life must be re-surfaced NOW, not after the 5-min TTL. We simply
+    // RE-ANNOUNCE the existing claim AS-IS — deliberately NOT folding it back
+    // into the open prompt: a fold would MERGE it with any batch spooled in the
+    // open prompt into one `.processing`, which the agent's next consume deletes
+    // wholesale → the spooled batch would be LOST (Codex review). Instead the
+    // agent reads the existing `.processing`; anything spooled in the open prompt
+    // stays separate and is claimed on a later poll. At-least-once: a still-alive
+    // agent may re-read a batch (a harmless dup), but nothing is ever lost. No
+    // fold, no re-claim, no lock — just one announce.
+    if (firstRun && convo != null && fs.existsSync(processingFile)) {
+      console.log(`[tele-listen] prompt ready: ${promptFile} (re-surfaced on first-run — read the .processing)`);
+      process.exit(0);
+    }
     // P3: do NOT block. Reclaim a stale claim (agent died mid-processing), then
     // fall through to fetch + append-to-open / spool-fresh below.
     if (fs.existsSync(processingFile)) {
