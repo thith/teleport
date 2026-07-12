@@ -60,8 +60,9 @@ test('empty/null thread map: falls back to legacy reply-to matching', () => {
 // ── RFC 08: daemon-control prefix `/dm <cmd>` ─────────────────────────────────
 import {
   isDmControlMessage, stripDmControlPrefix, collectMessagesToProcess, DM_CONTROL_PREFIX,
-  shouldSettleBatch, settleWindowFor, settleSignals,
-  SETTLE_MS_A, SETTLE_MS_B, SETTLE_MS_C, DEFAULT_SETTLE_MS, DEFAULT_SETTLE_FOLLOWUP_MS,
+  shouldSettleBatch, settleWindowFor, settleSignals, settleOverride,
+  SETTLE_MS_A, SETTLE_MS_B, SETTLE_MS_C, WAIT_SIGNAL_MS,
+  DEFAULT_SETTLE_MS, DEFAULT_SETTLE_FOLLOWUP_MS,
 } from './tele-listen.mjs';
 
 // Build a batch entry with a Telegram `date` (seconds) + optional signal fields.
@@ -117,6 +118,30 @@ test('shouldSettleBatch: empty / future-dated / disabled-tier never defer', () =
   assert.equal(shouldSettleBatch([mk(105, { text: 'hi' })], 100_000), false);                 // future (age<0)
   assert.equal(shouldSettleBatch([mk(90, { text: 'hi' })], 100_000, { a: 0, b: 20_000, c: 10_000 }), false); // A disabled
   assert.equal(shouldSettleBatch([mk(90, { text: 'hi' })], 100_000, { a: NaN, b: 20_000, c: 10_000 }), false);
+});
+
+// Explicit user override on the newest message's ending (maintainer request):
+//   ".." (exactly two dots) → deliver NOW; comma(s) → wait up to 60s.
+test('settleOverride: exactly ".." → 0; ellipsis/4-dots → null; commas → 60s; else null', () => {
+  assert.equal(settleOverride({ text: 'done..' }), 0);
+  assert.equal(settleOverride({ text: 'ok..  ' }), 0);              // trailing whitespace ignored
+  assert.equal(settleOverride({ text: 'wait...' }), null);         // ellipsis is NOT no-wait
+  assert.equal(settleOverride({ text: 'hmm....' }), null);         // 4 dots ≠ exactly 2
+  assert.equal(settleOverride({ text: 'more,' }), WAIT_SIGNAL_MS);
+  assert.equal(settleOverride({ text: 'more,,,' }), WAIT_SIGNAL_MS); // any number of commas
+  assert.equal(settleOverride({ text: 'a normal message' }), null);
+  assert.equal(WAIT_SIGNAL_MS, 60_000);
+});
+
+test('settleWindowFor: explicit override beats the adaptive tier', () => {
+  assert.equal(settleWindowFor({ text: 'go..' }, 1), 0);                 // lone short would be A(30s) → forced 0
+  assert.equal(settleWindowFor({ text: 'a full sentence,' }, 3), WAIT_SIGNAL_MS); // batch would be C(10s) → forced 60s
+});
+
+test('shouldSettleBatch: ".." delivers now; "," waits up to 60s', () => {
+  assert.equal(shouldSettleBatch([mk(99, { text: 'go..' })], 100_000), false);   // window 0 → never defer
+  assert.equal(shouldSettleBatch([mk(70, { text: 'more,' })], 100_000), true);   // age 30s < 60s → defer
+  assert.equal(shouldSettleBatch([mk(39, { text: 'more,' })], 100_000), false);  // age 61s ≥ 60s → release
 });
 
 test('isDmControlMessage: matches /dm forms (case-insensitive, @botname, bare), rejects others', () => {
