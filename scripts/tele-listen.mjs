@@ -2436,9 +2436,30 @@ async function main() {
   await reactToMessages(token, toProcess);
   advanceLoopOffset();
   const preview = data.text.slice(0, 60);
-  console.log(
-    `[tele-listen] prompt written to ${promptFile}: "${preview}${data.text.length > 60 ? '…' : ''}" (messageId: ${data.messageId})`,
-  );
+  const previewMsg = `"${preview}${data.text.length > 60 ? '…' : ''}" (messageId: ${data.messageId})`;
+  // RFC 03 unify (announcePreexisting only): the write-path also CLAIMS-before-
+  // ANNOUNCES, so it never leaves an OPEN prompt for the top-of-poll claim-branch to
+  // RE-announce next poll (the double-announce). Result: exactly one announce/message.
+  //
+  // claimPreexistingPrompt is the single decider (keyed on `.processing`, not on the
+  // write's merged/spooled outcome — which conflates empty-slot with busy-claimed):
+  //  - no `.processing` (idle agent, empty slot OR coalesced open prompt) → CLAIM the
+  //    just-written open prompt + announce ONCE;
+  //  - `.processing` in flight (agent busy) → returns false → we DON'T announce; the
+  //    prompt we just spooled waits, and the claim-branch surfaces it once the agent
+  //    frees up. Either way: exactly one announce, no dup.
+  if (append && announcePreexisting && convo != null) {
+    const writeLock = path.join(DEFAULT_TMP_DIR, `prompt-write-${convo}.lock`);
+    if (claimPreexistingPrompt(promptFile, processingFile, writeLock)) {
+      // Same "claimed by listener" marker as the top-of-poll claim-branch (§5.2) so
+      // the agent's CLAIM protocol treats both identically: read `.processing`, do
+      // NOT re-`mv` (a re-`mv` could clobber `.processing` if a fresh prompt spooled
+      // in the race window — subagent FINDING 1).
+      console.log(`[tele-listen] prompt ready: ${promptFile} (claimed by listener) ${previewMsg}`);
+    }
+    process.exit(0);
+  }
+  console.log(`[tele-listen] prompt written to ${promptFile}: ${previewMsg}`);
   // (Heartbeat auto-reminders moved to daemon.mjs.)
   process.exit(0);
 }
