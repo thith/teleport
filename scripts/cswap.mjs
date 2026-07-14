@@ -6,6 +6,7 @@
 // accounts is host-wide — it affects every agent sharing this machine's Claude
 // Code login — so the command is gated to maintainer in commands.json.
 import { fileURLToPath } from 'node:url';
+import { isMainModule } from './is-direct-run.mjs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 
@@ -19,7 +20,7 @@ export function planCswap(args) {
   return { argv: ['--switch-to', target] };
 }
 
-if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1])) {
+if (isMainModule(import.meta.url)) {
   const plan = planCswap(process.argv.slice(2));
   const r = spawnSync('cswap', plan.argv, { timeout: CSWAP_TIMEOUT_MS, maxBuffer: 1024 * 1024, encoding: 'utf8' });
   if (r.error) { process.stdout.write(`❌ ${r.error.code === 'ENOENT' ? 'cswap not found on PATH' : r.error.message}\n`); process.exit(1); }

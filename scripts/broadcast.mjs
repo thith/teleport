@@ -13,6 +13,7 @@
 
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { isMainModule } from './is-direct-run.mjs';
 import { readTopicsStore } from './topics-store.mjs';
 import { listLiveTopics } from './handover.mjs';
 import { durableWrite } from './steer.mjs';
@@ -100,7 +101,7 @@ export async function doBroadcast(argv, {
   return { ok: true, sent, skipped: failed.length, total: live.length, message: msg };
 }
 
-if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1])) {
+if (isMainModule(import.meta.url)) {
   const from = { id: process.env.TELE_FROM_ID, role: process.env.TELE_FROM_ROLE, name: process.env.TELE_FROM_NAME };
   const res = await doBroadcast(process.argv.slice(2), { from });
   process.stdout.write((res.message || '') + '\n');

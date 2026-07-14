@@ -15,6 +15,7 @@
 // modules are fully initialised, never at load. Do NOT add an eager teleport
 // import here or you reintroduce the cycle.
 import { fileURLToPath } from 'node:url';
+import { isMainModule } from './is-direct-run.mjs';
 import path from 'node:path';
 
 // 40 pairs. Names ≤ 2 words, all unique; emoji all unique. Curated so visually
@@ -205,6 +206,6 @@ async function runCli() {
 // the latter mismatches on paths with spaces/Unicode (URL-encoded in
 // import.meta.url, raw in argv) and on Windows, silently no-op'ing the CLI.
 // Same idiom as send-telegram.mjs.
-if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1])) {
+if (isMainModule(import.meta.url)) {
   runCli().catch((err) => { console.error(err); process.exit(1); });
 }

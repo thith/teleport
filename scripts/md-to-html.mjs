@@ -13,7 +13,7 @@
 // Gửi: send-telegram.mjs --file <...>.html (KHÔNG gửi path/.md dạng text).
 import fs from 'fs';
 import path from 'path';
-import { pathToFileURL } from 'url';
+import { isMainModule } from './is-direct-run.mjs';
 
 const ROOT = process.cwd();
 const OUT_DIR = path.join(ROOT, 'tmp/tele-html');
@@ -201,6 +201,6 @@ function main() {
 }
 
 // Chỉ chạy CLI khi gọi trực tiếp (node md-to-html.mjs …) — import từ test KHÔNG kích hoạt side-effect.
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) main();
+if (isMainModule(import.meta.url)) main();
 
 export { esc, safeUrl, emph, inlineMd, ROW, isBlockStart, parseList, mdToHtml, titleOf, tpl };

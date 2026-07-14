@@ -12,6 +12,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { isMainModule } from './is-direct-run.mjs';
 import { execFileSync } from 'node:child_process';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -153,7 +154,7 @@ function defaultGit(dest) {
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
-const isDirectRun = fileURLToPath(import.meta.url) === path.resolve(process.argv[1] ?? '');
+const isDirectRun = isMainModule(import.meta.url);
 if (isDirectRun) {
   const args = parseScaffoldArgs(process.argv.slice(2));
   const e1 = validateProjectName(args.project);

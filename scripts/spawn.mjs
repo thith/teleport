@@ -30,6 +30,7 @@ import { spawn as cpSpawn, execFileSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { isMainModule } from './is-direct-run.mjs';
 import { uuidToConvoInt } from './convo-registry.mjs';
 import { shortConvoHash } from './convo-hash.mjs';
 import { readTopicsStore } from './topics-store.mjs';
@@ -443,7 +444,7 @@ export function runSpawn(plan, { runner, cwd, spawnFn = cpSpawn } = {}) {
   return { ...plan, pid: child.pid };
 }
 
-const isDirectRun = fileURLToPath(import.meta.url) === path.resolve(process.argv[1] ?? '');
+const isDirectRun = isMainModule(import.meta.url);
 if (isDirectRun) {
   const argv = process.argv.slice(2);
 

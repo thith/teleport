@@ -10,6 +10,7 @@
 // existing `whisper.test.mjs` pins (proving the refactor kept behavior identical).
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { isMainModule } from './is-direct-run.mjs';
 import { doSteer, buildSteerPrompt, projectLabelForChat, targetFromReply, REPLY_TEXT_MAX } from './steer.mjs';
 
 export { projectLabelForChat, targetFromReply, REPLY_TEXT_MAX };
@@ -24,7 +25,7 @@ export const doWhisper = (argv, opts = {}) => doSteer(argv, {
   ack: ({ label }) => `🤫 whispered to ${label} (kín, không hiện trong group).`,
 }, opts);
 
-if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1])) {
+if (isMainModule(import.meta.url)) {
   const from = { id: process.env.TELE_FROM_ID, role: process.env.TELE_FROM_ROLE, name: process.env.TELE_FROM_NAME, messageId: process.env.TELE_MESSAGE_ID };
   const res = await doWhisper(process.argv.slice(2), { from }); // replyText from TELE_REPLY_TEXT
   process.stdout.write((res.message || '') + '\n');

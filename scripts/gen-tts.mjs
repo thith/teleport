@@ -13,6 +13,7 @@
 
 import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import { isMainModule } from './is-direct-run.mjs';
 import path from 'node:path';
 import {
   GEMINI_BASE, loadGeminiKey, callGemini, collectText, extFromMime,
@@ -181,6 +182,6 @@ async function main(argv) {
   if (a.send) deliverToTelegram(outPath, a.convo, `🗣️ ${a.prompt}`.slice(0, 1000));
 }
 
-if (fileURLToPath(import.meta.url) === path.resolve(process.argv[1] ?? '')) {
+if (isMainModule(import.meta.url)) {
   main(process.argv.slice(2)).catch((e) => { console.error('[gen-tts] ' + (e?.message ?? e)); process.exit(1); });
 }

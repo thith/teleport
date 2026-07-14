@@ -14,6 +14,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { isMainModule } from './is-direct-run.mjs';
 import { loadEnvFromFile, readSentRegistry, extractBotId } from './send-telegram.mjs';
 import {
   acquireLock, appendRowLocked, CONVO_SCHEMA_VERSION,
@@ -184,7 +185,7 @@ async function main() {
   }
 }
 
-const isDirectRun = fileURLToPath(import.meta.url) === path.resolve(process.argv[1] ?? '');
+const isDirectRun = isMainModule(import.meta.url);
 if (isDirectRun) {
   main().catch((e) => {
     console.error(`[import-convo] ${e instanceof Error ? e.message : String(e)}`);

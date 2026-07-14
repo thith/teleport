@@ -4,6 +4,7 @@
 // from `commands.json` (each command's `desc` carries its usage), so /help can
 // never drift from the real command table. Aliases are shown as `/x = /full`.
 import { fileURLToPath } from 'node:url';
+import { isMainModule } from './is-direct-run.mjs';
 import path from 'node:path';
 import fs from 'node:fs';
 
@@ -31,7 +32,7 @@ export function renderHelp(commands) {
   return lines.join('\n');
 }
 
-if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1])) {
+if (isMainModule(import.meta.url)) {
   const commands = JSON.parse(fs.readFileSync(COMMANDS_FILE, 'utf8'));
   process.stdout.write(renderHelp(commands) + '\n');
 }

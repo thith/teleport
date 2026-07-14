@@ -11,6 +11,7 @@
 // Same shared core as whisper (`steer.mjs`) — only the flag/usage/ack differ.
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { isMainModule } from './is-direct-run.mjs';
 import { doSteer, buildSteerPrompt } from './steer.mjs';
 
 const USAGE = 'usage: /instruct #<hash|persona|convoId> <text>  (hoặc reply tin bot/instruct trước rồi gõ /instruct <text>)';
@@ -22,7 +23,7 @@ export const doInstruct = (argv, opts = {}) => doSteer(argv, {
   ack: ({ label }) => `📩 instructed ${label} — trả lời sẽ về DM (không vào group).`,
 }, opts);
 
-if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1])) {
+if (isMainModule(import.meta.url)) {
   const from = { id: process.env.TELE_FROM_ID, role: process.env.TELE_FROM_ROLE, name: process.env.TELE_FROM_NAME, messageId: process.env.TELE_MESSAGE_ID };
   const res = await doInstruct(process.argv.slice(2), { from }); // replyText from TELE_REPLY_TEXT
   process.stdout.write((res.message || '') + '\n');

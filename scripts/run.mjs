@@ -6,6 +6,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { isMainModule } from './is-direct-run.mjs';
 import { spawnSync } from 'node:child_process';
 
 export const RUN_TIMEOUT_MS = 5 * 60 * 1000;
@@ -57,7 +58,7 @@ export function planRun(cwd, script, args, { detect = detectPackageManager, read
   return { pm: detect(cwd), argv: buildRunArgv(script, args), cwd };
 }
 
-if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1])) {
+if (isMainModule(import.meta.url)) {
   const [script, ...args] = process.argv.slice(2);
   const cwd = process.cwd();
   const plan = planRun(cwd, script, args);

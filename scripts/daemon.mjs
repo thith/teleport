@@ -33,6 +33,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { isMainModule } from './is-direct-run.mjs';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 const execFileP = promisify(execFile);
@@ -386,7 +387,7 @@ export async function dispatchCommand(parsed, from, {
 }
 
 // CLI: `node daemon.mjs` (run) | `--status` | `--stop`.
-const isDirectRun = fileURLToPath(import.meta.url) === path.resolve(process.argv[1] ?? '');
+const isDirectRun = isMainModule(import.meta.url);
 if (isDirectRun) {
   const argv = process.argv.slice(2);
   if (argv.includes('--status')) {

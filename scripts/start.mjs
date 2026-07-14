@@ -18,7 +18,8 @@ export const START_BODY = [
 ].join('\n');
 
 import { fileURLToPath } from 'node:url';
+import { isMainModule } from './is-direct-run.mjs';
 import path from 'node:path';
-if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1])) {
+if (isMainModule(import.meta.url)) {
   process.stdout.write(START_BODY + '\n');
 }

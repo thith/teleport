@@ -5,6 +5,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { isMainModule } from './is-direct-run.mjs';
 import {
   acquireLock as acquireConvoLock,
   appendRowLocked as appendConvoRow,
@@ -1899,7 +1900,7 @@ function emitConvoLine({ convoId, messageId }) {
   }
 }
 
-const isDirectRun = fileURLToPath(import.meta.url) === path.resolve(process.argv[1] ?? '');
+const isDirectRun = isMainModule(import.meta.url);
 if (isDirectRun) {
   const tokenForScrub =
     process.env.REPORT_BOT_TOKEN || loadEnvFromFile(ENV_FILE).REPORT_BOT_TOKEN || '';
