@@ -678,6 +678,41 @@ export function buildTempMarkdownFileName(now = new Date(), pid = process.pid) {
  * document preserves the markdown source so the admin can read it properly,
  * instead of collapsing formatting to plain text.
  */
+/**
+ * Chuyển Markdown (bản ta hay viết) sang HTML mà Telegram nhận.
+ *
+ * Telegram HTML chỉ cho một nhúm thẻ: b · i · u · s · code · pre · a · blockquote. Không có heading,
+ * không có bảng, không có danh sách — nên phần đó phải hạ xuống chữ thường chứ không bỏ đi, nếu
+ * không người nhận mất nội dung.
+ *
+ * ⚠️ THỨ TỰ QUAN TRỌNG: escape `& < >` TRƯỚC, rồi mới chèn thẻ. Làm ngược lại thì chính thẻ ta vừa
+ * chèn bị escape thành chữ.
+ */
+export function markdownToTelegramHtml(md) {
+  const esc = (t) => t.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const out = [];
+  // Khối code ```…``` giữ nguyên, không đụng tới ruột.
+  const parts = String(md).split(/```/);
+  for (let i = 0; i < parts.length; i += 1) {
+    if (i % 2 === 1) { out.push(`<pre>${esc(parts[i])}</pre>`); continue; }
+    let t = esc(parts[i]);
+    t = t.replace(/`([^`\n]+)`/g, '<code>$1</code>');
+    // Heading markdown → in đậm (Telegram không có heading).
+    t = t.replace(/^#{1,6}\s*(.+)$/gm, '<b>$1</b>');
+    t = t.replace(/\*\*([^*\n]+)\*\*/g, '<b>$1</b>');
+    t = t.replace(/(^|[^*])\*([^*\n]+)\*/g, '$1<i>$2</i>');
+    t = t.replace(/^\s*[-*]\s+/gm, '• ');
+    // Bảng markdown: bỏ dòng kẻ ---|---, giữ dòng dữ liệu (mất cột nhưng còn chữ).
+    // ⚠️ `[^\\S\\n]` (khoảng trắng NGANG) chứ không phải `\\s`: `\\s` khớp cả xuống dòng nên nó nuốt
+    // luôn các dòng sau, làm cả bảng dính thành một dòng. Đã dính lỗi này lúc thử.
+    t = t.replace(/^[ \t|:-]*-[ \t|:-]*$/gm, '');
+    // Lại `[^\\S\\n]` chứ không `\\s` — cùng lý do: `\\s*$` nuốt xuống dòng, cả bảng dính một dòng.
+    t = t.replace(/^[^\S\n]*\|(.+)\|[^\S\n]*$/gm, (_m, row) => row.split('|').map((c) => c.trim()).filter(Boolean).join(' · '));
+    out.push(t);
+  }
+  return out.join('');
+}
+
 export function createTempMarkdownFile(content, tmpDir = os.tmpdir()) {
   const filePath = path.join(tmpDir, buildTempMarkdownFileName());
   fs.writeFileSync(filePath, content, 'utf8');
@@ -1243,6 +1278,27 @@ export async function sendTextChunk(token, chatId, rawChunk, { raw, plain, reply
 
   const desc = first.description ?? `HTTP ${first.status}`;
   if (/can't parse entities|can\u2019t parse entities/i.test(desc)) {
+    /**
+     * BƯỚC CỨU 1 — THỬ HTML INLINE TRƯỚC KHI ĐÍNH FILE.
+     *
+     * ═══ VÌ SAO ═══
+     * Trước bước này, MarkdownV2 fail là rơi THẲNG xuống đính file. Người nhận phải TẢI VỀ rồi mới
+     * đọc được một tin nhắn lẽ ra chỉ là mấy dòng chữ — chị Hà phản ánh đúng chỗ này ("sao cứ phải
+     * gửi file md vậy, khó xem").
+     *
+     * MarkdownV2 của Telegram khó chiều: nó bắt escape ~15 ký tự, chỉ cần sót MỘT dấu chấm hay dấu
+     * ngoặc là cả tin bị từ chối. HTML thì chỉ có BA ký tự phải escape (& < >), nên gần như luôn
+     * qua được. Đổi lại chỉ mất vài kiểu định dạng hiếm dùng.
+     *
+     * Thứ tự nay là: MarkdownV2 → HTML inline → mới tới file. File thành phương án CUỐI, không phải
+     * phương án thứ hai.
+     */
+    const htmlBody = markdownToTelegramHtml(rawChunk);
+    const htmlTry = await postSendMessage(token, chatId, htmlBody, 'HTML', replyTo, messageThreadId);
+    if (htmlTry.ok) {
+      return { ok: true, fallback: false, messageId: assertMessageId(htmlTry, 'html inline fallback') };
+    }
+
     let tmpPath;
     try {
       tmpPath = createTempMarkdownFile(rawChunk);
