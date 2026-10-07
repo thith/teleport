@@ -12,7 +12,7 @@ function tmpJson(obj) {
 }
 
 test('normUsername: strips @, lowercases, empty → null', () => {
-  assert.equal(normUsername('@Thi_Truong'), 'thi_truong');
+  assert.equal(normUsername('@Alice_Nguyen'), 'alice_nguyen');
   assert.equal(normUsername('lan'), 'lan');
   assert.equal(normUsername(''), null);
   assert.equal(normUsername(null), null);
@@ -21,11 +21,11 @@ test('normUsername: strips @, lowercases, empty → null', () => {
 // --- Rule 1: row already keyed by id → SKIP, never overwrite ---------------
 
 test('upsertMember: id already present → unchanged (object preserved)', () => {
-  const roles = { '144242180': { role: 'admin', title: 'anh', name: 'Thi' } };
-  const r = upsertMember(roles, { id: 144242180, username: 'newhandle', first_name: 'X' });
+  const roles = { '100000001': { role: 'admin', title: 'anh', name: 'Alice' } };
+  const r = upsertMember(roles, { id: 100000001, username: 'newhandle', first_name: 'X' });
   assert.equal(r.changed, false);
   assert.equal(r.roles, roles); // same ref, nothing rewritten
-  assert.deepEqual(r.roles['144242180'], { role: 'admin', title: 'anh', name: 'Thi' });
+  assert.deepEqual(r.roles['100000001'], { role: 'admin', title: 'anh', name: 'Alice' });
 });
 
 test('upsertMember: id present even as string shorthand → unchanged', () => {
@@ -104,26 +104,26 @@ test('upsertMember: different username does NOT match an id-keyed row (no false 
 // --- harvestMembers persistence -------------------------------------------
 
 test('harvestMembers: writes new rows into [code].roles atomically', () => {
-  const f = tmpJson({ luni: { chatId: '-100', roles: { '1': 'admin' } } });
-  const n = harvestMembers([{ id: 2, username: 'lan', first_name: 'Lan' }], { projectCode: 'luni', file: f });
+  const f = tmpJson({ acmebot: { chatId: '-100', roles: { '1': 'admin' } } });
+  const n = harvestMembers([{ id: 2, username: 'lan', first_name: 'Lan' }], { projectCode: 'acmebot', file: f });
   assert.equal(n, 1);
   const after = JSON.parse(fs.readFileSync(f, 'utf8'));
-  assert.equal(after.luni.roles['1'], 'admin'); // untouched
-  assert.equal(after.luni.roles['2'].username, 'lan');
+  assert.equal(after.acmebot.roles['1'], 'admin'); // untouched
+  assert.equal(after.acmebot.roles['2'].username, 'lan');
   fs.unlinkSync(f);
 });
 
 test('harvestMembers: catch-all members harvest into the _default roster', () => {
-  const f = tmpJson({ _default: { chatId: '-100', roles: {} }, luni: { chatId: '-200' } });
+  const f = tmpJson({ _default: { chatId: '-100', roles: {} }, acmebot: { chatId: '-200' } });
   const n = harvestMembers([{ id: 5, username: 'mai', first_name: 'Mai' }], { projectCode: '_default', file: f });
   assert.equal(n, 1);
   const after = JSON.parse(fs.readFileSync(f, 'utf8'));
-  assert.equal(after._default.roles['5'].username, 'mai'); // went into _default, not luni
+  assert.equal(after._default.roles['5'].username, 'mai'); // went into _default, not acmebot
   fs.unlinkSync(f);
 });
 
 test('harvestMembers: auto-creates the _default block when absent (but NOT a normal project)', () => {
-  const f = tmpJson({ luni: { chatId: '-200' } }); // no _default yet
+  const f = tmpJson({ acmebot: { chatId: '-200' } }); // no _default yet
   const n = harvestMembers([{ id: 6, username: 'tan', first_name: 'Tan' }], { projectCode: '_default', file: f });
   assert.equal(n, 1);
   assert.equal(JSON.parse(fs.readFileSync(f, 'utf8'))._default.roles['6'].username, 'tan'); // _default stubbed
@@ -135,7 +135,7 @@ test('harvestMembers: auto-creates the _default block when absent (but NOT a nor
 });
 
 test('harvestMembers: de-dupes batch + skips bots & known ids → may write 0', () => {
-  const f = tmpJson({ luni: { chatId: '-100', roles: { '1': 'admin' } } });
+  const f = tmpJson({ acmebot: { chatId: '-100', roles: { '1': 'admin' } } });
   const n = harvestMembers(
     [
       { id: 1, username: 'admin' }, // known → skip
@@ -143,33 +143,33 @@ test('harvestMembers: de-dupes batch + skips bots & known ids → may write 0', 
       { id: 5, username: 'a' },
       { id: 5, username: 'a' }, // dup in batch → once
     ],
-    { projectCode: 'luni', file: f },
+    { projectCode: 'acmebot', file: f },
   );
   assert.equal(n, 1);
   const after = JSON.parse(fs.readFileSync(f, 'utf8'));
-  assert.ok(after.luni.roles['5']);
-  assert.equal(after.luni.roles['9'], undefined);
+  assert.ok(after.acmebot.roles['5']);
+  assert.equal(after.acmebot.roles['9'], undefined);
   fs.unlinkSync(f);
 });
 
 test('harvestMembers: no project entry → no write, returns 0', () => {
   const f = tmpJson({ other: { chatId: '-1', roles: {} } });
   const before = fs.readFileSync(f, 'utf8');
-  const n = harvestMembers([{ id: 2, username: 'x' }], { projectCode: 'luni', file: f });
+  const n = harvestMembers([{ id: 2, username: 'x' }], { projectCode: 'acmebot', file: f });
   assert.equal(n, 0);
   assert.equal(fs.readFileSync(f, 'utf8'), before); // untouched
   fs.unlinkSync(f);
 });
 
 test('harvestMembers: nothing changed → file untouched (returns 0)', () => {
-  const f = tmpJson({ luni: { chatId: '-100', roles: { '1': 'admin' } } });
+  const f = tmpJson({ acmebot: { chatId: '-100', roles: { '1': 'admin' } } });
   const before = fs.readFileSync(f, 'utf8');
-  const n = harvestMembers([{ id: 1, username: 'admin' }], { projectCode: 'luni', file: f });
+  const n = harvestMembers([{ id: 1, username: 'admin' }], { projectCode: 'acmebot', file: f });
   assert.equal(n, 0);
   assert.equal(fs.readFileSync(f, 'utf8'), before);
   fs.unlinkSync(f);
 });
 
 test('harvestMembers: missing/corrupt file → 0, no throw', () => {
-  assert.equal(harvestMembers([{ id: 1 }], { projectCode: 'luni', file: '/no/such/file.json' }), 0);
+  assert.equal(harvestMembers([{ id: 1 }], { projectCode: 'acmebot', file: '/no/such/file.json' }), 0);
 });

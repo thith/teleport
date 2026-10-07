@@ -14,13 +14,13 @@ const HASH2 = shortConvoHash(CONVO2);
 const ACK = `🤫 whispered to ☃️ X #${HASH} (kín)`; // a bot-ack-shaped reply text
 
 test('buildWhisperPrompt: injected shape with whisper flag + real fromRole', () => {
-  const p = buildWhisperPrompt({ targetConvoId: '2205483045424020', targetChatId: '-100', fromUserId: '144242180', fromName: 'Thi', fromRole: 'admin', text: 'hãy confirm' });
+  const p = buildWhisperPrompt({ targetConvoId: '2205483045424020', targetChatId: '-100', fromUserId: '100000001', fromName: 'Alice', fromRole: 'admin', text: 'hãy confirm' });
   assert.equal(p.whisper, true);
   assert.equal(p.messageId, null);       // injected, not a real message
   assert.equal(p.convoId, 2205483045424020);
   assert.equal(p.chatId, '-100');
   assert.equal(p.fromRole, 'admin');
-  assert.equal(p.fromUserId, '144242180');
+  assert.equal(p.fromUserId, '100000001');
   assert.equal(p.text, 'hãy confirm');
   assert.deepEqual(p.attachments, []);
 });
@@ -28,7 +28,7 @@ test('buildWhisperPrompt: injected shape with whisper flag + real fromRole', () 
 test('doWhisper: resolves convoId target, writes prompt, carries identity', async () => {
   const writes = [];
   const res = await doWhisper([CONVO, 'nhắc', 'nhẹ', 'nhé'], {
-    from: { id: '7', role: 'admin', name: 'Thi' }, config: CONFIG, store: STORE,
+    from: { id: '7', role: 'admin', name: 'Alice' }, config: CONFIG, store: STORE,
     tmpDir: '/tmp/tele', writePrompt: (prompt, file) => writes.push({ prompt, file }),
   });
   assert.equal(res.ok, true);

@@ -12,7 +12,7 @@ test('parseBroadcastArgs: text join; --chat (space/=) extracted; empty → usage
 });
 
 test('buildBroadcastPrompt: broadcast field, non-privileged role, injected (messageId null)', () => {
-  const p = buildBroadcastPrompt({ targetConvoId: '111', targetChatId: '-100', fromUserId: '144', fromName: 'Thi', fromRole: 'admin', text: 'reload guide' });
+  const p = buildBroadcastPrompt({ targetConvoId: '111', targetChatId: '-100', fromUserId: '144', fromName: 'Alice', fromRole: 'admin', text: 'reload guide' });
   assert.equal(p.messageId, null);
   assert.equal(p.fromRole, 'admin');           // sender's real role carried for the receiver's gate
   assert.equal(p.fromMember, null);
@@ -38,7 +38,7 @@ test('doBroadcast: durable fan-out — a hard write failure on one topic is coun
     if (file.includes('222')) throw new Error('disk full'); // 222 fails hard (NOT busy — busy coalesces)
     written.push(file);
   };
-  const r = await doBroadcast(['reload', 'guide'], { from: { id: '144', role: 'admin', name: 'Thi' }, config: CFG, store: STORE, writePrompt, env: {}, envFile: {} });
+  const r = await doBroadcast(['reload', 'guide'], { from: { id: '144', role: 'admin', name: 'Alice' }, config: CFG, store: STORE, writePrompt, env: {}, envFile: {} });
   assert.equal(r.ok, true);
   assert.equal(r.sent, 1);
   assert.equal(r.skipped, 1);   // 1 hard failure

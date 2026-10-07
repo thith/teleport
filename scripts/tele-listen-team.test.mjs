@@ -6,7 +6,7 @@ const ADMINS = ['-1001234'];
 const TMAP = new Map([['-1001234', 55]]);
 
 function upd(id, { thread = null, text = 'hi', replyTo = null, chatId = -1001234 } = {}) {
-  const message = { message_id: id, chat: { id: chatId }, from: { id: 7, first_name: 'Thi' }, text };
+  const message = { message_id: id, chat: { id: chatId }, from: { id: 7, first_name: 'Alice' }, text };
   if (thread != null) message.message_thread_id = thread;
   if (replyTo != null) message.reply_to_message = { message_id: replyTo };
   return { update_id: id, message };
@@ -147,22 +147,22 @@ test('shouldSettleBatch: ".." delivers now; "," waits up to 60s', () => {
 test('isDmControlMessage: matches /dm forms (case-insensitive, @botname, bare), rejects others', () => {
   assert.equal(DM_CONTROL_PREFIX, 'dm');
   assert.ok(isDmControlMessage('/dm setup -100'));
-  assert.ok(isDmControlMessage('/DM spawn luni'));
+  assert.ok(isDmControlMessage('/DM spawn acmebot'));
   assert.ok(isDmControlMessage('  /dm@TeleBot ls  '));
   assert.ok(isDmControlMessage('/dm'));                 // bare → still hidden from agent
   assert.equal(isDmControlMessage('/dmesg now'), false); // not the dm command (no separator)
   assert.equal(isDmControlMessage('hello /dm'), false);  // not at start
-  assert.equal(isDmControlMessage('/spawn luni'), false);
+  assert.equal(isDmControlMessage('/spawn acmebot'), false);
   assert.equal(isDmControlMessage(null), false);
 });
 
 test('stripDmControlPrefix: /dm <cmd> → /<cmd>; bare /dm → null; inner slash kept', () => {
   assert.equal(stripDmControlPrefix('/dm setup -100 --code x'), '/setup -100 --code x');
-  assert.equal(stripDmControlPrefix('/DM spawn luni'), '/spawn luni');
+  assert.equal(stripDmControlPrefix('/DM spawn acmebot'), '/spawn acmebot');
   assert.equal(stripDmControlPrefix('/dm /ls'), '/ls');   // already-slashed inner kept as-is
   assert.equal(stripDmControlPrefix('/dm'), null);        // nothing to dispatch
   assert.equal(stripDmControlPrefix('/dm   '), null);
-  assert.equal(stripDmControlPrefix('/spawn luni'), null); // not a /dm message
+  assert.equal(stripDmControlPrefix('/spawn acmebot'), null); // not a /dm message
 });
 
 test('collectMessagesToProcess: drops /dm control messages from the agent prompt', () => {

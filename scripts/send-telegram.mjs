@@ -10,11 +10,13 @@ import {
   acquireLock as acquireConvoLock,
   appendRowLocked as appendConvoRow,
   buildConvoFilter,
+  argConvoFromArgv,
   CONVO_ID_RE,
   CONVO_SCHEMA_VERSION,
   DEFAULT_LOCK_FILE as CONVO_LOCK_FILE,
   DEFAULT_REGISTRY_FILE as CONVO_REGISTRY_FILE,
   hasAllocationRow,
+  lookupAllocationByConvo,
   lookupConvoIdByMessageId,
   pruneLocked as pruneConvoRegistry,
   resolveConvoIdFromEnv,
@@ -38,7 +40,7 @@ import {
 import { CONVO_HASH_LONG_LEN, shortConvoHash as _shortConvoHash } from './convo-hash.mjs';
 import { formatPersona, personaForConvo } from './persona.mjs';
 import { resolvePersonaInGroup, peekPersona } from './persona-store.mjs';
-import { readProjectsConfig, resolveProjectConfig, adminIdsFrom, resolveDefaultChatId, resolveDaemonUserId, assertChatIdKind } from './projects-config.mjs';
+import { readProjectsConfig, resolveProjectConfig, resolveProjectRouting, adminIdsFrom, resolveDefaultChatId, resolveDaemonUserId, assertChatIdKind, resolveSendOnly } from './projects-config.mjs';
 
 // Re-export so existing imports of `shortConvoHash` from send-telegram keep
 // working. Logic now lives in convo-hash.mjs (leaf, no circular deps).
@@ -52,19 +54,168 @@ const TELEGRAM_API = 'https://api.telegram.org/bot';
 const SENT_REGISTRY_FILE = path.join(__dirname, 'tmp', 'tele-reply', 'sent-registry.jsonl');
 const TELE_REPLY_DIR = path.join(__dirname, 'tmp', 'tele-reply');
 
-// RFC 02 P1: auto-consume. After a successful send into a convo, delete that
-// convo's CLAIMED prompt (`prompt-convo-N.processing.json`) so the agent never
-// manually `rm`. Deletes ONLY the `.processing.json` (a claimed batch), NEVER
-// the bare `prompt-convo-N.json` (the OPEN inbox — dropping it would lose
-// unhandled messages). No-op when the convo was not claimed (Gemini/Codex, or a
+// Deletes ONLY the `.processing.json` (a claimed batch), NEVER the bare
+// `prompt-convo-N.json` (the OPEN inbox — dropping it would lose unhandled
+// messages). No-op when the convo was not claimed (Gemini/Codex, or a
 // proactive/status send create no `.processing.json`) → those flows unchanged
 // (the G4 firewall). Best-effort; returns true if it consumed something.
-export function autoConsumeClaimedPrompt(convoId, tmpDir = TELE_REPLY_DIR) {
+// The batch this send is PROVABLY answering, or not. Two independent proofs:
+//  1. `--claim-id` — the token the listener printed in the announce the agent
+//     read. An exact match means the agent handled THIS claim. This is the only
+//     mechanism that is always available and always right.
+//  2. `--reply-to <messageId>` — already part of the reply flow; if it names a
+//     message inside the claim, the agent demonstrably read the claim.
+//
+// With NEITHER proof the two situations we care about are genuinely
+// INDISTINGUISHABLE from here — "the agent read this batch and is answering it"
+// and "this batch was claimed mid-turn and the agent never saw it" both look like
+// a claim that was stamped after the agent's previous send. (An earlier revision
+// of this function tried to separate them by comparing `claimedAt` against the
+// previous send; that is wrong for the ordinary turn — the admin's message is
+// always claimed after the bot's last message — and would have parked, and
+// endlessly re-announced, batches that were in fact answered.) So we keep the
+// long-standing behaviour and delete, EXCEPT in the one case we can still prove:
+// a claim stamped after THIS process started cannot have been read by the agent,
+// which was already composing this send.
+//
+// Losses are prevented on the delivery side instead: the listener announces the
+// batch's FULL text, so a batch consumed unread has still reached the agent's
+// context and can be re-requested — and an agent that passes `--claim-id` (the
+// announce prints it, the guide mandates it) is never exposed to this at all.
+// ONE classifier for "does this send answer the batch sitting in the claim slot?".
+//
+// This evidence logic had been hand-copied into the consume gate and the routing
+// gate with different defaults, so every axiom added to one side had to be
+// mirrored by hand — and three review rounds in a row found bugs that were
+// exactly that mirroring going wrong (a steer deleted as "answered" by a reply
+// that went to the topic; a token treated as decisive on one side and ignored on
+// the other). One place for the evidence makes divergence structurally
+// impossible; the call sites become policy one-liners over the verdict.
+//
+// Returns 'yes' | 'no' | 'unknown'. What to DO about 'unknown' is each call
+// site's policy: consume deletes (parking an answered batch would re-announce it
+// forever), redirect stays fail-closed (better a steer answered privately than
+// leaked to the group).
+
+/**
+ * Every message id whose naming PROVES the sender read this claim.
+ *
+ * The batch's own message ids always qualify. The claim's `replyToMessageId` only
+ * qualifies for a STEER, and the asymmetry is the whole point:
+ *  - a steer's `replyToMessageId` is the sender's command message, living in the
+ *    sender's DM — an agent can only learn it FROM the claim, so naming it proves
+ *    reading. A real steer carries `messageId: null` and no `messages[]`
+ *    (steer.mjs marks injected prompts that way), so without this the set is empty
+ *    and a genuine steer answer would look like a reply that went elsewhere.
+ *  - a PLAIN claim's `replyToMessageId` is typically the bot's OWN report, which
+ *    the agent knows independently of the claim (it sent it) and routinely threads
+ *    off. Counting it would let "the admin replied to my report" be mistaken for
+ *    "I read the admin's reply" — and that false 'yes' outranks the processStartMs
+ *    park, deleting a mid-turn batch unread (Fable review).
+ */
+export function claimMessageIds(claim) {
+  const isSteer = !!(claim?.whisper || claim?.instruct);
+  return new Set([
+    claim?.messageId,
+    ...(Array.isArray(claim?.messages) ? claim.messages.map((m) => m?.messageId) : []),
+    ...(isSteer ? [claim?.replyToMessageId] : []),
+  ].filter((v) => v != null).map(Number));
+}
+
+/** True when the claim carries an edited version of message `id`. */
+export function claimNamesEditedMessage(claim, id) {
+  const n = Number(id);
+  if (Array.isArray(claim?.messages) && claim.messages.some((m) => m?.edited && Number(m.messageId) === n)) return true;
+  return Boolean(claim?.edited) && Number(claim?.messageId) === n && !Array.isArray(claim?.messages);
+}
+
+export function sendAnswersClaim(claim, { claimId = null, replyToMessageId = null, processStartMs = null } = {}) {
+  if (!claim || typeof claim !== 'object') return 'unknown';
+  // A token can only come from a STAMPED announce, so a token against an
+  // unstamped claim proves a different batch is in the slot.
+  // An unstamped claim falls out of the same comparison (a token never equals
+  // undefined), so this one line covers both "wrong batch" and "unstamped batch".
+  if (claimId != null) return claimId === claim.claimId ? 'yes' : 'no';
+  const isSteer = Boolean(claim.whisper || claim.instruct);
+  // A STEER's command message lives in the sender's DM (the daemon ignores its
+  // edits), so naming it stays proof even for a late claim — losing that would
+  // push a private steer reply into the public topic.
+  if (isSteer && replyToMessageId != null && claimMessageIds(claim).has(Number(replyToMessageId))) return 'yes';
+  // A claim stamped after THIS process started cannot have been read by the agent,
+  // which was already composing this send. Checked BEFORE plain reply-to evidence:
+  // an EDITED message keeps its original message_id, so a reply-to match cannot
+  // tell the (already answered) original from a correction claimed just now.
+  // (Edits claimed BEFORE a later send began are handled below: a reply-to that
+  // names an edited message is never proof.)
+  if (typeof claim.claimedAt === 'number' && processStartMs != null && claim.claimedAt > processStartMs) return 'no';
+  if (replyToMessageId != null) {
+    // A reply-to naming an EDITED message proves nothing: the edit keeps the
+    // original message_id, which the agent already knew from the version it
+    // answered. Park (re-deliver) unless the claim token says otherwise.
+    if (claimNamesEditedMessage(claim, replyToMessageId)) return 'no';
+    if (claimMessageIds(claim).has(Number(replyToMessageId))) return 'yes';
+    // For a STEER this is decisive: an agent answering a whisper/instruct replies
+    // to the steer itself or passes nothing, so a --reply-to naming anything else
+    // means this send belongs to another batch. Deliberately NOT gated on a
+    // non-empty id set — a real steer's set is empty by construction, which is
+    // exactly the case that must be caught. For a PLAIN claim a non-match is NOT a
+    // veto (an agent may reply to any bot message while answering the batch);
+    // vetoing there would park answered batches and re-announce them forever.
+    if (claim.whisper || claim.instruct) return 'no';
+  }
+  return 'unknown';
+}
+
+/** Consume policy: delete unless the evidence says the slot holds someone else's batch. */
+export function claimIsAnswered(claim, proof = {}) {
+  return sendAnswersClaim(claim, proof) !== 'no';
+}
+
+/** Routing policy: only a PROVEN other batch takes this send off the steer path. */
+// Same evidence as the consume gate (incl. processStartMs) — otherwise a steer
+// claimed AFTER this send started would route the send to the steer's DM while
+// the consume gate parks that steer as unread.
+export function answersAnotherClaim(args = {}, claimed = null, { processStartMs = PROCESS_START_MS } = {}) {
+  return sendAnswersClaim(claimed, { claimId: args.claimId, replyToMessageId: args.replyTo, processStartMs }) === 'no';
+}
+
+// Deletes ONLY the `.processing.json` (a claimed batch), NEVER the bare
+// `prompt-convo-N.json` (the OPEN inbox — dropping it would lose unhandled
+// messages). No-op when the convo was not claimed (Gemini/Codex, or a
+// proactive/status send create no `.processing.json`) → those flows unchanged
+// (the G4 firewall). Best-effort; returns true if it consumed something.
+// RFC 02 P1: auto-consume. After a successful send into a convo, delete that
+// convo's CLAIMED prompt (`prompt-convo-N.processing.json`) so the agent never
+// manually `rm` — but ONLY when this send is answering that batch (see
+// claimIsAnswered). An UNANSWERED claim is one the agent never read; deleting it
+// lost the message for good (the offset had already advanced). Instead we park it
+// as a `.stale.<pid>` snapshot — the exact shape `sweepOrphanSnapshots` in
+// tele-listen already adopts on its next poll (~seconds), folding it back into the
+// OPEN prompt so it is re-announced. Dup at worst, never a loss.
+export function autoConsumeClaimedPrompt(convoId, tmpDir = TELE_REPLY_DIR, proof = {}) {
   if (convoId == null) return false;
   const processingFile = path.join(tmpDir, `prompt-convo-${convoId}.processing.json`);
+  // TAKE the claim first, THEN judge it. Inspecting the shared pathname and
+  // deleting it afterwards is a TOCTOU: a peer consumer could take our claim and
+  // the listener could publish a DIFFERENT batch at the same path in between, and
+  // our `rm` would destroy a batch we never even looked at (Codex review). An
+  // atomic rename to a private snapshot means whatever we judge is exactly what we
+  // act on — and the snapshot name is one `sweepOrphanSnapshots` already adopts,
+  // so a crash right here re-delivers the batch instead of dropping it.
+  let taken = `${processingFile}.stale.${process.pid}`;
   try {
-    if (fs.existsSync(processingFile)) { fs.rmSync(processingFile, { force: true }); return true; }
-  } catch { /* best-effort */ }
+    for (let n = 1; fs.existsSync(taken); n++) taken = `${processingFile}.stale.${process.pid}-${n}`;
+    fs.renameSync(processingFile, taken);
+  } catch { return false; }                      // no claim (or a peer took it) → nothing to do
+  let claim = null;
+  try { claim = JSON.parse(fs.readFileSync(taken, 'utf8')); } catch { claim = null; }
+  if (claimIsAnswered(claim, proof)) {
+    try { fs.rmSync(taken, { force: true }); } catch { /* best-effort */ }
+    return true;
+  }
+  // Not ours: leave it parked. The listener's orphan sweep folds it back into the
+  // OPEN prompt on its next poll (~seconds) and announces it again.
+  console.error(`[send-telegram] a batch in this convo is not the one this send is answering — parked for re-delivery instead of deleted (pass --claim-id <id> from the "prompt ready" line to consume the batch you handled)`);
   return false;
 }
 
@@ -134,20 +285,49 @@ export function parseAdminChatIds(raw) {
 // Record one send into the convo-registry. `convoId` is REQUIRED (resolved
 // from the env chain or --convo by the caller). First use on a given
 // (botId, chatId, convoId) auto-writes the allocation row.
+// Routing results that came from a fresh cold-start resolution (not an anchor).
+const COLD_START_RESOLUTIONS = new Set(['git', 'cwd', 'default', 'override']);
+
 // Returns the resolved convoId (so the caller can echo it on stdout).
-export async function recordConvoSend({ convoId, messageId, chatId, botId }, registryFile = CONVO_REGISTRY_FILE, lockFile = CONVO_LOCK_FILE) {
+export async function recordConvoSend({ convoId, messageId, chatId, botId, projectKey = null, resolvedBy = null }, registryFile = CONVO_REGISTRY_FILE, lockFile = CONVO_LOCK_FILE) {
   if (convoId == null) throw new Error('recordConvoSend: convoId is required');
   const acquired = await acquireConvoLock(lockFile);
   if (!acquired) return { ok: false, reason: 'lock-timeout' };
   try {
     const { rows } = readConvoRows(registryFile);
     const resolved = convoId;
-    if (!hasAllocationRow(rows, resolved, botId, String(chatId))) {
-      // First send for this convo on this chat — write the allocation row.
-      appendConvoRow(
-        { v: CONVO_SCHEMA_VERSION, convoId: resolved, messageId: resolved, chatId: String(chatId), botId, ts: Date.now() },
-        registryFile,
-      );
+    // RFC 15: the allocation gate is (convoId, botId)-scoped, NOT chatId-scoped
+    // — one anchor per convo across chats. Re-check UNDER the lock (adopt-
+    // existing): if a concurrent cold-start already allocated, do NOT write a
+    // second allocation row (keeps first-writer-wins deterministic).
+    const existingAlloc = lookupAllocationByConvo(rows, resolved, botId);
+    if (!existingAlloc) {
+      // First send for this convo — write the anchor allocation row, stamping
+      // the resolved project (projectKey) + resolvedBy for recovery/diagnosis.
+      const allocRow = { v: CONVO_SCHEMA_VERSION, convoId: resolved, messageId: resolved, chatId: String(chatId), botId, ts: Date.now() };
+      if (projectKey) allocRow.projectKey = projectKey;
+      if (resolvedBy) allocRow.resolvedBy = resolvedBy;
+      appendConvoRow(allocRow, registryFile);
+    } else if (
+      (existingAlloc.resolvedBy === 'default-unresolved' && resolvedBy && resolvedBy !== 'default-unresolved')
+      // A legacy anchor whose chat no project owns any more was routed by a cold
+      // start (git/cwd/default/override) → pin that result too.
+      || (!existingAlloc.resolvedBy && !existingAlloc.projectKey && COLD_START_RESOLUTIONS.has(resolvedBy) && String(existingAlloc.chatId) !== String(chatId))
+    ) {
+      // The anchor was written while git was failing (or is a stale legacy row).
+      // This send resolved for real → PROMOTE it to the anchor
+      // (lookupAllocationByConvo prefers it), so the convo stops re-resolving per
+      // cwd and can't drift between projects.
+      const promoRow = { v: CONVO_SCHEMA_VERSION, convoId: resolved, messageId: resolved, chatId: String(chatId), botId, ts: Date.now() };
+      if (projectKey) promoRow.projectKey = projectKey;
+      promoRow.resolvedBy = resolvedBy;
+      promoRow.promotedFrom = existingAlloc.resolvedBy === 'default-unresolved' ? 'unresolved' : 'legacy';
+      appendConvoRow(promoRow, registryFile);
+    } else if (String(existingAlloc.chatId) !== String(chatId)) {
+      // Diagnostic only: this send's chat differs from the anchor's — a split
+      // already happened (concurrent cold-start race). We keep first-writer-wins
+      // (don't overwrite) and surface it via resolvedBy for debugging.
+      console.error(`[send-telegram] WARNING: convo ${resolved} anchored to chat ${existingAlloc.chatId} but sending to ${chatId} (resolvedBy=${resolvedBy ?? '?'}) — split detected, keeping anchor`);
     }
     if (messageId !== resolved) {
       // Dedupe against an existing (botId, chatId, messageId) row to avoid
@@ -252,7 +432,7 @@ export async function postReaction(token, chatId, messageId, emoji = '👍') {
 }
 
 export function parseArgs(argv) {
-  const result = { filePath: null, positional: [], raw: false, plain: false, replyTo: null, react: null, convo: null, gcTopics: false, closeTopic: false, dm: false };
+  const result = { filePath: null, positional: [], raw: false, plain: false, replyTo: null, react: null, convo: null, gcTopics: false, closeTopic: false, dm: false, claimId: null };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === '--convo') {
@@ -284,6 +464,13 @@ export function parseArgs(argv) {
       const n = parseInt(next, 10);
       if (isNaN(n) || String(n) !== next.trim() || n <= 0) throw new Error(`--reply-to must be a positive integer message ID, got: ${next}`);
       result.replyTo = n;
+      i++;
+      continue;
+    }
+    if (arg === '--claim-id') {
+      const next = argv[i + 1];
+      if (!next) throw new Error('--claim-id requires the token printed by tele-listen ("[claim: <id>]")');
+      result.claimId = next.trim();
       i++;
       continue;
     }
@@ -1283,7 +1470,7 @@ export async function sendTextChunk(token, chatId, rawChunk, { raw, plain, reply
      *
      * ═══ VÌ SAO ═══
      * Trước bước này, MarkdownV2 fail là rơi THẲNG xuống đính file. Người nhận phải TẢI VỀ rồi mới
-     * đọc được một tin nhắn lẽ ra chỉ là mấy dòng chữ — chị Hà phản ánh đúng chỗ này ("sao cứ phải
+     * đọc được một tin nhắn lẽ ra chỉ là mấy dòng chữ — người dùng phản ánh đúng chỗ này ("sao cứ phải
      * gửi file md vậy, khó xem").
      *
      * MarkdownV2 của Telegram khó chiều: nó bắt escape ~15 ký tự, chỉ cần sót MỘT dấu chấm hay dấu
@@ -1400,18 +1587,30 @@ export function isDmUnreachableError(desc) {
 async function main() {
   const envFromFile = loadEnvFromFile(ENV_FILE);
   const token = process.env.REPORT_BOT_TOKEN || envFromFile.REPORT_BOT_TOKEN;
-  // Lookup key = basename(cwd) (= the projects.json key). No env override, no
-  // project-local .env reading. The DISPLAY code is projCfg.code (entry.code
-  // short alias, e.g. "d_be", else the lookup key).
-  const lookupKey = path.basename(process.cwd()) || '';
-  // RFC 02: per-project group via projects.json[key].chatId (DEDICATED) →
-  // fallback to the catch-all default group (projects.json `_default.chatId`,
-  // or the deprecated TELEGRAM_ADMIN_CHAT_ID env). `dedicated` drives the
-  // topic-title form (dedicated persona-only vs catch-all code-first) and the
-  // `[code]` message prefix (catch-all only).
+  // RFC 15: routing is convo-anchored, not raw basename(cwd). Once a convo has an
+  // allocation row it OWNS its group/project (cwd — worktree/subdir — can't split
+  // it); only cold-start derives from cwd (git-common-dir → main checkout, then
+  // `_default`). `resolveProjectRouting` is the SHARED resolver (send + listen
+  // agree). convoId here is the env session id (Claude/Codex) — the stable anchor
+  // key across the whole session; args aren't parsed yet, so Gemini's --convo
+  // anchor is a follow-up (its cold-start git route still works).
   const projectsConfig = readProjectsConfig();
   const fallbackChatId = resolveDefaultChatId(projectsConfig, { env: process.env, envFile: envFromFile });
-  const projCfg = resolveProjectConfig(lookupKey, { config: projectsConfig, fallbackChatId });
+  const routingBotId = token ? extractBotId(token) : null;
+  // convoId for the anchor: native session env wins (Claude/Codex); `--convo`
+  // is the fallback for agents without a native session (Gemini), extracted
+  // minimally here since parseArgs runs below (RFC 15 — Gemini review Major).
+  const routingConvoId = resolveConvoIdFromEnv({ argConvo: argConvoFromArgv() }).convoId;
+  const routingRows = readConvoRows(CONVO_REGISTRY_FILE).rows;
+  const { lookupKey, projCfg, resolvedBy: routeResolvedBy } = resolveProjectRouting({
+    cwd: process.cwd(),
+    convoId: routingConvoId,
+    botId: routingBotId,
+    env: process.env,
+    registryRows: routingRows,
+    projectsConfig,
+    fallbackChatId,
+  });
   const projectCode = projCfg.code;
   const dedicatedGroup = projCfg.dedicated;
   // Per-project forum-topic icon (projects.json `topicIcon: { emoji?, color? }`).
@@ -1436,12 +1635,15 @@ async function main() {
     console.error(`[send-telegram] ${error.message}`);
     process.exit(1);
   }
+  // What this send can prove about the batch it is answering (see claimIsAnswered).
+  setConsumeProof({ claimId: args.claimId, replyTo: args.replyTo });
 
   // A group target is required for every path EXCEPT --dm (which pushes to the
   // owner's private chat and never touches the group). Gate the group-config
   // fail-fast on !args.dm so a DM works even in a project with no group mapped.
   if (!args.dm && adminIds.length === 0) {
-    console.error(`[send-telegram] project "${lookupKey}" chưa cấu hình group: thêm "${lookupKey}".chatId vào teleport/projects.json, hoặc đặt _default.chatId trong projects.json (shared catch-all).`);
+    const kd = lookupKey || path.basename(process.cwd()) || '(unknown)';
+    console.error(`[send-telegram] project "${kd}" chưa cấu hình group: thêm "${kd}".chatId vào teleport/projects.json, hoặc đặt _default.chatId trong projects.json (shared catch-all).`);
     process.exit(1);
   }
 
@@ -1571,7 +1773,10 @@ async function main() {
     // mode the caller pre-escaped its body, so we MdV2-escape the tag too; in
     // non-raw mode sendText/DocumentToAdmin escapes the whole message (Telegram
     // strips the backslashes, so the daemon still reads a clean `#hash`).
-    const signDm = (body) => buildDmSignedBody(body, preResolved, { raw: args.raw });
+    // Send-only machine: no listener here can receive the `/instruct` round-trip
+    // (the owner's daemon would look the hash up on ANOTHER machine), so don't
+    // sign — a tag that invites steering but goes nowhere is worse than none.
+    const signDm = (body) => buildDmSignedBody(body, resolveSendOnly(projectsConfig) ? null : preResolved, { raw: args.raw });
     try {
       let messageId;
       if (args.filePath) {
@@ -1631,7 +1836,7 @@ async function main() {
       }
     }
     const claimed = peekClaimedPrompt(redirectConvo);
-    if (redirectConvo != null && claimed && (claimed.instruct || claimed.whisper)) {
+    if (redirectConvo != null && claimed && !answersAnotherClaim(args, claimed) && (claimed.instruct || claimed.whisper)) {
       const kind = claimed.instruct ? 'instruct' : 'whisper';
       // Prefer the real sender; fail-closed to the owner's DM if it's absent.
       const ownerDm = resolveDaemonUserId(projectsConfig, { env: process.env, envFile: envFromFile });
@@ -1650,8 +1855,9 @@ async function main() {
       // messageThreadId: null → lands in the sender's private chat root.
       const dmOpts = { raw: args.raw, plain: args.plain, replyTo: replyToId, messageThreadId: null };
       // Sign with this convo's identity tag (as --dm does) so the sender can
-      // reply-to and steer the session back.
-      const signDm = (body) => buildDmSignedBody(body, redirectConvo, { raw: args.raw });
+      // reply-to and steer the session back — except on a send-only machine,
+      // where that round-trip can't land (same rule as --dm).
+      const signDm = (body) => buildDmSignedBody(body, resolveSendOnly(projectsConfig) ? null : redirectConvo, { raw: args.raw });
       try {
         let messageId;
         if (args.filePath) {
@@ -1681,7 +1887,9 @@ async function main() {
       }
       // Consume the claim (no manual rm; later topic sends for this convo won't
       // be re-routed).
-      if (autoConsumeClaimedPrompt(redirectConvo)) {
+      // Same gate as the group path: the steer flow must not blind-delete a claim
+      // either (a second whisper claimed mid-turn used to die here).
+      if (autoConsumeClaimedPrompt(redirectConvo, TELE_REPLY_DIR, consumeProof())) {
         console.log(`[send-telegram] consumed prompt-convo-${redirectConvo}.processing.json`);
       }
       return;
@@ -1781,7 +1989,7 @@ async function main() {
         // sent-registry has no row → admin reply can't be routed).
         appendToSentRegistry({ messageId, chatId, botId, convoId: convoIdForSend });
         try { updatePendingStore((s) => recordBotSend(s, { convoId: convoIdForSend, project: projectCode, messageId })); } catch {}
-        const recordedConvoId = await maybeRecordConvo({ convoId: convoIdForSend, messageId, chatId, botId });
+        const recordedConvoId = await maybeRecordConvo({ convoId: convoIdForSend, messageId, chatId, botId, projectKey: lookupKey, resolvedBy: routeResolvedBy });
         if (recordedConvoId != null) lastConvoId = recordedConvoId;
         const parts = [];
         if (fallback) parts.push('caption sent as plain text');
@@ -1797,7 +2005,7 @@ async function main() {
     }
     if (failures === effectiveAdminIds.length) process.exit(1);
     if (failures < effectiveAdminIds.length) {
-      console.log(listenerHintForCurrentAgent(lastConvoId));
+      console.log(listenerHintForCurrentAgent(lastConvoId, process.env, { sendOnly: resolveSendOnly(projectsConfig) }));
     }
     return;
   }
@@ -1851,7 +2059,7 @@ async function main() {
       for (const mid of allMessageIds) appendToSentRegistry({ messageId: mid, chatId, botId, convoId: convoIdForSend });
       // Pending-store after — opportunistic, doesn't block on failure.
       try { updatePendingStore((s) => recordBotSend(s, { convoId: convoIdForSend, project: projectCode, messageId })); } catch {}
-      const recordedConvoId = await maybeRecordConvo({ convoId: convoIdForSend, messageId, chatId, botId });
+      const recordedConvoId = await maybeRecordConvo({ convoId: convoIdForSend, messageId, chatId, botId, projectKey: lookupKey, resolvedBy: routeResolvedBy });
       if (recordedConvoId != null) lastConvoId = recordedConvoId;
       const parts = [];
       if (fallback === 'auto-file') parts.push('long-message → .md file');
@@ -1869,7 +2077,7 @@ async function main() {
 
   if (failures === effectiveAdminIds.length) process.exit(1);
   if (failures < effectiveAdminIds.length) {
-    console.log(listenerHintForCurrentAgent(lastConvoId));
+    console.log(listenerHintForCurrentAgent(lastConvoId, process.env, { sendOnly: resolveSendOnly(projectsConfig) }));
   }
 }
 
@@ -1895,9 +2103,9 @@ export function resolveConvoIdPreSend({ preResolved, replyTo, chatId, botId }) {
 
 // Record the send into convo-registry. `convoId` is the final value (caller
 // substitutes messageId for new-convo case).
-async function maybeRecordConvo({ convoId, messageId, chatId, botId }) {
+async function maybeRecordConvo({ convoId, messageId, chatId, botId, projectKey = null, resolvedBy = null }) {
   if (!messageId || convoId == null) return null;
-  const result = await recordConvoSend({ convoId, messageId, chatId, botId });
+  const result = await recordConvoSend({ convoId, messageId, chatId, botId, projectKey, resolvedBy });
   if (result.ok && result.shouldPrune) await pruneAfterSend();
   if (!result.ok) {
     // Surface convoId so the operator can repair via import-convo without
@@ -1919,7 +2127,10 @@ async function maybeRecordConvo({ convoId, messageId, chatId, botId }) {
  *
  * `--wait-once` is the operational default for every non-Monitor runtime.
  */
-export function listenerHintForCurrentAgent(convoId, env = process.env) {
+export function listenerHintForCurrentAgent(convoId, env = process.env, { sendOnly = false } = {}) {
+  if (sendOnly) {
+    return '[send-telegram] Send-only machine: do NOT start a reply listener here (another machine owns this bot\'s updates). Delivery is one-way: replies to this message will NOT reach you — tell the user so if you expected an answer.';
+  }
   const convoArg = convoId != null ? ` --convo ${convoId}` : '';
   if (env.CLAUDE_CODE_SESSION_ID) {
     return `[send-telegram] ⚠️ Keep ONE self-re-arming reply listener alive via Monitor (start once per convo, don't re-arm per send): \`first=1; while :; do node ../teleport/scripts/tele-listen.mjs${convoArg} --settle --loop --append --announce-preexisting \${first:+--first-run}; rc=$?; first=; case $rc in 3) break;; 1) sleep 30;; esac; sleep 2; done\``;
@@ -1941,6 +2152,28 @@ export function listenerHintForCurrentAgent(convoId, env = process.env) {
   return lines.join('\n');
 }
 
+// The proof this process can offer when consuming a claim: the agent's
+// `--claim-id` / `--reply-to`. Set once from parsed args (emitConvoLine is called
+// deep in the send path and doesn't thread args).
+const CONSUME_PROOF = { claimId: null, replyTo: null };
+export function setConsumeProof({ claimId = null, replyTo = null } = {}) {
+  CONSUME_PROOF.claimId = claimId;
+  CONSUME_PROOF.replyTo = replyTo;
+}
+
+/** What this process can prove when consuming a claim (see claimIsAnswered). */
+function consumeProof() {
+  return {
+    claimId: CONSUME_PROOF.claimId,
+    replyToMessageId: CONSUME_PROOF.replyTo,
+    processStartMs: PROCESS_START_MS,
+  };
+}
+
+// When THIS process began. A claim stamped after that cannot have been read by
+// the agent — it was already composing this send.
+const PROCESS_START_MS = Date.now();
+
 function emitConvoLine({ convoId, messageId }) {
   if (!messageId || convoId == null) return;
   console.log(`[send-telegram] convo: ${convoId} messageId: ${messageId} pid: ${process.pid}`);
@@ -1951,7 +2184,7 @@ function emitConvoLine({ convoId, messageId }) {
   const persona = peekPersona(convoId);
   if (persona != null) console.log(`[send-telegram] persona: ${formatPersona(persona)}`);
   // RFC 02 P1: consume the claimed prompt for this convo (no-op if unclaimed).
-  if (autoConsumeClaimedPrompt(convoId)) {
+  if (autoConsumeClaimedPrompt(convoId, TELE_REPLY_DIR, consumeProof())) {
     console.log(`[send-telegram] consumed prompt-convo-${convoId}.processing.json`);
   }
 }

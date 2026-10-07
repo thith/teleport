@@ -27,15 +27,15 @@ const noSleep = async () => {};
 test('topics-store — recordThreadId persists positive mapping', () => {
   const file = tmp();
   let store = {};
-  recordThreadId(store, 1234, 'tea_game', 12);
+  recordThreadId(store, 1234, 'my_game', 12);
   writeTopicsStore(store, file);
   store = readTopicsStore(file);
-  assert.strictEqual(getThreadId(store, 1234, 'tea_game'), 12);
+  assert.strictEqual(getThreadId(store, 1234, 'my_game'), 12);
   fs.unlinkSync(file);
 });
 
 test('topics-store — getThreadId returns null for unknown project', () => {
-  const store = { '1234': { tea_game: 12 } };
+  const store = { '1234': { my_game: 12 } };
   assert.strictEqual(getThreadId(store, 1234, 'unknown'), null);
 });
 
@@ -50,14 +50,14 @@ test('topics-store — recordThreadId persists mapping over a legacy negative en
   // older build is just inert metadata — recordThreadId neither reads nor
   // clears it, and the positive mapping lands as normal.
   const store = { '1234': { _no_topic_support: true, _checked_at: '2026-05-22T09:00:00.000Z' } };
-  recordThreadId(store, 1234, 'tea_game', 7);
-  assert.strictEqual(store['1234'].tea_game, 7);
+  recordThreadId(store, 1234, 'my_game', 7);
+  assert.strictEqual(store['1234'].my_game, 7);
 });
 
 test('topics-store — clearThreadId removes only specified project, keeps others', () => {
-  const store = { '1234': { tea_game: 12, teleport: 15 } };
-  clearThreadId(store, 1234, 'tea_game');
-  assert.strictEqual(getThreadId(store, 1234, 'tea_game'), null);
+  const store = { '1234': { my_game: 12, teleport: 15 } };
+  clearThreadId(store, 1234, 'my_game');
+  assert.strictEqual(getThreadId(store, 1234, 'my_game'), null);
   assert.strictEqual(getThreadId(store, 1234, 'teleport'), 15);
 });
 
@@ -75,10 +75,10 @@ test('topics-store — readTopicsStore returns {} on malformed JSON', () => {
 
 test('topics-store — chatId as number or string yields same lookup', () => {
   const store = {};
-  recordThreadId(store, 1234, 'tea_game', 12);
+  recordThreadId(store, 1234, 'my_game', 12);
   // Caller may pass number or string; both should hit the same row.
-  assert.strictEqual(getThreadId(store, '1234', 'tea_game'), 12);
-  assert.strictEqual(getThreadId(store, 1234, 'tea_game'), 12);
+  assert.strictEqual(getThreadId(store, '1234', 'my_game'), 12);
+  assert.strictEqual(getThreadId(store, 1234, 'my_game'), 12);
 });
 
 test('isTopicGoneError — detects the three known errors', () => {
@@ -92,11 +92,11 @@ test('isTopicGoneError — detects the three known errors', () => {
 test('resolveThreadId — positive cache hit returns thread_id without API call', async () => {
   const file = tmp();
   let store = {};
-  recordThreadId(store, 1234, 'tea_game', 42);
+  recordThreadId(store, 1234, 'my_game', 42);
   writeTopicsStore(store, file);
   let fetcherCalls = 0;
   const fetcher = () => { fetcherCalls++; return { ok: true, messageThreadId: 999 }; };
-  const got = await resolveThreadId({ token: 'X', chatId: 1234, projectCode: 'tea_game', topicsFile: file, fetcher });
+  const got = await resolveThreadId({ token: 'X', chatId: 1234, projectCode: 'my_game', topicsFile: file, fetcher });
   assert.strictEqual(got, 42);
   assert.strictEqual(fetcherCalls, 0); // no API call
   fs.unlinkSync(file);
@@ -119,10 +119,10 @@ test('resolveThreadId — legacy negative entry is ignored, create is re-attempt
 test('resolveThreadId — successful create persists mapping', async () => {
   const file = tmp();
   const fetcher = async () => ({ ok: true, messageThreadId: 77, status: 200 });
-  const got = await resolveThreadId({ token: 'X', chatId: 1234, projectCode: 'tea_game', topicsFile: file, nowFn: () => Date.parse('2026-05-22T10:00:00Z'), fetcher });
+  const got = await resolveThreadId({ token: 'X', chatId: 1234, projectCode: 'my_game', topicsFile: file, nowFn: () => Date.parse('2026-05-22T10:00:00Z'), fetcher });
   assert.strictEqual(got, 77);
   const after = readTopicsStore(file);
-  assert.strictEqual(after['1234'].tea_game, 77);
+  assert.strictEqual(after['1234'].my_game, 77);
   fs.unlinkSync(file);
 });
 

@@ -14,7 +14,7 @@ const ACK = `📩 instructed ☃️ X #${HASH} — trả lời sẽ về DM`;
 const mk = () => { const w = []; return { writes: w, opts: { from: { id: '7', role: 'admin' }, config: CONFIG, store: STORE, tmpDir: '/tmp/tele', writePrompt: (p) => w.push(p) } }; };
 
 test('buildInstructPrompt: carries instruct flag (NOT whisper) + real fromRole', () => {
-  const p = buildInstructPrompt({ targetConvoId: '2205483045424020', targetChatId: '-100', fromUserId: '144242180', fromName: 'Thi', fromRole: 'admin', text: 'chỉnh lại X' });
+  const p = buildInstructPrompt({ targetConvoId: '2205483045424020', targetChatId: '-100', fromUserId: '100000001', fromName: 'Alice', fromRole: 'admin', text: 'chỉnh lại X' });
   assert.equal(p.instruct, true);
   assert.equal(p.whisper, undefined);        // instruct must NOT be discreet-flagged
   assert.equal(p.messageId, null);           // injected, not a real message

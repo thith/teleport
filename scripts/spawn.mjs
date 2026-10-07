@@ -416,8 +416,109 @@ export function resolveMode(argv) {
   return (!raw || raw.startsWith('-')) ? null : raw;
 }
 
+/** How long to wait for the screen session to appear, and how often to look. */
+export const SPAWN_VERIFY_TIMEOUT_MS = 15_000;
+export const SPAWN_VERIFY_POLL_MS = 250;
+
 /** Non-blocking delay (avoids spawning the `sleep` binary + its fractional-second assumption). */
 const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Launch the agent "as if it had been started by hand from a terminal" (RFC 15
+ * follow-up; 3-reviewer decision).
+ *
+ * We are ourselves a Claude session, so our env is the user's shell env PLUS a
+ * layer Claude injects per session: `CLAUDE_CODE_CHILD_SESSION=1` (the poisonous
+ * one — inherited by the new `claude` it TURNS OFF transcript saving:
+ * "Transcript saving is off — inherited CLAUDE_CODE_CHILD_SESSION marker"), the
+ * parent's `CLAUDE_CODE_SESSION_ID` / messaging socket+token / `CLAUDE_PID`,
+ * plus `CLAUDE_EFFORT`, `CLAUDE_CODE_EXECPATH`, `CLAUDE_PLUGIN_DATA`… A spawned
+ * agent is a real, standalone session: it must keep its transcript (that is what
+ * /handover, /resume and the session-log workflow read later) and must not run
+ * at OUR reasoning effort or against OUR plugin/IPC state.
+ *
+ * Deleting a hand-kept list of those names is a losing game (the CLI adds/renames
+ * them at will, and a miss fails SILENTLY — you only notice when a transcript is
+ * missing). So we don't build an env at all: we start from a bare seed and let
+ * the user's own LOGIN + INTERACTIVE shell rebuild it, exactly as it would for a
+ * `claude` typed into Terminal. Anything Claude injects is gone by construction —
+ * including vars that don't exist yet — while everything the user exports in their
+ * rc file survives (e.g. `CLAUDE_CODE_MAX_OUTPUT_TOKENS` in ~/.zshrc).
+ *
+ * `-i` is REQUIRED, not paranoia: zsh sources ~/.zshrc only for interactive
+ * shells, and on this machine `-lc` alone yields no user exports and a PATH
+ * without nvm — i.e. `claude` itself would not be on it.
+ *
+ * `CLAUDE_CODE_FORCE_SESSION_PERSISTENCE` is deliberately NOT set: a clean env is
+ * empirically enough to keep transcripts on, a real terminal doesn't have it, and
+ * it would leak down to the agent's own genuine sub-sessions.
+ */
+
+/**
+ * Vars a fresh terminal gets from launchd / the login session, which rc files do
+ * NOT set — the session sockets matter most (ssh-agent for `git push`, the
+ * desktop bus for keyrings/credential helpers, the display for GUI tools).
+ */
+export const ENV_SEED_KEYS = [
+  'HOME', 'USER', 'LOGNAME', 'SHELL', 'TERM', 'TMPDIR', 'LANG', 'LC_ALL', 'LC_CTYPE',
+  'SSH_AUTH_SOCK', 'XDG_RUNTIME_DIR', 'DBUS_SESSION_BUS_ADDRESS', 'DISPLAY', 'WAYLAND_DISPLAY',
+  '__CF_USER_TEXT_ENCODING', 'COLORTERM', 'TERM_PROGRAM',
+  'http_proxy', 'https_proxy', 'no_proxy', 'HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY', 'ALL_PROXY',
+];
+
+/** Bootstrap PATH — only needs to be enough for the rc files to run; they rebuild the real one. */
+export const SEED_PATH = '/usr/bin:/bin:/usr/sbin:/sbin';
+
+/**
+ * The bare env the login shell starts from. `TELEPORT_SPAWN=1` is a courtesy
+ * marker so a heavy rc file can early-return if the user ever wants that.
+ */
+export function loginSeedEnv(base = process.env) {
+  const env = {};
+  for (const k of ENV_SEED_KEYS) if (base[k] != null && base[k] !== '') env[k] = base[k];
+  env.PATH = SEED_PATH;
+  env.TELEPORT_SPAWN = '1';
+  return env;
+}
+
+/**
+ * Wrap a command so the user's login+interactive shell execs it.
+ *
+ * `exec "$@"` with the argv passed POSITIONALLY is what makes this safe: the
+ * multi-line prompt seed (quotes, newlines, backticks) stays one argv item and is
+ * never re-parsed by the shell — the classic footgun of building a `-c` string.
+ * `exec` means no extra process survives, so the returned pid is still the agent's.
+ * Returns null when there is no usable POSIX-style $SHELL (caller falls back).
+ */
+export function wrapInLoginShell(command, base = process.env) {
+  const shell = base.SHELL;
+  if (!shell || !shell.startsWith('/')) return null;
+  // `exec "$@"` is POSIX-sh syntax: only wrap known POSIX shells (sh, bash, zsh,
+  // ksh, mksh, dash, yash). Anything else (fish, csh, nu, pwsh, xonsh…) → let the
+  // caller fall back instead of failing the spawn.
+  if (!/\/(ba|z|k|mk|da|ya)?sh$/.test(shell)) return null;
+  return [shell, '-lic', 'exec "$@"', 'teleport-spawn', ...command];
+}
+
+/**
+ * Fallback env for the (rare) no-$SHELL case: scrub every Claude-injected var by
+ * PREFIX so a future rename can't sneak through. This may also drop a user's own
+ * `CLAUDE_*` export — accepted, because the alternative (leaking the session
+ * marker) is the bug we are fixing.
+ */
+export function scrubClaudeEnv(base = process.env) {
+  const env = { ...base };
+  for (const k of Object.keys(env)) if (/^CLAUDE(CODE)?(_|$)/.test(k)) delete env[k];
+  return env;
+}
+
+/** The (command, env) pair to actually spawn: login-shell wrapped when possible. */
+export function childLaunch(command, base = process.env) {
+  const wrapped = wrapInLoginShell(command, base);
+  return wrapped
+    ? { command: wrapped, env: loginSeedEnv(base) }
+    : { command, env: scrubClaudeEnv(base) };
+}
 
 /**
  * Execute a plan. `runner` is injectable for tests (default actually spawns).
@@ -427,19 +528,22 @@ const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
 export function runSpawn(plan, { runner, cwd, spawnFn = cpSpawn } = {}) {
   if (runner) return runner(plan);
   // `cwd` sets the spawned agent's working directory — which is how it later
-  // resolves its Telegram group (RFC 02: group derived from basename(cwd)). The
-  // supervisor daemon passes a sibling project dir here so `/spawn <project>`
-  // lands the new agent in that project's group. Undefined → inherit our cwd.
-  const opts = cwd ? { cwd } : {};
+  // resolves its Telegram group. Since RFC 15 routing is convo-anchored: at
+  // cold-start the project comes from the MAIN git checkout of that cwd
+  // (git-common-dir → projects.json), not raw basename(cwd). The supervisor
+  // daemon passes a sibling project dir here so `/spawn <project>` lands the new
+  // agent in that project's group. Undefined → inherit our cwd.
+  const { command, env } = childLaunch(plan.command);
+  const opts = { env, ...(cwd ? { cwd } : {}) };
   if (plan.mode === 'interactive') {
     // No `detached: true` needed: `screen -dm` self-daemonizes, so the front-end
     // `screen` process exits immediately and the claude session lives on inside
     // screen. unref() releases our handle to that short-lived front-end.
-    const r = spawnFn(plan.command[0], plan.command.slice(1), { stdio: 'ignore', ...opts });
+    const r = spawnFn(command[0], command.slice(1), { stdio: 'ignore', ...opts });
     r.unref?.();
     return { ...plan };
   }
-  const child = spawnFn(plan.command[0], plan.command.slice(1), { detached: true, stdio: 'ignore', ...opts });
+  const child = spawnFn(command[0], command.slice(1), { detached: true, stdio: 'ignore', ...opts });
   child.unref();
   return { ...plan, pid: child.pid };
 }
@@ -539,12 +643,23 @@ if (isDirectRun) {
   const plan = buildSpawnPlan({ interactive, permissionMode });
   const result = runSpawn(plan);
   if (plan.mode === 'interactive') {
-    // Verify the screen session actually came up — `screen -dmS` returns 0 even
-    // if claude failed to exec inside it. Tiny settle delay. (NB: verifies screen
-    // presence, not claude liveness.)
-    await sleepMs(500);
-    if (!screenSessionExists(plan.sessionName)) {
-      console.error(`[spawn] FAILED: screen session "${plan.sessionName}" not found after launch (claude or screen may have errored). Check: screen -ls`);
+    // Verify the screen session actually came up — `screen -dmS` returns 0 even if
+    // claude failed to exec inside it. (NB: verifies screen presence, not claude
+    // liveness.)
+    //
+    // POLL, don't sleep once: the launch now goes through the user's login shell
+    // (see childLaunch — that is what keeps the agent's env identical to a
+    // hand-typed `claude`), and an interactive zsh with a real rc file takes a
+    // couple of SECONDS to start before `screen` is even exec'd. A single 500ms
+    // settle reported a healthy spawn as FAILED — verified on this machine, where
+    // the session was in fact running the whole time.
+    let up = false;
+    for (let waited = 0; waited < SPAWN_VERIFY_TIMEOUT_MS; waited += SPAWN_VERIFY_POLL_MS) {
+      if (screenSessionExists(plan.sessionName)) { up = true; break; }
+      await sleepMs(SPAWN_VERIFY_POLL_MS);
+    }
+    if (!up && !screenSessionExists(plan.sessionName)) {
+      console.error(`[spawn] FAILED: screen session "${plan.sessionName}" not found after ${SPAWN_VERIFY_TIMEOUT_MS / 1000}s (claude or screen may have errored). Check: screen -ls`);
       process.exit(1);
     }
     console.log(`[spawn] interactive agent launched in screen session "${plan.sessionName}" (subscription billing).`);

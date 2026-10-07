@@ -1,7 +1,7 @@
 # RFC 01: Supervisor Daemon — registry-driven control plane
 
 > **Status:** In Review (retroactive — code đã ship + review, RFC viết sau theo yêu cầu maintainer để chốt design as-built và soi lại lỗ hổng)
-> **Author:** Claude (🐮 Bò) + Thi
+> **Author:** Claude (🐮 Bò) + the owner
 > **Created:** 2026-06-20
 > **Last Updated:** 2026-06-20
 
@@ -57,7 +57,7 @@ Tham chiếu: `rules/telegram-guide.md` (§ Supervisor daemon, § Whisper), `scr
 ### 4.4 Alternative D: Tái dùng `package.json` scripts của project làm registry lệnh
 - Lệnh `/xxx` map vào `npm run xxx` của project.
 - Pros: không cần file registry riêng.
-- Cons: **teleport phải self-sufficient** — danh sách lệnh BUILT-IN (spawn/kill/ls…) không được phụ thuộc `package.json` của luni hay bất kỳ project nào. `/run` thì hợp lý chạy script của project, nhưng built-in thì không.
+- Cons: **teleport phải self-sufficient** — danh sách lệnh BUILT-IN (spawn/kill/ls…) không được phụ thuộc `package.json` của bất kỳ project nào. `/run` thì hợp lý chạy script của project, nhưng built-in thì không.
 - Vì sao không chọn: lẫn lộn "lệnh built-in của teleport" với "script của project". Tách: built-in ở `commands.json` (teleport sở hữu), `/run` mới đụng `package.json` của project.
 
 ## 5. Proposed Design
@@ -116,7 +116,7 @@ Gate gồm nhiều lớp:
 5. **Secret boundary (strip secrets của teleport khỏi child):** mỗi key teleport nạp từ **file `.env`** (theo contract "`.env` = secrets only") **bị strip khỏi env tiến trình con** trước khi exec — đặc biệt cho `/run`, vốn chạy npm script của project sibling; một `package.json` độc sẽ KHÔNG đọc được `REPORT_BOT_TOKEN`/keys. **Phạm vi bảo đảm:** chỉ các secret nằm trong teleport `.env` (đúng nơi teleport quy ước cất secret). Secret mà *operator tự export ra shell cha* (không qua `.env`) nằm ngoài phạm vi — không nên export secret kiểu đó khi chạy daemon (P2 có thể siết bằng allowlist env nếu cần). **Contract về credential:**
    - *teleport Node script* cần secret thì đọc lại từ **file** `.env` (như `send-telegram`), nên strip không bao giờ làm đói chúng.
    - *grandchild* như `claude` (do `spawn.mjs` bật) KHÔNG đọc teleport `.env`: agent dùng credential riêng của nó (subscription / `~/.claude`), Telegram token thì script con của agent đọc-từ-file lúc gửi. → strip an toàn cho cả spawn.
-   - **File `.env` GIỮ NGUYÊN** — daemon chỉ *đọc*, không sửa/xoá. "Strip" = không *truyền* secret vào biến môi trường của tiến trình con; nội dung file y nguyên. (Chốt với Thi 2026-06-21.)
+   - **File `.env` GIỮ NGUYÊN** — daemon chỉ *đọc*, không sửa/xoá. "Strip" = không *truyền* secret vào biến môi trường của tiến trình con; nội dung file y nguyên. (Chốt với the owner 2026-06-21.)
    - teleport `.env` thực tế chứa `REPORT_BOT_TOKEN` + `GEMINI_API_KEY`. Cả hai bị strip khỏi child. `REPORT_BOT_TOKEN`: script teleport đọc-từ-file nên không sao. `GEMINI_API_KEY`: KHÔNG lệnh daemon nào (spawn/run/whisper/…) chạy `gemini`, nên strip vô hại; CLI `gemini` (khi operator/agent tự dùng) lấy key từ shell của họ, không qua daemon child.
    - Chỉ `TELE_FROM_*` (identity) được bơm thêm vào child.
 6. **Prototype-pollution guards:** own-property check ở `resolveCommand`, `roleFor`, `memberFor`.
@@ -136,7 +136,7 @@ Các câu hỏi gốc (scratch spec) đã được implementation chốt — ghi
 - **Q2 — Health Phase 1?** → **Chốt: chỉ báo cáo** (`/pending` + heartbeat), không auto-restart.
 - **Q3 — Phối hợp cache?** → **Chốt: làm luôn** — co-op harvest ngay từ P1 (§5.4).
 - **Q4 — Đặt tên lệnh?** → **Chốt: registry** (`commands.json`), không hardcode; CLI daemon là `--status`/`--stop`.
-- ~~**Q5**~~ **(đã chốt 2026-06-21):** Thi chọn **(b)** — KHÔNG thêm `package.json` cho teleport; sửa README + comment về `node ../teleport/scripts/daemon.mjs`. Thêm trigger "start/launch/chạy daemon" vào wiring snippet (README) + 3 global config (CLAUDE.md/GEMINI.md/AGENTS.md) để agent tự hiểu khi user bảo "chạy daemon".
+- ~~**Q5**~~ **(đã chốt 2026-06-21):** the owner chọn **(b)** — KHÔNG thêm `package.json` cho teleport; sửa README + comment về `node ../teleport/scripts/daemon.mjs`. Thêm trigger "start/launch/chạy daemon" vào wiring snippet (README) + 3 global config (CLAUDE.md/GEMINI.md/AGENTS.md) để agent tự hiểu khi user bảo "chạy daemon".
 - **Q6 (mới):** fire-and-forget cho phép nhiều lệnh chạy song song trong một DM một người — có cần hàng đợi/serialize không, hay chấp nhận (admin tự biết)? (Liên quan: mất-lệnh-âm-thầm khi crash, §8.)
 - ~~**Q7 (naming)**~~ **(đã chốt 2026-06-21):** **giữ tên "Supervisor Daemon"** — đã dùng ở nhiều nơi (README, telegram-guide, header daemon.mjs + ~7 comment code); Phase 2 sẽ thêm auto-restart đúng nghĩa supervise; đổi bây giờ chỉ là churn cosmetic.
 
@@ -159,6 +159,6 @@ Các câu hỏi gốc (scratch spec) đã được implementation chốt — ghi
 - 2026-06 (`f00edb9`): tách config khỏi `.env` vào `projects.json` `_default` (group catch-all) + `_config` (daemonChatId/quietHours); `.env` = secrets. `resolveSenderRole` chỉ tin `_default.roles` + dedicated.
 - 2026-06 (`f0fe5f2`): `/run` — auto-detect PM, validate script, `--` delimiter, containment.
 - 2026-06 (`384db02`): **chuyển sang registry-driven** (Alt C/D bị loại) — `commands.json` + `_commands`; daemon thành dispatcher mỏng; tách run/whisper/pending/start thành script; code review (Gemini→Codex): dispatch fire-and-forget, `tokenizeArgs` quote-aware, own-property guards.
-- 2026-06-20: **RFC review vòng 1 (Gemini, debate mode).** Blocker: `/run` rò secret qua child env → **fix code:** strip mọi key `.env` khỏi env tiến trình con (§5.5.5) + test. Nits: làm rõ chặn `.`/`..` bằng equality (không phải charset); "no shell" chỉ ở tầng teleport gọi PM. Discussion: ghi risk "mất-lệnh-âm-thầm khi crash" (§8); naming "Supervisor" → Q7 chờ Thi.
-- 2026-06-21: **Thi chốt open questions** (qua Telegram): Q5=(b) không thêm package.json, sửa doc về `node …/daemon.mjs` + thêm trigger "chạy daemon" vào README wiring snippet + 3 global config (CLAUDE/GEMINI/AGENTS); Q7 giữ tên "Supervisor"; Q3 (secret) — strip đúng ý: file `.env` giữ nguyên, chỉ không truyền vào env con, KHÔNG cần move key. Gỡ mọi nhắc `pnpm daemon` (README/header daemon.mjs).
-- 2026-06-20: **RFC review vòng 2 (Codex, debate mode).** Tinh chỉnh: strip chỉ bảo đảm secret trong teleport `.env` (không phủ secret export ra shell cha) → thu hẹp phát biểu §5.5.5/§8; nêu **contract credential** (agent/PM creds ngoài teleport `.env`) cần Thi xác nhận; **trust boundary** registry = config operator, không phải bề mặt mở rộng untrusted (§5.3); thu hẹp G4 về "không mất Telegram update" (không phải "không mất lệnh"); Q5 chỉ là tiện-ích packaging (README nhắc `pnpm daemon` nhưng chưa có `package.json` → lệch doc cần sửa); pseudocode dùng `process.execPath`. Không phát sinh fix code mới (strip đã đúng trong phạm vi).
+- 2026-06-20: **RFC review vòng 1 (Gemini, debate mode).** Blocker: `/run` rò secret qua child env → **fix code:** strip mọi key `.env` khỏi env tiến trình con (§5.5.5) + test. Nits: làm rõ chặn `.`/`..` bằng equality (không phải charset); "no shell" chỉ ở tầng teleport gọi PM. Discussion: ghi risk "mất-lệnh-âm-thầm khi crash" (§8); naming "Supervisor" → Q7 chờ the owner.
+- 2026-06-21: **the owner chốt open questions** (qua Telegram): Q5=(b) không thêm package.json, sửa doc về `node …/daemon.mjs` + thêm trigger "chạy daemon" vào README wiring snippet + 3 global config (CLAUDE/GEMINI/AGENTS); Q7 giữ tên "Supervisor"; Q3 (secret) — strip đúng ý: file `.env` giữ nguyên, chỉ không truyền vào env con, KHÔNG cần move key. Gỡ mọi nhắc `pnpm daemon` (README/header daemon.mjs).
+- 2026-06-20: **RFC review vòng 2 (Codex, debate mode).** Tinh chỉnh: strip chỉ bảo đảm secret trong teleport `.env` (không phủ secret export ra shell cha) → thu hẹp phát biểu §5.5.5/§8; nêu **contract credential** (agent/PM creds ngoài teleport `.env`) cần the owner xác nhận; **trust boundary** registry = config operator, không phải bề mặt mở rộng untrusted (§5.3); thu hẹp G4 về "không mất Telegram update" (không phải "không mất lệnh"); Q5 chỉ là tiện-ích packaging (README nhắc `pnpm daemon` nhưng chưa có `package.json` → lệch doc cần sửa); pseudocode dùng `process.execPath`. Không phát sinh fix code mới (strip đã đúng trong phạm vi).

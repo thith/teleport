@@ -1,7 +1,7 @@
 # Profile overlay — code-web
 
 > Fills the core `> [overlay]` hooks for a production web app (e.g. Next.js/SSR,
-> like digesty-frontend).
+> like a typical web-app frontend).
 
 ## Branch / deploy policy (process §1)
 - **Production repo — no direct push.** `feat|fix|chore|refactor/*` → PR to `develop` → auto-deploy **staging** → verify on staging → PR `develop`→`main` → auto-deploy **prod** → smoke-check the prod URL.

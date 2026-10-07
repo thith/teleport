@@ -6,10 +6,10 @@ import path from 'node:path';
 import { readProjectsConfig, resolveProjectConfig, resolveProjectKey, roleFor, memberFor, adminIdsFrom, isGroupChatId, isPrivateChatId, assertChatIdKind, readGlobalConfig, readDefaultGroup, projectEntries, resolveDefaultChatId, resolveDaemonChatId, resolveQuietHours } from './projects-config.mjs';
 
 test('readGlobalConfig/readDefaultGroup + projectEntries: reserved keys separated from projects', () => {
-  const cfg = { _config: { daemonChatId: '42' }, _default: { chatId: '-100', roles: { '1': 'admin' } }, luni: { chatId: '-1' }, md: { chatId: '-2' } };
+  const cfg = { _config: { daemonChatId: '42' }, _default: { chatId: '-100', roles: { '1': 'admin' } }, acmebot: { chatId: '-1' }, md: { chatId: '-2' } };
   assert.deepEqual(readGlobalConfig(cfg), { daemonChatId: '42' });
   assert.deepEqual(readDefaultGroup(cfg), { chatId: '-100', roles: { '1': 'admin' } });
-  assert.deepEqual(projectEntries(cfg).map(([k]) => k), ['luni', 'md']); // _config + _default skipped
+  assert.deepEqual(projectEntries(cfg).map(([k]) => k), ['acmebot', 'md']); // _config + _default skipped
   assert.deepEqual(readGlobalConfig({}), {});
 });
 
@@ -33,10 +33,10 @@ test('resolveQuietHours: _config.quietHours wins; env fallback; invalid → null
 });
 
 test('resolveProjectConfig: shared project inherits _default.roles', () => {
-  const cfg = { _default: { chatId: '-100', roles: { '144242180': { role: 'admin' } } }, ded: { chatId: '-200', roles: { '999': { role: 'dev' } } } };
+  const cfg = { _default: { chatId: '-100', roles: { '100000001': { role: 'admin' } } }, ded: { chatId: '-200', roles: { '999': { role: 'dev' } } } };
   const shared = resolveProjectConfig('some-shared-proj', { config: cfg, fallbackChatId: '-100' });
   assert.equal(shared.dedicated, false);
-  assert.deepEqual(shared.roles, { '144242180': { role: 'admin' } }); // from _default
+  assert.deepEqual(shared.roles, { '100000001': { role: 'admin' } }); // from _default
   const dedicated = resolveProjectConfig('ded', { config: cfg, fallbackChatId: '-100' });
   assert.equal(dedicated.dedicated, true);
   assert.deepEqual(dedicated.roles, { '999': { role: 'dev' } }); // own entry
@@ -48,17 +48,17 @@ test('resolveProjectConfig: shared project inherits _default.roles', () => {
 test('resolveProjectKey: worktree folder → longest matching project key (boundary-safe)', () => {
   const cfg = {
     _config: { daemonUserId: '1' }, _default: { chatId: '-100' },
-    digesty: { chatId: '-999' }, 'digesty-frontend': { chatId: '-999' }, 'digesty-worker': { chatId: '-999' },
+    acme: { chatId: '-999' }, 'acme-frontend': { chatId: '-999' }, 'acme-worker': { chatId: '-999' },
   };
   // exact key wins, unchanged
-  assert.equal(resolveProjectKey('digesty', cfg), 'digesty');
-  assert.equal(resolveProjectKey('digesty-frontend', cfg), 'digesty-frontend');
-  // worktree suffix → LONGEST prefix key (not the shorter `digesty`)
-  assert.equal(resolveProjectKey('digesty-frontend-uifix', cfg), 'digesty-frontend');
-  assert.equal(resolveProjectKey('digesty-x', cfg), 'digesty');
+  assert.equal(resolveProjectKey('acme', cfg), 'acme');
+  assert.equal(resolveProjectKey('acme-frontend', cfg), 'acme-frontend');
+  // worktree suffix → LONGEST prefix key (not the shorter `acme`)
+  assert.equal(resolveProjectKey('acme-frontend-uifix', cfg), 'acme-frontend');
+  assert.equal(resolveProjectKey('acme-x', cfg), 'acme');
   // boundary safety: bare substring never matches (no `-` boundary)
-  assert.equal(resolveProjectKey('digest', cfg), 'digest');
-  assert.equal(resolveProjectKey('digestyfrontend', cfg), 'digestyfrontend');
+  assert.equal(resolveProjectKey('acm', cfg), 'acm');
+  assert.equal(resolveProjectKey('acmefrontend', cfg), 'acmefrontend');
   // unrelated folder → unchanged (default fallback stands)
   assert.equal(resolveProjectKey('some-other-repo', cfg), 'some-other-repo');
   // reserved `_`-keys are never matched
@@ -67,10 +67,10 @@ test('resolveProjectKey: worktree folder → longest matching project key (bound
 });
 
 test('resolveProjectKey → resolveProjectConfig: worktree resolves to project group, not _default', () => {
-  const cfg = { _default: { chatId: '-100' }, 'digesty-frontend': { chatId: '-1004470275584' }, digesty: { chatId: '-1004470275584' } };
-  const key = resolveProjectKey('digesty-frontend-uifix', cfg);
+  const cfg = { _default: { chatId: '-100' }, 'acme-frontend': { chatId: '-1004444444444' }, acme: { chatId: '-1004444444444' } };
+  const key = resolveProjectKey('acme-frontend-uifix', cfg);
   const proj = resolveProjectConfig(key, { config: cfg, fallbackChatId: '-100' });
-  assert.equal(proj.chatId, '-1004470275584'); // real project group, NOT -100
+  assert.equal(proj.chatId, '-1004444444444'); // real project group, NOT -100
   assert.equal(proj.dedicated, true);
   // unrelated worktree keeps default fallback
   const other = resolveProjectConfig(resolveProjectKey('unrelated-repo', cfg), { config: cfg, fallbackChatId: '-100' });
@@ -81,19 +81,19 @@ test('resolveProjectKey → resolveProjectConfig: worktree resolves to project g
 test('isGroupChatId / isPrivateChatId: sign convention', () => {
   assert.equal(isGroupChatId('-1001234567890'), true);
   assert.equal(isGroupChatId('-100'), true);
-  assert.equal(isGroupChatId('144242180'), false);  // private user id
+  assert.equal(isGroupChatId('100000001'), false);  // private user id
   assert.equal(isGroupChatId('abc'), false);
-  assert.equal(isPrivateChatId('144242180'), true);
+  assert.equal(isPrivateChatId('100000001'), true);
   assert.equal(isPrivateChatId('-1001234567890'), false);
   assert.equal(isPrivateChatId(''), false);
   assert.equal(isGroupChatId(-100), true);          // number input too
-  assert.equal(isPrivateChatId(144242180), true);
+  assert.equal(isPrivateChatId(100000001), true);
 });
 
 test('assertChatIdKind: passes the right kind, throws on the wrong one', () => {
   assert.doesNotThrow(() => assertChatIdKind('-100', 'group', 'project chatId'));
-  assert.doesNotThrow(() => assertChatIdKind('144242180', 'private', 'DAEMON_CHAT_ID'));
-  assert.throws(() => assertChatIdKind('144242180', 'group', "project 'd_be' chatId"), /must be a GROUP/);
+  assert.doesNotThrow(() => assertChatIdKind('100000001', 'private', 'DAEMON_CHAT_ID'));
+  assert.throws(() => assertChatIdKind('100000001', 'group', "project 'd_be' chatId"), /must be a GROUP/);
   assert.throws(() => assertChatIdKind('-100', 'private', 'DAEMON_CHAT_ID'), /must be a PRIVATE/);
   assert.throws(() => assertChatIdKind('xyz', 'group', 'catch-all'), /must be a GROUP/);
 });
@@ -105,7 +105,7 @@ function tmpJson(obj) {
 }
 
 const CONFIG = {
-  luni: { chatId: '-1003805278607', roles: { '144242180': 'admin', '555': 'dev' } },
+  acmebot: { chatId: '-1003333333333', roles: { '100000001': 'admin', '555': 'dev' } },
   noChat: { roles: { '7': 'maintainer' } }, // entry with roles but no chatId
 };
 
@@ -124,10 +124,10 @@ test('readProjectsConfig: missing/corrupt → {}', () => {
 });
 
 test('resolveProjectConfig: json hit → dedicated, chatId + roles from json', () => {
-  const r = resolveProjectConfig('luni', { config: CONFIG, fallbackChatId: '-999' });
-  assert.equal(r.chatId, '-1003805278607');
+  const r = resolveProjectConfig('acmebot', { config: CONFIG, fallbackChatId: '-999' });
+  assert.equal(r.chatId, '-1003333333333');
   assert.equal(r.dedicated, true);
-  assert.equal(r.roles['144242180'], 'admin');
+  assert.equal(r.roles['100000001'], 'admin');
 });
 
 test('resolveProjectConfig: no entry → fallback chatId, NOT dedicated, empty roles', () => {
@@ -153,14 +153,14 @@ test('resolveProjectConfig: no entry + no fallback → chatId null (caller fail-
 });
 
 test('resolveProjectConfig: entry.code → display code (short alias); roster lookup stays the key', () => {
-  const cfg = { 'digesty-worker': { code: 'd_be', chatId: '-100', roles: {} } };
-  const r = resolveProjectConfig('digesty-worker', { config: cfg, fallbackChatId: '-999' });
+  const cfg = { 'acme-worker': { code: 'd_be', chatId: '-100', roles: {} } };
+  const r = resolveProjectConfig('acme-worker', { config: cfg, fallbackChatId: '-999' });
   assert.equal(r.code, 'd_be');
 });
 
 test('resolveProjectConfig: no entry.code → code falls back to the lookup key', () => {
-  const r = resolveProjectConfig('luni', { config: CONFIG, fallbackChatId: '-999' });
-  assert.equal(r.code, 'luni');
+  const r = resolveProjectConfig('acmebot', { config: CONFIG, fallbackChatId: '-999' });
+  assert.equal(r.code, 'acmebot');
 });
 
 test('resolveProjectConfig: blank/non-string code is ignored → falls back to lookup key', () => {
@@ -181,7 +181,7 @@ test('resolveProjectConfig: topicIcon object passed through when present', () =>
 });
 
 test('resolveProjectConfig: topicIcon null when absent or not an object', () => {
-  assert.equal(resolveProjectConfig('luni', { config: CONFIG }).topicIcon, null);
+  assert.equal(resolveProjectConfig('acmebot', { config: CONFIG }).topicIcon, null);
   const cfg = { p: { chatId: '-100', topicIcon: 'nope' } };
   assert.equal(resolveProjectConfig('p', { config: cfg }).topicIcon, null);
 });
@@ -196,7 +196,7 @@ test('resolveProjectConfig: description passed through (trimmed) for dedicated +
 });
 
 test('resolveProjectConfig: description null when absent, blank, or non-string', () => {
-  assert.equal(resolveProjectConfig('luni', { config: CONFIG }).description, null); // absent
+  assert.equal(resolveProjectConfig('acmebot', { config: CONFIG }).description, null); // absent
   assert.equal(resolveProjectConfig('p', { config: { p: { chatId: '-100', description: '   ' } } }).description, null); // blank → null
   assert.equal(resolveProjectConfig('p', { config: { p: { chatId: '-100', description: 123 } } }).description, null); // non-string → null
   assert.equal(resolveProjectConfig('ghost', { config: CONFIG, fallbackChatId: '-999' }).description, null); // no entry
@@ -241,9 +241,9 @@ test('adminIdsFrom: dedicated → [chatId]; shared → parseAdminChatIds(fallbac
 });
 
 test('roleFor: mapped → role; unmapped → member; no userId → null', () => {
-  const roles = { '144242180': 'admin' };
-  assert.equal(roleFor(roles, 144242180), 'admin');
-  assert.equal(roleFor(roles, '144242180'), 'admin');
+  const roles = { '100000001': 'admin' };
+  assert.equal(roleFor(roles, 100000001), 'admin');
+  assert.equal(roleFor(roles, '100000001'), 'admin');
   assert.equal(roleFor(roles, 999), 'member');   // unmapped user → default member
   assert.equal(roleFor(null, 1), 'member');       // no roles map → member
   assert.equal(roleFor(roles, null), null);       // no sender → null (can't attribute)
@@ -251,7 +251,7 @@ test('roleFor: mapped → role; unmapped → member; no userId → null', () => 
 
 test('roleFor: object profile → reads .role; missing .role → member', () => {
   const roles = {
-    '1': { role: 'admin', title: 'anh', name: 'Thi', position: 'dev' },
+    '1': { role: 'admin', title: 'anh', name: 'Alice', position: 'dev' },
     '2': { title: 'chị', name: 'Lan' }, // profile with no explicit role
   };
   assert.equal(roleFor(roles, 1), 'admin'); // pulls .role out of the object
@@ -275,7 +275,7 @@ test('roleFor/memberFor: a polluted prototype never grants privilege (own-proper
 });
 
 test('memberFor: object → profile; string shorthand/unmapped/no-userId → null', () => {
-  const profile = { role: 'admin', title: 'anh', name: 'Thi', position: 'founder / dev' };
+  const profile = { role: 'admin', title: 'anh', name: 'Alice', position: 'founder / dev' };
   const roles = { '1': profile, '2': 'dev' };
   assert.deepEqual(memberFor(roles, 1), profile); // full profile exposed
   assert.equal(memberFor(roles, '1'), profile);   // userId coerced to string

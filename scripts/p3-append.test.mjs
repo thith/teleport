@@ -28,7 +28,7 @@ test('parseArgs: --first-run opt-in, default false, requires --append', () => {
 });
 
 test('mergePromptData: concatenates text, unions attachments, takes NEWEST metadata', () => {
-  const existing = { text: 'first', attachments: [{ a: 1 }], messageId: 10, fromName: 'Thi', persona: { name: 'X' } };
+  const existing = { text: 'first', attachments: [{ a: 1 }], messageId: 10, fromName: 'Alice', persona: { name: 'X' } };
   const incoming = { text: 'second', attachments: [{ b: 2 }], messageId: 11, fromName: 'Nam', chatId: '-100' };
   const m = mergePromptData(existing, incoming);
   assert.equal(m.text, 'first\n\nsecond');
@@ -339,12 +339,12 @@ test('mergeOrSpoolPrompt: on lock exhaustion it THROWS (durable write must prece
   fs.rmSync(d, { recursive: true, force: true });
 });
 
-// RFC 03 bug (caught by Thi's dogfood): mergePromptData did `{ ...incoming }`, so a
+// RFC 03 bug (caught by Alice's dogfood): mergePromptData did `{ ...incoming }`, so a
 // kind-flag on the OLDER (existing) side was DROPPED when a plain message coalesced
 // in — a whisper/instruct would look like a plain message → the agent could reply to
 // it PUBLICLY (leak). All 7 kind-flags must survive a merge (union, incoming wins).
 test('mergePromptData: preserves kind-flags from the OLDER side (whisper/instruct/broadcast/ask/handover — no silent downgrade)', () => {
-  const plain = { text: 'x', textAttributed: false, fromName: 'Thi', fromRole: 'admin', fromUserId: '1' };
+  const plain = { text: 'x', textAttributed: false, fromName: 'Alice', fromRole: 'admin', fromUserId: '1' };
   const cases = {
     whisper: true, instruct: true, broadcast: { from: { role: 'admin' } },
     ask: { replyTo: '9' }, askReply: { answer: 'a' },
@@ -356,7 +356,7 @@ test('mergePromptData: preserves kind-flags from the OLDER side (whisper/instruc
     const m = mergePromptData(flagged, plain);
     assert.deepEqual(m[flag], val, `${flag} must survive when it is the older side`);
     // reply still targets the newest (plain) sender; text carries both, attributed
-    assert.equal(m.fromName, 'Thi');
+    assert.equal(m.fromName, 'Alice');
     assert.match(m.text, /kín/);
   }
 });
@@ -386,4 +386,15 @@ test('mergePromptData: no spurious kind-flags when neither side has them; incomi
   // both have the flag → incoming's value wins (union, not duplicate)
   const a2 = { ...a, whisper: 'old' }; const b2 = { ...b, whisper: 'new' };
   assert.equal(mergePromptData(a2, b2).whisper, 'new');
+});
+
+test('sweepOrphanSnapshots: a parked `.stale.<pid>-<n>` (second park in one process) is adopted too', () => {
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), 'sweep5-'));
+  const parked = path.join(d, `prompt-convo-7.processing.json.stale.${DEAD_PID}-1`);
+  fs.writeFileSync(parked, JSON.stringify({ text: 'lô bị park lần hai', textAttributed: false, fromName: 'An', fromRole: 'admin', fromUserId: '1', messageId: 6 }));
+  sweepOrphanSnapshots(7, d);
+  assert.equal(fs.existsSync(parked), false);
+  const open = JSON.parse(fs.readFileSync(path.join(d, 'prompt-convo-7.json'), 'utf8'));
+  assert.match(open.text, /lô bị park lần hai/);
+  fs.rmSync(d, { recursive: true, force: true });
 });

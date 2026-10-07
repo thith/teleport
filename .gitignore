@@ -2,3 +2,6 @@
 tmp/
 scripts/tmp/
 projects.json
+
+# Per-machine session archives (RFC 09) — kept local, never published
+sessions/

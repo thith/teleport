@@ -4,7 +4,7 @@
 //
 //   {
 //     "<convoId>": {
-//       "project": "tea_game",
+//       "project": "my_game",
 //       "lastBotSend": "2026-05-22T10:00:00.000Z",
 //       "lastBotSendMessageId": 2700,
 //       "lastAdminReply": "2026-05-22T09:55:00.000Z" | null,

@@ -152,10 +152,10 @@ test('per-bot cache isolation: a bot only ever sees its own update_id sequence',
 });
 
 test('botScopedFiles: distinct bots get distinct, botId-suffixed cache+offset files', () => {
-  const a = botScopedFiles(8741523718, '/x/tmp');
+  const a = botScopedFiles(1234567890, '/x/tmp');
   const b = botScopedFiles(123456, '/x/tmp');
-  assert.strictEqual(a.cacheFile, '/x/tmp/updates-cache.8741523718.jsonl');
-  assert.strictEqual(a.globalOffsetFile, '/x/tmp/global-offset.8741523718.txt');
+  assert.strictEqual(a.cacheFile, '/x/tmp/updates-cache.1234567890.jsonl');
+  assert.strictEqual(a.globalOffsetFile, '/x/tmp/global-offset.1234567890.txt');
   // The two bots must NOT share any update_id-state file — the whole point of
   // the fix. If main() were reverted to the shared constants this contract
   // would be broken.

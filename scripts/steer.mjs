@@ -43,14 +43,25 @@ export function projectLabelForChat(chatId, config) {
 
 // First `#hash` in `replyText` that RESOLVES to a live topic (skip dead ones —
 // RFC 07 §2.1/D2). Used ONLY to pick a target; never read for role/sender/command.
-// NB: a hashtag is 1:1 with a convoId, so a reply hash can't be "shadowed"/ambiguous
-// across topics the way a reused persona NAME can — only `status:'found'` matters.
+// NB: only `status:'found'` is honoured. A hashtag is NOT 1:1 with a convoId
+// (`shortConvoHash` keeps the last 8 digits only), so two live convos CAN share
+// one — matchTarget reports that as `ambiguous` and we skip it rather than steer a
+// PRIVATE whisper/instruct at a coin-flip target.
 export function targetFromReply(replyText, live) {
   if (!replyText) return null;
   const hashes = String(replyText).slice(0, REPLY_TEXT_MAX).match(/#[A-Za-z0-9]+/g) || [];
   for (const h of hashes) {
     const m = matchTarget(normalizeTarget(h), live);
     if (m.status === 'found') return m.match; // { convoId, chatId }
+    // A COLLIDING hash must stop the scan, not be skipped: continuing would let a
+    // later hash in the same text receive a steer meant for the ambiguous one —
+    // i.e. a private instruction delivered to a different agent (Codex review).
+    // Return the ambiguity rather than null, so the CALLER can say so: a bare null
+    // reads as "the reply named nobody" and makes resolveSteerTarget fall back to
+    // treating the first WORD of the command as a target name — the owner would
+    // get `target làm not found among live topics` for `/whisper làm tiếp`
+    // (Gemini review).
+    if (m.status === 'ambiguous') return { ambiguous: h, candidates: m.candidates };
   }
   return null;
 }
@@ -106,7 +117,8 @@ export function resolveSteerTarget(argv, { live, replyText, usage }) {
     return { match: m.match, text: argv.slice(1).join(' ').trim() };
   }
   const replyMatch = targetFromReply(replyText, live);
-  if (replyMatch) return { match: replyMatch, text: argv.join(' ').trim() }; // ALL argv = text
+  if (replyMatch?.ambiguous) return fail(replyMatch.ambiguous, 'ambiguous');   // say WHY, don't guess
+  if (replyMatch) return { match: replyMatch, text: argv.join(' ').trim() };   // ALL argv = text
   if (a0) {
     const m = matchTarget(normalizeTarget(a0), live); // non-reply: convoId or persona-name
     if (m.status !== 'found') return fail(a0, m.status);

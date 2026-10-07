@@ -30,7 +30,7 @@ import { peekPersona } from './persona-store.mjs';
 import { shortConvoHash } from './convo-hash.mjs';
 import { readTopicsStore } from './topics-store.mjs';
 import { resolveConvoIdFromEnv } from './convo-registry.mjs';
-import { buildCombinedPromptData, DEFAULT_TMP_DIR, mergeOrSpoolPrompt } from './tele-listen.mjs';
+import { buildCombinedPromptData, resyncPromptSegments, DEFAULT_TMP_DIR, mergeOrSpoolPrompt } from './tele-listen.mjs';
 import { loadEnvFromFile } from './send-telegram.mjs';
 import { getLastAliveMs, DEFAULT_FRESH_MS as ALIVE_FRESH_MS } from './listener-alive.mjs';
 import {
@@ -87,7 +87,7 @@ function buildPromptBase({ targetConvoId, targetChatId, text, nowSec }) {
   base.fromUserId = null;
   base.fromMember = null;        // ASK never raises privilege (context, not authority)
   base.attachments = [];
-  return base;
+  return resyncPromptSegments(base);   // messages[0] must not contradict the neutered identity
 }
 
 // ASK prompt injected into B's queue.
@@ -130,7 +130,9 @@ export function readText(args, deps = {}) {
 export function planAsk({ args, sourceConvoId, text, envFile = {}, nowSec, deps = {} }) {
   const store = deps.readTopicsStore ? deps.readTopicsStore() : readTopicsStore();
   // SAME-group scope: resolveChatIds with NO override → the asker's own chat.
-  const { chatIds } = (deps.resolveChatIds ?? resolveChatIds)({ envFile });
+  // Route with the SAME convo we attribute to, so the searched group and the
+  // source identity can never diverge.
+  const { chatIds } = (deps.resolveChatIds ?? resolveChatIds)({ envFile, convoId: sourceConvoId != null ? Number(sourceConvoId) : null });
   if (!chatIds.length) return { code: EXIT.USAGE, message: 'no admin chat configured for this project (cwd)' };
   const live = listLiveTopics(store, chatIds);
   const target = normalizeTarget(args.to);

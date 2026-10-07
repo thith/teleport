@@ -102,6 +102,19 @@ export function lookupConvoIdByMessageId(rows, botId, chatId, messageId) {
   return best ? best.convoId : null;
 }
 
+// Extract a validated `--convo <id>` integer from an argv array, for routing
+// decisions taken BEFORE full arg parsing (RFC 15). Space form only, matching
+// the listener/sender contract. Returns the integer or null. Fed to
+// resolveConvoIdFromEnv as `argConvo` (env still wins for native sessions).
+export function argConvoFromArgv(argv = process.argv) {
+  const i = argv.indexOf('--convo');
+  if (i < 0 || i + 1 >= argv.length) return null;
+  const v = String(argv[i + 1]).trim();
+  if (!CONVO_ID_RE.test(v)) return null;
+  const n = Number(v);
+  return Number.isSafeInteger(n) ? n : null;
+}
+
 export function validateConvoIdString(s) {
   if (typeof s !== 'string' || !CONVO_ID_RE.test(s)) {
     throw new Error(`invalid convoId (expected positive integer string, got ${JSON.stringify(s)})`);
@@ -241,6 +254,50 @@ export function hasAllocationRow(rows, convoId, botId, chatId) {
   return false;
 }
 
+// Find the ALLOCATION row (messageId === convoId) for a (convoId, botId),
+// ACROSS chatIds — the convo anchor (RFC 15). A convo that was split (or raced)
+// pre-fix can have >1 allocation row in different chats; we pick the one with
+// the smallest `ts` = FIRST-writer-wins (deterministic), NOT the field-richest
+// (a newer row with `projectKey` must NOT beat an older legacy row). This is
+// deliberately the OPPOSITE of lookupConvoIdByMessageId's newest-wins — that
+// answers "who owns this messageId now", this answers "where was this convo
+// first allocated". Tie on ts → first scanned (prune preserves file order, so
+// stable for allocation rows). Returns the row (with optional `projectKey`) or null.
+export function lookupAllocationByConvo(rows, convoId, botId) {
+  let best = null;
+  for (const row of rows) {
+    if (typeof row.v === 'number' && row.v > CONVO_SCHEMA_VERSION) continue;
+    if (row.convoId !== convoId) continue;
+    if (row.botId !== botId) continue;
+    if (row.messageId !== convoId) continue; // allocation row only
+    const ts = Number.isInteger(row.ts) ? row.ts : 0;
+    if (best == null || ts < best.ts) best = { row, ts };
+  }
+  if (!best) return null;
+  // A first send whose git lookup failed ('default-unresolved') is not a real
+  // anchor: the first LATER allocation that did resolve (a promotion row written
+  // by recordConvoSend) becomes the anchor. Until then the unresolved row stands.
+  // Same for a LEGACY anchor (pre-RFC row: no resolvedBy, no projectKey) that
+  // routing had to resolve afresh because no project owns its chat any more.
+  const isLegacy = !best.row.resolvedBy && !best.row.projectKey;
+  if (best.row.resolvedBy === 'default-unresolved' || isLegacy) {
+    let promoted = null;
+    for (const row of rows) {
+      if (typeof row.v === 'number' && row.v > CONVO_SCHEMA_VERSION) continue;
+      if (row.convoId !== convoId || row.botId !== botId || row.messageId !== convoId) continue;
+      // Only an explicit PROMOTION row (written by recordConvoSend, carrying
+      // `promotedFrom` for this anchor kind) qualifies — never an ordinary later
+      // allocation (an old split, an import-convo row), which must not move a
+      // still-valid anchor.
+      if (row === best.row || row.promotedFrom !== (isLegacy ? 'legacy' : 'unresolved')) continue;
+      const ts = Number.isInteger(row.ts) ? row.ts : 0;
+      if (promoted == null || ts < promoted.ts) promoted = { row, ts };
+    }
+    if (promoted) return promoted.row;
+  }
+  return best.row;
+}
+
 // Append one row under the lock. The caller MUST have acquired it. We open with
 // 'a', write+fsync, close. The trailing newline guarantees a reader sees no
 // partial-line ambiguity.
@@ -265,20 +322,18 @@ export function pruneLocked(registryFile = DEFAULT_REGISTRY_FILE) {
   if (rawLines.length <= REGISTRY_CAP) return { pruned: false, kept: rawLines.length };
   const allocIdx = new Set();
   const forwardIdx = new Set();
-  // Track allocation rows (one per (botId, chatId, convoId)).
-  const seenAlloc = new Set();
   for (let i = 0; i < rows.length; i++) {
     const row = rows[i];
     if (typeof row.v === 'number' && row.v > CONVO_SCHEMA_VERSION) {
       forwardIdx.add(i); // unknown v: preserve byte-for-byte
       continue;
     }
+    // EVERY allocation row is kept, not just the first per chat: a promotion row
+    // (RFC 15 — written when an unresolved/legacy anchor resolves for real) can
+    // share its chat with the anchor it supersedes; dropping it would revert the
+    // convo to the unresolved anchor. Allocation rows are ~1 per convo, so cheap.
     if (row.messageId === row.convoId && row.botId != null && row.chatId != null) {
-      const key = `${row.botId}:${row.chatId}:${row.convoId}`;
-      if (!seenAlloc.has(key)) {
-        allocIdx.add(i);
-        seenAlloc.add(key);
-      }
+      allocIdx.add(i);
     }
   }
   const nonAlloc = [];

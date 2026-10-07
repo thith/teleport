@@ -9,11 +9,11 @@ import { formatFromName, buildPromptData, buildCombinedPromptData } from './tele
 import { personaForConvo } from './persona.mjs';
 
 test('formatFromName: full name from first + last', () => {
-  assert.equal(formatFromName({ first_name: 'Thi', last_name: 'Truong' }), 'Thi Truong');
+  assert.equal(formatFromName({ first_name: 'Alice', last_name: 'Nguyen' }), 'Alice Nguyen');
 });
 
 test('formatFromName: first name only', () => {
-  assert.equal(formatFromName({ first_name: 'Thi' }), 'Thi');
+  assert.equal(formatFromName({ first_name: 'Alice' }), 'Alice');
 });
 
 test('formatFromName: falls back to @username', () => {
@@ -26,32 +26,32 @@ test('formatFromName: null when no identity', () => {
 });
 
 test('buildPromptData includes fromName', () => {
-  const msg = { message_id: 1, chat: { id: -100 }, from: { id: 7, first_name: 'Thi' }, text: 'hi' };
+  const msg = { message_id: 1, chat: { id: -100 }, from: { id: 7, first_name: 'Alice' }, text: 'hi' };
   const out = buildPromptData(msg);
-  assert.equal(out.fromName, 'Thi');
+  assert.equal(out.fromName, 'Alice');
   assert.equal(out.fromUserId, '7');
 });
 
 test('buildCombinedPromptData uses last sender for fromName; text attributes each sender (P2)', () => {
   const mk = (id, name) => ({ msg: { message_id: id, chat: { id: -100 }, from: { id: id, first_name: name }, text: `m${id}` } });
-  const out = buildCombinedPromptData([mk(1, 'Thi'), mk(2, 'Nam')]);
+  const out = buildCombinedPromptData([mk(1, 'Alice'), mk(2, 'Nam')]);
   assert.equal(out.fromName, 'Nam');                 // top-level metadata = last sender (UNCHANGED)
   assert.doesNotMatch(out.text, /Admin follow-up/);  // old blanket label removed
-  assert.match(out.text, /Thi \(member\): m1/);      // no roles → default 'member'
+  assert.match(out.text, /Alice \(member\): m1/);      // no roles → default 'member'
   assert.match(out.text, /Nam \(member\): m2/);
 });
 
 test('buildCombinedPromptData: multi-msg attributes real name + role from roles config (P2)', () => {
   const mk = (id, name) => ({ msg: { message_id: id, chat: { id: -100 }, from: { id, first_name: name }, text: `m${id}` } });
   const roles = { 1: { role: 'admin' }, 2: { role: 'member' } };
-  const out = buildCombinedPromptData([mk(1, 'Thi'), mk(2, 'Nam')], null, null, roles);
-  assert.match(out.text, /Thi \(admin\): m1/);       // authority now visible: admin ≠ member
+  const out = buildCombinedPromptData([mk(1, 'Alice'), mk(2, 'Nam')], null, null, roles);
+  assert.match(out.text, /Alice \(admin\): m1/);       // authority now visible: admin ≠ member
   assert.match(out.text, /Nam \(member\): m2/);
 });
 
 test('buildCombinedPromptData: single message text is bare — no attribution prefix (common case unchanged)', () => {
   const mk = (id, name) => ({ msg: { message_id: id, chat: { id: -100 }, from: { id, first_name: name }, text: `m${id}` } });
-  assert.equal(buildCombinedPromptData([mk(1, 'Thi')]).text, 'm1');
+  assert.equal(buildCombinedPromptData([mk(1, 'Alice')]).text, 'm1');
 });
 
 // RFC 02 P3: textAttributed flags whether `text` already carries per-segment
@@ -59,8 +59,8 @@ test('buildCombinedPromptData: single message text is bare — no attribution pr
 // time), true for a pre-labeled multi-message batch (so it is not double-labeled).
 test('buildCombinedPromptData: textAttributed is false for a lone message, true for a batch', () => {
   const mk = (id, name) => ({ msg: { message_id: id, chat: { id: -100 }, from: { id, first_name: name }, text: `m${id}` } });
-  assert.equal(buildCombinedPromptData([mk(1, 'Thi')]).textAttributed, false);
-  assert.equal(buildCombinedPromptData([mk(1, 'Thi'), mk(2, 'Nam')]).textAttributed, true);
+  assert.equal(buildCombinedPromptData([mk(1, 'Alice')]).textAttributed, false);
+  assert.equal(buildCombinedPromptData([mk(1, 'Alice'), mk(2, 'Nam')]).textAttributed, true);
 });
 
 // Forum phantom-reply: Telegram sets reply_to_message → the topic-creation
@@ -68,7 +68,7 @@ test('buildCombinedPromptData: textAttributed is false for a lone message, true 
 // must not surface as bogus reply context to the agent.
 test('buildPromptData: forum phantom reply_to is suppressed', () => {
   const msg = {
-    message_id: 95, chat: { id: -100 }, from: { id: 7, first_name: 'Thi' }, text: 'hi',
+    message_id: 95, chat: { id: -100 }, from: { id: 7, first_name: 'Alice' }, text: 'hi',
     reply_to_message: { message_id: 93, forum_topic_created: { name: '🐍 Rắn' } },
   };
   const out = buildPromptData(msg);
@@ -78,7 +78,7 @@ test('buildPromptData: forum phantom reply_to is suppressed', () => {
 
 test('buildPromptData: a genuine reply is preserved as context', () => {
   const msg = {
-    message_id: 96, chat: { id: -100 }, from: { id: 7, first_name: 'Thi' }, text: 'theo ý đó',
+    message_id: 96, chat: { id: -100 }, from: { id: 7, first_name: 'Alice' }, text: 'theo ý đó',
     reply_to_message: { message_id: 50, text: 'đề xuất A' },
   };
   const out = buildPromptData(msg);
@@ -88,7 +88,7 @@ test('buildPromptData: a genuine reply is preserved as context', () => {
 
 test('buildCombinedPromptData: phantom suppressed, real reply kept (from last msg)', () => {
   const phantom = { message_id: 93, forum_topic_created: { name: 'x' } };
-  const mk = (id, replyTo) => ({ msg: { message_id: id, chat: { id: -100 }, from: { id, first_name: 'Thi' }, text: `m${id}`, reply_to_message: replyTo } });
+  const mk = (id, replyTo) => ({ msg: { message_id: id, chat: { id: -100 }, from: { id, first_name: 'Alice' }, text: `m${id}`, reply_to_message: replyTo } });
 
   const allPhantom = buildCombinedPromptData([mk(1, phantom), mk(2, phantom)]);
   assert.equal(allPhantom.replyToMessageId, null);
@@ -102,7 +102,7 @@ test('buildCombinedPromptData: phantom suppressed, real reply kept (from last ms
 // RFC 04: the agent's own persona is injected into the inbound prompt so it can
 // self-identify and recognize when a human addresses it by name.
 test('buildCombinedPromptData: injects own persona when convoId is known', () => {
-  const mk = (id) => ({ msg: { message_id: id, chat: { id: -100 }, from: { id, first_name: 'Thi' }, text: `m${id}` } });
+  const mk = (id) => ({ msg: { message_id: id, chat: { id: -100 }, from: { id, first_name: 'Alice' }, text: `m${id}` } });
   const convoId = 2120524005926900; // → 🐧 Cánh Cụt (index 26) on the 110-pool
   const out = buildCombinedPromptData([mk(1)], null, convoId);
   assert.deepEqual(out.persona, personaForConvo(convoId));
@@ -111,7 +111,7 @@ test('buildCombinedPromptData: injects own persona when convoId is known', () =>
 });
 
 test('buildCombinedPromptData: no persona field when convoId absent', () => {
-  const mk = (id) => ({ msg: { message_id: id, chat: { id: -100 }, from: { id, first_name: 'Thi' }, text: `m${id}` } });
+  const mk = (id) => ({ msg: { message_id: id, chat: { id: -100 }, from: { id, first_name: 'Alice' }, text: `m${id}` } });
   const out = buildCombinedPromptData([mk(1)]);
   assert.equal(out.convoId, undefined);
   assert.equal('persona' in out, false);
@@ -119,13 +119,13 @@ test('buildCombinedPromptData: no persona field when convoId absent', () => {
 
 // RFC 02: a project's `description` reaches the agent as prompt `projectDescription`.
 test('buildCombinedPromptData: includes projectDescription when provided (trimmed)', () => {
-  const mk = (id) => ({ msg: { message_id: id, chat: { id: -100 }, from: { id, first_name: 'Thi' }, text: `m${id}` } });
+  const mk = (id) => ({ msg: { message_id: id, chat: { id: -100 }, from: { id, first_name: 'Alice' }, text: `m${id}` } });
   assert.equal(buildCombinedPromptData([mk(1)], null, null, null, 'Backend API + worker').projectDescription, 'Backend API + worker');
   assert.equal(buildCombinedPromptData([mk(1)], null, null, null, '  padded  ').projectDescription, 'padded'); // boundary trim
 });
 
 test('buildCombinedPromptData: no projectDescription field when null/absent/blank/non-string', () => {
-  const mk = (id) => ({ msg: { message_id: id, chat: { id: -100 }, from: { id, first_name: 'Thi' }, text: `m${id}` } });
+  const mk = (id) => ({ msg: { message_id: id, chat: { id: -100 }, from: { id, first_name: 'Alice' }, text: `m${id}` } });
   assert.equal('projectDescription' in buildCombinedPromptData([mk(1)]), false); // arg omitted
   assert.equal('projectDescription' in buildCombinedPromptData([mk(1)], null, null, null, null), false); // explicit null
   assert.equal('projectDescription' in buildCombinedPromptData([mk(1)], null, null, null, '   '), false); // whitespace-only → dropped
@@ -135,7 +135,7 @@ test('buildCombinedPromptData: no projectDescription field when null/absent/blan
 // RFC 02: member `note` rides fromMember; the builder normalizes it at the boundary
 // (keep only a non-empty string) WITHOUT mutating the shared roles config.
 test('buildCombinedPromptData: fromMember.note passthrough + boundary sanitization', () => {
-  const mk = (id) => ({ msg: { message_id: id, chat: { id: -100 }, from: { id, first_name: 'Thi' }, text: `m${id}` } });
+  const mk = (id) => ({ msg: { message_id: id, chat: { id: -100 }, from: { id, first_name: 'Alice' }, text: `m${id}` } });
   const roles = { 1: { role: 'maintainer', name: 'Bảo', note: '  review kỹ  ' } };
   assert.equal(buildCombinedPromptData([mk(1)], null, null, roles).fromMember.note, 'review kỹ'); // trimmed passthrough
 

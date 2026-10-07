@@ -1,7 +1,7 @@
 # Profile overlay — code-bot
 
 > Fills the `> [overlay]` hooks in `../teleport-docs/guides/process.md` / `review-guide.md` for a
-> Telegram/CLI bot (single-maintainer experimental service, e.g. luni).
+> Telegram/CLI bot (single-maintainer experimental service).
 
 ## Branch / deploy policy (process §1)
 - Commit directly to `main` (small single-maintainer repo); no PR / staging gate.

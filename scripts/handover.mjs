@@ -30,8 +30,8 @@ import { peekPersona } from './persona-store.mjs';
 import { shortConvoHash } from './convo-hash.mjs';
 import { listAliveConvos } from './listener-alive.mjs';
 import { readTopicsStore } from './topics-store.mjs';
-import { readProjectsConfig, resolveProjectConfig, resolveProjectKey, adminIdsFrom, resolveDefaultChatId } from './projects-config.mjs';
-import { resolveConvoIdFromEnv, validateConvoIdString } from './convo-registry.mjs';
+import { readProjectsConfig, resolveProjectRouting, adminIdsFrom, resolveDefaultChatId } from './projects-config.mjs';
+import { resolveConvoIdFromEnv, validateConvoIdString, readRows as readConvoRows } from './convo-registry.mjs';
 
 /** True iff `s` is a convoId the listener can actually watch (positive,
  * safe-integer, no leading zero) — i.e. `prompt-convo-<s>.json` is a path some
@@ -39,8 +39,8 @@ import { resolveConvoIdFromEnv, validateConvoIdString } from './convo-registry.m
 function isWatchableConvoId(s) {
   try { validateConvoIdString(String(s)); return true; } catch { return false; }
 }
-import { buildCombinedPromptData, DEFAULT_TMP_DIR, mergeOrSpoolPrompt } from './tele-listen.mjs';
-import { loadEnvFromFile, parseAdminChatIds } from './send-telegram.mjs';
+import { buildCombinedPromptData, resyncPromptSegments, DEFAULT_TMP_DIR, mergeOrSpoolPrompt } from './tele-listen.mjs';
+import { loadEnvFromFile, parseAdminChatIds, extractBotId } from './send-telegram.mjs';
 import { buildSpawnPlan, runSpawn, genSessionSeed, listSpawnSessions, hasBinary } from './spawn.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -76,7 +76,7 @@ const USAGE = `Usage:
   cat notes.md | node handover.mjs --new --by-role <admin|maintainer> [--from-convo N]
   node handover.mjs --to "Cú" --notes-file ./tmp/handover.md
   node handover.mjs --ack <sourceConvoId> [--from-convo N]   # receiver confirms receipt back to source
-Notes come from stdin (default) or --notes-file. See teleport-docs/rfc/05-handover.md.`;
+Notes come from stdin (default) or --notes-file. Guide: rules/telegram-guide.md (Handover).`;
 
 /**
  * Parse argv. Returns `{ to, isNew, notesFile, fromConvo, byRole, chatId, ack, error }`.
@@ -150,7 +150,7 @@ export function listLiveTopics(store, chatIds) {
       if (!(typeof threadId === 'number' && threadId > 0)) continue;
       // Only numeric convoId keys are valid handover targets: the listener
       // watches `prompt-convo-<positive-int>.json`. A legacy/shared project-code
-      // key (e.g. "luni", "tea_game") would match by name/hashtag but the
+      // key (e.g. "acmebot", "my_game") would match by name/hashtag but the
       // injected file could never be picked up → silent permanent hang + a false
       // exit-0 baton no one catches (review C1). Skip it.
       if (!isWatchableConvoId(key)) continue;
@@ -214,12 +214,23 @@ export function listSteerableTargets(store, chatIds, { aliveDir, now = Date.now(
  * - `{ status: 'ambiguous', candidates }`
  * - `{ status: 'not_found' }`
  *
- * Hashtag/convoId are unique (hashtag is derived 1:1 from convoId), so they
- * never collide. Persona NAMES are reused (~40-pair pool, index = hash % 40), so
- * a name can match several historical topics. The relevant one is almost always
- * the most RECENTLY ACTIVE → pick the freshest by `_ts` and report the others as
- * `shadowed` (so the user can redirect with `--to "#hashtag"`). Only a genuine
+ * `convoId` is the only truly unique address. A **`#hashtag` is NOT unique**:
+ * `shortConvoHash` keeps only the LAST 8 digits, so `1205483045424020` and
+ * `2205483045424020` both render `#e5424020` (verified). This comment used to
+ * claim hashtags "never collide" and that belief is why nothing checked.
+ *
+ * Persona NAMES are reused by design (110-name pool, index = hash % 110), so a
+ * name routinely matches several topics. The relevant one is almost always the
+ * most RECENTLY ACTIVE → pick the freshest by `_ts` and report the others as
+ * `shadowed` (the user can redirect with `--to "#hashtag"`). Only a genuine
  * recency TIE (equal/zero `_ts` at the top) stays ambiguous.
+ *
+ * A COLLIDING HASHTAG, by contrast, is never recency-picked: a hashtag is an
+ * exact machine address — whoever typed it meant that one convo — and the
+ * consequence of guessing is silent misdelivery (a whisper/instruct is private:
+ * picking the "freshest" of two colliding hashtags would leak it to the wrong
+ * agent). Refusing costs nothing in the normal case, since a hashtag collision
+ * needs a 7-digit tail match, i.e. it is vastly rarer than a name collision.
  */
 export function matchTarget(target, liveTopics) {
   let hits;
@@ -238,6 +249,18 @@ export function matchTarget(target, liveTopics) {
   }
   if (hits.length === 0) return { status: 'not_found' };
   if (hits.length === 1) return { status: 'found', match: hits[0] };
+  // An exact address matching two DIFFERENT convos is a collision: refuse rather
+  // than guess (see the header comment). Matching the same convo twice is NOT a
+  // collision — `listLiveTopics` emits one row per (chatId, convoId), so a convo
+  // with topics in two groups (or a topic row plus an RFC 14 alive-only row)
+  // legitimately appears more than once. Refusing there would break exact
+  // convoId/hashtag targeting for a case with no ambiguity at all (Codex review).
+  if (target.kind === 'hashtag' || target.kind === 'convoId') {
+    const distinct = new Set(hits.map((h) => String(h.convoId)));
+    if (distinct.size > 1) {
+      return { status: 'ambiguous', candidates: [...hits].sort((a, b) => (b.ts || 0) - (a.ts || 0)) };
+    }
+  }
   // ≥2 hits: prefer the most recently active. Tie at the top (incl. all-zero
   // ts, i.e. no recency signal) → ambiguous, let the human disambiguate.
   const sorted = [...hits].sort((a, b) => (b.ts || 0) - (a.ts || 0));
@@ -299,6 +322,7 @@ export function buildHandoverPrompt({ targetConvoId, targetChatId, sourceConvoId
   base.fromUserId = null;
   base.fromMember = null;
   base.attachments = [];
+  resyncPromptSegments(base);          // messages[0] must not contradict the neutered identity
   base.handover = {
     from: {
       persona: sourcePersona,
@@ -347,6 +371,7 @@ export function buildAckPrompt({ targetConvoId, targetChatId, sourceConvoId, not
   base.fromUserId = null;
   base.fromMember = null;
   base.attachments = [];
+  resyncPromptSegments(base);          // messages[0] must not contradict the neutered identity
   base.handoverAck = {
     from: {
       persona: ackerPersona,
@@ -377,17 +402,33 @@ export function buildSeedPrompt({ sourceConvoId, notes }) {
   ].join('\n');
 }
 
-/** Resolve the admin chat ids this run is scoped to (cwd project → dedicated
- * group, else shared catch-all), honoring an explicit --chat-id override. */
-export function resolveChatIds({ cwd = process.cwd(), env = process.env, envFile = {}, chatIdOverride = null } = {}) {
+/** Resolve the admin chat ids this run is scoped to via the SAME convo-anchored
+ * routing send-telegram/tele-listen use (RFC 15: anchor → override → git root →
+ * non-git basename → `_default`), so handover searches the group this session
+ * actually posts to — worktree/subdir safe. Honors an explicit --chat-id
+ * override. Routing inputs are injectable for tests. */
+export function resolveChatIds({
+  cwd = process.cwd(), env = process.env, envFile = {}, chatIdOverride = null,
+  argConvo = null, projectsConfig = null, convoId, botId, registryRows, gitRootFn, gitTreeFn,
+} = {}) {
   if (chatIdOverride) return { chatIds: [String(chatIdOverride)], roles: {} };
-  const projectsConfig = readProjectsConfig();
-  // A git-worktree folder (e.g. `digesty-frontend-uifix`) is not itself a
-  // projects.json key; resolve it to the longest matching project key so it lands
-  // in the project's real group instead of the shared `_default` fallback.
-  const lookupKey = resolveProjectKey(path.basename(cwd) || '', projectsConfig);
-  const fallbackChatId = resolveDefaultChatId(projectsConfig, { env, envFile });
-  const projCfg = resolveProjectConfig(lookupKey, { config: projectsConfig, fallbackChatId });
+  const config = projectsConfig ?? readProjectsConfig();
+  const fallbackChatId = resolveDefaultChatId(config, { env, envFile });
+  const token = env.REPORT_BOT_TOKEN || envFile.REPORT_BOT_TOKEN;
+  const { projCfg } = resolveProjectRouting({
+    cwd,
+    // Same precedence as send-telegram's anchor: native session env, then the
+    // caller's --from-convo (Gemini). Numeric: registry rows compare strictly.
+    convoId: convoId !== undefined ? convoId
+      : resolveConvoIdFromEnv({ argConvo: argConvo != null && /^\d+$/.test(String(argConvo)) ? Number(argConvo) : null, env }).convoId,
+    botId: botId !== undefined ? botId : (token ? extractBotId(token) : null),
+    env,
+    registryRows: registryRows ?? readConvoRows().rows,
+    projectsConfig: config,
+    fallbackChatId,
+    ...(gitRootFn !== undefined ? { gitRootFn } : {}),
+    ...(gitTreeFn !== undefined ? { gitTreeFn } : {}),
+  });
   const chatIds = adminIdsFrom(projCfg, fallbackChatId, parseAdminChatIds).filter(Boolean);
   return { chatIds, roles: projCfg.roles };
 }
@@ -477,7 +518,9 @@ async function main() {
   }
 
   // (i) existing topic → resolve + inject.
-  const { chatIds } = resolveChatIds({ envFile, chatIdOverride: args.chatId });
+  // Route with the SAME convo we attribute to (sourceConvoId), so the group we
+  // search and the identity we sign as can never diverge.
+  const { chatIds } = resolveChatIds({ envFile, chatIdOverride: args.chatId, convoId: Number(sourceConvoId) });
   if (!chatIds.length) {
     err('[handover] no admin chat configured (set projects.json[<cwd>].chatId or _default.chatId)');
     process.exit(EXIT.USAGE);

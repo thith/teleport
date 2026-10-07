@@ -24,8 +24,8 @@ function tmp() {
 
 test('pending-store — recordBotSend creates entry with project + messageId', () => {
   const store = {};
-  recordBotSend(store, { convoId: 100, project: 'tea_game', messageId: 555, now: Date.parse('2026-05-22T10:00:00Z') });
-  assert.strictEqual(store['100'].project, 'tea_game');
+  recordBotSend(store, { convoId: 100, project: 'my_game', messageId: 555, now: Date.parse('2026-05-22T10:00:00Z') });
+  assert.strictEqual(store['100'].project, 'my_game');
   assert.strictEqual(store['100'].lastBotSendMessageId, 555);
   assert.strictEqual(store['100'].lastBotSend, '2026-05-22T10:00:00.000Z');
   assert.strictEqual(store['100'].remindedAt, null);
@@ -99,9 +99,9 @@ test('pending-store — formatPendingList: empty list returns "no pending" messa
 
 test('pending-store — formatPendingList: includes project + convo hash + elapsed', () => {
   const out = formatPendingList([
-    { convoId: '2205483045424020', project: 'tea_game', lastBotSendMessageId: 2700, elapsedMs: 2 * 60 * 60_000 + 30 * 60_000, remindedAt: null },
+    { convoId: '2205483045424020', project: 'my_game', lastBotSendMessageId: 2700, elapsedMs: 2 * 60 * 60_000 + 30 * 60_000, remindedAt: null },
   ]);
-  assert.match(out, /tea_game/);
+  assert.match(out, /my_game/);
   // Encoded shortConvoHash for last 8 = "45424020", first digit 4 → 'e' → "e5424020"
   assert.match(out, /#e5424020/);
   assert.match(out, /2h 30m/);
@@ -205,7 +205,7 @@ test('runHeartbeatReminders — skips send when isQuietHour is true', async () =
   process.env.QUIET_HOURS_END = end;
   try {
     let calls = 0;
-    const sent = await runHeartbeatReminders('TOKEN', ['144242180'], {
+    const sent = await runHeartbeatReminders('TOKEN', ['100000001'], {
       sendText: async () => { calls++; return true; },
       now,
       storeFile: file,
@@ -223,7 +223,7 @@ test('runHeartbeatReminders — skips send when isQuietHour is true', async () =
 
 test('runHeartbeatReminders — no due → no send', async () => {
   let calls = 0;
-  const sent = await runHeartbeatReminders('TOKEN', ['144242180'], { sendText: async () => { calls++; return true; }, now: Date.now() });
+  const sent = await runHeartbeatReminders('TOKEN', ['100000001'], { sendText: async () => { calls++; return true; }, now: Date.now() });
   assert.strictEqual(calls, 0);
   assert.strictEqual(sent, 0);
 });
@@ -404,7 +404,7 @@ test('runHeartbeatReminders — registers reminder message ID for orphan-path ro
     sendCalls.push([chatId, text]);
     return true; // intentionally truthy non-object — should NOT crash
   };
-  await runHeartbeatReminders('TOKEN', ['144242180'], {
+  await runHeartbeatReminders('TOKEN', ['100000001'], {
     sendText,
     now,
     storeFile: file,

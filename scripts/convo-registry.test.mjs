@@ -8,7 +8,7 @@ import {
   acquireLock, appendRowLocked, buildConvoFilter, CONVO_ID_RE,
   CONVO_SCHEMA_VERSION, hasAllocationRow, lookupConvoIdByMessageId,
   pruneLocked, readRows, releaseLock, REGISTRY_CAP, REGISTRY_KEEP_NON_ALLOC,
-  resolveConvoIdFromEnv, uuidToConvoInt, validateConvoIdString,
+  resolveConvoIdFromEnv, uuidToConvoInt, validateConvoIdString, lookupAllocationByConvo,
 } from './convo-registry.mjs';
 import { appendToSentRegistry, escapeMarkdownV2, injectConvoHash, listenerHintForCurrentAgent, parseArgs as parseSendArgs, previewLineWithHashtag, readSentRegistry, shortConvoHash } from './send-telegram.mjs';
 import { parseArgs as parseListenArgs, compareSameConvo, filterAdminMessages, findOrphanMessages, resolveStartOffset, waitOnceSupervisor } from './tele-listen.mjs';
@@ -247,18 +247,18 @@ test('parseArgs (send-telegram) — --convo accepts a positive integer', () => {
 });
 
 test('injectConvoHash — emoji prefix + convoId produces clickable hashtag', () => {
-  const out = injectConvoHash('🦊 *Claude on topic:*\n\n✅ done', 'tea_game', 12345);
-  assert.strictEqual(out, '[tea_game] [🦊 #t12345] *Claude on topic:*\n\n✅ done');
+  const out = injectConvoHash('🦊 *Claude on topic:*\n\n✅ done', 'my_game', 12345);
+  assert.strictEqual(out, '[my_game] [🦊 #t12345] *Claude on topic:*\n\n✅ done');
 });
 
 test('injectConvoHash — no emoji prefix falls back to [#c<id>] prefix', () => {
-  const out = injectConvoHash('Plain text update', 'tea_game', 999);
-  assert.strictEqual(out, '[tea_game] [#t999] Plain text update');
+  const out = injectConvoHash('Plain text update', 'my_game', 999);
+  assert.strictEqual(out, '[my_game] [#t999] Plain text update');
 });
 
 test('injectConvoHash — null convoId keeps legacy [Project] prefix (no hashtag)', () => {
-  const out = injectConvoHash('🦊 *Claude on topic:*', 'tea_game', null);
-  assert.strictEqual(out, '[tea_game] 🦊 *Claude on topic:*');
+  const out = injectConvoHash('🦊 *Claude on topic:*', 'my_game', null);
+  assert.strictEqual(out, '[my_game] 🦊 *Claude on topic:*');
 });
 
 test('injectConvoHash — missing projectCode emits bare [<emoji> #c<id>] tag', () => {
@@ -267,18 +267,18 @@ test('injectConvoHash — missing projectCode emits bare [<emoji> #c<id>] tag', 
 });
 
 test('injectConvoHash — null message returns null', () => {
-  assert.strictEqual(injectConvoHash(null, 'tea_game', 1), null);
+  assert.strictEqual(injectConvoHash(null, 'my_game', 1), null);
 });
 
 test('injectConvoHash — empty message + no convoId stays empty (legacy)', () => {
-  assert.strictEqual(injectConvoHash('', 'tea_game', null), '');
+  assert.strictEqual(injectConvoHash('', 'my_game', null), '');
 });
 
 test('injectConvoHash — empty message + convoId emits hashtag prefix only (no trailing space)', () => {
   // Document send with no caption still needs the hashtag so admins can filter.
   // No trailing space so the caption is clean.
-  const out = injectConvoHash('', 'tea_game', 42);
-  assert.strictEqual(out, '[tea_game] [#t42]');
+  const out = injectConvoHash('', 'my_game', 42);
+  assert.strictEqual(out, '[my_game] [#t42]');
 });
 
 test('injectConvoHash — empty message + convoId + no projectCode emits bare hashtag', () => {
@@ -304,11 +304,11 @@ test('injectConvoHash + escapeMarkdownV2 — hashtag survives escape pipeline', 
   // renders as `#c42` and is detected as a clickable hashtag.
   // This test locks in the expected escape format so a future regression in
   // escapeMarkdownV2 logic gets caught.
-  const injected = injectConvoHash('🦊 *topic*', 'tea_game', 42);
+  const injected = injectConvoHash('🦊 *topic*', 'my_game', 42);
   const escaped = escapeMarkdownV2(injected);
-  // tea_game is treated as text token; `_` only escapes when unbalanced (it
+  // my_game is treated as text token; `_` only escapes when unbalanced (it
   // appears once = unbalanced, gets escaped). brackets and `#` always escape.
-  assert.match(escaped, /\\\[tea[_\\_]+game\\\]/); // [tea_game] form
+  assert.match(escaped, /\\\[my[_\\_]+game\\\]/); // [my_game] form
   assert.match(escaped, /\\\[🦊 \\#t42\\\]/);     // [🦊 #t42] form with escaped # and brackets
   // The `*topic*` markdown bold survives (balanced *).
   assert.match(escaped, /\*topic\*/);
@@ -400,11 +400,11 @@ test('injectConvoHash — keycap sequence', () => {
 });
 
 test('injectConvoHash — raw mode escapes injected [, ], # for MarkdownV2', () => {
-  const out = injectConvoHash('🦊 \\*pre\\-escaped\\*', 'tea_game', 42, { pretokensEscaped: true });
+  const out = injectConvoHash('🦊 \\*pre\\-escaped\\*', 'my_game', 42, { pretokensEscaped: true });
   // Brackets and # in our injected prefix must be MdV2-escaped so Telegram parser accepts.
-  // tea_game has no special chars; pure underscore "_" is not special in MdV2 strictly
+  // my_game has no special chars; pure underscore "_" is not special in MdV2 strictly
   // but our escape regex includes it for safety because MdV2 spec mandates escape.
-  assert.strictEqual(out, '\\[tea\\_game\\] \\[🦊 \\#t42\\] \\*pre\\-escaped\\*');
+  assert.strictEqual(out, '\\[my\\_game\\] \\[🦊 \\#t42\\] \\*pre\\-escaped\\*');
 });
 
 test('injectConvoHash — raw mode escapes ALL 18 MdV2 special chars in projectCode', () => {
@@ -425,8 +425,8 @@ test('injectConvoHash — emoji directly followed by markdown asterisk (no space
 });
 
 test('injectConvoHash — non-raw mode keeps injected prefix unescaped (escaped later by escapeMarkdownV2)', () => {
-  const out = injectConvoHash('🦊 *topic*', 'tea_game', 42);
-  assert.strictEqual(out, '[tea_game] [🦊 #t42] *topic*');
+  const out = injectConvoHash('🦊 *topic*', 'my_game', 42);
+  assert.strictEqual(out, '[my_game] [🦊 #t42] *topic*');
 });
 
 test('listenerHintForCurrentAgent — non-Claude agents use wait-once', () => {
@@ -457,19 +457,19 @@ test('findOrphanMessages — phantom topic-creation reply is treated as orphan (
     update_id: 1,
     message: {
       message_id: 100,
-      chat: { id: 144242180, type: 'private' },
-      text: 'Tôi gõ trong topic không reply',
+      chat: { id: 100000001, type: 'private' },
+      text: 'tin gõ trong topic, không reply',
       message_thread_id: 1915267,
       is_topic_message: true,
       reply_to_message: {
         message_id: 99,
-        chat: { id: 144242180, type: 'private' },
-        forum_topic_created: { name: 'tea_game', icon_color: 7322096 },
+        chat: { id: 100000001, type: 'private' },
+        forum_topic_created: { name: 'my_game', icon_color: 7322096 },
         is_topic_message: true,
       },
     },
   }];
-  const orphans = findOrphanMessages(updates, ['144242180'], new Set());
+  const orphans = findOrphanMessages(updates, ['100000001'], new Set());
   assert.strictEqual(orphans.length, 1);
   assert.strictEqual(orphans[0].msg.message_id, 100);
 });
@@ -480,7 +480,7 @@ test('findOrphanMessages — real user reply (non-phantom) is NOT orphan', () =>
     update_id: 2,
     message: {
       message_id: 200,
-      chat: { id: 144242180, type: 'private' },
+      chat: { id: 100000001, type: 'private' },
       text: 'reply text',
       reply_to_message: {
         message_id: 150,
@@ -488,7 +488,7 @@ test('findOrphanMessages — real user reply (non-phantom) is NOT orphan', () =>
       },
     },
   }];
-  const orphans = findOrphanMessages(updates, ['144242180'], new Set());
+  const orphans = findOrphanMessages(updates, ['100000001'], new Set());
   assert.strictEqual(orphans.length, 0);
 });
 
@@ -738,3 +738,39 @@ test('pruneLocked — preserves unknown-v rows byte-for-byte', async () => {
   assert.ok(content.includes('"futureField":"preserved"'), 'unknown-v row preserved through prune');
   fs.unlinkSync(file);
 });
+
+test('pruneLocked keeps a SAME-chat promotion row → the anchor stays promoted after prune', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'prune-promo-'));
+  const file = path.join(dir, 'reg.jsonl');
+  const lines = [
+    JSON.stringify({ v: 1, convoId: 5, messageId: 5, chatId: '-100900', botId: 7, ts: 1, resolvedBy: 'default-unresolved' }),
+    JSON.stringify({ v: 1, convoId: 5, messageId: 5, chatId: '-100900', botId: 7, ts: 2, resolvedBy: 'default', projectKey: 'unreg', promotedFrom: 'unresolved' }),
+  ];
+  for (let i = 0; i < REGISTRY_CAP + 2000; i++) lines.push(JSON.stringify({ v: 1, convoId: 9, messageId: 1000 + i, chatId: '-100900', botId: 7, ts: 10 + i }));
+  fs.writeFileSync(file, lines.join('\n') + '\n');
+  try {
+    pruneLocked(file);
+    const anchor = lookupAllocationByConvo(readRows(file).rows, 5, 7);
+    assert.strictEqual(anchor.projectKey, 'unreg');
+    assert.strictEqual(anchor.resolvedBy, 'default');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('lookupAllocationByConvo: a later row WITHOUT resolvedBy (import-convo shape) is never a promotion', () => {
+  const rows = [
+    { v: 1, convoId: 5, messageId: 5, chatId: '-100900', botId: 7, ts: 1, resolvedBy: 'default-unresolved' },
+    { v: 1, convoId: 5, messageId: 5, chatId: '-100111', botId: 7, ts: 2 }, // legacy-shaped import row
+  ];
+  assert.strictEqual(lookupAllocationByConvo(rows, 5, 7).resolvedBy, 'default-unresolved');
+});
+
+test('lookupAllocationByConvo: an ordinary later RESOLVED row never supersedes a legacy anchor (needs promotedFrom)', () => {
+  const rows = [
+    { v: 1, convoId: 5, messageId: 5, chatId: '-1001001', botId: 7, ts: 1 },                                   // legacy A
+    { v: 1, convoId: 5, messageId: 5, chatId: '-1002002', botId: 7, ts: 2, resolvedBy: 'git', projectKey: 'b' }, // old split → B
+  ];
+  assert.strictEqual(lookupAllocationByConvo(rows, 5, 7).chatId, '-1001001');
+  rows.push({ v: 1, convoId: 5, messageId: 5, chatId: '-1003003', botId: 7, ts: 3, resolvedBy: 'git', projectKey: 'c', promotedFrom: 'legacy' });
+  assert.strictEqual(lookupAllocationByConvo(rows, 5, 7).chatId, '-1003003');
+});
+

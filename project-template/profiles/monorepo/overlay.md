@@ -1,7 +1,7 @@
 # Profile overlay — monorepo
 
 > Fills the core `> [overlay]` hooks for a multi-package monorepo (client / server /
-> packages, e.g. tea_game).
+> packages, e.g. my_game).
 
 ## Branch / deploy policy (process §1)
 - Per-package branch/deploy policy behind a PR gate. State **which packages auto-deploy where**, and coordinate cross-package version/release bumps.

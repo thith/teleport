@@ -1,15 +1,6 @@
 {
   "_note": "Custom emoji IDs hợp lệ cho topicIcon.emoji (forum topic icon) — Bot API getForumTopicIconStickers, KHÔNG cần premium. Refresh: node scripts/refresh-topic-icons.mjs",
-  "_assigned": {
-    "iw": "💼",
-    "307": "👨‍👩‍👧‍👦",
-    "luni": "🤖",
-    "digesty-frontend": "🎨",
-    "digesty-worker": "⚡️",
-    "digesty-hub": "📚",
-    "digesty": "🔮",
-    "agri": "🍓"
-  },
+  "_assigned": {},
   "emojiToId": {
     "📰": "5434144690511290129",
     "💡": "5312536423851630001",

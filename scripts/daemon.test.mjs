@@ -76,9 +76,9 @@ test('dispatchCommand: gates by minRole (member cannot run a maintainer command)
 
 test('dispatchCommand: needsProject → folder is the positional first token, dropped from argv; cwd=project; identity in env', async () => {
   const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'ws-'));
-  fs.mkdirSync(path.join(parent, 'luni'));
+  fs.mkdirSync(path.join(parent, 'acmebot'));
   const calls = []; const sent = [];
-  await dispatchCommand({ cmd: 'run', rest: 'luni dev --port 3000' }, { id: '7', first_name: 'Thi', username: 'thi' }, {
+  await dispatchCommand({ cmd: 'run', rest: 'acmebot dev --port 3000' }, { id: '7', first_name: 'Alice', username: 'alice' }, {
     daemonUserId: '1', projectsConfig: { _default: { roles: { '7': { role: 'admin' } } } }, registry: REG,
     parentDir: parent, scriptsDir: '/scripts',
     sendText: async (_c, t) => sent.push(t),
@@ -86,10 +86,10 @@ test('dispatchCommand: needsProject → folder is the positional first token, dr
   });
   assert.equal(calls[0].bin, process.execPath);            // runs `node <script>`
   assert.deepEqual(calls[0].argv, ['/scripts/run.mjs', 'dev', '--port', '3000']); // folder dropped, args passed
-  assert.equal(calls[0].cwd, path.join(parent, 'luni'));   // cwd = the project
+  assert.equal(calls[0].cwd, path.join(parent, 'acmebot'));   // cwd = the project
   assert.equal(calls[0].env.TELE_FROM_ID, '7');
   assert.equal(calls[0].env.TELE_FROM_ROLE, 'admin');
-  assert.equal(calls[0].env.TELE_FROM_NAME, 'Thi');
+  assert.equal(calls[0].env.TELE_FROM_NAME, 'Alice');
   assert.equal(sent[0], 'served');                         // stdout relayed verbatim
   fs.rmSync(parent, { recursive: true, force: true });
 });
@@ -278,17 +278,17 @@ test('resolveSenderRole: consults _default.roles (catch-all owner not in any pro
 test('validateDaemonConfig: enforces group/private split', () => {
   // ok: groups negative, daemon private positive
   assert.doesNotThrow(() => validateDaemonConfig({
-    projectsConfig: { d_be: { chatId: '-1001' }, luni: { chatId: '-1002' } },
-    catchAllIds: ['-100999'], daemonUserId: '144242180',
+    projectsConfig: { d_be: { chatId: '-1001' }, acmebot: { chatId: '-1002' } },
+    catchAllIds: ['-100999'], daemonUserId: '100000001',
   }));
   // daemon chat must be private
   assert.throws(() => validateDaemonConfig({ projectsConfig: {}, catchAllIds: ['-100'], daemonUserId: '-100' }), /daemonUserId.* must be a PRIVATE/);
   // missing daemon chat
   assert.throws(() => validateDaemonConfig({ projectsConfig: {}, catchAllIds: ['-100'], daemonUserId: '' }), /Missing daemonUserId/);
   // a project chat that is private → error
-  assert.throws(() => validateDaemonConfig({ projectsConfig: { bad: { chatId: '144242180' } }, catchAllIds: ['-100'], daemonUserId: '1' }), /project 'bad' chatId must be a GROUP/);
+  assert.throws(() => validateDaemonConfig({ projectsConfig: { bad: { chatId: '100000001' } }, catchAllIds: ['-100'], daemonUserId: '1' }), /project 'bad' chatId must be a GROUP/);
   // catch-all private → error
-  assert.throws(() => validateDaemonConfig({ projectsConfig: {}, catchAllIds: ['144242180'], daemonUserId: '1' }), /_default.chatId.* must be a GROUP/);
+  assert.throws(() => validateDaemonConfig({ projectsConfig: {}, catchAllIds: ['100000001'], daemonUserId: '1' }), /_default.chatId.* must be a GROUP/);
   // reserved _config / _default keys are skipped during project iteration
   assert.doesNotThrow(() => validateDaemonConfig({ projectsConfig: { _config: { daemonUserId: '1' }, _default: { chatId: '-100' }, ok: { chatId: '-101' } }, catchAllIds: ['-100'], daemonUserId: '1' }));
 });

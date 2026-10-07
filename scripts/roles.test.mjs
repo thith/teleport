@@ -8,7 +8,7 @@ import { buildPromptData, buildCombinedPromptData } from './tele-listen.mjs';
 
 test('buildPromptData: fromRole from roles object', () => {
   const roles = { '7': 'admin' };
-  const msg = { message_id: 1, chat: { id: -100 }, from: { id: 7, first_name: 'Thi' }, text: 'hi' };
+  const msg = { message_id: 1, chat: { id: -100 }, from: { id: 7, first_name: 'Alice' }, text: 'hi' };
   assert.equal(buildPromptData(msg, null, null, roles).fromRole, 'admin');
 });
 
@@ -19,13 +19,13 @@ test('buildPromptData: unmapped sender → member', () => {
 });
 
 test('buildPromptData: no roles object → member', () => {
-  const msg = { message_id: 1, chat: { id: -100 }, from: { id: 7, first_name: 'Thi' }, text: 'hi' };
+  const msg = { message_id: 1, chat: { id: -100 }, from: { id: 7, first_name: 'Alice' }, text: 'hi' };
   assert.equal(buildPromptData(msg).fromRole, 'member');
 });
 
 test('buildCombinedPromptData: role of LAST sender (object roles)', () => {
   const roles = { '2': 'dev' };
   const mk = (id, name) => ({ msg: { message_id: id, chat: { id: -100 }, from: { id, first_name: name }, text: `m${id}` } });
-  const out = buildCombinedPromptData([mk(1, 'Thi'), mk(2, 'Nam')], null, null, roles);
+  const out = buildCombinedPromptData([mk(1, 'Alice'), mk(2, 'Nam')], null, null, roles);
   assert.equal(out.fromRole, 'dev');
 });

@@ -1,5 +1,10 @@
 # project-template — layered scaffold for new teleport projects
 
+> **Note:** this template assumes a sibling **`teleport-docs/`** folder holding your shared
+> `guides/process.md` and `guides/review-guide.md` (and design notes it links to). That repo is the
+> maintainer's own and is **not published** — create your own `../teleport-docs/guides/` with your
+> team's process and review guides, or edit the paths in the scaffolded `CLAUDE.md`/`AGENTS.md`/`GEMINI.md`.
+
 A new project is **core + one profile**, not a fixed tree (project shapes differ too much —
 bot vs web vs monorepo vs content). See `../../teleport-docs/rfc/09-project-structure-and-process.md`.
 

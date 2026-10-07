@@ -6,13 +6,13 @@ import path from 'node:path';
 import { formatGitFooter, isFirstConvoMessage, readGitContext } from './send-telegram.mjs';
 
 test('formatGitFooter: clean tree → folder · branch · clean, leading blank line', () => {
-  const out = formatGitFooter({ folder: 'luni', branch: 'main', dirty: 0 });
-  assert.equal(out, '\n\n📁 luni · 🌿 main · clean');
+  const out = formatGitFooter({ folder: 'acmebot', branch: 'main', dirty: 0 });
+  assert.equal(out, '\n\n📁 acmebot · 🌿 main · clean');
 });
 
 test('formatGitFooter: dirty tree shows change count', () => {
-  const out = formatGitFooter({ folder: 'luni', branch: 'main', dirty: 3 });
-  assert.equal(out, '\n\n📁 luni · 🌿 main · dirty (3)');
+  const out = formatGitFooter({ folder: 'acmebot', branch: 'main', dirty: 3 });
+  assert.equal(out, '\n\n📁 acmebot · 🌿 main · dirty (3)');
 });
 
 test('formatGitFooter: null ctx (not a git repo) → empty string', () => {

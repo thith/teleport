@@ -121,3 +121,10 @@ test('inactivityNote: no heartbeat at all → advisory names absent listener', (
     deps: { getLastAliveMs: () => null } });
   assert.match(note, /không thấy listener/);
 });
+
+test('planAsk: routes with the SAME (numeric) convo it attributes to', () => {
+  let seen;
+  const deps = { ...depsInGroup(['G1']), resolveChatIds: (o) => { seen = o; return { chatIds: ['G1'] }; } };
+  planAsk({ args: { to: '111', reply: false }, sourceConvoId: '999', text: 'q', nowSec: 1, deps });
+  assert.strictEqual(seen.convoId, 999);
+});

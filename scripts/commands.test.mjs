@@ -113,7 +113,7 @@ test('resolveCommand: an inherited prototype name never resolves to a command', 
 });
 
 test('tokenizeArgs: splits on whitespace but keeps quoted spans as one token', () => {
-  assert.deepEqual(tokenizeArgs('luni dev --port 3000'), ['luni', 'dev', '--port', '3000']);
+  assert.deepEqual(tokenizeArgs('acmebot dev --port 3000'), ['acmebot', 'dev', '--port', '3000']);
   assert.deepEqual(tokenizeArgs('app test --grep "a b c"'), ['app', 'test', '--grep', 'a b c']);
   assert.deepEqual(tokenizeArgs("x --msg 'hello world'"), ['x', '--msg', 'hello world']);
   assert.deepEqual(tokenizeArgs('  spaced   out  '), ['spaced', 'out']); // collapses runs

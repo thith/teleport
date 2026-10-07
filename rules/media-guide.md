@@ -65,4 +65,4 @@ Reads text aloud. Model `gemini-3.1-flash-tts-preview` (env `GEN_TTS_MODEL`); In
 
 ---
 
-Design rationale, API internals, and model-id decisions live in `../teleport-docs/rfc/06-media-generation.md` — this guide is the runtime source of truth agents follow.
+Design rationale lives in the maintainers' notes (not published) — this guide is the runtime source of truth agents follow.

@@ -26,7 +26,7 @@ test('topicTarget: dedicated (in projects.json) → persona-only, name-first tit
   const t = topicTarget({
     convoId: '3039138158370420',
     persona: { emoji: '🐷', name: 'Heo' },
-    projectCode: 'luni',
+    projectCode: 'acmebot',
     dedicated: true,
   });
   assert.deepEqual(t, { topicKey: '3039138158370420', topicName: 'Heo 🐷' });
@@ -34,15 +34,15 @@ test('topicTarget: dedicated (in projects.json) → persona-only, name-first tit
 
 test('topicTarget: no convoId falls back to projectCode', () => {
   assert.deepEqual(
-    topicTarget({ convoId: null, persona: { emoji: '🐷', name: 'Heo' }, projectCode: 'luni' }),
-    { topicKey: 'luni', topicName: 'luni' },
+    topicTarget({ convoId: null, persona: { emoji: '🐷', name: 'Heo' }, projectCode: 'acmebot' }),
+    { topicKey: 'acmebot', topicName: 'acmebot' },
   );
 });
 
 test('topicTarget: no persona falls back to projectCode', () => {
   assert.deepEqual(
-    topicTarget({ convoId: '1', persona: null, projectCode: 'luni' }),
-    { topicKey: 'luni', topicName: 'luni' },
+    topicTarget({ convoId: '1', persona: null, projectCode: 'acmebot' }),
+    { topicKey: 'acmebot', topicName: 'acmebot' },
   );
 });
 
@@ -53,8 +53,8 @@ test('topicTarget: catch-all (not in projects.json) → code-first title "code �
 
 test('topicTarget: dedicated default (false) is catch-all → code-first', () => {
   // `dedicated` omitted defaults to false (catch-all): code leads the title.
-  const t = topicTarget({ convoId: '99', persona: { emoji: '🐷', name: 'Heo' }, projectCode: 'luni' });
-  assert.deepEqual(t, { topicKey: '99', topicName: 'luni · 🐷 Heo' });
+  const t = topicTarget({ convoId: '99', persona: { emoji: '🐷', name: 'Heo' }, projectCode: 'acmebot' });
+  assert.deepEqual(t, { topicKey: '99', topicName: 'acmebot · 🐷 Heo' });
 });
 
 test('topicTarget: catch-all with empty projectCode → name-first persona-only (no orphan " · ")', () => {
@@ -63,7 +63,7 @@ test('topicTarget: catch-all with empty projectCode → name-first persona-only 
 });
 
 test('topicTarget: dedicated persona-only title trails the emoji (never adjacent to the leading topicIcon)', () => {
-  const t = topicTarget({ convoId: '7', persona: { emoji: '🐷', name: 'Heo' }, projectCode: 'luni', dedicated: true });
+  const t = topicTarget({ convoId: '7', persona: { emoji: '🐷', name: 'Heo' }, projectCode: 'acmebot', dedicated: true });
   // dedicated groups carry a leading topicIcon; name-first keeps the persona emoji off the front.
   assert.ok(/^Heo 🐷$/u.test(t.topicName), `expected name-first persona-only, got ${t.topicName}`);
 });
@@ -193,16 +193,16 @@ test('resolveThreadId: team keys cache by topicKey, creates with topicName', asy
   let createdName = null;
   const fetcher = async (_t, _c, name) => { createdName = name; return { ok: true, messageThreadId: 777 }; };
   const tid = await resolveThreadId({
-    token: 'tok', chatId: '-100', projectCode: 'luni',
-    topicKey: '3039138158370420', topicName: 'luni · 🐷 Heo',
+    token: 'tok', chatId: '-100', projectCode: 'acmebot',
+    topicKey: '3039138158370420', topicName: 'acmebot · 🐷 Heo',
     topicsFile: file, fetcher,
   });
   assert.equal(tid, 777);
-  assert.equal(createdName, 'luni · 🐷 Heo');
+  assert.equal(createdName, 'acmebot · 🐷 Heo');
   // Cached under the convoId key, not the project name.
   const store = readTopicsStore(file);
   assert.equal(getThreadId(store, '-100', '3039138158370420'), 777);
-  assert.equal(getThreadId(store, '-100', 'luni'), null);
+  assert.equal(getThreadId(store, '-100', 'acmebot'), null);
   fs.unlinkSync(file);
 });
 
@@ -225,7 +225,7 @@ test('resolveThreadId: icon defaults to {} when omitted (no crash, fetcher gets 
   const file = tmpTopics();
   let gotIcon = 'unset';
   const fetcher = async (_t, _c, _name, icon) => { gotIcon = icon; return { ok: true, messageThreadId: 1 }; };
-  await resolveThreadId({ token: 't', chatId: '-100', projectCode: 'luni', topicKey: 'k', topicName: 'n', topicsFile: file, fetcher });
+  await resolveThreadId({ token: 't', chatId: '-100', projectCode: 'acmebot', topicKey: 'k', topicName: 'n', topicsFile: file, fetcher });
   assert.deepEqual(gotIcon, {});
   fs.unlinkSync(file);
 });
@@ -258,7 +258,7 @@ test('resolveThreadId: a 400 with NO icon sent does NOT trigger an icon-retry', 
   let call = 0;
   const fetcher = async () => { call++; return { ok: false, status: 400, description: 'something else' }; };
   const tid = await resolveThreadId({
-    token: 'tok', chatId: '-100', projectCode: 'luni', topicKey: 'k', topicName: 'n',
+    token: 'tok', chatId: '-100', projectCode: 'acmebot', topicKey: 'k', topicName: 'n',
     topicsFile: file, fetcher, sleepFn: noSleep,
   });
   assert.equal(tid, null);
@@ -269,10 +269,10 @@ test('resolveThreadId: a 400 with NO icon sent does NOT trigger an icon-retry', 
 test('resolveThreadId: default mode still keys by projectCode', async () => {
   const file = tmpTopics();
   const fetcher = async () => ({ ok: true, messageThreadId: 5 });
-  const tid = await resolveThreadId({ token: 'tok', chatId: '-100', projectCode: 'luni', topicsFile: file, fetcher });
+  const tid = await resolveThreadId({ token: 'tok', chatId: '-100', projectCode: 'acmebot', topicsFile: file, fetcher });
   assert.equal(tid, 5);
   const store = readTopicsStore(file);
-  assert.equal(getThreadId(store, '-100', 'luni'), 5);
+  assert.equal(getThreadId(store, '-100', 'acmebot'), 5);
   fs.unlinkSync(file);
 });
 
@@ -280,8 +280,8 @@ test('resolveThreadId: positive cache hit returns without calling fetcher', asyn
   const file = tmpTopics();
   let calls = 0;
   const fetcher = async () => { calls++; return { ok: true, messageThreadId: 9 }; };
-  await resolveThreadId({ token: 't', chatId: '-100', projectCode: 'luni', topicKey: 'k', topicName: 'n', topicsFile: file, fetcher });
-  await resolveThreadId({ token: 't', chatId: '-100', projectCode: 'luni', topicKey: 'k', topicName: 'n', topicsFile: file, fetcher });
+  await resolveThreadId({ token: 't', chatId: '-100', projectCode: 'acmebot', topicKey: 'k', topicName: 'n', topicsFile: file, fetcher });
+  await resolveThreadId({ token: 't', chatId: '-100', projectCode: 'acmebot', topicKey: 'k', topicName: 'n', topicsFile: file, fetcher });
   assert.equal(calls, 1);
   fs.unlinkSync(file);
 });
@@ -291,10 +291,10 @@ test('resolveThreadId: forceCreate bypasses the positive cache (topic-gone recov
   let calls = 0;
   const fetcher = async () => { calls++; return { ok: true, messageThreadId: 100 + calls }; };
   // First resolve caches thread 101.
-  const a = await resolveThreadId({ token: 't', chatId: '-100', projectCode: 'luni', topicKey: 'k', topicName: 'n', topicsFile: file, fetcher });
+  const a = await resolveThreadId({ token: 't', chatId: '-100', projectCode: 'acmebot', topicKey: 'k', topicName: 'n', topicsFile: file, fetcher });
   assert.equal(a, 101);
   // forceCreate must IGNORE the cache and create a fresh topic (102), never reuse 101.
-  const b = await resolveThreadId({ token: 't', chatId: '-100', projectCode: 'luni', topicKey: 'k', topicName: 'n', topicsFile: file, fetcher, forceCreate: true });
+  const b = await resolveThreadId({ token: 't', chatId: '-100', projectCode: 'acmebot', topicKey: 'k', topicName: 'n', topicsFile: file, fetcher, forceCreate: true });
   assert.equal(b, 102);
   assert.equal(calls, 2);
   fs.unlinkSync(file);
@@ -312,7 +312,7 @@ test('resolveThreadId: transient 504 on create retries once then succeeds + cach
   const sleeps = [];
   const fetcher = async () => seq[calls++];
   const tid = await resolveThreadId({
-    token: 't', chatId: '-100', projectCode: 'luni', topicKey: 'k', topicName: 'n',
+    token: 't', chatId: '-100', projectCode: 'acmebot', topicKey: 'k', topicName: 'n',
     topicsFile: file, fetcher, sleepFn: async (ms) => { sleeps.push(ms); },
   });
   assert.equal(tid, 555);
@@ -331,7 +331,7 @@ test('resolveThreadId: network throw on create retries then succeeds', async () 
     return { ok: true, status: 200, messageThreadId: 42 };
   };
   const tid = await resolveThreadId({
-    token: 't', chatId: '-100', projectCode: 'luni', topicKey: 'k', topicName: 'n',
+    token: 't', chatId: '-100', projectCode: 'acmebot', topicKey: 'k', topicName: 'n',
     topicsFile: file, fetcher, sleepFn: noSleep,
   });
   assert.equal(tid, 42);
@@ -344,7 +344,7 @@ test('resolveThreadId: persistent 504 → null, no negative cache (next send ret
   let calls = 0;
   const fetcher = async () => { calls++; return { ok: false, status: 504, description: 'Gateway Timeout' }; };
   const tid = await resolveThreadId({
-    token: 't', chatId: '-100', projectCode: 'luni', topicKey: 'k', topicName: 'n',
+    token: 't', chatId: '-100', projectCode: 'acmebot', topicKey: 'k', topicName: 'n',
     topicsFile: file, fetcher, sleepFn: noSleep,
   });
   assert.equal(tid, null);
@@ -362,7 +362,7 @@ test('resolveThreadId: permanent 403 → null, single call (no retry), no negati
   const sleeps = [];
   const fetcher = async () => { calls++; return { ok: false, status: 403, description: 'not enough rights' }; };
   const tid = await resolveThreadId({
-    token: 't', chatId: '-100', projectCode: 'luni', topicKey: 'k', topicName: 'n',
+    token: 't', chatId: '-100', projectCode: 'acmebot', topicKey: 'k', topicName: 'n',
     topicsFile: file, fetcher, sleepFn: async (ms) => { sleeps.push(ms); },
   });
   assert.equal(tid, null);

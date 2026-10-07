@@ -9,7 +9,7 @@ import {
 } from './scaffold.mjs';
 
 test('parseScaffoldArgs: positional project + --type (space and =), flags', () => {
-  assert.deepEqual(parseScaffoldArgs(['luni', '--type', 'code-bot']), { project: 'luni', type: 'code-bot', dryRun: false, git: true, into: null });
+  assert.deepEqual(parseScaffoldArgs(['acmebot', '--type', 'code-bot']), { project: 'acmebot', type: 'code-bot', dryRun: false, git: true, into: null });
   assert.deepEqual(parseScaffoldArgs(['--type=code-web', 'shop', '--dry-run', '--no-git']), { project: 'shop', type: 'code-web', dryRun: true, git: false, into: null });
   assert.equal(parseScaffoldArgs(['x', '--into', '/tmp/z']).into, '/tmp/z');
 });
@@ -29,8 +29,8 @@ test('validateType: only the 4 profiles pass', () => {
 
 test('applyPlaceholders: substitutes PROJECT, profile, and the long type placeholder', () => {
   const src = '# <PROJECT>\nwith the **<profile>** overlay\nProfile: `<code-bot | code-web | monorepo | content>`';
-  const out = applyPlaceholders(src, { project: 'luni', type: 'code-bot' });
-  assert.match(out, /# luni/);
+  const out = applyPlaceholders(src, { project: 'acmebot', type: 'code-bot' });
+  assert.match(out, /# acmebot/);
   assert.match(out, /\*\*code-bot\*\* overlay/);
   assert.match(out, /Profile: `code-bot`/);
   assert.ok(!out.includes('<PROJECT>') && !out.includes('<profile>') && !out.includes('<code-bot |'));

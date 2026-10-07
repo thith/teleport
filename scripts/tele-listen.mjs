@@ -17,11 +17,12 @@ import {
 import { recordAlive, getLastAliveMs, pruneStale as pruneAliveStale, DEFAULT_FRESH_MS as ALIVE_FRESH_MS } from './listener-alive.mjs';
 import { readTopicsStore, getThreadId, DEFAULT_TOPICS_FILE } from './topics-store.mjs';
 import { peekPersona } from './persona-store.mjs';
-import { readProjectsConfig, resolveProjectConfig, roleFor, memberFor, adminIdsFrom, resolveDefaultChatId } from './projects-config.mjs';
+import { readProjectsConfig, resolveProjectConfig, resolveProjectRouting, roleFor, memberFor, adminIdsFrom, resolveDefaultChatId, resolveSendOnly, SEND_ONLY_LISTEN_REFUSAL } from './projects-config.mjs';
 import { harvestMembers } from './roster-upsert.mjs';
 import {
   acquireLock as acquireConvoLock,
   appendRowLocked as appendConvoRow,
+  argConvoFromArgv,
   buildConvoFilter,
   CONVO_SCHEMA_VERSION,
   DEFAULT_LOCK_FILE as CONVO_LOCK_FILE,
@@ -312,10 +313,207 @@ export function parseArgs(argv) {
 
 // extractBotId is imported from send-telegram.mjs (single source of truth).
 
+// Telegram splits media across distinct fields; a file the user "sent" can land
+// in any of these. A message carries at most ONE media, but Telegram also mirrors
+// an animation (GIF) into `document` for backward compatibility — so the specific
+// fields must be probed BEFORE `document`, and only the first hit is taken.
+// Keep this list and extractAttachments() in sync.
+const MEDIA_FIELDS = ['animation', 'audio', 'voice', 'video', 'video_note', 'document'];
+
+/**
+ * Flatten Telegram's EXPANDED EDITOR payload into text.
+ *
+ * A message composed in the expanded (rich-text) editor arrives with NO `text`
+ * and NO `caption` — the content sits in `rich_message.blocks[]`
+ * (`{type: 'paragraph'|'heading'|…, text, size}`). Everything here used to read
+ * `msg.text ?? msg.caption`, so such a message looked EMPTY: `hasUserContent`
+ * rejected it, the listener never reacted 👍 and never delivered it — and since
+ * the poll offset advances regardless, it was lost for good. (Confirmed on a real
+ * update: message 1613, `rich_message` with 4 blocks, no `text` field.)
+ *
+ * Rendering is deliberately plain: headings keep their level as `#` markers,
+ * list items become `- ` lines, everything else contributes its `text`. Empty
+ * blocks are dropped so the spacer paragraphs the editor emits don't pile up.
+ */
+/**
+ * Flatten one block's `text`, which is NOT always a string.
+ *
+ * Real payloads nest inline formatting arbitrarily deep: a block's `text` may be
+ * a string, or an ARRAY mixing strings with `{type:'bold'|'underline'|…, text}`
+ * nodes whose own `text` is again any of those forms. The first version of this
+ * function assumed a plain string — true of the first captured message but NOT of
+ * the very next one the owner sent, which was silently dropped again. Recurse.
+ */
+/**
+ * The user message inside an update, whichever kind it is.
+ *
+ * Telegram delivers an EDIT as its own update type (`edited_message`, same
+ * `message_id`, plus `edit_date`) and it arrives by default — but every intake
+ * site read `u.message` only, so edits were silently ignored: the admin fixed a
+ * typo or added a sentence and the agent never learned. The edited Message has
+ * the identical shape, so accepting it here is enough for the whole pipeline.
+ */
+export function updateMessage(u) {
+  return u?.message ?? u?.edited_message ?? null;
+}
+
+export function richInlineText(node) {
+  if (node == null) return '';
+  if (typeof node === 'string') return node;
+  if (Array.isArray(node)) return node.map(richInlineText).join('');
+  if (typeof node !== 'object') return '';
+  // Bot API 10.1 RichText nodes: every formatting node nests its content under
+  // `text` (bold/italic/underline/strikethrough/spoiler/code/mention/hashtag/…),
+  // `url` nodes additionally carry the target, and a mathematical_expression
+  // carries a bare string instead of nested text.
+  if (typeof node.mathematical_expression === 'string') return node.mathematical_expression;
+  const inner = richInlineText(node.text ?? node.content);
+  if (node.type === 'url' && typeof node.url === 'string' && node.url && node.url !== inner) {
+    return inner ? `${inner} (${node.url})` : node.url;
+  }
+  return inner;
+}
+
+/** A list block: `items[]` are OBJECTS (`{label, blocks[], has_checkbox, is_checked}`), not strings. */
+function richListText(block, depth) {
+  const items = Array.isArray(block.items) ? block.items : [];
+  const lines = [];
+  for (const it of items) {
+    if (it == null) continue;
+    // Be liberal: a real item is an OBJECT (`{label, blocks[], has_checkbox}`),
+    // but the schema has surprised us twice already, so a bare string or an inline
+    // array is accepted as the item's content rather than silently dropped.
+    const isObj = typeof it === 'object' && !Array.isArray(it);
+    const body = (isObj
+      ? (richInlineText(it.text ?? it.content).trim() || richBlocksText(it.blocks, depth + 1))
+      : richInlineText(it)).trim();
+    if (!body) continue;
+    const marker = isObj && it.has_checkbox
+      ? (it.is_checked ? '- [x]' : '- [ ]')
+      : (isObj && typeof it.label === 'string' && it.label.trim() ? it.label.trim() : '-');
+    const pad = '  '.repeat(depth);
+    const [first, ...rest] = body.split('\n');
+    lines.push(`${pad}${marker} ${first}`);
+    for (const r of rest) lines.push(`${pad}  ${r}`);
+  }
+  return lines.join('\n');
+}
+
+/** A table block: `cells[][]` of `{text, align}` → a markdown table. */
+function richTableText(block) {
+  const rows = (Array.isArray(block.cells) ? block.cells : [])
+    .map((r) => (Array.isArray(r) ? r.map((c) => richInlineText(c && typeof c === 'object' ? (c.text ?? c.content) : c).replace(/\|/g, '\\|').trim()) : []));
+  if (!rows.length) return '';
+  const width = Math.max(...rows.map((r) => r.length));
+  const line = (cells) => `| ${Array.from({ length: width }, (_, i) => cells[i] ?? '').join(' | ')} |`;
+  const [head, ...body] = rows;
+  return [line(head), `| ${Array.from({ length: width }, () => '---').join(' | ')} |`, ...body.map(line)].join('\n');
+}
+
+/** Media blocks carry their file under the same field names as a plain message. */
+const RICH_MEDIA_LABEL = {
+  photo: '[ảnh]', video: '[video]', animation: '[ảnh động]', audio: '[audio]',
+  voice_note: '[voice]', collage: '[bộ ảnh]', slideshow: '[slideshow]', map: '[bản đồ]',
+};
+
+/**
+ * One block → text.
+ *
+ * Field names differ between what a BOT SENDS (Bot API 10.1 `InputRichMessage`:
+ * `content`, `header`) and what the expanded editor SENDS US (`text`, `summary`),
+ * so both spellings are accepted everywhere. Block `type` values follow the
+ * documented set — `section_heading`, `block_quotation`, `preformatted`,
+ * `divider`, … — plus the shorter ones seen on real incoming payloads
+ * (`heading`, `quote`).
+ */
+function richBlockText(b, depth) {
+  const inline = () => richInlineText(b.text ?? b.content).trim();
+  switch (b.type) {
+    case 'heading':
+    case 'section_heading': {
+      const level = Number.isInteger(b.size) && b.size > 0 && b.size <= 6 ? b.size : 2;
+      const t = inline();
+      return t ? `${'#'.repeat(level)} ${t}` : '';
+    }
+    case 'code':
+    case 'preformatted': {
+      const t = inline();
+      return t ? `\`\`\`\n${t}\n\`\`\`` : '';
+    }
+    case 'quote':
+    case 'block_quotation':
+    case 'pull_quotation': {
+      // Documented as RichText, but a quotation may also arrive as nested blocks.
+      const t = inline() || richBlocksText(b.blocks, depth);
+      return t ? t.split('\n').map((l) => `> ${l}`).join('\n') : '';
+    }
+    case 'divider': return '---';
+    case 'footer': {
+      const t = inline();
+      return t ? `— ${t}` : '';
+    }
+    case 'thinking': {
+      const t = inline();
+      return t ? `(suy nghĩ) ${t}` : '';
+    }
+    case 'mathematical_expression': {
+      const t = typeof b.mathematical_expression === 'string' ? b.mathematical_expression.trim() : inline();
+      return t ? `$${t}$` : '';
+    }
+    case 'anchor': return '';                       // a link target, no reader-visible content
+    case 'list': return richListText(b, depth);
+    case 'table': return richTableText(b);
+    case 'details': {
+      const summary = richInlineText(b.summary ?? b.header).trim();
+      const body = richBlocksText(b.blocks, depth) || richInlineText(b.content).trim();
+      return [summary ? `▸ ${summary}` : '', body].filter(Boolean).join('\n\n');
+    }
+    case 'map': {
+      const loc = b.location;
+      const at = loc && loc.latitude != null ? ` ${loc.latitude},${loc.longitude}` : '';
+      return `${RICH_MEDIA_LABEL.map}${at}`;
+    }
+    case 'photo': case 'video': case 'animation': case 'audio':
+    case 'voice_note': case 'collage': case 'slideshow': {
+      // The bytes travel via `attachments[]` (see richMediaHolders); the text keeps
+      // a marker + caption so the agent knows something was attached and where.
+      const caption = richInlineText(b.caption ?? b.text ?? b.content).trim();
+      const label = RICH_MEDIA_LABEL[b.type] ?? '[media]';
+      return caption ? `${label} ${caption}` : label;
+    }
+    default: return inline() || richBlocksText(b.blocks, depth);
+  }
+}
+
+/** Flatten a block list. Recursive: blocks nest inside list items and details. */
+export function richBlocksText(blocks, depth = 0) {
+  if (!Array.isArray(blocks)) return '';
+  const out = [];
+  for (const b of blocks) {
+    if (!b || typeof b !== 'object') continue;
+    const t = richBlockText(b, depth);
+    if (t.trim()) out.push(t);
+  }
+  return out.join('\n\n');
+}
+
+export function richMessageText(rich) {
+  if (!Array.isArray(rich?.blocks)) return null;
+  const text = richBlocksText(rich.blocks);
+  return text.trim() ? text : null;
+}
+
+/** The human-readable text of a message, whichever field Telegram put it in. */
+export function messageText(msg) {
+  return msg?.text ?? msg?.caption ?? richMessageText(msg?.rich_message) ?? '';
+}
+
 function hasUserContent(msg) {
-  return Boolean(
-    msg && (msg.text || msg.caption || msg.document || (Array.isArray(msg.photo) && msg.photo.length))
-  );
+  if (!msg) return false;
+  if (msg.text || msg.caption) return true;
+  if (richMessageText(msg.rich_message)) return true;
+  if (Array.isArray(msg.photo) && msg.photo.length) return true;
+  return MEDIA_FIELDS.some((f) => msg[f]);
 }
 
 function sanitizeFileName(rawName) {
@@ -350,14 +548,52 @@ function sanitizeFileName(rawName) {
   return name;
 }
 
+/**
+ * Media carried INSIDE a rich message's blocks.
+ *
+ * `extractAttachments` only ever probed top-level message fields, so a photo or
+ * video composed in the expanded editor — which lands in a `photo`/`video`/…
+ * BLOCK, or in a `collage`/`slideshow` block's `media[]` — produced no attachment
+ * at all: the file was never downloaded and the agent never saw it. Media blocks
+ * use the same field shapes as a plain message, so we return them as
+ * message-shaped holders and reuse the same probe.
+ */
+export function richMediaHolders(rich) {
+  const out = [];
+  const seen = new Set();
+  const walk = (blocks) => {
+    for (const b of Array.isArray(blocks) ? blocks : []) {
+      if (!b || typeof b !== 'object' || seen.has(b)) continue;
+      seen.add(b);
+      if (b.photo || MEDIA_FIELDS.some((f) => b[f])) out.push(b);
+      for (const m of Array.isArray(b.media) ? b.media : []) {
+        if (m && typeof m === 'object') out.push(m);
+      }
+      walk(b.blocks);
+      for (const it of Array.isArray(b.items) ? b.items : []) {
+        if (it && typeof it === 'object') walk(it.blocks);
+      }
+    }
+  };
+  walk(rich?.blocks);
+  return out;
+}
+
 function extractAttachments(msg, updateId = null, botId = null) {
   const out = [];
-  if (msg.document) {
-    const d = msg.document;
+  // All media fields share the same shape (file_id + optional
+  // file_name/mime_type/file_size), so one probe covers them. `kind` keeps the
+  // originating field name so callers can tell them apart. Stop at the first hit:
+  // a message carries one media, and an animation also appears under `document`.
+  const field = MEDIA_FIELDS.find((f) => msg[f]);
+  if (field) {
+    const m = msg[field];
     out.push({
-      kind: 'document', botId, updateId,
-      fileId: d.file_id, fileName: d.file_name ?? null,
-      mimeType: d.mime_type ?? null, fileSize: d.file_size ?? null,
+      kind: field, botId, updateId,
+      fileId: m.file_id,
+      // voice/video_note never carry a name; audio may expose a title instead.
+      fileName: m.file_name ?? m.title ?? null,
+      mimeType: m.mime_type ?? null, fileSize: m.file_size ?? null,
       localPath: null, error: null,
     });
   }
@@ -369,6 +605,11 @@ function extractAttachments(msg, updateId = null, botId = null) {
       mimeType: null, fileSize: largest.file_size ?? null,
       localPath: null, error: null,
     });
+  }
+  // Media composed in the expanded editor lives in blocks, not on the message —
+  // same shapes, so the same probe applies to each holder.
+  for (const holder of richMediaHolders(msg.rich_message)) {
+    out.push(...extractAttachments(holder, updateId, botId));
   }
   return out;
 }
@@ -469,7 +710,7 @@ function streamDownload(token, filePath, finalPath) {
 async function downloadAttachments(token, attachments, baseDir) {
   const perMessage = new Map(); // updateId -> { dir, made, count }
   for (const att of attachments) {
-    if (att.error || (att.kind !== 'document' && att.kind !== 'photo')) continue;
+    if (att.error || (att.kind !== 'photo' && !MEDIA_FIELDS.includes(att.kind))) continue;
     if (att.fileSize != null && att.fileSize > ATTACHMENT_MAX_BYTES) {
       att.error = ATTACHMENT_ERRORS.OVERSIZE; continue;
     }
@@ -554,7 +795,7 @@ export function filterAdminMessages(updates, adminIds, filterReplyTo = null, mod
   }
   return updates
     .filter((u) => {
-      const msg = u.message;
+      const msg = updateMessage(u);
       if (!hasUserContent(msg)) return false;
       if (adminIds.length > 0 && !adminIds.includes(String(msg.chat.id))) return false;
       if (useThread) {
@@ -574,12 +815,12 @@ export function filterAdminMessages(updates, adminIds, filterReplyTo = null, mod
       }
       return true;
     })
-    .map((u) => ({ update: u, msg: u.message }));
+    .map((u) => ({ update: u, msg: updateMessage(u) }));
 }
 
 /**
  * Human-readable sender name for attribution (RFC 01 P2). Prefers full name
- * ("Thi" / "Thi Truong"), falls back to "@username", then null. Used so a team
+ * ("Alice" / "Alice Nguyen"), falls back to "@username", then null. Used so a team
  * group can see WHO issued an instruction, not just a numeric user id.
  */
 export function formatFromName(from) {
@@ -608,10 +849,106 @@ function agentMemberFrom(roles, userId) {
   return rest;
 }
 
-export function buildPromptData(msg, updateId = null, botId = null, roles = null) {
+/**
+ * One message, WHOLE, as it appears inside a prompt's `messages[]`.
+ *
+ * A batch used to be flattened into a single labeled text blob, and
+ * buildCombinedPromptData kept metadata from the LAST message only — its comment
+ * said outright that "reply/quote metadata from earlier messages in the batch is
+ * intentionally dropped". That is why a reply-to vanished whenever the admin
+ * tapped reply and then typed one more bubble inside the settle window: the two
+ * coalesced and the reply-to belonged to the older half.
+ *
+ * The owner's requirement is that every message keeps its ID even when merged —
+ * because the message being replied to may itself sit inside a merged batch, and
+ * there must be a way to point at it. So the batch is now a STRUCTURE: `text`
+ * stays as the human-readable rendering, `messages[]` is the truth.
+ */
+/**
+ * An edit must be UNMISSABLE in the text, not just a field: the agent may have
+ * already acted on the previous wording, so "this replaces what I said" has to
+ * survive into the prose it reads. `editedAt` keeps the machine-readable form.
+ */
+export function editMarker(msg) {
+  return msg?.edit_date != null ? '✏️ (đã sửa) ' : '';
+}
+
+export function buildPromptSegment(msg, updateId = null, botId = null, roles = null) {
   const replyTo = realReplyTo(msg);
   return {
-    text: msg.text ?? msg.caption ?? '',
+    messageId: msg.message_id,
+    edited: msg.edit_date != null,
+    editedAt: msg.edit_date ?? null,
+    fromUserId: String(msg.from?.id ?? msg.chat?.id),
+    fromName: formatFromName(msg.from),
+    fromRole: roleFor(roles, msg.from?.id),
+    text: `${editMarker(msg)}${messageText(msg)}`,
+    replyToMessageId: replyTo?.message_id ?? null,
+    replyToText: replyTo?.text ?? replyTo?.caption ?? (replyTo ? summarizeMediaReplyTarget(replyTo) : null),
+    quotedText: msg.quote?.text ?? null,
+    timestamp: msg.date,
+    attachments: extractAttachments(msg, updateId, botId),
+  };
+}
+
+/**
+ * Re-sync a SYNTHETIC prompt's single segment with its top level.
+ *
+ * ask/handover build a prompt from a fake message and then deliberately neuter
+ * the identity ("ASK never raises privilege"): messageId/fromUserId/fromMember →
+ * null, fromRole → 'agent-ask'/'handover'. Those overrides land on the top level
+ * only, so the segment would keep the pre-override identity (e.g. the chat id as
+ * fromUserId) — and `messages[]` is documented as the truth. Routing reads the top
+ * level, so this was never a privilege escalation; it was a contradiction, which
+ * is worse than useless in a security-relevant field.
+ */
+export function resyncPromptSegments(data) {
+  if (!data || !Array.isArray(data.messages) || data.messages.length !== 1) return data;
+  data.messages = [{
+    ...data.messages[0],
+    messageId: data.messageId ?? null,
+    fromUserId: data.fromUserId ?? null,
+    fromName: data.fromName ?? null,
+    fromRole: data.fromRole ?? null,
+    text: data.text ?? data.messages[0].text ?? '',
+    attachments: [...(data.attachments ?? [])],   // copy the array; the objects stay shared
+  }];
+  return data;
+}
+
+/**
+ * Normalize any prompt to the `messages[]` shape. A prompt written by an OLDER
+ * build has no `messages` — synthesize a 1-element segment from its top-level
+ * fields so merges never lose it. A legacy MULTI-message blob can't be
+ * un-flattened (its per-message identities are already gone); it becomes one
+ * opaque segment, which is strictly better than dropping it.
+ */
+export function promptSegments(data) {
+  if (!data) return [];
+  if (Array.isArray(data.messages) && data.messages.length > 0) return data.messages;
+  return [{
+    messageId: data.messageId ?? null,
+    fromUserId: data.fromUserId ?? null,
+    fromName: data.fromName ?? null,
+    fromRole: data.fromRole ?? null,
+    text: data.text ?? '',
+    replyToMessageId: data.replyToMessageId ?? null,
+    replyToText: data.replyToText ?? null,
+    quotedText: data.quotedText ?? null,
+    timestamp: data.timestamp ?? null,
+    attachments: data.attachments ?? [],
+  }];
+}
+
+export function buildPromptData(msg, updateId = null, botId = null, roles = null) {
+  const replyTo = realReplyTo(msg);
+  // One segment, and the top-level `attachments` is the SAME array object — see
+  // buildCombinedPromptData for why sharing matters (in-place download hydration).
+  const segment = buildPromptSegment(msg, updateId, botId, roles);
+  return {
+    text: segment.text,
+    edited: segment.edited,
+    editedAt: segment.editedAt,
     messageId: msg.message_id,
     chatId: String(msg.chat.id),
     fromUserId: String(msg.from?.id ?? msg.chat.id),
@@ -624,7 +961,9 @@ export function buildPromptData(msg, updateId = null, botId = null, roles = null
     replyToText: replyTo?.text ?? replyTo?.caption ?? (replyTo ? summarizeMediaReplyTarget(replyTo) : null),
     quotedText: msg.quote?.text ?? null,
     timestamp: msg.date,
-    attachments: extractAttachments(msg, updateId, botId),
+    attachments: segment.attachments,
+    // Always present, even for a lone message: one shape for every reader.
+    messages: [segment],
   };
 }
 
@@ -655,14 +994,17 @@ export function attributionLabelFromData(d) {
  * Single message → bare text (unchanged). Multi-message batch → each line is
  * prefixed with its sender's "<name> (<role>):" attribution (P2 — replaces the
  * old blanket "Admin follow-up:" that mislabeled non-admin senders and hid who).
- * messageId/chatId/timestamp + reply & quote metadata are taken from the
- * LAST message (newest) so the AI replies to the right thread. Reply/quote
- * metadata from earlier messages in the batch is intentionally dropped.
+ * messageId/chatId/timestamp + reply & quote metadata at the TOP LEVEL are taken
+ * from the LAST message (newest) so the AI replies to the right thread and every
+ * existing reader keeps working unchanged. Nothing is dropped any more: each
+ * message's own id/sender/reply/quote/attachments live on in `messages[]` (see
+ * buildPromptSegment) — that is what lets an agent resolve a reply-to that points
+ * at a message INSIDE a merged batch.
  */
 export function buildCombinedPromptData(messages, botId = null, convoId = null, roles = null, projectDescription = null) {
   if (!messages.length) throw new Error('messages must not be empty');
   const [first, ...rest] = messages;
-  const getText = (m) => m.text ?? m.caption ?? '';
+  const getText = (m) => `${editMarker(m)}${messageText(m)}`;
   const text =
     rest.length === 0
       ? getText(first.msg)
@@ -670,13 +1012,25 @@ export function buildCombinedPromptData(messages, botId = null, convoId = null, 
   const last = messages[messages.length - 1].msg;
   const replyTo = realReplyTo(last);
 
-  const attachments = [];
-  for (const m of messages) {
-    attachments.push(...extractAttachments(m.msg, m.update?.update_id ?? null, botId));
-  }
+  // Build the segments FIRST and flatten them into the top-level array, so both
+  // views share the SAME attachment objects: downloadAttachments mutates
+  // `localPath`/`error` in place on the top-level array, and a segment holding a
+  // separate copy would forever read `localPath: null` (an agent reading
+  // `messages[]` would conclude the media was never downloaded).
+  const segments = messages.map((m) => buildPromptSegment(m.msg, m.update?.update_id ?? null, botId, roles));
+  const attachments = segments.flatMap((seg) => seg.attachments);
   
   const out = {
     text,
+    // The batch as a STRUCTURE — the truth `text` is only a rendering of.
+    messages: segments,
+    // Batch-level: true when ANY message in it is an edit (segments keep the detail),
+    // with `editedAt` = the MOST RECENT edit in the batch. Both are set here as well
+    // as per-segment: the single-message path goes through this function too, and
+    // leaving `editedAt` off the top level made a live edit arrive as
+    // `edited: true, editedAt: null` — the flag without the timestamp.
+    edited: segments.some((seg) => seg.edited),
+    editedAt: segments.reduce((acc, seg) => (seg.editedAt != null && (acc == null || seg.editedAt > acc) ? seg.editedAt : acc), null),
     // RFC 02 P3: does `text` ALREADY carry per-segment `<name> (<role>):` labels?
     // A multi-message batch is pre-labeled here; a lone message stays bare. This
     // flag lets mergePromptData attribute an unlabeled segment at coalesce time
@@ -721,7 +1075,7 @@ export function buildCombinedPromptData(messages, botId = null, convoId = null, 
 
 export function findOrphanMessages(updates, adminIds, systemMsgIds = new Set()) {
   return updates.filter((u) => {
-    const msg = u.message;
+    const msg = updateMessage(u);
     if (!hasUserContent(msg)) return false;
     if (msg.chat.type !== 'private') return false;
     if (adminIds.length > 0 && !adminIds.includes(String(msg.chat.id))) return false;
@@ -745,7 +1099,7 @@ export function findOrphanMessages(updates, adminIds, systemMsgIds = new Set()) 
     if (msg.external_reply) return false;
     if (msg.text && msg.text.trim().startsWith('/')) return false;
     return true;
-  }).map((u) => ({ update: u, msg: u.message, orphan: true }));
+  }).map((u) => ({ update: u, msg: updateMessage(u), orphan: true }));
 }
 
 // ── Daemon control from a group topic (RFC 08) ────────────────────────────────
@@ -806,7 +1160,7 @@ export const WAIT_SIGNAL_MS = 60_000; // explicit "wait for the next bubble" (en
 //  - otherwise → null → fall through to the adaptive tier.
 // Trailing whitespace is ignored. Returns the override window (ms) or null.
 export function settleOverride(newestMsg) {
-  const t = (newestMsg?.text ?? newestMsg?.caption ?? '').trimEnd();
+  const t = messageText(newestMsg).trimEnd();
   if (t.endsWith('..') && !t.endsWith('...')) return 0;   // exactly two trailing dots
   if (t.endsWith(',')) return WAIT_SIGNAL_MS;             // any number of trailing commas
   return null;
@@ -822,7 +1176,7 @@ export function settleOverride(newestMsg) {
  */
 export function settleSignals(newestMsg, count) {
   const single = count === 1 ? 1 : 0;  // exactly one message (a lone bubble = the "first", nothing coalesced yet)
-  const text = (newestMsg?.text ?? newestMsg?.caption ?? '');
+  const text = messageText(newestMsg);
   const forwarded = !!(newestMsg?.forward_origin || newestMsg?.forward_from || newestMsg?.forward_date);
   const hasPhoto = Array.isArray(newestMsg?.photo) && newestMsg.photo.length > 0;
   const fragment = forwarded || hasPhoto || text.length < 20;
@@ -1605,6 +1959,10 @@ export function mergePromptData(existing, incoming) {
     ...incoming,
     text: `${seg(existing)}\n\n${seg(incoming)}`,
     attachments: [...(existing.attachments ?? []), ...(incoming.attachments ?? [])],
+    // Per-message truth survives the merge: concatenated in arrival order, each
+    // segment keeping its own id/sender/reply/quote. Top-level scalars stay
+    // "newest wins" (routing is unchanged); `text` stays the rendering.
+    messages: [...promptSegments(existing), ...promptSegments(incoming)],
     // The merged text now carries per-segment labels wherever a sender was known.
     textAttributed: true,
   };
@@ -1633,7 +1991,7 @@ export function mergePromptData(existing, incoming) {
 // died before consuming leaves an orphan. After PROCESSING_TTL_MS, fold it back
 // into the OPEN prompt (merging any batch spooled meanwhile) with a warning, so
 // the next agent re-handles it instead of the convo wedging. Best-effort.
-export function reclaimStaleProcessing(processingFile, promptFile) {
+export function reclaimStaleProcessing(processingFile, promptFile, writeLockFile = null) {
   try {
     // Snapshot the stale claim FIRST via atomic rename. If an agent concurrently
     // claims the open prompt (atomic rename promptFile → processingFile, which on
@@ -1659,17 +2017,35 @@ export function reclaimStaleProcessing(processingFile, promptFile) {
       console.error(`[tele-listen] reclaim: ${path.basename(processingFile)} is CORRUPT (${e instanceof Error ? e.message : String(e)}) — quarantined as ${path.basename(dest)} (NOT deleted); inspect/recover manually`);
       return;
     }
-    claimed.text = `⚠️ (khôi phục lô bị treo — agent trước đã claim rồi dừng giữa chừng)\n\n${claimed.text ?? ''}`;
-    if (fs.existsSync(promptFile)) {
-      let open = null;
-      try { open = JSON.parse(fs.readFileSync(promptFile, 'utf8')); } catch {}
-      writePromptAtomic(open ? mergePromptData(claimed, open) : claimed, promptFile);
-      fs.rmSync(staleFile, { force: true });
-    } else {
-      // Write the warning-annotated `claimed` (renaming the raw snapshot would
-      // drop the warning we injected in memory).
-      writePromptAtomic(claimed, promptFile);
-      fs.rmSync(staleFile, { force: true });
+    const warning = '⚠️ (khôi phục lô bị treo — agent trước đã claim rồi dừng giữa chừng)';
+    claimed.text = `${warning}\n\n${claimed.text ?? ''}`;
+    // `messages[]` is documented as the truth `text` only renders, so the recovery
+    // marker has to live there too — otherwise an agent rendering from segments
+    // can't tell it is re-handling a stalled batch.
+    if (Array.isArray(claimed.messages) && claimed.messages.length > 0) {
+      claimed.messages = claimed.messages.map((m, i) => (i === 0 ? { ...m, text: `${warning}\n\n${m?.text ?? ''}` } : m));
+    }
+    // Same serialization as the orphan sweep: the open prompt has other writers
+    // (mergeOrSpoolPrompt, claimPreexistingPrompt) that hold the per-convo
+    // prompt-write lock, and an unlocked read-modify-write here can clobber a
+    // batch spooled in the window (Codex review). Contended → leave the `.stale`
+    // snapshot for the orphan sweep to adopt on a later poll (never lost).
+    const locked = writeLockFile ? acquirePollLock(writeLockFile) : true;
+    if (!locked) return;
+    try {
+      if (fs.existsSync(promptFile)) {
+        let open = null;
+        try { open = JSON.parse(fs.readFileSync(promptFile, 'utf8')); } catch {}
+        writePromptAtomic(open ? mergePromptData(claimed, open) : claimed, promptFile);
+        fs.rmSync(staleFile, { force: true });
+      } else {
+        // Write the warning-annotated `claimed` (renaming the raw snapshot would
+        // drop the warning we injected in memory).
+        writePromptAtomic(claimed, promptFile);
+        fs.rmSync(staleFile, { force: true });
+      }
+    } finally {
+      if (writeLockFile) releasePollLock(writeLockFile);
     }
   } catch (e) {
     // Honest failure mode (subagent review): after the rename-to-.stale, a
@@ -1723,8 +2099,11 @@ export function sweepOrphanSnapshots(convo, tmpDir = DEFAULT_TMP_DIR) {
       else if (name.startsWith(appendBase)) kindBase = appendBase;
       else continue;
       const pidStr = name.slice(kindBase.length);
-      if (!/^\d+$/.test(pidStr)) continue;            // only our `.<pid>` snapshots
-      const pid = Number(pidStr);
+      // `.<pid>` or `.<pid>-<n>` — the consumer parks with a `-<n>` suffix when it
+      // has to snapshot twice in one process (never overwrite a parked batch).
+      const owner = /^(\d+)(?:-\d+)?$/.exec(pidStr);
+      if (!owner) continue;                           // only our own snapshots
+      const pid = Number(owner[1]);
       if (pid > 1 && isProcessAlive(pid)) continue;   // live owner (incl. ourself) → leave it
       const full = path.join(tmpDir, name);
       let raw;
@@ -1745,6 +2124,16 @@ export function sweepOrphanSnapshots(convo, tmpDir = DEFAULT_TMP_DIR) {
         } catch { /* raced away or rename failed → leave it */ }
         continue;
       }
+      // Serialize against the OTHER writers of the open prompt. The sweep lock only
+      // keeps sweepers apart; mergeOrSpoolPrompt and claimPreexistingPrompt use the
+      // per-convo `prompt-write` lock, so without taking it too this read-modify-
+      // write can clobber a batch spooled in the window (Codex review) — and the
+      // new parking path makes that race routine, not theoretical. Contended →
+      // leave the snapshot parked and adopt it on the next poll (never lost).
+      // Lock order is always sweep → write; nothing takes them the other way, so
+      // there is no deadlock.
+      const writeLock = path.join(tmpDir, `prompt-write-${convo}.lock`);
+      if (!acquirePollLock(writeLock)) continue;
       try {
         let open = null;
         if (fs.existsSync(promptFile)) {
@@ -1767,6 +2156,8 @@ export function sweepOrphanSnapshots(convo, tmpDir = DEFAULT_TMP_DIR) {
           console.error(`[tele-listen] orphan-sweep: failed to adopt ${name} → ${path.basename(promptFile)}: ${e instanceof Error ? e.message : String(e)} (left parked, retried next sweep)`);
           try { fs.writeFileSync(warned, String(Date.now())); } catch {}
         }
+      } finally {
+        releasePollLock(writeLock);
       }
     }
   } finally {
@@ -1790,6 +2181,43 @@ export function sweepOrphanSnapshots(convo, tmpDir = DEFAULT_TMP_DIR) {
 // cannot destroy an in-flight batch. `writeLockFile` may be null in tests/callers
 // that don't need cross-process serialization. `touch` makes the stale-reclaim TTL
 // count from the claim, matching the agent-side claim protocol.
+/** Render the `claim: <id>` tail of an announce (empty when the claim couldn't be stamped). */
+export function claimSuffix(claim) {
+  return typeof claim === 'string' ? ` [claim: ${claim}]` : '';
+}
+
+/** Announce bodies are capped — one Telegram message can't exceed this anyway. */
+export const ANNOUNCE_TEXT_CAP = 4096;
+
+/**
+ * The announce carries the batch's FULL text, not a 60-char teaser.
+ *
+ * Delivery used to be "here is a path" — so a batch that was consumed before the
+ * agent read the file was gone, and all the agent had ever seen was the teaser
+ * ("I glimpsed a message but lost it, please resend"). With the text inline, the
+ * message has already reached the agent's context by the time anything can delete
+ * the file: the worst case degrades to "read the file for the metadata", never to
+ * a lost message. Reads the claimed file so the two announce sites (the
+ * claim-branch, which had NO preview at all, and the write-path) say the same
+ * thing.
+ */
+export function announceBody(file, fallbackText = null) {
+  let data = null;
+  try { data = JSON.parse(fs.readFileSync(file, 'utf8')); } catch { /* fall through */ }
+  const text = data?.text ?? fallbackText ?? '';
+  const body = text.length > ANNOUNCE_TEXT_CAP
+    ? `${text.slice(0, ANNOUNCE_TEXT_CAP)}… (cắt bớt — đọc file để xem đủ)`
+    : text;
+  const id = data?.messageId ?? null;
+  // JSON.stringify, not `"${body}"`: admin messages routinely contain newlines,
+  // and the announce is consumed LINE BY LINE (Claude's Monitor turns each stdout
+  // line into its own event). A raw multi-line body would split the announce, wrap
+  // the trailing `[claim: <id>]` onto a line of its own where a line-oriented
+  // reader never sees it — and the agent would then reply without --claim-id,
+  // defeating the whole mechanism (Gemini review). Escaping keeps it one line.
+  return `${JSON.stringify(body)}${id != null ? ` (messageId: ${id})` : ''}`;
+}
+
 export function claimPreexistingPrompt(promptFile, processingFile, writeLockFile = null) {
   if (fs.existsSync(processingFile)) return false;   // agent handling a batch → don't pre-empt
   if (!fs.existsSync(promptFile)) return false;      // nothing pending
@@ -1799,10 +2227,30 @@ export function claimPreexistingPrompt(promptFile, processingFile, writeLockFile
     // Re-check under the lock: a peer may have claimed/consumed in the window.
     if (fs.existsSync(processingFile)) return false;
     if (!fs.existsSync(promptFile)) return false;
-    fs.renameSync(promptFile, processingFile);       // source consumed → no clobber (see above)
+    // Stamp the claim's IDENTITY *BEFORE* publishing it. `claimId` is what lets the
+    // consumer (send-telegram) prove it is deleting the batch it actually handled
+    // rather than whatever happens to sit in the slot — the confirmed data-loss
+    // bug: a SECOND send in the same turn used to delete a batch claimed mid-turn
+    // that the agent had never read. Stamping AFTER the rename would leave a
+    // window where `.processing.json` is readable but unstamped: a concurrent
+    // consumer would find no claimId to compare, conclude "answered", and delete a
+    // batch nobody had read (Codex review). So we stamp the OPEN file first and
+    // only then rename — the rename is atomic, so the claim is never visible
+    // unstamped. Best-effort: if stamping fails we still publish (the old
+    // positional behaviour), never lose the batch.
     const now = new Date();
+    const claimId = crypto.randomBytes(8).toString('hex');
+    let stamped = false;
+    try {
+      const claimed = JSON.parse(fs.readFileSync(promptFile, 'utf8'));
+      claimed.claimId = claimId;
+      claimed.claimedAt = now.getTime();
+      writePromptAtomic(claimed, promptFile);
+      stamped = true;
+    } catch { /* unparseable/unwritable → publish as-is */ }
+    fs.renameSync(promptFile, processingFile);       // source consumed → no clobber (see above)
     try { fs.utimesSync(processingFile, now, now); } catch { /* best-effort touch */ }
-    return true;
+    return stamped ? claimId : true;
   } catch (e) {
     if (e.code === 'ENOENT') return false;           // source vanished in the race → no-op
     throw e;
@@ -2004,10 +2452,22 @@ async function main() {
   // RFC 02: resolve this project's group + roles from teleport/projects.json
   // (keyed by basename(cwd) = the projects.json key — also the roster-harvest
   // target), falling back to TELEGRAM_ADMIN_CHAT_ID env (shared catch-all).
-  const lookupKey = path.basename(process.cwd()) || '';
+  // RFC 15: convo-anchored routing (shared resolver — MUST agree with the send
+  // side, else the listener watches a different group than sends land in, G4).
+  // `convo` is already resolved above (--convo → env). botId from the token.
   const projectsConfig = readProjectsConfig();
   const fallbackChatId = resolveDefaultChatId(projectsConfig, { env: process.env, envFile: envFromFile });
-  const projCfg = resolveProjectConfig(lookupKey, { config: projectsConfig, fallbackChatId });
+  const routingBotId = token ? extractBotId(token) : null;
+  const routingRows = readConvoRows(CONVO_REGISTRY_FILE).rows;
+  const { lookupKey, projCfg } = resolveProjectRouting({
+    cwd: process.cwd(),
+    convoId: convo,
+    botId: routingBotId,
+    env: process.env,
+    registryRows: routingRows,
+    projectsConfig,
+    fallbackChatId,
+  });
   const adminIds = adminIdsFrom(projCfg, fallbackChatId, parseAdminChatIds);
   // Roles (RFC 02): from projects.json[key].roles ONLY (advisory; agent-side
   // enforcement). Unmapped sender → 'member' (see roleFor).
@@ -2022,7 +2482,8 @@ async function main() {
   // the listener would accept messages from ANY chat. Fail-fast like the send
   // side (review G-Critical RFC 02).
   if (adminIds.length === 0) {
-    console.error(`[tele-listen] project "${lookupKey}" chưa cấu hình group: thêm "${lookupKey}".chatId vào teleport/projects.json, hoặc đặt _default.chatId trong projects.json (shared catch-all).`);
+    const kd = lookupKey || path.basename(process.cwd()) || '(unknown)';
+    console.error(`[tele-listen] project "${kd}" chưa cấu hình group: thêm "${kd}".chatId vào teleport/projects.json, hoặc đặt _default.chatId trong projects.json (shared catch-all).`);
     process.exit(1);
   }
 
@@ -2162,7 +2623,14 @@ async function main() {
     // agent may re-read a batch (a harmless dup), but nothing is ever lost. No
     // fold, no re-claim, no lock — just one announce.
     if (firstRun && convo != null && fs.existsSync(processingFile)) {
-      console.log(`[tele-listen] prompt ready: ${promptFile} (re-surfaced on first-run — read the .processing)`);
+      // Carry the SAME two guarantees as a fresh announce: the full text (so a
+      // re-surfaced batch is delivered even if the file is later consumed unread)
+      // and the claim token already stored in the file (so the agent can prove
+      // which batch it answered). Without them a restart reopened the exact
+      // "glimpsed but lost" hole this change closes (Codex review).
+      let stored = null;
+      try { stored = JSON.parse(fs.readFileSync(processingFile, 'utf8'))?.claimId ?? null; } catch { /* best-effort */ }
+      console.log(`[tele-listen] prompt ready: ${promptFile} (re-surfaced on first-run — read the .processing) ${announceBody(processingFile)}${claimSuffix(stored)}`);
       process.exit(0);
     }
     // P3: do NOT block. Reclaim a stale claim (agent died mid-processing), then
@@ -2175,7 +2643,8 @@ async function main() {
       // activation) MUST `touch` the file so TTL measures from claim.
       let stale = false;
       try { stale = Date.now() - fs.statSync(processingFile).mtimeMs > PROCESSING_TTL_MS; } catch {}
-      if (stale) reclaimStaleProcessing(processingFile, promptFile);
+      // convo-scoped lock only when there IS a convo (legacy filter-mode has none).
+      if (stale) reclaimStaleProcessing(processingFile, promptFile, convo != null ? path.join(DEFAULT_TMP_DIR, `prompt-write-${convo}.lock`) : null);
     }
     // Follow-up #1: adopt any orphaned .stale.*/.appending.* snapshots left by a
     // reclaim/append that died after its atomic rename but before writing back.
@@ -2203,8 +2672,12 @@ async function main() {
     // it reads the .processing we made). One dup, at-least-once — acceptable.
     if (announcePreexisting && convo != null) {
       const writeLock = path.join(DEFAULT_TMP_DIR, `prompt-write-${convo}.lock`);
-      if (claimPreexistingPrompt(promptFile, processingFile, writeLock)) {
-        console.log(`[tele-listen] prompt ready: ${promptFile} (pre-existing — claimed by listener)`);
+      const claim = claimPreexistingPrompt(promptFile, processingFile, writeLock);
+      if (claim) {
+        // Echo the claim token: the agent passes it back as `--claim-id` when it
+        // replies, which is what lets send-telegram delete THIS batch and only
+        // this one (forgetting it costs a duplicate, never a loss).
+        console.log(`[tele-listen] prompt ready: ${promptFile} (pre-existing — claimed by listener) ${announceBody(processingFile)}${claimSuffix(claim)}`);
         process.exit(0);
       }
     }
@@ -2253,7 +2726,7 @@ async function main() {
           const orphanSet = new Set(orphans.map((o) => o.update.update_id));
           const cachedSet = new Set(nonOrphan.map((u) => u.update_id));
           const lines = fetched.map((u) => {
-            const m = u.message;
+            const m = updateMessage(u);
             const kind = orphanSet.has(u.update_id)
               ? 'orphan'
               : cachedSet.has(u.update_id)
@@ -2265,9 +2738,9 @@ async function main() {
               message_id: m?.message_id ?? null,
               from: m?.from?.id ?? null,
               reply_to: m?.reply_to_message?.message_id ?? null,
-              has_text: Boolean(m?.text),
-              text_preview: m?.text ? m.text.slice(0, 60) : null,
-              update_type: m
+              has_text: Boolean(m && messageText(m)),
+              text_preview: m && messageText(m) ? messageText(m).slice(0, 60) : null,
+              update_type: u.message
                 ? 'message'
                 : u.edited_message
                   ? 'edited_message'
@@ -2514,12 +2987,13 @@ async function main() {
   //    frees up. Either way: exactly one announce, no dup.
   if (append && announcePreexisting && convo != null) {
     const writeLock = path.join(DEFAULT_TMP_DIR, `prompt-write-${convo}.lock`);
-    if (claimPreexistingPrompt(promptFile, processingFile, writeLock)) {
+    const claim = claimPreexistingPrompt(promptFile, processingFile, writeLock);
+    if (claim) {
       // Same "claimed by listener" marker as the top-of-poll claim-branch (§5.2) so
       // the agent's CLAIM protocol treats both identically: read `.processing`, do
       // NOT re-`mv` (a re-`mv` could clobber `.processing` if a fresh prompt spooled
       // in the race window — subagent FINDING 1).
-      console.log(`[tele-listen] prompt ready: ${promptFile} (claimed by listener) ${previewMsg}`);
+      console.log(`[tele-listen] prompt ready: ${promptFile} (claimed by listener) ${announceBody(processingFile, data.text)}${claimSuffix(claim)}`);
     }
     process.exit(0);
   }
@@ -2653,13 +3127,25 @@ async function readOurLockBody(lockFile) {
 // env) so supervisors can call it before any lock/prompt handling.
 function requireProjectAdminIdsOrExit(logPrefix = '[tele-listen]') {
   const envFromFile = loadEnvFromFile(ENV_FILE);
-  const lookupKey = path.basename(process.cwd()) || '';
+  const token = process.env.REPORT_BOT_TOKEN || envFromFile.REPORT_BOT_TOKEN;
   const projectsConfig = readProjectsConfig();
   const fallbackChatId = resolveDefaultChatId(projectsConfig, { env: process.env, envFile: envFromFile });
-  const projCfg = resolveProjectConfig(lookupKey, { config: projectsConfig, fallbackChatId });
+  // RFC 15: same convo-anchored resolver as main() so a supervisor fail-fast can
+  // never compute a different group than the child listener/sender. convoId +
+  // botId from env/token (self-contained; no args threaded here). Precedence
+  // matches main(): an explicit --convo wins over the session env.
+  const argConvo = argConvoFromArgv();
+  const routingConvoId = argConvo != null ? argConvo : resolveConvoIdFromEnv({}).convoId;
+  const routingBotId = token ? extractBotId(token) : null;
+  const routingRows = readConvoRows(CONVO_REGISTRY_FILE).rows;
+  const { lookupKey, projCfg } = resolveProjectRouting({
+    cwd: process.cwd(), convoId: routingConvoId, botId: routingBotId,
+    env: process.env, registryRows: routingRows, projectsConfig, fallbackChatId,
+  });
   const adminIds = adminIdsFrom(projCfg, fallbackChatId, parseAdminChatIds);
   if (adminIds.length === 0) {
-    console.error(`${logPrefix} project "${lookupKey}" chưa cấu hình group: thêm "${lookupKey}".chatId vào teleport/projects.json, hoặc đặt _default.chatId trong projects.json (shared catch-all).`);
+    const kd = lookupKey || path.basename(process.cwd()) || '(unknown)';
+    console.error(`${logPrefix} project "${kd}" chưa cấu hình group: thêm "${kd}".chatId vào teleport/projects.json, hoặc đặt _default.chatId trong projects.json (shared catch-all).`);
     process.exit(1);
   }
   return { envFromFile, lookupKey, projCfg, adminIds, roles: projCfg.roles };
@@ -2815,9 +3301,23 @@ export async function waitOnceSupervisor(argv, deps = {}) {
   }
 }
 
+// Exit code for a listener refused on a send-only machine, chosen so every
+// documented caller stops cleanly: --loop / --wait-once → 3 (the Monitor wrapper
+// `break`s instead of re-arming), bare one-shot (the pre-critical-action drain)
+// → 2 "no new admin messages" — this machine owns no inbound stream, so there is
+// nothing to drain and the critical action must not be blocked by an "error".
+export function sendOnlyExitCode(argv) {
+  return argv.includes('--loop') || argv.includes('--wait-once') ? 3 : 2;
+}
+
 const isDirectRun = isMainModule(import.meta.url);
 if (isDirectRun) {
   const argv = process.argv.slice(2);
+  // Checked before ANY state is touched (tmp dir, locks, offsets, getUpdates).
+  if (resolveSendOnly(readProjectsConfig())) {
+    console.error(`[tele-listen] ${SEND_ONLY_LISTEN_REFUSAL}`);
+    process.exit(sendOnlyExitCode(argv));
+  }
   if (argv.includes('--wait-once')) {
     waitOnceSupervisor(argv).catch((e) => {
       console.error(`[tele-wait-once] ${e instanceof Error ? e.message : String(e)}`);

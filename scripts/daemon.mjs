@@ -44,6 +44,7 @@ import {
 import {
   readProjectsConfig, roleFor, assertChatIdKind, projectEntries, readDefaultGroup,
   resolveDefaultChatId, resolveDaemonUserId, resolveQuietHours,
+  resolveSendOnly, SEND_ONLY_LISTEN_REFUSAL,
 } from './projects-config.mjs';
 import {
   DEFAULT_TMP_DIR, botScopedFiles, fetchUpdates, appendToCache, readCacheSinceOffset,
@@ -398,6 +399,11 @@ if (isDirectRun) {
     const s = daemonStatus();
     if (!s.running) { console.log('daemon not running'); process.exit(0); }
     try { process.kill(s.pid, 'SIGTERM'); console.log(`sent SIGTERM to daemon (pid ${s.pid})`); } catch (e) { console.error(`stop failed: ${e?.message ?? e}`); process.exit(1); }
+    process.exit(0);
+  } else if (resolveSendOnly(readProjectsConfig(PROJECTS_FILE))) {
+    // Refused before the singleton lock / getUpdates. Exit 0 = "nothing to run
+    // here by design", so a restart-on-failure supervisor doesn't loop on it.
+    console.error(`[daemon] ${SEND_ONLY_LISTEN_REFUSAL}`);
     process.exit(0);
   } else {
     main().catch((e) => { console.error(`[daemon] fatal: ${e instanceof Error ? e.stack : e}`); releaseSingleton(); process.exit(1); });

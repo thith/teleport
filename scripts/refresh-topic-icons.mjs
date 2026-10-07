@@ -30,7 +30,7 @@ if (!data.ok) {
 }
 
 // Giữ lại _assigned cũ nếu file đã tồn tại.
-let assigned = { luni: '🤖', 'digesty-frontend': '🎨', 'digesty-worker': '⚡️', 'digesty-hub': '📚' };
+let assigned = {};
 try { assigned = JSON.parse(fs.readFileSync(outPath, 'utf8'))._assigned ?? assigned; } catch {}
 
 const emojiToId = Object.fromEntries(data.result.map((s) => [s.emoji, s.custom_emoji_id]));

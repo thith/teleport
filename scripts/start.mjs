@@ -14,7 +14,7 @@ export const START_BODY = [
   '3. Add your teammates too if you want a shared team group.',
   '4. Then configure the group + .env — details: https://github.com/thith/teleport',
   '',
-  '— Created by digesty.vn team and agents',
+  '— Created by thith and agents',
 ].join('\n');
 
 import { fileURLToPath } from 'node:url';

@@ -185,8 +185,8 @@ test('listLiveTopics excludes non-convoId (legacy project-code) keys — not pic
   const store = {
     '-1': {
       [TARGET_CONVO]: 5,   // valid numeric convoId → kept
-      luni: 9,             // project-code key → excluded
-      tea_game: 11,        // project-code key → excluded
+      acmebot: 9,             // project-code key → excluded
+      my_game: 11,        // project-code key → excluded
       '007': 3,            // leading zero → not a valid convoId → excluded
     },
   };
@@ -195,7 +195,7 @@ test('listLiveTopics excludes non-convoId (legacy project-code) keys — not pic
 });
 
 test('every listLiveTopics convoId is one a listener would watch (CONVO_ID_RE)', () => {
-  const store = { '-1': { [TARGET_CONVO]: 5, '111': 6, luni: 9 } };
+  const store = { '-1': { [TARGET_CONVO]: 5, '111': 6, acmebot: 9 } };
   for (const t of listLiveTopics(store, ['-1'])) {
     assert.match(String(t.convoId), /^[1-9]\d{0,18}$/);
   }
@@ -330,6 +330,19 @@ test('isPrivilegedRole: only admin/maintainer pass (fail-closed)', () => {
 test('resolveChatIds: --chat-id override wins', () => {
   const r = resolveChatIds({ chatIdOverride: '-100777' });
   assert.deepEqual(r.chatIds, ['-100777']);
+});
+
+test('resolveChatIds: same convo-anchored routing as send (anchor, --from-convo, Tier 3a)', () => {
+  const cfg = { _default: { chatId: '-100' }, acmebot: { chatId: '-1001111111111' }, other: { chatId: '-1002222222222' } };
+  const anchorRow = { v: 1, convoId: 5, messageId: 5, chatId: '-1001111111111', botId: 7, ts: 1000, projectKey: 'acmebot' };
+  const base = { cwd: '/nowhere/other', env: {}, projectsConfig: cfg, botId: 7, registryRows: [anchorRow], gitRootFn: () => null };
+  // anchor (injected convoId) wins over cwd
+  assert.deepEqual(resolveChatIds({ ...base, convoId: 5, gitTreeFn: () => false }).chatIds, ['-1001111111111']);
+  // --from-convo (string, as parsed) reaches the anchor too
+  assert.deepEqual(resolveChatIds({ ...base, argConvo: '5', gitTreeFn: () => false }).chatIds, ['-1001111111111']);
+  // no anchor: outside a repo → registered basename(cwd); inside a repo with git failing → _default
+  assert.deepEqual(resolveChatIds({ ...base, convoId: null, gitTreeFn: () => false }).chatIds, ['-1002222222222']);
+  assert.deepEqual(resolveChatIds({ ...base, convoId: null, gitTreeFn: () => true }).chatIds, ['-100']);
 });
 
 // --- CLI exit-code contract (real subprocess) ------------------------------

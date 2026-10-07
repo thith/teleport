@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 // Isolate the persona pin store so `--list` persona mapping DERIVES instead of
 // reading machine-local pins (resolved at call-time from TELE_PERSONA_STORE).
 process.env.TELE_PERSONA_STORE = path.join(os.tmpdir(), `teleport-persona-store-spawn-${process.pid}.jsonl`);
-import { buildSpawnPlan, genSessionSeed, runSpawn, hasBinary, screenSessionExists, normalizeSessionName, parseScreenSessions, listSpawnSessions, resolveKillId, resolveAttachId, resolveAttachTarget, formatSessionList, resolveMode, SPAWN_PROMPT, PERMISSION_MODES, DEFAULT_PERMISSION_MODE, USAGE, personaByHashtag, gracefulKill, KILL_GRACE_MS } from './spawn.mjs';
+import { buildSpawnPlan, genSessionSeed, runSpawn, childLaunch, loginSeedEnv, wrapInLoginShell, scrubClaudeEnv, SEED_PATH, hasBinary, screenSessionExists, normalizeSessionName, parseScreenSessions, listSpawnSessions, resolveKillId, resolveAttachId, resolveAttachTarget, formatSessionList, resolveMode, SPAWN_PROMPT, PERMISSION_MODES, DEFAULT_PERMISSION_MODE, USAGE, personaByHashtag, gracefulKill, KILL_GRACE_MS } from './spawn.mjs';
 import { uuidToConvoInt } from './convo-registry.mjs';
 import { shortConvoHash } from './convo-hash.mjs';
 import { personaForConvo } from './persona.mjs';
@@ -32,8 +32,8 @@ test('runSpawn: passes cwd through to the spawn call (sibling-project targeting)
   assert.equal(rH.pid, 4242);
   // interactive plan
   const planI = buildSpawnPlan({ interactive: true, seed: genSessionSeed(() => FIXED_UUID) });
-  runSpawn(planI, { cwd: '/work/luni', spawnFn: fakeSpawn });
-  assert.equal(calls[1].opts.cwd, '/work/luni');
+  runSpawn(planI, { cwd: '/work/acmebot', spawnFn: fakeSpawn });
+  assert.equal(calls[1].opts.cwd, '/work/acmebot');
 });
 
 test('runSpawn: no cwd → no cwd option (inherit)', () => {
@@ -41,6 +41,68 @@ test('runSpawn: no cwd → no cwd option (inherit)', () => {
   const fakeSpawn = (cmd, args, opts) => { calls.push(opts); return { unref() {} }; };
   runSpawn(buildSpawnPlan(), { spawnFn: fakeSpawn });
   assert.equal('cwd' in calls[0], false);
+});
+
+test('loginSeedEnv: bare seed only — nothing Claude injected can survive it', () => {
+  const env = loginSeedEnv({
+    HOME: '/home/alice', SHELL: '/bin/zsh', TERM: 'xterm', PATH: '/inherited/bin', LANG: '',
+    CLAUDE_CODE_CHILD_SESSION: '1', CLAUDE_CODE_SESSION_ID: 'abc', CLAUDE_EFFORT: 'medium',
+    SOME_USER_VAR: 'x',
+  });
+  assert.deepEqual(Object.keys(env).sort(), ['HOME', 'PATH', 'SHELL', 'TELEPORT_SPAWN', 'TERM'].sort());
+  assert.equal(env.PATH, SEED_PATH);          // bootstrap only — the rc files rebuild the real PATH
+  assert.equal(env.LANG, undefined);          // empty values are not seeded
+});
+
+test('wrapInLoginShell: login+interactive shell, argv passed POSITIONALLY (no re-parsing)', () => {
+  const seed = 'line1\n"quoted" `backtick` $VAR\nline3';
+  const cmd = wrapInLoginShell(['claude', '-p', seed], { SHELL: '/bin/zsh' });
+  assert.deepEqual(cmd.slice(0, 4), ['/bin/zsh', '-lic', 'exec "$@"', 'teleport-spawn']);
+  // The prompt stays ONE argv item, byte-identical — never interpolated into the -c string.
+  assert.equal(cmd.at(-1), seed);
+  assert.equal(cmd[2].includes(seed), false);
+  // `-i` is required: zsh only sources ~/.zshrc for interactive shells.
+  assert.match(cmd[1], /i/);
+});
+
+test('wrapInLoginShell: no usable $SHELL → null (caller falls back)', () => {
+  assert.equal(wrapInLoginShell(['claude'], {}), null);
+  assert.equal(wrapInLoginShell(['claude'], { SHELL: 'zsh' }), null);   // must be an absolute path
+});
+
+test('scrubClaudeEnv: fallback scrubs by PREFIX so a future rename cannot sneak through', () => {
+  const env = scrubClaudeEnv({
+    PATH: '/bin', CLAUDECODE: '1', CLAUDE_PID: '1', CLAUDE_EFFORT: 'medium',
+    CLAUDE_CODE_CHILD_SESSION: '1', CLAUDE_CODE_SOME_FUTURE_MARKER: '1', CLAUDE_PLUGIN_DATA: '/x',
+  });
+  assert.deepEqual(Object.keys(env), ['PATH']);
+});
+
+test('childLaunch: wraps when $SHELL is usable, scrubs when it is not', () => {
+  const poisoned = { SHELL: '/bin/zsh', HOME: '/h', CLAUDE_CODE_CHILD_SESSION: '1' };
+  const wrapped = childLaunch(['claude', '-p', 'hi'], poisoned);
+  assert.equal(wrapped.command[0], '/bin/zsh');
+  assert.equal('CLAUDE_CODE_CHILD_SESSION' in wrapped.env, false);
+  const bare = childLaunch(['claude', '-p', 'hi'], { HOME: '/h', CLAUDE_CODE_CHILD_SESSION: '1' });
+  assert.deepEqual(bare.command, ['claude', '-p', 'hi']);
+  assert.equal('CLAUDE_CODE_CHILD_SESSION' in bare.env, false);
+});
+
+test('runSpawn: both modes launch through the login shell with the seed env', () => {
+  const calls = [];
+  const fakeSpawn = (cmd, args, opts) => { calls.push({ cmd, args, opts }); return { unref() {}, pid: 7 }; };
+  runSpawn(buildSpawnPlan(), { spawnFn: fakeSpawn });                                              // headless
+  runSpawn(buildSpawnPlan({ interactive: true, seed: genSessionSeed(() => FIXED_UUID) }), { cwd: '/work/acmebot', spawnFn: fakeSpawn }); // interactive
+  for (const c of calls) {
+    assert.equal(c.cmd, process.env.SHELL);
+    assert.deepEqual(c.args.slice(0, 3), ['-lic', 'exec "$@"', 'teleport-spawn']);
+    assert.equal('CLAUDE_CODE_CHILD_SESSION' in c.opts.env, false);
+    assert.equal(c.opts.env.CLAUDE_CODE_FORCE_SESSION_PERSISTENCE, undefined); // clean env is enough
+  }
+  assert.equal(calls[0].args[3], 'claude');                        // headless: shell execs claude itself
+  assert.ok(calls[0].args.includes('-p'));                         // …with its args intact
+  assert.equal(calls[1].args[3], 'screen');                        // interactive still goes through screen
+  assert.equal(calls[1].opts.cwd, '/work/acmebot');                   // cwd still wins
 });
 
 test('buildSpawnPlan headless (default): claude -p <prompt>, no session/teardown', () => {
@@ -460,3 +522,20 @@ for (const flag of ['--help', '-h']) {
     assert.ok(!/agent launched/.test(r.stdout), '--help fell through to a real spawn');
   });
 }
+
+test('wrapInLoginShell: only POSIX shells are wrapped; others fall back (null)', () => {
+  for (const sh of ['/bin/sh', '/bin/bash', '/bin/zsh', '/bin/ksh', '/usr/bin/dash']) {
+    assert.ok(Array.isArray(wrapInLoginShell(['claude'], { SHELL: sh })), sh);
+  }
+  for (const sh of ['/opt/homebrew/bin/fish', '/bin/csh', '/bin/tcsh', '/usr/local/bin/nu', '/usr/local/bin/pwsh', '/usr/bin/xonsh']) {
+    assert.equal(wrapInLoginShell(['claude'], { SHELL: sh }), null, sh);
+  }
+});
+
+test('loginSeedEnv: keeps session sockets the login shell cannot rebuild (ssh-agent, bus, display)', () => {
+  const env = loginSeedEnv({ HOME: '/h', SSH_AUTH_SOCK: '/tmp/agent.sock', DBUS_SESSION_BUS_ADDRESS: 'unix:x', DISPLAY: ':0', CLAUDECODE: '1' });
+  assert.equal(env.SSH_AUTH_SOCK, '/tmp/agent.sock');
+  assert.equal(env.DBUS_SESSION_BUS_ADDRESS, 'unix:x');
+  assert.equal(env.DISPLAY, ':0');
+  assert.equal(env.CLAUDECODE, undefined);
+});
