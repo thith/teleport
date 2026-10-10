@@ -7,7 +7,7 @@ import {
   parseDaemonCommand, resolveSpawnCwd, dispatchCommand, handleControlMessages,
   validateDaemonConfig, resolveSenderRole, acquireSingleton, releaseSingleton, daemonStatus,
   reloadDaemonState, readJsonStrict,
-  prLinksOnly, takeMergeButton, handlePrLinks, handleMergeButton,
+  prLinksOnly, takeMergeButton, handlePrLinks, handleMergeButton, startupGreeting, gitShortHead,
 } from './daemon.mjs';
 
 test('parseDaemonCommand: extracts command + rest, strips @botname, lowercases', () => {
@@ -527,4 +527,11 @@ test('fetchUpdates asks for message, edited_message and callback_query explicitl
   globalThis.fetch = async (u) => { url = u; return { ok: true, json: async () => ({ ok: true, result: [] }) }; };
   try { await fetchUpdates('T', 5); } finally { globalThis.fetch = orig; }
   assert.match(decodeURIComponent(url), /allowed_updates=\["message","edited_message","callback_query"\]/);
+});
+
+test('startupGreeting / gitShortHead: the owner hears about every (re)start, with the code version', () => {
+  assert.equal(startupGreeting({ pid: 42, commit: 'abc1234', commands: 17 }), '🟢 Teleport daemon đã chạy · pid 42 · code abc1234 · 17 lệnh. Gõ /help để xem lệnh.');
+  assert.doesNotMatch(startupGreeting({ pid: 42, commit: null, commands: 3 }), /code/);
+  assert.equal(gitShortHead(() => 'deadbee\n'), 'deadbee');
+  assert.equal(gitShortHead(() => { throw new Error('not a repo'); }), null);
 });

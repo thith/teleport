@@ -36,7 +36,7 @@ import crypto from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isMainModule } from './is-direct-run.mjs';
-import { execFile } from 'node:child_process';
+import { execFile, execFileSync as execFileSyncD } from 'node:child_process';
 import { promisify } from 'node:util';
 const execFileP = promisify(execFile);
 
@@ -277,6 +277,10 @@ async function main() {
     try { await sendTextToAdmin(token, chatId, text, { raw: false, plain: true }); } catch (e) { console.error(`[daemon] send failed: ${e?.message ?? e}`); }
   };
 
+  // Say hello to the owner on every start, so a /restartd (or a crash-restart by
+  // systemd) is visible from Telegram, with the code version it came up on.
+  sendText(daemonUserId, startupGreeting({ pid: process.pid, commit: gitShortHead(), commands: Object.keys(registry).length }));
+
   // Bot API calls for the PR-link merge buttons (sendMessage with an inline
   // keyboard, answer/edit on press). Failures are logged, never fatal.
   const tg = async (method, body) => {
@@ -400,6 +404,17 @@ export function handleControlMessages(mine, ctx) {
     dispatchCommand(parsed, msg.from || {}, ctx, rt?.text ?? rt?.caption, msg.message_id).catch((e) =>
       ctx.sendText(ctx.daemonUserId, `❌ /${parsed.cmd} failed: ${e instanceof Error ? e.message : e}`));
   }
+}
+
+/** Short HEAD sha of the teleport checkout the daemon runs from, or null. */
+export function gitShortHead(exec = execFileSyncD) {
+  try { return String(exec('git', ['-C', path.join(__dirname, '..'), 'rev-parse', '--short', 'HEAD'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })).trim() || null; }
+  catch { return null; }
+}
+
+/** The owner's "daemon is up" message. Pure. */
+export function startupGreeting({ pid, commit, commands }) {
+  return `🟢 Teleport daemon đã chạy · pid ${pid}${commit ? ` · code ${commit}` : ''} · ${commands} lệnh. Gõ /help để xem lệnh.`;
 }
 
 // ── Paste a PR link → preview + [✅ Merge] [✖ Cancel] ─────────────────────────
