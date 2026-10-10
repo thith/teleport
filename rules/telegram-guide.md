@@ -52,8 +52,9 @@ When the user asks to **spawn / start / launch** a Claude agent — e.g. "spawn 
 
 **List / attach / kill running agents:**
 - **"list agents / which agents are running"** → `node ../teleport/scripts/spawn.mjs --list` (prints each `tele-<hashtag>`
-  session + its topic hashtag, then **every** `claude` process of this user — incl. ones opened by hand in a terminal —
-  with PID, cwd, tty, uptime, screen-or-terminal, session id + `#hashtag`; daemon: `/ls`).
+  session + its topic hashtag) in two sections: **📺 Screen** (each `tele-*` screen with the claude PID inside) then
+  **🖥 Terminal** (`claude` processes opened by hand) — every line with PID, cwd, uptime, the **full session id** and
+  `#hashtag`; daemon: `/ls`).
 - **"attach / open / xem agent <id>"** → `node ../teleport/scripts/spawn.mjs --attach <id>` — re-attaches your terminal
   to that interactive `claude` session (it runs `screen -U -d -r tele-<id>`; `-U` = UTF-8 so
   Vietnamese/multibyte output isn't garbled). `<id>` accepts the **3-char hashtag tail** (`116` ⇒
@@ -77,13 +78,19 @@ When the user asks to **spawn / start / launch** a Claude agent — e.g. "spawn 
 For an agent opened **by hand** in a terminal whose listener died while the owner is away (nobody can type into that
 terminal): `claude --resume <uuid>` inside screen `tele-<hashtag>` (hashtag derived from the uuid = the agent's own
 topic hashtag; `--hashtag` is only a typo cross-check). The seed prompt tells the resumed agent to **re-arm its
-Monitor listener** (with `--first-run`) and work its queue — it keeps its persona, convo and topic. Run it from the
+Monitor listener** (with `--first-run`) — exactly: *you were just restarted → check your mailbox
+(`mailbox.mjs check`) → re-arm the Telegram Monitor → greet in your topic*, then work its queue. It keeps its persona,
+convo and topic. Run it from the
 **session's project** (its transcript must be in that folder). It **refuses** while a live `claude` process still
 holds the session (two writers = corrupt transcript) — stop that one first:
 - **`/kill pid:<PID>`** (daemon, **owner only**) — SIGTERM one `claude` process of this user (PID from `/ls`); checks
   uid + `comm == claude`, waits ≤10s, never SIGKILLs, audits to `scripts/tmp/kill-pid-audit.jsonl`. Agents do **not**
   run this themselves (the owner gate is TELE_FROM_ID from the daemon; forging it is out of contract).
-- Typical flow: `/ls` → `/kill pid:<PID>` → `/spawn <project> --resume-session <uuid>`.
+- **`/kill pid:<PID> --restart`** = both in one: SIGTERM, wait for exit, then resume that session in screen
+  `tele-<hashtag>` in its **old cwd**. Everything the restart needs (a session id from the session file — never a
+  guess — and its transcript) is checked **before** killing, so a doomed restart kills nothing.
+- Typical flow: `/ls` → `/kill pid:<PID> --restart` (or `/kill pid:<PID>` then `/spawn <project> --resume-session <uuid>`).
+- If you are the agent that wakes up from such a restart: follow the seed prompt (mailbox → Monitor → greet).
 
 The helper takes NO task argument (prompt is hard-coded); the user assigns work via Telegram
 after the new agent greets.
@@ -320,7 +327,8 @@ node ../teleport/scripts/send-telegram.mjs --dm --file <path> "<caption>"
 từ xa **kể cả khi mọi agent đã chết** (quota/network). Nó nghe một **private DM**
 (`DAEMON_CHAT_ID`) và xử lý lệnh: `/spawn <project>`, `/run <project> <script> [args]`,
 `/whisper #<hash> <text>` (alias `/w`), `/instruct #<hash> <text>` (alias `/i`, agent trả lời
-qua DM), `/pending`, `/start`, cùng **heartbeat auto-reminder** (đã
+qua DM), `/pending`, `/start`, `/reload` (admin — đọc lại `commands.json` + `projects.json` không cần
+restart), cùng **heartbeat auto-reminder** (đã
 chuyển từ tele-listen sang đây — nên **khi daemon KHÔNG chạy thì sẽ không có reminder/`/pending`**).
 `/run` tự detect npm/pnpm/yarn của project, validate script trong package.json, rồi chạy
 `<pm> run <script>` (chỉ admin/maintainer — remote exec).

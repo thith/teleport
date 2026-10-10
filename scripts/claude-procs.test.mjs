@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import {
   parsePsOutput, parseSessionFile, cwdToProjectSlug, hashtagForSession, styFromEnviron,
-  procStartFromStat, screenFromAncestors, buildProcRows, formatProcRows, parseKillPidArg,
+  procStartFromStat, screenFromAncestors, buildProcRows, formatAgentList, parseKillPidArg, findUnidentifiedProcs,
   checkKillTarget, killClaudePid, findProcForSession, etimeToSeconds, guessSessionFromTranscripts,
 } from './claude-procs.mjs';
 
@@ -135,20 +135,63 @@ test('guessSessionFromTranscripts: newest unclaimed, written since start; ignore
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
-test('formatProcRows: terminal vs screen, guessed marker, ~ shortening, hints', () => {
-  const out = formatProcRows([
+test('formatAgentList: screens section first (with the claude inside), then terminal; full session ids', () => {
+  const procs = [
     { pid: 830318, tty: 'pts/7', etime: '2-00:49:26', cwd: '/home/u/Projects/umipay', screen: null, sessionId: SID, guessed: false, hashtag: 'a7611284', name: '🪱 Giun', status: 'idle' },
-    { pid: 9, tty: null, etime: '00:01', cwd: null, screen: 'tele-x', sessionId: SID2, guessed: true, hashtag: 'i0744244', name: null, status: null },
-  ], { home: '/home/u' });
-  assert.match(out, /PID 830318 · 🪱 Giun · \(idle\)/);
-  assert.match(out, /cwd ~\/Projects\/umipay · tty pts\/7/);
-  assert.match(out, /terminal \(không screen\)/);
-  assert.match(out, /screen tele-x/);
-  assert.match(out, new RegExp(`session ${SID} · #a7611284`));
-  assert.match(out, /đoán từ transcript/);
+    { pid: 9, tty: 'pts/8', etime: '00:01', cwd: null, screen: 'tele-i0744244', sessionId: SID2, guessed: true, hashtag: 'i0744244', name: null, status: null },
+    { pid: 11, tty: null, etime: '00:02', cwd: '/w', screen: 'work', sessionId: null, guessed: false, hashtag: null, name: 'x', status: null },
+  ];
+  const out = formatAgentList({
+    screens: [{ pid: '1', name: 'tele-i0744244' }, { pid: '2', name: 'tele-empty123' }], procs,
+    personaOf: (h) => (h === 'i0744244' ? '🦛 Hà Mã' : null), home: '/home/u',
+  });
+  const iScreen = out.indexOf('📺 Screen (3)');
+  const iTerm = out.indexOf('🖥 Terminal (1)');
+  assert.ok(iScreen === 0 && iTerm > iScreen, out);
+  assert.match(out, /• tele-i0744244 · 🦛 Hà Mã\n  PID 9 · \? · 00:01\n  session 5ce13594-1e43-4d2d-afd3-ac16ccfece93 \(đoán\) · #i0744244/);
+  assert.match(out, /• tele-empty123 · \(không thấy claude bên trong\)/);
+  assert.match(out, /• work\n  PID 11 · x · \/w · 00:02\n  session \?/); // non-tele screen hosting a claude
+  const term = out.slice(iTerm);
+  assert.match(term, new RegExp(`• PID 830318 · 🪱 Giun \\(idle\\) · ~/Projects/umipay · pts/7 · 2-00:49:26\\n  session ${SID} · #a7611284`));
+  assert.doesNotMatch(term, /PID 9 /); // a screen claude is not repeated under Terminal
   assert.match(out, /\/kill pid:<PID>/);
   assert.match(out, /--resume-session/);
-  assert.match(formatProcRows([]), /Không có tiến trình claude/);
+  const empty = formatAgentList({});
+  assert.match(empty, /📺 Screen \(0\)\n  \(không có\)/);
+  assert.match(empty, /🖥 Terminal \(0\)\n  \(không có\)/);
+});
+
+test('findUnidentifiedProcs: no session file (or guessed) AND cwd unknown/same', () => {
+  const rows = [
+    { pid: 1, sessionId: SID, guessed: false, cwd: '/w/a' },  // identified → fine
+    { pid: 2, sessionId: null, guessed: false, cwd: '/w/a' }, // unknown, same cwd → suspect
+    { pid: 3, sessionId: SID2, guessed: true, cwd: '/w/a' },  // guess is not proof → suspect
+    { pid: 4, sessionId: null, guessed: false, cwd: null },   // cwd unknown → suspect
+    { pid: 5, sessionId: null, guessed: false, cwd: '/w/b' }, // other folder → can't hold /w/a's session
+  ];
+  assert.deepEqual(findUnidentifiedProcs('/w/a', rows).map((r) => r.pid), [2, 3, 4]);
+});
+
+test('killClaudePid: pid reused between check and signal (start changed) → no signal', async () => {
+  const sent = []; let n = 0;
+  const r = await killClaudePid(500, {
+    uid: 1000, describe: () => null, kill: (p, s) => sent.push(s),
+    inspect: () => ({ uid: 1000, comm: 'claude', start: n++ === 0 ? '100' : '200' }),
+  });
+  assert.equal(r.ok, false);
+  assert.match(r.error, /pid bị dùng lại/);
+  assert.equal(sent.length, 0);
+});
+
+test('killClaudePid: replaced by a non-claude during describe → refused on the re-check', async () => {
+  const sent = []; let n = 0;
+  const r = await killClaudePid(500, {
+    uid: 1000, describe: () => null, kill: (p, s) => sent.push(s),
+    inspect: () => (n++ === 0 ? { uid: 1000, comm: 'claude', start: '1' } : { uid: 1000, comm: 'bash', start: '2' }),
+  });
+  assert.equal(r.ok, false);
+  assert.match(r.error, /không phải claude/);
+  assert.equal(sent.length, 0);
 });
 
 test('parseKillPidArg', () => {

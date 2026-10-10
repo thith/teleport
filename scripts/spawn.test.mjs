@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 // Isolate the persona pin store so `--list` persona mapping DERIVES instead of
 // reading machine-local pins (resolved at call-time from TELE_PERSONA_STORE).
 process.env.TELE_PERSONA_STORE = path.join(os.tmpdir(), `teleport-persona-store-spawn-${process.pid}.jsonl`);
-import { buildSpawnPlan, genSessionSeed, runSpawn, childLaunch, loginSeedEnv, wrapInLoginShell, scrubClaudeEnv, SEED_PATH, hasBinary, screenSessionExists, normalizeSessionName, parseScreenSessions, listSpawnSessions, resolveKillId, resolveAttachId, resolveAttachTarget, formatSessionList, resolveMode, SPAWN_PROMPT, PERMISSION_MODES, DEFAULT_PERMISSION_MODE, USAGE, personaByHashtag, gracefulKill, KILL_GRACE_MS, RESUME_PROMPT, resolveResumeSession, checkResumePreflight, findTranscriptDirs, checkPidKillAuth, resolveKillPid, appendKillAudit } from './spawn.mjs';
+import { buildSpawnPlan, genSessionSeed, runSpawn, childLaunch, loginSeedEnv, wrapInLoginShell, scrubClaudeEnv, SEED_PATH, hasBinary, screenSessionExists, normalizeSessionName, parseScreenSessions, listSpawnSessions, resolveKillId, resolveAttachId, resolveAttachTarget, formatSessionList, resolveMode, SPAWN_PROMPT, PERMISSION_MODES, DEFAULT_PERMISSION_MODE, USAGE, personaByHashtag, gracefulKill, KILL_GRACE_MS, RESUME_PROMPT, resolveResumeSession, checkResumePreflight, findTranscriptDirs, checkPidKillAuth, resolveKillPid, appendKillAudit, acquireResumeLock, performResume, checkRestartTarget } from './spawn.mjs';
 import fs from 'node:fs';
 import { uuidToConvoInt } from './convo-registry.mjs';
 import { shortConvoHash } from './convo-hash.mjs';
@@ -494,7 +494,7 @@ const hasFlagToken = (usage, flag) =>
 test('USAGE documents every flag, mode, and the hard-coded prompt (drift guard)', () => {
   // Each user-facing flag / alias must appear in --help as a standalone token so
   // the text can't drift away from the direct-run dispatch.
-  for (const flag of ['-i', '--interactive', '--mode', '--list', '--ls', '--attach', '--resume', '--kill', '--quit', '--help', '-h', '--resume-session', '--hashtag', 'pid:']) {
+  for (const flag of ['-i', '--interactive', '--mode', '--list', '--ls', '--attach', '--resume', '--kill', '--quit', '--help', '-h', '--resume-session', '--hashtag', 'pid:', '--restart']) {
     assert.ok(hasFlagToken(USAGE, flag), `USAGE missing standalone flag ${flag}`);
   }
   // Sanity-check the guard itself distinguishes a short alias from its long form:
@@ -552,8 +552,11 @@ test('buildSpawnPlan resume: screen tele-<uuid hashtag>, claude --resume <uuid> 
   assert.deepEqual(plan.command, ['screen', '-U', '-dmS', 'tele-a7611284', 'claude', '--permission-mode', 'auto', '--resume', GIUN, RESUME_PROMPT]);
   assert.ok(!plan.command.includes('--session-id'));
   assert.equal(plan.teardown, 'screen -S tele-a7611284 -X quit');
+  assert.match(RESUME_PROMPT, /restarted/);
+  assert.match(RESUME_PROMPT, /mailbox\.mjs check/);
   assert.match(RESUME_PROMPT, /Listening for replies/);
   assert.match(RESUME_PROMPT, /--first-run/);
+  assert.match(RESUME_PROMPT, /greeting in your Telegram topic/);
 });
 
 test('buildSpawnPlan resume: implies interactive, validates uuid + mode', () => {
@@ -630,4 +633,101 @@ test('appendKillAudit: one JSON line per call with a timestamp', () => {
   const lines = fs.readFileSync(f, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
   assert.deepEqual(lines.map((l) => [l.pid, l.result]), [[1, 'denied'], [2, 'exited']]);
   assert.ok(lines.every((l) => !Number.isNaN(Date.parse(l.ts))));
+});
+
+test('checkResumePreflight: failed process scan or an unidentified claude in the same cwd → refuse', () => {
+  const base = { sessionId: GIUN, sessionName: 'tele-a7611284', cwd: '/w/umipay', screenExists: false, transcriptDirs: ['-w-umipay'] };
+  assert.match(checkResumePreflight({ ...base, procs: null, procsError: 'ps failed' }).error, /cannot verify.*ps failed/);
+  assert.match(checkResumePreflight({ ...base, procs: undefined }).error, /cannot verify/);
+  assert.match(checkResumePreflight({ ...base, procs: [{ pid: 7, sessionId: null, cwd: '/w/umipay' }] }).error, /PID 7.*no session file/);
+  assert.deepEqual(checkResumePreflight({ ...base, procs: [{ pid: 7, sessionId: null, cwd: '/w/other' }] }), { ok: true });
+});
+
+test('acquireResumeLock: exclusive, released, stale lock broken', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rlock-'));
+  const a = acquireResumeLock(GIUN, { dir });
+  assert.ok(a.release);
+  assert.match(acquireResumeLock(GIUN, { dir }).error, /in progress/);
+  a.release(); a.release(); // idempotent
+  const b = acquireResumeLock(GIUN, { dir });
+  assert.ok(b.release);
+  // stale: pretend the lock is older than staleMs
+  const c = acquireResumeLock(GIUN, { dir, staleMs: 1000, now: () => Date.now() + 5000 });
+  assert.ok(c.release, 'stale lock should be broken');
+  c.release();
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+// performResume with every side effect faked.
+const fakeDeps = (over = {}) => {
+  const log = { ran: [], released: 0 };
+  let up = false;
+  const deps = {
+    acquireLock: () => ({ release: () => { log.released++; } }),
+    listProcs: () => [],
+    screenExists: () => up,
+    transcriptDirs: () => ['-w-umipay'],
+    run: (plan) => { log.ran.push(plan); up = true; },
+    sleep: async () => {}, timeoutMs: 1000, pollMs: 250,
+    ...over,
+  };
+  return { deps, log };
+};
+
+test('performResume: happy path launches the resume plan in cwd and releases the lock', async () => {
+  const { deps, log } = fakeDeps();
+  const r = await performResume({ sessionId: GIUN, cwd: '/w/umipay', permissionMode: 'plan' }, deps);
+  assert.equal(r.ok, true);
+  assert.equal(log.ran.length, 1);
+  assert.deepEqual(log.ran[0].command.slice(4, 9), ['claude', '--permission-mode', 'plan', '--resume', GIUN]);
+  assert.equal(log.released, 1);
+});
+
+test('performResume: lock busy / preflight refusal / ps failure → never launches; lock always released', async () => {
+  let { deps, log } = fakeDeps({ acquireLock: () => ({ error: 'another resume in progress' }) });
+  assert.match((await performResume({ sessionId: GIUN, cwd: '/w/umipay' }, deps)).error, /in progress/);
+  assert.equal(log.ran.length, 0);
+
+  ({ deps, log } = fakeDeps({ listProcs: () => [{ pid: 830318, sessionId: GIUN, cwd: '/w/umipay' }] }));
+  assert.match((await performResume({ sessionId: GIUN, cwd: '/w/umipay' }, deps)).error, /still held/);
+  assert.equal(log.ran.length, 0);
+  assert.equal(log.released, 1);
+
+  ({ deps, log } = fakeDeps({ listProcs: () => { throw new Error('ps failed'); } }));
+  assert.match((await performResume({ sessionId: GIUN, cwd: '/w/umipay' }, deps)).error, /ps failed/);
+  assert.equal(log.ran.length, 0);
+  assert.equal(log.released, 1);
+});
+
+test('performResume: screen never appears → error after timeout, lock released', async () => {
+  const { deps, log } = fakeDeps({ run: (plan) => { log.ran.push(plan); } });
+  const r = await performResume({ sessionId: GIUN, cwd: '/w/umipay' }, deps);
+  assert.match(r.error, /not found after/);
+  assert.equal(log.ran.length, 1);
+  assert.equal(log.released, 1);
+});
+
+test('performResume: the lock is held while preflight + launch run (concurrent resume blocked)', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rlock2-'));
+  let second;
+  const { deps } = fakeDeps({
+    acquireLock: (id) => acquireResumeLock(id, { dir }),
+    run: () => { second = acquireResumeLock(GIUN, { dir }); },
+    screenExists: () => second !== undefined,
+  });
+  const r = await performResume({ sessionId: GIUN, cwd: '/w/umipay' }, deps);
+  assert.equal(r.ok, true);
+  assert.match(second.error, /in progress/);
+  assert.ok(acquireResumeLock(GIUN, { dir }).release, 'released after');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('checkRestartTarget: needs a real (non-guessed) session id, a cwd and its transcript there', () => {
+  const t = { pid: 1, sessionId: GIUN, guessed: false, cwd: '/w/umipay' };
+  assert.deepEqual(checkRestartTarget(t, { transcriptDirs: ['-w-umipay'] }), { ok: true });
+  assert.match(checkRestartTarget(null, { transcriptDirs: [] }).error, /no session id/);
+  assert.match(checkRestartTarget({ ...t, sessionId: null }, { transcriptDirs: [] }).error, /no session id/);
+  assert.match(checkRestartTarget({ ...t, guessed: true }, { transcriptDirs: ['-w-umipay'] }).error, /only a guess/);
+  assert.match(checkRestartTarget({ ...t, cwd: null }, { transcriptDirs: ['-w-umipay'] }).error, /working directory/);
+  assert.match(checkRestartTarget(t, { transcriptDirs: ['-w-other'] }).error, /no transcript/);
 });

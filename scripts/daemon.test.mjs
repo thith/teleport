@@ -6,6 +6,7 @@ import path from 'node:path';
 import {
   parseDaemonCommand, resolveSpawnCwd, dispatchCommand, handleControlMessages,
   validateDaemonConfig, resolveSenderRole, acquireSingleton, releaseSingleton, daemonStatus,
+  reloadDaemonState,
 } from './daemon.mjs';
 
 test('parseDaemonCommand: extracts command + rest, strips @botname, lowercases', () => {
@@ -344,4 +345,53 @@ test('handleControlMessages: bare /dm from a group is a no-op (nothing dispatche
   );
   await new Promise((r) => setTimeout(r, 30));
   assert.equal(ran, false);
+});
+
+// ── /reload (in-process built-in) ─────────────────────────────────────────────
+const ADMIN_CFG = { _default: { roles: { '7': { role: 'admin' }, '9': { role: 'maintainer' } } } };
+
+test('dispatchCommand /reload: admin → calls reload, reports count; never runs a child', async () => {
+  const sent = []; let ran = false; let reloaded = 0;
+  await dispatchCommand({ cmd: 'reload', rest: '' }, { id: '7' }, {
+    daemonUserId: '1', projectsConfig: ADMIN_CFG, registry: REG,
+    sendText: async (_c, t) => sent.push(t), runner: async () => { ran = true; return {}; },
+    reload: () => { reloaded++; return { registry: { a: {}, b: {}, c: {} }, projectsConfig: ADMIN_CFG, ownerChanged: false }; },
+  });
+  assert.equal(reloaded, 1);
+  assert.equal(ran, false);
+  assert.match(sent[0], /3 lệnh/);
+  assert.doesNotMatch(sent[0], /daemonUserId/);
+});
+
+test('dispatchCommand /reload: maintainer refused; config error keeps old + reports; owner change warned', async () => {
+  const sent = []; let reloaded = 0;
+  const ctx = (reload) => ({ daemonUserId: '1', projectsConfig: ADMIN_CFG, registry: REG, sendText: async (_c, t) => sent.push(t), reload });
+  await dispatchCommand({ cmd: 'reload', rest: '' }, { id: '9' }, ctx(() => { reloaded++; return {}; }));
+  assert.equal(reloaded, 0);
+  assert.match(sent[0], /cần quyền admin/);
+  await dispatchCommand({ cmd: 'reload', rest: '' }, { id: '7' }, ctx(() => ({ error: 'bad json' })));
+  assert.match(sent[1], /giữ cấu hình cũ — bad json/);
+  await dispatchCommand({ cmd: 'reload', rest: '' }, { id: '7' }, ctx(() => ({ registry: {}, ownerChanged: true })));
+  assert.match(sent[2], /restart daemon/);
+});
+
+test('dispatchCommand /reload: a registry entry named reload cannot shadow the built-in', async () => {
+  let ran = false; let reloaded = 0;
+  await dispatchCommand({ cmd: 'reload', rest: '' }, { id: '7' }, {
+    daemonUserId: '1', projectsConfig: ADMIN_CFG, registry: { ...REG, reload: { run: 'evil.mjs', minRole: 'public' } },
+    sendText: async () => {}, runner: async () => { ran = true; return {}; },
+    reload: () => { reloaded++; return { registry: {} }; },
+  });
+  assert.equal(ran, false);
+  assert.equal(reloaded, 1);
+});
+
+test('reloadDaemonState: returns fresh state; invalid config → { error } (old state kept by caller); owner change flagged', () => {
+  const good = { _default: { chatId: '-100' } };
+  const base = { daemonUserId: '5', loadRegistry: () => ({ x: {} }), resolveOwner: () => '5', resolveCatchAll: () => ['-100'] };
+  const r = reloadDaemonState({ ...base, readConfig: () => good });
+  assert.deepEqual(r, { projectsConfig: good, registry: { x: {} }, ownerChanged: false });
+  assert.match(reloadDaemonState({ ...base, readConfig: () => { throw new Error('Unexpected token'); } }).error, /Unexpected token/);
+  assert.ok(reloadDaemonState({ ...base, readConfig: () => good, resolveCatchAll: () => ['123'] }).error); // catch-all must be a group
+  assert.equal(reloadDaemonState({ ...base, readConfig: () => good, resolveOwner: () => '6' }).ownerChanged, true);
 });

@@ -178,23 +178,47 @@ export function buildProcRows({ psRows, uid, sessions = new Map(), procExtras = 
   return out.sort((a, b) => a.pid - b.pid);
 }
 
-/** Render rows for Telegram (plain text). `home` shortens paths to `~`. */
-export function formatProcRows(rows, { home = os.homedir() } = {}) {
-  if (!rows.length) return '🖥 Không có tiến trình claude nào đang chạy.';
+/**
+ * Render `/ls` for Telegram (plain text), in two sections:
+ *   📺 Screen   — every `tele-*` screen (spawned agents) plus any other screen that
+ *                 hosts a claude, each with the claude PID inside (if found);
+ *   🖥 Terminal — claude processes opened by hand (no screen).
+ * Every claude line carries the FULL session id (copy-paste into
+ * --resume-session) and its #hashtag. Pure.
+ *   screens  — parseScreenSessions() rows `{ pid, name }` (tele-* only)
+ *   procs    — buildProcRows() rows
+ *   personaOf(hashtag) → label | null — topic persona for a tele-* screen
+ */
+export function formatAgentList({ screens = [], procs = [], personaOf = () => null, home = os.homedir() } = {}) {
   const short = (p) => (p && home && (p === home || p.startsWith(home + '/')) ? '~' + p.slice(home.length) : p);
-  const lines = [`🖥 ${rows.length} tiến trình claude:`, ''];
-  for (const r of rows) {
-    const head = [`PID ${r.pid}`, r.name, r.status ? `(${r.status})` : null].filter(Boolean).join(' · ');
-    lines.push(`• ${head}`);
-    lines.push(`  cwd ${short(r.cwd) ?? '?'} · tty ${r.tty ?? '-'} · chạy ${r.etime}`);
-    lines.push(`  ${r.screen ? `screen ${r.screen}` : 'terminal (không screen)'}`);
-    if (r.sessionId) {
-      lines.push(`  session ${r.sessionId}${r.guessed ? ' (đoán từ transcript mới nhất)' : ''}${r.hashtag ? ` · #${r.hashtag}` : ''}`);
-    } else {
-      lines.push('  session ?');
-    }
+  const sess = (r) => (r.sessionId
+    ? `  session ${r.sessionId}${r.guessed ? ' (đoán)' : ''}${r.hashtag ? ` · #${r.hashtag}` : ''}`
+    : '  session ?');
+  const procLine = (r, { withTty }) => [
+    `PID ${r.pid}`, r.name ? `${r.name}${r.status ? ` (${r.status})` : ''}` : (r.status ? `(${r.status})` : null),
+    short(r.cwd) ?? '?', withTty ? (r.tty ?? null) : null, r.etime,
+  ].filter(Boolean).join(' · ');
+
+  const inScreen = new Map(); // screen name → claude rows inside it
+  const terminal = [];
+  for (const r of procs) {
+    if (r.screen) (inScreen.get(r.screen) || inScreen.set(r.screen, []).get(r.screen)).push(r);
+    else terminal.push(r);
   }
-  lines.push('', 'Dừng (chỉ owner): /kill pid:<PID>');
+  const screenNames = [...new Set([...screens.map((s) => s.name), ...inScreen.keys()])];
+
+  const lines = [`📺 Screen (${screenNames.length})`];
+  if (!screenNames.length) lines.push('  (không có)');
+  for (const name of screenNames) {
+    const persona = name.startsWith('tele-') ? personaOf(name.slice(5)) : null;
+    const rows = inScreen.get(name) || [];
+    lines.push(`• ${[name, persona].filter(Boolean).join(' · ')}${rows.length ? '' : ' · (không thấy claude bên trong)'}`);
+    for (const r of rows) { lines.push(`  ${procLine(r, { withTty: false })}`); lines.push(sess(r)); }
+  }
+  lines.push('', `🖥 Terminal (${terminal.length})`);
+  if (!terminal.length) lines.push('  (không có)');
+  for (const r of terminal) { lines.push(`• ${procLine(r, { withTty: true })}`); lines.push(sess(r)); }
+  lines.push('', 'Dừng (chỉ owner): /kill pid:<PID> · screen: /kill <hashtag>');
   lines.push('Chạy lại trong screen: /spawn <project> --resume-session <session>');
   return lines.join('\n');
 }
@@ -227,28 +251,37 @@ function readFileOrNull(file, enc = 'utf8') {
   try { return fs.readFileSync(file, enc); } catch { return null; }
 }
 
-/** All processes via `ps` (portable). Returns [] if ps fails. */
+/**
+ * All processes via `ps` (portable). Returns null when ps fails or yields no rows
+ * (it always lists at least ourselves) — callers that make SAFETY decisions on
+ * the list (resume) must treat that as "unknown", never as "nothing running".
+ */
 export function readPs(exec = execFileSync) {
   try {
-    return parsePsOutput(exec('ps', ['-A', '-o', 'pid=,ppid=,uid=,tty=,etime=,comm=,args='], { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 }));
-  } catch { return []; }
+    const rows = parsePsOutput(exec('ps', ['-A', '-o', 'pid=,ppid=,uid=,tty=,etime=,comm=,args='], { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 }));
+    return rows.length ? rows : null;
+  } catch { return null; }
 }
 
 /**
- * Fresh `{ uid, comm }` of one pid, or null if it doesn't exist. Linux: read
- * /proc/<pid>/comm + the real uid from /proc/<pid>/status (what the owner asked
- * for). Elsewhere: `ps -p`.
+ * Fresh `{ uid, comm, start }` of one pid, or null if it doesn't exist. Linux:
+ * /proc/<pid>/comm, the real uid from /proc/<pid>/status, start = stat field 22.
+ * Elsewhere: `ps -p` (start = lstart). `start` is the pid-reuse fingerprint.
  */
 export function inspectPid(pid, { procDir = '/proc', exec = execFileSync } = {}) {
-  const comm = readFileOrNull(path.join(procDir, String(pid), 'comm'));
+  const base = path.join(procDir, String(pid));
+  const comm = readFileOrNull(path.join(base, 'comm'));
   if (comm != null) {
-    const status = readFileOrNull(path.join(procDir, String(pid), 'status')) || '';
+    const status = readFileOrNull(path.join(base, 'status')) || '';
     const m = status.match(/^Uid:\s+(\d+)/m);
-    return m ? { uid: Number(m[1]), comm: comm.trim() } : null;
+    return m ? { uid: Number(m[1]), comm: comm.trim(), start: procStartFromStat(readFileOrNull(path.join(base, 'stat'))) } : null;
   }
   if (fs.existsSync(procDir)) return null; // /proc exists but no entry → gone
-  const row = readPs(exec).find((r) => r.pid === pid);
-  return row ? { uid: row.uid, comm: row.comm } : null;
+  try {
+    const out = String(exec('ps', ['-p', String(pid), '-o', 'uid=,comm=,lstart='], { encoding: 'utf8' })).trim();
+    const m = out.match(/^(\d+)\s+(\S+)\s+(.+)$/);
+    return m ? { uid: Number(m[1]), comm: path.basename(m[2]), start: m[3].trim() } : null;
+  } catch { return null; }
 }
 
 function pidAlive(pid) {
@@ -271,12 +304,16 @@ export function guessSessionFromTranscripts(cwd, { projectsDir = PROJECTS_DIR, c
   return best ? { sessionId: best.sessionId } : null;
 }
 
-/** Gather everything and return display rows (see buildProcRows). */
+/** Gather everything and return display rows (see buildProcRows). `strict` → throw if ps fails (else []). */
 export function listClaudeProcs({
   uid = process.getuid?.() ?? -1, sessionsDir = SESSIONS_DIR, procDir = '/proc',
-  projectsDir = PROJECTS_DIR, exec = execFileSync,
+  projectsDir = PROJECTS_DIR, exec = execFileSync, strict = false,
 } = {}) {
   const psRows = readPs(exec);
+  if (!psRows) {
+    if (strict) throw new Error('cannot list processes (ps failed)');
+    return [];
+  }
   const sessions = new Map();
   const procExtras = new Map();
   for (const r of psRows) {
@@ -314,9 +351,21 @@ export async function killClaudePid(pid, {
   sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
   graceMs = KILL_PID_GRACE_MS, pollMs = 500, selfPid = process.pid,
 } = {}) {
-  const chk = checkKillTarget(pid, inspect(pid), { uid, selfPid });
+  const first = inspect(pid);
+  const chk = checkKillTarget(pid, first, { uid, selfPid });
   if (chk.error) return { ok: false, exited: false, error: chk.error };
+  // describe() is slow (full ps scan + file reads), so do it BEFORE the final
+  // check, then re-inspect immediately before signalling: same uid, still
+  // `claude`, and the same start time — a pid that died and got reused in
+  // between (even by another claude) is refused. Narrows the race to the gap
+  // between two syscalls; it can't be closed fully without pidfds.
   const target = describe(pid);
+  const last = inspect(pid);
+  const chk2 = checkKillTarget(pid, last, { uid, selfPid });
+  if (chk2.error) return { ok: false, exited: false, error: chk2.error, target };
+  if (first.start != null && last.start !== first.start) {
+    return { ok: false, exited: false, error: `PID ${pid} đã đổi tiến trình trong lúc kiểm tra (pid bị dùng lại) — không gửi tín hiệu.`, target };
+  }
   try { kill(pid, 'SIGTERM'); } catch (e) {
     return { ok: false, exited: false, error: `SIGTERM thất bại: ${e?.code || e?.message || e}`, target };
   }
@@ -332,7 +381,16 @@ export function findProcForSession(sessionId, rows) {
   return rows.find((r) => r.sessionId === sessionId) || null;
 }
 
-// CLI: `node claude-procs.mjs` → the /ps listing.
+/**
+ * Live claude processes that MIGHT hold a session in `cwd` but can't be proven
+ * not to: no session file (sessionId unknown or only guessed) and a cwd that is
+ * unknown or equal to `cwd`. A guess is display-only — never proof of absence.
+ */
+export function findUnidentifiedProcs(cwd, rows) {
+  return rows.filter((r) => (!r.sessionId || r.guessed) && (!r.cwd || r.cwd === cwd));
+}
+
+// CLI: `node claude-procs.mjs` → the process part of the /ls listing.
 if (isMainModule(import.meta.url)) {
-  process.stdout.write(formatProcRows(listClaudeProcs()) + '\n');
+  process.stdout.write(formatAgentList({ procs: listClaudeProcs() }) + '\n');
 }

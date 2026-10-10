@@ -38,8 +38,8 @@ import { readTopicsStore } from './topics-store.mjs';
 import { formatPersona } from './persona.mjs';
 import { peekPersona } from './persona-store.mjs';
 import {
-  listClaudeProcs, findProcForSession, cwdToProjectSlug, PROJECTS_DIR,
-  formatProcRows, parseKillPidArg, killClaudePid, KILL_PID_GRACE_MS,
+  listClaudeProcs, findProcForSession, findUnidentifiedProcs, cwdToProjectSlug, PROJECTS_DIR,
+  formatAgentList, parseKillPidArg, killClaudePid, KILL_PID_GRACE_MS,
 } from './claude-procs.mjs';
 import { readProjectsConfig, resolveDaemonUserId } from './projects-config.mjs';
 
@@ -53,7 +53,7 @@ export const SPAWN_PROMPT = 'Find and read process.md and review-guide.md if pre
 // (persona, convo, task) — it only lost its Telegram listener when the old
 // process died. So: re-arm the listener FIRST (with --first-run so a prompt left
 // claimed by the dead life is re-surfaced), then work the queue.
-export const RESUME_PROMPT = 'Teleport resumed this session in a screen (spawn --resume-session) — your previous process and its Telegram listener are gone. Right now: re-read ../teleport/rules/telegram-guide.md section "Listening for replies" and restart your Monitor listener for your existing convo (the canonical command, which passes --first-run on its first poll so anything left pending is re-surfaced). Then handle whatever is queued, and post one short "back online" line in your topic.';
+export const RESUME_PROMPT = 'You were just restarted by teleport: your previous process was stopped and this same session was resumed in a screen (spawn --resume-session / daemon /kill pid:<PID> --restart). Do these now, in order: 1) check your mailbox: node ../teleport/scripts/mailbox.mjs check (read it if there is mail); 2) re-arm your Telegram Monitor listener for your existing convo: re-read ../teleport/rules/telegram-guide.md section "Listening for replies" and use the canonical command (it passes --first-run on its first poll so anything left pending is re-surfaced); 3) send a short greeting in your Telegram topic saying you are back online, then handle whatever is queued.';
 
 export const PERMISSION_MODES = ['default', 'auto', 'acceptEdits', 'bypassPermissions', 'dontAsk', 'plan'];
 export const DEFAULT_PERMISSION_MODE = 'auto';
@@ -73,7 +73,8 @@ Usage:
   node spawn.mjs --list | --ls                        list running agent sessions
   node spawn.mjs --attach|--resume [<id>]             re-attach your terminal to a session
   node spawn.mjs --kill|--quit <id>                   gracefully tear a session down
-  node spawn.mjs --kill pid:<PID>                     SIGTERM one claude process (daemon owner only)
+  node spawn.mjs --kill pid:<PID> [--restart]         SIGTERM one claude process (daemon owner only);
+                                                      --restart then resumes its session in a screen
   node spawn.mjs --help | -h                          show this help
 
 Spawn modes:
@@ -104,6 +105,9 @@ Manage sessions (interactive/screen only):
                      never SIGKILL. Only via the daemon, only for its owner
                      (TELE_FROM_ID must equal projects.json _config.daemonUserId);
                      audited to scripts/tmp/kill-pid-audit.jsonl.
+    --restart        after it exits, resume the same session in screen tele-<hashtag>
+                     in its old cwd (= --resume-session). Needs a session id known
+                     from its session file — checked BEFORE killing.
 
 The prompt is HARD-CODED ("${SPAWN_PROMPT}"): the new
 instance greets you in its own Telegram persona topic and waits for work there.
@@ -511,16 +515,105 @@ export function resolveResumeSession(argv) {
  * `procs` = listClaudeProcs() rows; `transcriptDirs` = project-dir names that
  * contain `<sessionId>.jsonl`.
  */
-export function checkResumePreflight({ sessionId, sessionName, cwd, procs, screenExists, transcriptDirs }) {
+export function checkResumePreflight({ sessionId, sessionName, cwd, procs, procsError = null, screenExists, transcriptDirs }) {
+  // Unknown is not "nothing running": a failed process scan refuses.
+  if (procsError || !Array.isArray(procs)) return { error: `cannot verify no live process holds the session (${procsError || 'no process list'}) — refusing.` };
   const holder = findProcForSession(sessionId, procs);
   if (holder) {
     return { error: `session ${sessionId} is still held by live claude PID ${holder.pid}${holder.guessed ? ' (guessed from its newest transcript)' : ''}${holder.cwd ? ` in ${holder.cwd}` : ''}. Stop it first (owner: /kill pid:${holder.pid}), then resume.` };
+  }
+  const unknown = findUnidentifiedProcs(cwd, procs);
+  if (unknown.length) {
+    return { error: `live claude process(es) ${unknown.map((r) => `PID ${r.pid}`).join(', ')} in ${cwd} have no session file, so they might hold this session — check /ls; stop them (/kill pid:<PID>) if they do.` };
   }
   if (screenExists) return { error: `a screen session "${sessionName}" already exists (try: spawn.mjs --attach ${sessionName}).` };
   const slug = cwdToProjectSlug(cwd);
   if (!transcriptDirs.includes(slug)) {
     if (transcriptDirs.length) return { error: `session ${sessionId} belongs to another folder (${transcriptDirs.join(', ')}), not ${cwd} — resume it from that project.` };
     return { error: `no transcript for session ${sessionId} under ~/.claude/projects/ — wrong id?` };
+  }
+  return { ok: true };
+}
+
+/**
+ * Cross-process lock for one resume, so two concurrent `/spawn --resume-session`
+ * of the same uuid can't both pass the preflight before either screen exists
+ * (the daemon dispatches fire-and-forget). Atomic create (`wx`); a lock older
+ * than `staleMs` (a crashed spawn) is broken. Hold it until the screen is
+ * verified up — after that the preflight's screen check refuses a second resume.
+ * Returns { release } or { error }.
+ */
+export const RESUME_LOCK_STALE_MS = 120_000;
+export function acquireResumeLock(sessionId, {
+  dir = path.join(path.dirname(fileURLToPath(import.meta.url)), 'tmp'), staleMs = RESUME_LOCK_STALE_MS, now = Date.now,
+} = {}) {
+  const file = path.join(dir, `resume-${sessionId}.lock`);
+  fs.mkdirSync(dir, { recursive: true });
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      fs.writeFileSync(file, `${process.pid} ${now()}\n`, { flag: 'wx' });
+      let released = false;
+      return { file, release: () => { if (!released) { released = true; try { fs.unlinkSync(file); } catch {} } } };
+    } catch (e) {
+      if (e.code !== 'EEXIST') return { error: `cannot create resume lock: ${e.message}` };
+      let age = 0;
+      try { age = now() - fs.statSync(file).mtimeMs; } catch { continue; } // vanished → retry
+      if (age < staleMs) return { error: `another resume of ${sessionId} is in progress (lock ${path.basename(file)}).` };
+      try { fs.unlinkSync(file); } catch {}
+    }
+  }
+  return { error: `could not acquire the resume lock for ${sessionId}.` };
+}
+
+/**
+ * The whole resume: plan → lock → preflight → launch in `cwd` → verify the screen
+ * came up. Shared by `--resume-session` and `--kill pid:<P> --restart`. Every
+ * side effect is injectable for tests. Returns { ok, plan } | { error, plan }.
+ */
+export async function performResume({ sessionId, cwd, permissionMode = DEFAULT_PERMISSION_MODE }, {
+  acquireLock = acquireResumeLock,
+  listProcs = () => listClaudeProcs({ strict: true }),
+  screenExists = (n) => screenSessionExists(n),
+  transcriptDirs = (id) => findTranscriptDirs(id),
+  run = (plan) => runSpawn(plan, { cwd }),
+  sleep = sleepMs, timeoutMs = SPAWN_VERIFY_TIMEOUT_MS, pollMs = SPAWN_VERIFY_POLL_MS,
+} = {}) {
+  const plan = buildSpawnPlan({ interactive: true, permissionMode, resumeSessionId: sessionId });
+  // Held until the screen is verified — see acquireResumeLock.
+  const lock = acquireLock(plan.sessionId);
+  if (lock.error) return { error: lock.error, plan };
+  try {
+    let procs = null, procsError = null;
+    try { procs = listProcs(); } catch (e) { procsError = e?.message ?? String(e); }
+    const pre = checkResumePreflight({
+      sessionId: plan.sessionId, sessionName: plan.sessionName, cwd,
+      procs, procsError, screenExists: screenExists(plan.sessionName),
+      transcriptDirs: transcriptDirs(plan.sessionId),
+    });
+    if (pre.error) return { error: pre.error, plan };
+    run(plan);
+    // Poll (the login shell takes seconds to exec screen) — same as a fresh spawn.
+    for (let waited = 0; waited < timeoutMs; waited += pollMs) {
+      if (screenExists(plan.sessionName)) return { ok: true, plan };
+      await sleep(Math.min(pollMs, timeoutMs - waited));
+    }
+    if (screenExists(plan.sessionName)) return { ok: true, plan };
+    return { error: `screen session "${plan.sessionName}" not found after ${timeoutMs / 1000}s (claude or screen may have errored). Check: screen -ls`, plan };
+  } finally {
+    lock.release();
+  }
+}
+
+/**
+ * Can `--restart` resume this kill target? Checked BEFORE the kill so a restart
+ * that can't work never leaves the agent dead. `target` = the /ls row. Pure.
+ */
+export function checkRestartTarget(target, { transcriptDirs }) {
+  if (!target || !target.sessionId) return { error: 'cannot restart: no session id known for this PID (no session file).' };
+  if (target.guessed) return { error: `cannot restart: session id ${target.sessionId} is only a guess — resume manually after checking /ls.` };
+  if (!target.cwd) return { error: 'cannot restart: unknown working directory.' };
+  if (!transcriptDirs.includes(cwdToProjectSlug(target.cwd))) {
+    return { error: `cannot restart: no transcript for ${target.sessionId} under ${target.cwd}'s project folder.` };
   }
   return { ok: true };
 }
@@ -713,23 +806,14 @@ if (isDirectRun) {
 
   // --list / --ls: show our spawned screen sessions (name == convo hashtag).
   if (argv.includes('--list') || argv.includes('--ls')) {
-    const sessions = hasBinary('screen') ? listSpawnSessions() : null;
-    if (sessions === null) console.log('[spawn] `screen` not found on PATH — no tele-* sessions to list.');
-    else if (!sessions.length) console.log('[spawn] no agent sessions (tele-*) running.');
-    else {
-      console.log(`[spawn] ${sessions.length} agent session(s):`);
-      const pmap = personaByHashtag();
-      for (const s of sessions) {
-        const hashtag = s.name.replace(/^tele-/, '');
-        const persona = pmap[hashtag];
-        const label = persona ? `${formatPersona(persona)}  ` : '';
-        console.log(`  ${label}${s.name}  (pid ${s.pid})  → topic #${hashtag}`);
-      }
-    }
-    // Every claude process of this user — including hand-opened terminal sessions
-    // that the screen list above can't see (the reason /ls grew this section).
-    console.log('');
-    console.log(formatProcRows(listClaudeProcs()));
+    // Two sections (screens first, then hand-opened terminal sessions), each claude
+    // line with its full session id — see formatAgentList.
+    const screens = hasBinary('screen') ? listSpawnSessions() : [];
+    const pmap = personaByHashtag();
+    console.log(formatAgentList({
+      screens, procs: listClaudeProcs(),
+      personaOf: (h) => (pmap[h] ? formatPersona(pmap[h]) : null),
+    }));
     process.exit(0);
   }
 
@@ -747,11 +831,29 @@ if (isDirectRun) {
       console.error(`[spawn] ❌ ${auth.error}`);
       process.exit(1);
     }
+    const restart = argv.includes('--restart');
+    let restartMode = DEFAULT_PERMISSION_MODE;
+    if (restart) {
+      // Everything a restart needs is checked BEFORE the kill: never leave the
+      // agent dead because the resume half was doomed from the start.
+      restartMode = resolveMode(argv);
+      if (restartMode === null || !PERMISSION_MODES.includes(restartMode)) {
+        console.error(`[spawn] --mode needs one of: ${PERMISSION_MODES.join(', ')} (default ${DEFAULT_PERMISSION_MODE}).`); process.exit(1);
+      }
+      if (!hasBinary('claude') || !hasBinary('screen')) { console.error('[spawn] --restart needs `claude` and `screen` on PATH.'); process.exit(1); }
+      const pre = listClaudeProcs().find((row) => row.pid === killPid.pid) || null;
+      const rc = checkRestartTarget(pre, { transcriptDirs: pre?.sessionId ? findTranscriptDirs(pre.sessionId) : [] });
+      if (rc.error) {
+        appendKillAudit({ pid: killPid.pid, fromId, result: 'refused', reason: rc.error, restart: true });
+        console.error(`[spawn] ❌ ${rc.error} Nothing was killed.`);
+        process.exit(1);
+      }
+    }
     console.log(`[spawn] SIGTERM → PID ${killPid.pid}, waiting up to ${KILL_PID_GRACE_MS / 1000}s…`);
     const r = await killClaudePid(killPid.pid);
     const t = r.target;
     appendKillAudit({
-      pid: killPid.pid, fromId, result: r.error ? 'refused' : r.exited ? 'exited' : 'still-alive',
+      pid: killPid.pid, fromId, restart, result: r.error ? 'refused' : r.exited ? 'exited' : 'still-alive',
       reason: r.error, sessionId: t?.sessionId ?? null, sessionGuessed: t?.guessed ?? false,
       cwd: t?.cwd ?? null, name: t?.name ?? null, tty: t?.tty ?? null,
     });
@@ -759,6 +861,20 @@ if (isDirectRun) {
     const who = [t?.name, t?.cwd, t?.sessionId ? `session ${t.sessionId}${t.guessed ? ' (guessed)' : ''}` : null].filter(Boolean).join(' · ');
     if (r.exited) {
       console.log(`[spawn] ✅ PID ${killPid.pid} exited${who ? ` (${who})` : ''}.`);
+      if (restart) {
+        // Re-validated against the row captured at kill time (the pre-kill check
+        // used an earlier snapshot of the same pid).
+        const rc = checkRestartTarget(t, { transcriptDirs: t?.sessionId ? findTranscriptDirs(t.sessionId) : [] });
+        const res = rc.error ? rc : await performResume({ sessionId: t.sessionId, cwd: t.cwd, permissionMode: restartMode });
+        appendKillAudit({ pid: killPid.pid, fromId, result: res.error ? 'restart-failed' : 'restarted', reason: res.error, sessionId: t?.sessionId ?? null, screen: res.plan?.sessionName ?? null });
+        if (res.error) {
+          console.error(`[spawn] ❌ killed, but restart failed: ${res.error}`);
+          if (t?.sessionId && !t.guessed) console.error(`[spawn] retry: /spawn <project> --resume-session ${t.sessionId}`);
+          process.exit(1);
+        }
+        console.log(`[spawn] 🔁 restarted session ${t.sessionId} in screen "${res.plan.sessionName}" (cwd ${t.cwd}) → topic #${res.plan.sessionName.replace(/^tele-/, '')}. It will check its mailbox, re-arm its listener and greet in its topic.`);
+        process.exit(0);
+      }
       // Only suggest a resume for a session we KNOW (session file), never a guess.
       if (t?.sessionId && !t.guessed) console.log(`[spawn] resume it in a screen: /spawn <project> --resume-session ${t.sessionId}`);
       process.exit(0);
@@ -834,15 +950,16 @@ if (isDirectRun) {
     console.error('[spawn] interactive mode needs `screen` (or install tmux + switch backend). Not found on PATH.');
     process.exit(1);
   }
-  const plan = buildSpawnPlan({ interactive, permissionMode, resumeSessionId: resume.found ? resume.sessionId : undefined });
-  if (plan.resumed) {
-    const pre = checkResumePreflight({
-      sessionId: plan.sessionId, sessionName: plan.sessionName, cwd: process.cwd(),
-      procs: listClaudeProcs(), screenExists: screenSessionExists(plan.sessionName),
-      transcriptDirs: findTranscriptDirs(plan.sessionId),
-    });
-    if (pre.error) { console.error(`[spawn] refusing to resume: ${pre.error}`); process.exit(1); }
+  if (resume.found) {
+    const res = await performResume({ sessionId: resume.sessionId, cwd: process.cwd(), permissionMode });
+    if (res.error) { console.error(`[spawn] refusing to resume / FAILED: ${res.error}`); process.exit(1); }
+    const { plan } = res;
+    console.log(`[spawn] resumed session ${plan.sessionId} in screen "${plan.sessionName}" → topic #${plan.sessionName.replace(/^tele-/, '')} (subscription billing).`);
+    console.log('[spawn] it will check its mailbox, re-arm its Telegram listener and greet in its existing topic.');
+    console.log(`[spawn] teardown: ${plan.teardown}`);
+    process.exit(0);
   }
+  const plan = buildSpawnPlan({ interactive, permissionMode });
   const result = runSpawn(plan);
   if (plan.mode === 'interactive') {
     // Verify the screen session actually came up — `screen -dmS` returns 0 even if
@@ -865,9 +982,7 @@ if (isDirectRun) {
       process.exit(1);
     }
     console.log(`[spawn] interactive agent launched in screen session "${plan.sessionName}" (subscription billing).`);
-    if (plan.resumed) {
-      console.log(`[spawn] resumed session ${plan.sessionId} → topic #${plan.sessionName.replace(/^tele-/, '')}; it will re-arm its Telegram listener and post in its existing topic.`);
-    } else if (plan.sessionId) {
+    if (plan.sessionId) {
       // The session name IS the convo hashtag → it matches the #tag the agent
       // shows in its Telegram topic, so you can map screen ⇄ topic at a glance.
       console.log(`[spawn] forced session-id ${plan.sessionId} → topic hashtag #${plan.sessionName.replace(/^tele-/, '')}.`);
