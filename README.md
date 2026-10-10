@@ -155,7 +155,7 @@ It's driven by **one owner user** (`_config.daemonUserId`) and is a thin, **regi
 |---|---|---|
 | `/spawn <project> [--resume-session <uuid> [--hashtag <h>]]` | maintainer | launch an interactive agent in `<project>`; with `--resume-session`, `claude --resume <uuid>` an existing session (e.g. a hand-opened one whose listener died) in screen `tele-<hashtag>` — refuses while a live process still holds it |
 | `/headless <project>` | maintainer | launch a headless agent in `<project>` |
-| `/kill <id>` · `/kill pid:<PID> [--restart]` | maintainer · **owner** | kill a `tele-*` screen agent by hashtag · SIGTERM one `claude` process of this user by PID (owner only, uid + `comm=claude` + start time re-checked, no SIGKILL, audited); `--restart` then resumes that session in a screen in its old cwd |
+| `/kill <id>` · `/kill pid:<PID>\|name:<name> [--restart]` | maintainer · **owner** | kill a `tele-*` screen agent by hashtag · SIGTERM one `claude` process of this user by PID or by its session name / Telegram persona (full name, must match exactly one) (owner only, uid + `comm=claude` + start time re-checked, no SIGKILL, audited); `--restart` then resumes that session in a screen in its old cwd |
 | `/ls` | member | list running agents in two sections — 📺 screens (with the claude inside), then 🖥 hand-opened terminal `claude` processes — each with pid, folder, uptime, full session id, `#hashtag` |
 | `/run <project> <script> [args]` | maintainer | run a `package.json` script — auto-detects npm/pnpm/yarn, validates the script, runs `<pm> run <script> -- <args>` (remote exec) |
 | `/whisper #<hash> <text>` | admin | discreet steer into a topic (also accepts a persona name or convoId as the target) — alias `/w` |
