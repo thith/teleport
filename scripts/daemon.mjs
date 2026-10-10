@@ -454,11 +454,14 @@ export async function handlePrLinks(links, msg, {
 }) {
   const spec = resolveCommand('merge', registry);
   if (!spec || !sendButtons) return;
+  // The button chooses the operation: never let a deployment arg (`--close`)
+  // turn the Merge preview into a close check.
+  const baseArgs = spec.args.filter((a) => a !== '--close');
   const role = resolveSenderRole(projectsConfig, msg.from && msg.from.id);
   if (!roleMeets(role, spec.minRole)) { await sendText(daemonUserId, `❌ merge cần quyền ${spec.minRole} (bạn: ${role}).`); return; }
   const run = async (extra) => {
     try {
-      const r = await runner(process.execPath, [path.join(scriptsDir, spec.run), ...spec.args, ...links, ...extra], {
+      const r = await runner(process.execPath, [path.join(scriptsDir, spec.run), ...baseArgs, ...links, ...extra], {
         cwd: parentDir, env: childEnv(msg.from, role, secretEnvKeys), timeout: COMMAND_TIMEOUT_MS, maxBuffer: COMMAND_MAX_BUFFER,
       });
       return { ok: true, out: (r.stdout || '').trim() };
@@ -506,8 +509,12 @@ export async function handleMergeButton(cq, ctx, { take = takeMergeButton, dispa
   const closing = m[1] === 'cl';
   await ctx.answerButton(cq.id, closing ? 'Đang đóng…' : 'Đang merge…');
   await ctx.editButtonsMessage(chatId, messageId, `${original}\n\n⏳ ${closing ? 'Đang đóng PR…' : 'Đang merge…'}`);
-  // Same path as typing /merge <links> [--close]: registry spec, role gate, all checks.
-  await dispatch({ cmd: 'merge', rest: entry.links.join(' ') + (closing ? ' --close' : '') }, cq.from || {}, ctx);
+  // Same path as typing /merge <links> [--close]: registry spec, role gate, all
+  // checks — but the operation is the button's: strip a deployment `--close`
+  // from the spec args so Merge can never close.
+  const raw = ctx.registry && ctx.registry.merge;
+  const registry = raw && Array.isArray(raw.args) ? { ...ctx.registry, merge: { ...raw, args: raw.args.filter((a) => a !== '--close') } } : ctx.registry;
+  await dispatch({ cmd: 'merge', rest: entry.links.join(' ') + (closing ? ' --close' : '') }, cq.from || {}, { ...ctx, registry });
 }
 
 // Generic registry dispatcher. Resolves `/cmd` to a command spec, gates by

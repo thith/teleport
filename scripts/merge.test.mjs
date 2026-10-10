@@ -283,4 +283,6 @@ test('--close: closes open PRs without merging (branch kept); refuses merged/clo
   assert.match(p.text, /is open — can be closed/, 'a conflicting PR can still be closed');
   assert.equal(f.calls.some((c) => c[0] === 'api'), false);
   assert.equal(parseMergeArgs(['https://github.com/a/b/pull/1', '--close']).close, true);
+  assert.equal(parseMergeArgs(['https://github.com/a/b/pull/1', '--squash', '--rebase', '--close']).close, true, 'conflicting merge methods are irrelevant to --close');
+  assert.match(parseMergeArgs(['https://github.com/a/b/pull/1', '--squash', '--rebase']).error, /pick one/);
 });

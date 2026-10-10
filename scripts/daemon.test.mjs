@@ -553,3 +553,17 @@ test('handlePrLinks: not mergeable but still open → only [Close] [Huỷ]; Merg
   await handleMergeButton(cq(`cl:${tok}`), ctx, { take, dispatch: async (p) => dispatched.push(p) });
   assert.deepEqual(dispatched, [{ cmd: 'merge', rest: `${L1} --close` }]);
 });
+
+test('a deployment arg --close never turns Merge into close (preview and dispatch)', async () => {
+  const argvs = [], buttons = [], store = new Map();
+  const reg = { merge: { run: 'merge.mjs', args: ['--close'], needsProject: false, minRole: 'admin' } };
+  await handlePrLinks([L1], { chat: { id: 1 }, from: { id: 1 } }, { daemonUserId: '1', projectsConfig: OWNER_CFG, registry: reg, store,
+    sendText: async () => {}, sendButtons: async (c, t, b) => buttons.push(b), runner: async (bin, argv) => { argvs.push(argv); return { stdout: 'ok' }; }, scriptsDir: '/s', parentDir: '/w' });
+  assert.deepEqual(argvs[0], ['/s/merge.mjs', L1, '--preview'], 'merge preview without the deployment --close');
+  const tok = buttons[0][0].callback_data.slice(3);
+  let seen;
+  await handleMergeButton({ id: 'q', data: `mg:${tok}`, from: { id: 1 }, message: { chat: { id: 1 }, message_id: 1, text: 'p' } },
+    { registry: reg, answerButton: async () => {}, editButtonsMessage: async () => {} },
+    { take: (t) => takeMergeButton(t, { store }), dispatch: async (p, f, c) => { seen = { p, args: c.registry.merge.args }; } });
+  assert.deepEqual(seen, { p: { cmd: 'merge', rest: L1 }, args: [] });
+});

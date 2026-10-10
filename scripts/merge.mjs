@@ -42,14 +42,14 @@ export function parsePrUrl(s) {
  */
 export function parseMergeArgs(argv) {
   const targets = [];
-  let project = null, method = null, keepBranch = false, force = false, preview = false, close = false;
+  let project = null, method = null, keepBranch = false, force = false, preview = false, close = false, methodConflict = null;
   argv.forEach((a, idx) => {
     if (targets.error) return;
     if (a === '--preview') { preview = true; return; }
     if (a === '--close') { close = true; return; }
     if (/^--(squash|merge|rebase)$/.test(a)) {
       const m = a.slice(2);
-      if (method && method !== m) { targets.error = `pick one merge method (--${method} or --${m}).`; return; }
+      if (method && method !== m) { methodConflict = `pick one merge method (--${method} or --${m}).`; return; }
       method = m;
     } else if (a === '--keep-branch') keepBranch = true;
     else if (a === '--force') force = true;
@@ -62,6 +62,7 @@ export function parseMergeArgs(argv) {
     else targets.error = `unexpected argument ${JSON.stringify(a)}. ${USAGE_LINE}`;
   });
   if (targets.error) return { error: targets.error };
+  if (methodConflict && !close) return { error: methodConflict }; // merge options are irrelevant to --close
   if (!targets.length) return { error: USAGE_LINE };
   const seen = new Set();
   for (const t of targets) {
