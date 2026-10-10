@@ -42,9 +42,10 @@ export function parsePrUrl(s) {
  */
 export function parseMergeArgs(argv) {
   const targets = [];
-  let project = null, method = null, keepBranch = false, force = false;
+  let project = null, method = null, keepBranch = false, force = false, preview = false;
   argv.forEach((a, idx) => {
     if (targets.error) return;
+    if (a === '--preview') { preview = true; return; }
     if (/^--(squash|merge|rebase)$/.test(a)) {
       const m = a.slice(2);
       if (method && method !== m) { targets.error = `pick one merge method (--${method} or --${m}).`; return; }
@@ -67,7 +68,7 @@ export function parseMergeArgs(argv) {
     if (seen.has(k)) return { error: `PR ${t.repo ? `${t.repo}` : ''}#${t.number} listed twice.` };
     seen.add(k);
   }
-  return { project, targets, method: method || DEFAULT_MERGE_METHOD, keepBranch, force };
+  return { project, targets, method: method || DEFAULT_MERGE_METHOD, keepBranch, force, ...(preview ? { preview } : {}) };
 }
 
 const FAILING = new Set(['FAILURE', 'ERROR', 'CANCELLED', 'TIMED_OUT', 'ACTION_REQUIRED', 'STARTUP_FAILURE']);
@@ -165,7 +166,7 @@ const ghError = (e) => String(e?.stderr || e?.message || e).trim().split('\n').s
  * mergeable=UNKNOWN — normal right after a previous merge in the same batch.
  * Returns { ok, text } | { error, text }.
  */
-export async function mergeOne(target, { method, keepBranch, force }, {
+export async function mergeOne(target, { method, keepBranch, force, preview = false }, {
   gh, sleep = (ms) => new Promise((r) => setTimeout(r, ms)), unknownTries = 5, unknownWaitMs = 2000,
   mergedHeads = [],
 }) {
@@ -193,6 +194,12 @@ export async function mergeOne(target, { method, keepBranch, force }, {
     catch (e) { return { error: true, text: `❌ PR ${c.label}${pr.number}: cannot check its base branch ${pr.baseRefName}: ${ghError(e)}` }; }
   }
   if (baseMerged) return { error: true, text: `❌ PR ${c.label}${pr.number} "${pr.title}": its base ${pr.baseRefName} is the branch of an already-merged PR (stacked PR) — retarget it (gh pr edit ${pr.number} --base <target>) first.\n${pr.url}` };
+  // --preview: everything checked, nothing changed (the daemon shows this with
+  // Merge / Cancel buttons when a PR link is pasted).
+  if (preview) {
+    const { total } = summarizeChecks(pr.statusCheckRollup);
+    return { ok: true, head: pr.isCrossRepository ? null : `${repo || ''}:${pr.headRefName}`, text: `🔎 PR ${c.label}${pr.number} "${pr.title}"\n${pr.headRefName} → ${pr.baseRefName} · checks: ${total ? 'all passed' : 'none'} · ready to ${method}\n${pr.url}` };
+  }
   try {
     gh(['api', '-X', 'PUT', `${c.api}/pulls/${pr.number}/merge`,
       '-f', `merge_method=${method}`, '-f', `sha=${pr.headRefOid}`]);
@@ -250,7 +257,9 @@ export async function mergeMany(args, deps) {
     lines.push(r.text);
     if (r.error) {
       const rest = targets.slice(i + 1);
-      if (targets.length > 1) lines.push(`⏹ stopped. merged: ${merged.length ? merged.map(name).join(', ') : 'none'}${rest.length ? ` · not attempted: ${rest.map(name).join(', ')}` : ''}`);
+      if (targets.length > 1) lines.push(args.preview
+        ? `⏹ ${name(t)} can't be merged${rest.length ? ` (not checked: ${rest.map(name).join(', ')})` : ''}.`
+        : `⏹ stopped. merged: ${merged.length ? merged.map(name).join(', ') : 'none'}${rest.length ? ` · not attempted: ${rest.map(name).join(', ')}` : ''}`);
       return { ok: false, text: lines.join('\n\n') };
     }
     merged.push(t);

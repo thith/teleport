@@ -32,6 +32,7 @@
 // pass (moved here from tele-listen).
 
 import fs from 'node:fs';
+import crypto from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isMainModule } from './is-direct-run.mjs';
@@ -275,6 +276,22 @@ async function main() {
     try { await sendTextToAdmin(token, chatId, text, { raw: false, plain: true }); } catch (e) { console.error(`[daemon] send failed: ${e?.message ?? e}`); }
   };
 
+  // Bot API calls for the PR-link merge buttons (sendMessage with an inline
+  // keyboard, answer/edit on press). Failures are logged, never fatal.
+  const tg = async (method, body) => {
+    const res = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+    });
+    const j = await res.json().catch(() => ({}));
+    if (!j.ok) throw new Error(j.description || `HTTP ${res.status}`);
+    return j.result;
+  };
+  const linkMergeUi = {
+    sendButtons: (chatId, text, buttons) => tg('sendMessage', { chat_id: chatId, text, reply_markup: { inline_keyboard: [buttons] }, link_preview_options: { is_disabled: true } }),
+    answerButton: (id, text) => tg('answerCallbackQuery', { callback_query_id: id, ...(text ? { text } : {}) }).catch(() => {}),
+    editButtonsMessage: (chatId, messageId, text) => tg('editMessageText', { chat_id: chatId, message_id: messageId, text, link_preview_options: { is_disabled: true } }).catch(() => {}),
+  };
+
   // `/reload`: swap in a fresh registry + projects config (see reloadDaemonState).
   const reload = () => {
     const r = reloadDaemonState({
@@ -324,8 +341,12 @@ async function main() {
         if (msg.chat?.type === 'private') return true;
         return isDmControlMessage(msg.text);
       });
-      if (mine.length) {
-        handleControlMessages(mine, { token, daemonUserId, projectsConfig, registry, sendText, secretEnvKeys, reload });
+      const ctx = { token, daemonUserId, projectsConfig, registry, sendText, secretEnvKeys, reload, ...linkMergeUi };
+      if (mine.length) handleControlMessages(mine, ctx);
+      // Inline-button presses (PR-link merge confirmation) — owner only.
+      const presses = updates.filter((u) => u.callback_query && String(u.callback_query.from?.id) === daemonUserId);
+      for (const u of presses) {
+        handleMergeButton(u.callback_query, ctx).catch((e) => console.error(`[daemon] button: ${e?.message ?? e}`));
       }
       if (updates.length) writeOffset(Math.max(...updates.map((u) => u.update_id)), daemonOffsetFile);
 
@@ -359,7 +380,16 @@ export function handleControlMessages(mine, ctx) {
     // carry no /dm prefix and pass through verbatim.
     const dispatchText = isDmControlMessage(msg.text) ? stripDmControlPrefix(msg.text) : msg.text;
     const parsed = parseDaemonCommand(dispatchText);
-    if (!parsed) continue;
+    if (!parsed) {
+      // A private message that is ONLY GitHub PR link(s) → merge preview with
+      // [Merge] [Cancel] buttons (nothing is merged until the button is pressed).
+      const links = msg.chat?.type === 'private' ? prLinksOnly(msg.text) : null;
+      if (links) {
+        handlePrLinks(links, msg, ctx).catch((e) =>
+          ctx.sendText(ctx.daemonUserId, `❌ merge preview failed: ${e instanceof Error ? e.message : e}`));
+      }
+      continue;
+    }
     // Pass the replied-to message text (if this DM is a Telegram reply) so
     // /whisper|/instruct can pick the target from a previous ack/reply instead of
     // retyping it (RFC 07/13). Fall back to `.caption`: a long agent reply is
@@ -369,6 +399,91 @@ export function handleControlMessages(mine, ctx) {
     dispatchCommand(parsed, msg.from || {}, ctx, rt?.text ?? rt?.caption, msg.message_id).catch((e) =>
       ctx.sendText(ctx.daemonUserId, `❌ /${parsed.cmd} failed: ${e instanceof Error ? e.message : e}`));
   }
+}
+
+// ── Paste a PR link → preview + [✅ Merge] [✖ Cancel] ─────────────────────────
+
+export const PR_LINK_RE = /^https?:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/pull\/\d+(?:[/?#]\S*)?$/;
+export const MERGE_BUTTON_TTL_MS = 15 * 60 * 1000;
+
+/** The message's links if it is NOTHING but GitHub PR URLs (deduped), else null. Pure. */
+export function prLinksOnly(text) {
+  const tokens = String(text ?? '').trim().split(/\s+/).filter(Boolean);
+  if (!tokens.length || !tokens.every((t) => PR_LINK_RE.test(t))) return null;
+  return [...new Set(tokens)];
+}
+
+// token → { links, chatId, createdAt }. In memory on purpose: a daemon restart
+// simply expires pending confirmations (the button then says so).
+export const pendingMergeButtons = new Map();
+
+/** One-shot take: returns the entry (if fresh) and deletes it, so a double tap can't merge twice. */
+export function takeMergeButton(tok, { now = Date.now(), store = pendingMergeButtons, ttlMs = MERGE_BUTTON_TTL_MS } = {}) {
+  const e = store.get(tok);
+  store.delete(tok);
+  for (const [k, v] of store) if (now - v.createdAt > ttlMs) store.delete(k); // sweep
+  if (!e || now - e.createdAt > ttlMs) return null;
+  return e;
+}
+
+/** Child env for a dispatched script: our env minus teleport secrets, plus the sender's identity. */
+function childEnv(from, role, secretEnvKeys, extra = {}) {
+  const env = { ...process.env };
+  for (const k of secretEnvKeys) delete env[k];
+  return Object.assign(env, {
+    TELE_FROM_ID: from && from.id != null ? String(from.id) : '',
+    TELE_FROM_ROLE: role,
+    TELE_FROM_NAME: (from && (from.first_name || from.username)) || 'admin',
+    TELE_FROM_USERNAME: (from && from.username) || '',
+    TELE_REPLY_TEXT: '', TELE_MESSAGE_ID: '',
+  }, extra);
+}
+
+export async function handlePrLinks(links, msg, {
+  daemonUserId, projectsConfig, registry, sendText, sendButtons, secretEnvKeys = [],
+  runner = execFileP, scriptsDir = __dirname, parentDir = PARENT_DIR, store = pendingMergeButtons,
+}) {
+  const spec = resolveCommand('merge', registry);
+  if (!spec || !sendButtons) return;
+  const role = resolveSenderRole(projectsConfig, msg.from && msg.from.id);
+  if (!roleMeets(role, spec.minRole)) { await sendText(daemonUserId, `❌ merge cần quyền ${spec.minRole} (bạn: ${role}).`); return; }
+  let out, ok = true;
+  try {
+    const r = await runner(process.execPath, [path.join(scriptsDir, spec.run), ...links, '--preview'], {
+      cwd: parentDir, env: childEnv(msg.from, role, secretEnvKeys), timeout: COMMAND_TIMEOUT_MS, maxBuffer: COMMAND_MAX_BUFFER,
+    });
+    out = (r.stdout || '').trim();
+  } catch (e) {
+    ok = false;
+    out = ((e.stdout || '') + (e.stderr ? `\n${e.stderr}` : '')).trim() || `❌ ${e.message || e}`;
+  }
+  if (!ok) { await sendText(msg.chat.id, out); return; } // something can't be merged → no buttons
+  const tok = crypto.randomBytes(8).toString('hex');
+  store.set(tok, { links, chatId: msg.chat.id, createdAt: Date.now() });
+  await sendButtons(msg.chat.id, `${out}\n\nMerge ${links.length > 1 ? `these ${links.length} PRs (in order)` : 'this PR'}?`,
+    [{ text: '✅ Merge', callback_data: `mg:${tok}` }, { text: '✖ Huỷ', callback_data: `mc:${tok}` }]);
+}
+
+export async function handleMergeButton(cq, ctx, { take = takeMergeButton, dispatch = dispatchCommand } = {}) {
+  const m = String(cq.data || '').match(/^(mg|mc):([0-9a-f]{16})$/);
+  if (!m) { await ctx.answerButton(cq.id); return; }
+  const entry = take(m[2]);
+  const chatId = cq.message?.chat?.id, messageId = cq.message?.message_id;
+  const original = cq.message?.text || '';
+  if (!entry) {
+    await ctx.answerButton(cq.id, '⌛ Hết hạn hoặc đã xử lý — dán lại link.');
+    if (chatId != null) await ctx.editButtonsMessage(chatId, messageId, `${original}\n\n⌛ Hết hạn.`);
+    return;
+  }
+  if (m[1] === 'mc') {
+    await ctx.answerButton(cq.id, 'Đã huỷ');
+    await ctx.editButtonsMessage(chatId, messageId, `${original}\n\n✖ Đã huỷ.`);
+    return;
+  }
+  await ctx.answerButton(cq.id, 'Đang merge…');
+  await ctx.editButtonsMessage(chatId, messageId, `${original}\n\n⏳ Đang merge…`);
+  // Same path as typing /merge <links>: registry spec, role gate, all checks.
+  await dispatch({ cmd: 'merge', rest: entry.links.join(' ') }, cq.from || {}, ctx);
 }
 
 // Generic registry dispatcher. Resolves `/cmd` to a command spec, gates by

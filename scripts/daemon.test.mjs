@@ -7,6 +7,7 @@ import {
   parseDaemonCommand, resolveSpawnCwd, dispatchCommand, handleControlMessages,
   validateDaemonConfig, resolveSenderRole, acquireSingleton, releaseSingleton, daemonStatus,
   reloadDaemonState, readJsonStrict,
+  prLinksOnly, takeMergeButton, handlePrLinks, handleMergeButton,
 } from './daemon.mjs';
 
 test('parseDaemonCommand: extracts command + rest, strips @botname, lowercases', () => {
@@ -416,4 +417,82 @@ test('reloadDaemonState: a corrupt projects.json (strict reader) or an empty reg
   assert.match(reloadDaemonState({ ...base, readConfig: () => readJsonStrict(bad, 'projects.json') }).error, /projects\.json/);
   assert.match(reloadDaemonState({ ...base, readConfig: () => ({}), loadRegistry: () => ({}) }).error, /registry is empty/);
   fs.rmSync(dir, { recursive: true, force: true });
+});
+
+// ── Paste a PR link → preview + buttons ───────────────────────────────────────
+const MREG = { merge: { run: 'merge.mjs', args: [], needsProject: false, minRole: 'admin' } };
+const OWNER_CFG = { _default: { roles: { '1': { role: 'admin' }, '9': { role: 'member' } } } };
+const L1 = 'https://github.com/thith/teleport/pull/3';
+
+test('prLinksOnly: only messages made of PR links (deduped); anything else → null', () => {
+  assert.deepEqual(prLinksOnly(` ${L1} `), [L1]);
+  assert.deepEqual(prLinksOnly(`${L1}\n${L1} https://github.com/a/b/pull/9/files`), [L1, 'https://github.com/a/b/pull/9/files']);
+  assert.equal(prLinksOnly(`xem giúp ${L1}`), null, 'text around the link → not a merge request');
+  assert.equal(prLinksOnly('https://github.com/a/b/issues/3'), null);
+  assert.equal(prLinksOnly('https://evil.com/a/b/pull/3'), null);
+  assert.equal(prLinksOnly(''), null);
+  assert.equal(prLinksOnly(undefined), null);
+});
+
+test('takeMergeButton: one-shot (a double tap cannot merge twice) and expires', () => {
+  const store = new Map([['t1', { links: [L1], createdAt: 1000 }], ['old', { links: [], createdAt: 0 }]]);
+  assert.deepEqual(takeMergeButton('t1', { now: 2000, store, ttlMs: 5000 }).links, [L1]);
+  assert.equal(takeMergeButton('t1', { now: 2000, store, ttlMs: 5000 }), null);
+  store.set('t2', { links: [L1], createdAt: 0 });
+  assert.equal(takeMergeButton('t2', { now: 10_000, store, ttlMs: 5000 }), null, 'expired');
+  assert.equal(store.size, 0, 'expired entries swept');
+});
+
+test('handlePrLinks: runs merge.mjs --preview (no merge) and offers buttons only when ready', async () => {
+  const calls = [], buttons = [], texts = [], store = new Map();
+  const ctx = (runner) => ({ daemonUserId: '1', projectsConfig: OWNER_CFG, registry: MREG, store, scriptsDir: '/s', parentDir: '/w',
+    sendText: async (c, t) => texts.push(t), sendButtons: async (c, t, b) => buttons.push({ c, t, b }), runner });
+  await handlePrLinks([L1], { chat: { id: 1 }, from: { id: 1 } }, ctx(async (bin, argv, opts) => { calls.push({ argv, opts }); return { stdout: '🔎 PR #3 ready' }; }));
+  assert.deepEqual(calls[0].argv, ['/s/merge.mjs', L1, '--preview']);
+  assert.equal(calls[0].opts.cwd, '/w');
+  assert.equal(buttons.length, 1);
+  assert.match(buttons[0].t, /🔎 PR #3 ready[\s\S]*Merge this PR\?/);
+  assert.deepEqual(buttons[0].b.map((x) => x.text), ['✅ Merge', '✖ Huỷ']);
+  assert.match(buttons[0].b[0].callback_data, /^mg:[0-9a-f]{16}$/);
+  assert.equal(store.size, 1);
+  // not mergeable → plain text, no buttons, nothing stored
+  await handlePrLinks([L1], { chat: { id: 1 }, from: { id: 1 } }, ctx(async () => { throw Object.assign(new Error('x'), { stdout: '❌ PR #3: draft' }); }));
+  assert.equal(buttons.length, 1);
+  assert.match(texts.at(-1), /draft/);
+  assert.equal(store.size, 1);
+  // non-admin → refused, preview never runs
+  let ran = false;
+  await handlePrLinks([L1], { chat: { id: 9 }, from: { id: 9 } }, ctx(async () => { ran = true; return { stdout: '' }; }));
+  assert.equal(ran, false);
+  assert.match(texts.at(-1), /cần quyền admin/);
+});
+
+test('handleMergeButton: Merge dispatches /merge <links> once; Cancel and expired never merge', async () => {
+  const store = new Map([['aaaaaaaaaaaaaaaa', { links: [L1], createdAt: Date.now() }], ['bbbbbbbbbbbbbbbb', { links: [L1], createdAt: Date.now() }]]);
+  const take = (t) => takeMergeButton(t, { store });
+  const ev = [], dispatched = [];
+  const ctx = { answerButton: async (id, t) => ev.push(`answer:${t || ''}`), editButtonsMessage: async (c, m, t) => ev.push(`edit:${t.split('\n').pop()}`) };
+  const cq = (data) => ({ id: 'q', data, from: { id: 1 }, message: { chat: { id: 1 }, message_id: 5, text: 'preview' } });
+  const dispatch = async (parsed) => dispatched.push(parsed);
+  await handleMergeButton(cq('mg:aaaaaaaaaaaaaaaa'), ctx, { take, dispatch });
+  assert.deepEqual(dispatched, [{ cmd: 'merge', rest: L1 }]);
+  await handleMergeButton(cq('mg:aaaaaaaaaaaaaaaa'), ctx, { take, dispatch }); // double tap
+  assert.equal(dispatched.length, 1);
+  assert.ok(ev.some((e) => /Hết hạn/.test(e)));
+  await handleMergeButton(cq('mc:bbbbbbbbbbbbbbbb'), ctx, { take, dispatch });
+  assert.equal(dispatched.length, 1);
+  assert.ok(ev.includes('edit:✖ Đã huỷ.'));
+  await handleMergeButton(cq('evil'), ctx, { take, dispatch });
+  assert.equal(dispatched.length, 1);
+});
+
+test('handleControlMessages: a private link-only message → preview with buttons; in a group or with extra text → nothing', async () => {
+  const buttons = [];
+  const ctx = { daemonUserId: '1', projectsConfig: OWNER_CFG, registry: MREG, sendText: async () => {}, store: new Map(),
+    sendButtons: async (c, t, b) => buttons.push(t), runner: async () => ({ stdout: 'ok' }) };
+  handleControlMessages([{ message: { chat: { id: 1, type: 'private' }, from: { id: 1 }, text: L1 } }], ctx);
+  handleControlMessages([{ message: { chat: { id: -5, type: 'supergroup' }, from: { id: 1 }, text: L1 } }], ctx);
+  handleControlMessages([{ message: { chat: { id: 1, type: 'private' }, from: { id: 1 }, text: `see ${L1}` } }], ctx);
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(buttons.length, 1);
 });

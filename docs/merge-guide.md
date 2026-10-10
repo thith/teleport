@@ -22,6 +22,10 @@ Dạng URL (ví dụ `https://github.com/thith/teleport/pull/3`) tự lấy repo
 
 Quyền: **admin**. Gửi trong DM với bot, hoặc trong topic nhóm thêm tiền tố `/dm` (ví dụ `/dm merge umipay 3`).
 
+## Cách nhanh nhất: dán link
+
+Trong **DM riêng với bot**, dán tin nhắn **chỉ gồm** link PR (một hoặc nhiều, cách nhau bởi dấu cách/xuống dòng). Daemon kiểm tra như `/merge` nhưng chưa merge gì, rồi trả về tóm tắt kèm nút **[✅ Merge] [✖ Huỷ]**. Bấm Merge là merge (mỗi nút chỉ dùng được một lần, hết hạn sau 15 phút). Dán link trong topic nhóm, hoặc tin có kèm chữ khác, thì không có tác dụng.
+
 ## Daemon kiểm tra gì trước khi merge
 
 - PR phải **đang mở**, không phải draft, không có conflict. Nếu GitHub chưa tính xong trạng thái conflict (thường xảy ra ngay sau lần merge trước trong cùng lệnh), lệnh tự đợi vài giây.
