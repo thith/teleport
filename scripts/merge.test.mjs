@@ -76,6 +76,10 @@ function fakeGh(prs, { defaultBranch = 'main', unknownFor = {} } = {}) {
     }
     if (args[0] === 'api' && args[2] === 'PUT') { const n = args[3].match(/pulls\/(\d+)/)[1]; prs[n].state = 'MERGED'; return '{}'; }
     if (args[0] === 'repo') return JSON.stringify({ defaultBranchRef: { name: defaultBranch } });
+    if (args[0] === 'pr' && args[1] === 'list' && args.includes('merged')) {
+      const head = args[args.indexOf('--head') + 1];
+      return JSON.stringify(Object.values(prs).filter((p) => p.state === 'MERGED' && p.headRefName === head).map((p) => ({ number: p.number })));
+    }
     if (args[0] === 'pr' && args[1] === 'list') return JSON.stringify(Object.values(prs).filter((p) => p.state === 'OPEN'));
     if (args[0] === 'api' && args[2] === 'DELETE') return '';
     throw new Error('unexpected ' + args.join(' '));
@@ -119,4 +123,27 @@ test('mergeMany: in order, stops at the first failure, reports merged / not atte
   const ok = await mergeMany(ARGS([1]), { gh: fakeGh({ 1: PR(1) }).gh });
   assert.equal(ok.ok, true);
   assert.doesNotMatch(ok.text, /stopped/);
+});
+
+test('mergeOne: refuses when GitHub returns a different PR than asked', async () => {
+  const { gh, calls } = fakeGh({ 3: PR(4) });
+  const r = await mergeOne(3, ARGS([3]), { gh });
+  assert.match(r.text, /asked for PR #3 but GitHub returned #4/);
+  assert.equal(calls.some((c) => c[2] === 'PUT'), false);
+});
+
+test('mergeMany: stacked PR (base = head of a PR merged earlier in the batch) is refused, not merged into the dead branch', async () => {
+  const { gh, calls } = fakeGh({ 10: PR(10), 11: PR(11, { baseRefName: 'feat/10' }) });
+  const r = await mergeMany(ARGS([10, 11]), { gh, sleep: async () => {} });
+  assert.equal(r.ok, false);
+  assert.match(r.text, /merged PR #10/);
+  assert.match(r.text, /PR #11 .*stacked PR.*gh pr edit 11 --base/);
+  assert.equal(calls.filter((c) => c[2] === 'PUT').length, 1);
+  assert.match(r.text, /kept branch feat\/10: still used by open PR #11/);
+});
+
+test('mergeOne: stacked on a PR merged BEFORE this command → refused too (even with --force)', async () => {
+  const { gh } = fakeGh({ 10: PR(10, { state: 'MERGED' }), 11: PR(11, { baseRefName: 'feat/10' }) });
+  const r = await mergeOne(11, ARGS([11], { force: true }), { gh });
+  assert.match(r.text, /stacked PR/);
 });

@@ -106,6 +106,7 @@ const ghError = (e) => String(e?.stderr || e?.message || e).trim().split('\n').s
  */
 export async function mergeOne(number, { method, keepBranch, force }, {
   gh, sleep = (ms) => new Promise((r) => setTimeout(r, ms)), unknownTries = 5, unknownWaitMs = 2000,
+  mergedHeads = [],
 }) {
   let pr;
   for (let i = 0; ; i++) {
@@ -114,8 +115,19 @@ export async function mergeOne(number, { method, keepBranch, force }, {
     if (pr.mergeable !== 'UNKNOWN' || i >= unknownTries) break;
     await sleep(unknownWaitMs);
   }
+  // Never act on a different PR than the one asked for (e.g. a CLI fallback).
+  if (pr.number !== number) return { error: true, text: `❌ asked for PR #${number} but GitHub returned #${pr.number} — refusing.` };
   const ok = assessPr(pr, { force });
   if (ok.error) return { error: true, text: `❌ PR #${pr.number} "${pr.title}": ${ok.error}\n${pr.url}` };
+  // Stacked PR: its base is the head of a PR that is already merged (earlier in
+  // this batch, or before). Merging now lands it on that dead branch, not on the
+  // real target — retarget it first. --force does not override this.
+  let baseMerged = mergedHeads.includes(pr.baseRefName);
+  if (!baseMerged) {
+    try { baseMerged = JSON.parse(gh(['pr', 'list', '--state', 'merged', '--head', pr.baseRefName, '--limit', '1', '--json', 'number'])).length > 0; }
+    catch (e) { return { error: true, text: `❌ PR #${pr.number}: cannot check its base branch ${pr.baseRefName}: ${ghError(e)}` }; }
+  }
+  if (baseMerged) return { error: true, text: `❌ PR #${pr.number} "${pr.title}": its base ${pr.baseRefName} is the branch of an already-merged PR (stacked PR) — retarget it (gh pr edit ${pr.number} --base <target>) first.\n${pr.url}` };
   try {
     gh(['api', '-X', 'PUT', `repos/{owner}/{repo}/pulls/${pr.number}/merge`,
       '-f', `merge_method=${method}`, '-f', `sha=${pr.headRefOid}`]);
@@ -134,14 +146,15 @@ export async function mergeOne(number, { method, keepBranch, force }, {
       } catch (e) { branchNote = `\n⚠️ merged, but deleting branch ${pr.headRefName} failed: ${ghError(e)}`; }
     }
   }
-  return { ok: true, text: `✅ merged PR #${pr.number} "${pr.title}" into ${pr.baseRefName} (${method}).${branchNote}\n${pr.url}` };
+  return { ok: true, head: pr.headRefName, text: `✅ merged PR #${pr.number} "${pr.title}" into ${pr.baseRefName} (${method}).${branchNote}\n${pr.url}` };
 }
 
 /** Merge PRs in order; stop at the first failure and say what was / wasn't merged. */
 export async function mergeMany(args, deps) {
-  const lines = [], merged = [];
+  const lines = [], merged = [], mergedHeads = [];
   for (const n of args.prs) {
-    const r = await mergeOne(n, args, deps);
+    const r = await mergeOne(n, args, { ...deps, mergedHeads });
+    if (r.head) mergedHeads.push(r.head);
     lines.push(r.text);
     if (r.error) {
       const rest = args.prs.slice(args.prs.indexOf(n) + 1);
