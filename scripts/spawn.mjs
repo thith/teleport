@@ -843,6 +843,36 @@ export function scrubClaudeEnv(base = process.env) {
   return env;
 }
 
+/**
+ * True when `/proc/self/cgroup` puts us inside a systemd SERVICE (e.g. the daemon
+ * running as teleport-daemon.service) — not the user manager itself. Pure.
+ */
+export function inSystemdService(cgroupText) {
+  for (const line of String(cgroupText ?? '').split('\n')) {
+    const leaf = line.trim().split('/').pop() || '';
+    if (leaf.endsWith('.service') && !/^user@\d+\.service$/.test(leaf)) return true;
+  }
+  return false;
+}
+
+/**
+ * Run agents OUTSIDE the daemon's service cgroup. Under systemd (KillMode=
+ * control-group, the default) everything the daemon launches lives in its
+ * cgroup, so restarting/stopping the daemon — or systemd restarting it after a
+ * crash — would kill every agent it ever spawned or resumed. `systemd-run --user
+ * --scope` gives the launch its own transient scope (it execs the command, so the
+ * pid is unchanged). Only when inside a service AND a probe of systemd-run
+ * succeeds; otherwise the command is returned as-is. Injectable for tests.
+ */
+export const SYSTEMD_SCOPE_PREFIX = ['systemd-run', '--user', '--scope', '--quiet', '--collect', '--'];
+export function escapeServiceCgroup(command, env, {
+  cgroup = (() => { try { return fs.readFileSync('/proc/self/cgroup', 'utf8'); } catch { return ''; } })(),
+  probe = () => { try { execFileSync('systemd-run', [...SYSTEMD_SCOPE_PREFIX, 'true'], { env, stdio: 'ignore', timeout: 10_000 }); return true; } catch { return false; } },
+} = {}) {
+  if (!inSystemdService(cgroup) || !probe()) return command;
+  return [...SYSTEMD_SCOPE_PREFIX, ...command];
+}
+
 /** The (command, env) pair to actually spawn: login-shell wrapped when possible. */
 export function childLaunch(command, base = process.env) {
   const wrapped = wrapInLoginShell(command, base);
@@ -856,7 +886,7 @@ export function childLaunch(command, base = process.env) {
  * - interactive: `screen -dm` self-detaches; we invoke and return.
  * - headless: detached + unref so it survives this process exiting.
  */
-export function runSpawn(plan, { runner, cwd, spawnFn = cpSpawn } = {}) {
+export function runSpawn(plan, { runner, cwd, spawnFn = cpSpawn, escape = escapeServiceCgroup } = {}) {
   if (runner) return runner(plan);
   // `cwd` sets the spawned agent's working directory — which is how it later
   // resolves its Telegram group. Since RFC 15 routing is convo-anchored: at
@@ -864,7 +894,9 @@ export function runSpawn(plan, { runner, cwd, spawnFn = cpSpawn } = {}) {
   // (git-common-dir → projects.json), not raw basename(cwd). The supervisor
   // daemon passes a sibling project dir here so `/spawn <project>` lands the new
   // agent in that project's group. Undefined → inherit our cwd.
-  const { command, env } = childLaunch(plan.command);
+  const launch = childLaunch(plan.command);
+  const { env } = launch;
+  const command = escape(launch.command, env);
   const opts = { env, ...(cwd ? { cwd } : {}) };
   if (plan.mode === 'interactive') {
     // No `detached: true` needed: `screen -dm` self-daemonizes, so the front-end

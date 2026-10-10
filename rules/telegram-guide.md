@@ -332,7 +332,8 @@ từ xa **kể cả khi mọi agent đã chết** (quota/network). Nó nghe mộ
 (`DAEMON_CHAT_ID`) và xử lý lệnh: `/spawn <project>`, `/run <project> <script> [args]`,
 `/whisper #<hash> <text>` (alias `/w`), `/instruct #<hash> <text>` (alias `/i`, agent trả lời
 qua DM), `/pending`, `/start`, `/reload` (admin — đọc lại `commands.json` + `projects.json` không cần
-restart), cùng **heartbeat auto-reminder** (đã
+restart), `/restartd` (admin — restart daemon khi chạy dưới systemd; **từ chối** nếu còn agent `claude` nằm chung
+cgroup với daemon, vì `KillMode=control-group` sẽ giết luôn chúng — nên đặt `KillMode=process` trong unit), cùng **heartbeat auto-reminder** (đã
 chuyển từ tele-listen sang đây — nên **khi daemon KHÔNG chạy thì sẽ không có reminder/`/pending`**).
 `/run` tự detect npm/pnpm/yarn của project, validate script trong package.json, rồi chạy
 `<pm> run <script>` (chỉ admin/maintainer — remote exec).
@@ -351,6 +352,8 @@ là một hằng số (`DM_CONTROL_PREFIX`) nên đổi tên cực dễ.
   `admin/maintainer` được authorize. Chạy detached giúp user nếu được yêu cầu:
   `screen -dmS teleport-daemon node ../teleport/scripts/daemon.mjs`.
   Sau khi bật, **chạy `--status` để xác nhận** (bản detached nuốt stderr). Trên **máy chỉ-gửi** (`_config.sendOnly`) daemon tự từ chối (exit `0`) — báo user "daemon không chạy ở máy chỉ-gửi", đừng báo đã bật.
+- **Agent sống độc lập với daemon:** khi daemon chạy dưới systemd, `spawn.mjs` bọc lệnh bằng
+  `systemd-run --user --scope` để mỗi agent có scope riêng — restart/crash daemon không kéo agent chết theo.
 - **Cấu hình:** đặt `_config.daemonChatId` (private chat id, dương) trong `../teleport/projects.json`
   (env chỉ giữ secrets). Mọi project/`_default.chatId` phải là **group (id âm)**; daemon
   chat phải là **private (id dương)** — daemon tự validate và báo lỗi nếu sai.

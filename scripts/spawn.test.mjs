@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 // Isolate the persona pin store so `--list` persona mapping DERIVES instead of
 // reading machine-local pins (resolved at call-time from TELE_PERSONA_STORE).
 process.env.TELE_PERSONA_STORE = path.join(os.tmpdir(), `teleport-persona-store-spawn-${process.pid}.jsonl`);
-import { buildSpawnPlan, genSessionSeed, runSpawn, childLaunch, loginSeedEnv, wrapInLoginShell, scrubClaudeEnv, SEED_PATH, hasBinary, screenSessionExists, normalizeSessionName, parseScreenSessions, listSpawnSessions, resolveKillId, resolveAttachId, resolveAttachTarget, formatSessionList, resolveMode, SPAWN_PROMPT, PERMISSION_MODES, DEFAULT_PERMISSION_MODE, USAGE, personaByHashtag, gracefulKill, KILL_GRACE_MS, RESUME_PROMPT, resolveResumeSession, checkResumePreflight, findTranscriptDirs, checkPidKillAuth, resolveKillPid, appendKillAudit, acquireResumeLock, performResume, checkRestartTarget, checkRestartPreflight, RESUME_LOCK_STALE_MS } from './spawn.mjs';
+import { buildSpawnPlan, genSessionSeed, runSpawn, childLaunch, loginSeedEnv, wrapInLoginShell, scrubClaudeEnv, SEED_PATH, hasBinary, screenSessionExists, normalizeSessionName, parseScreenSessions, listSpawnSessions, resolveKillId, resolveAttachId, resolveAttachTarget, formatSessionList, resolveMode, SPAWN_PROMPT, PERMISSION_MODES, DEFAULT_PERMISSION_MODE, USAGE, personaByHashtag, gracefulKill, KILL_GRACE_MS, RESUME_PROMPT, resolveResumeSession, checkResumePreflight, findTranscriptDirs, checkPidKillAuth, resolveKillPid, appendKillAudit, acquireResumeLock, performResume, checkRestartTarget, checkRestartPreflight, RESUME_LOCK_STALE_MS, inSystemdService, escapeServiceCgroup, SYSTEMD_SCOPE_PREFIX } from './spawn.mjs';
 import fs from 'node:fs';
 import { uuidToConvoInt } from './convo-registry.mjs';
 import { shortConvoHash } from './convo-hash.mjs';
@@ -850,4 +850,31 @@ test('performResume (default deps): a failing ps is a refusal, launched cwd is t
   });
   assert.equal(r2.ok, true);
   assert.equal(calls[0].cwd, '/w/umipay');
+});
+
+test('inSystemdService: a service leaf (not user@N.service, not a scope)', () => {
+  assert.equal(inSystemdService('0::/user.slice/user-1000.slice/user@1000.service/app.slice/teleport-daemon.service\n'), true);
+  assert.equal(inSystemdService('0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-org.gnome.Terminal.slice/vte-spawn-x.scope'), false);
+  assert.equal(inSystemdService('0::/user.slice/user-1000.slice/user@1000.service'), false);
+  assert.equal(inSystemdService(''), false);
+});
+
+test('escapeServiceCgroup: wraps with systemd-run --scope only inside a service AND when the probe works', () => {
+  const cmd = ['/bin/zsh', '-lic', 'exec "$@"', 'teleport-spawn', 'screen'];
+  const svc = '0::/a/teleport-daemon.service';
+  assert.deepEqual(escapeServiceCgroup(cmd, {}, { cgroup: svc, probe: () => true }), [...SYSTEMD_SCOPE_PREFIX, ...cmd]);
+  assert.deepEqual(escapeServiceCgroup(cmd, {}, { cgroup: svc, probe: () => false }), cmd);
+  let probed = 0;
+  assert.deepEqual(escapeServiceCgroup(cmd, {}, { cgroup: '0::/a/x.scope', probe: () => { probed++; return true; } }), cmd);
+  assert.equal(probed, 0, 'no probe outside a service');
+});
+
+test('runSpawn: the escape wrapper is applied to the (login-shell) launch command', () => {
+  const calls = [];
+  runSpawn(buildSpawnPlan({ interactive: true, seed: genSessionSeed(() => FIXED_UUID) }), {
+    spawnFn: (c, a) => { calls.push([c, ...a]); return { unref() {} }; },
+    escape: (command) => ['WRAP', ...command],
+  });
+  assert.equal(calls[0][0], 'WRAP');
+  assert.ok(calls[0].includes('screen'));
 });
