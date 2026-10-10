@@ -64,3 +64,8 @@ test('runRestartd: reads the DAEMON\'s cgroup (ppid), falls back to self', () =>
   runRestartd({ ppid: 777, readFile: (f) => { read.push(f); return f.includes('777') ? SVC : null; }, exec: fakeExec('process', []), listClaudes: () => [] });
   assert.equal(read[0], '/proc/777/cgroup');
 });
+
+test('runRestartd: a failing systemctl restart is reported, not swallowed', () => {
+  const exec = (bin, args) => { if (args.includes('restart')) throw new Error('Failed to restart'); return 'process\n'; };
+  assert.match(runRestartd({ ppid: 1, readFile: () => SVC, exec, listClaudes: () => [] }).error, /systemctl restart teleport-daemon\.service failed/);
+});

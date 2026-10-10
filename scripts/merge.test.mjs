@@ -164,7 +164,11 @@ test('mergeMany: in-batch stacked refusal is NOT overridable by --force; a fork 
 
 test('baseIsMergedHead: no false positives — default branch, fork PRs, re-created branch, deleted branch', async () => {
   // a fork once merged a PR from ITS `main`: must not block PRs into our main
-  let f = fakeGh({ 1: PR(1, { state: 'MERGED', headRefName: 'main', isCrossRepository: true }), 2: PR(2) }, { tips: { main: 'x' } });
+  // tip == that fork PR's head sha, so ONLY the cross-repo filter saves us here…
+  let f = fakeGh({ 1: PR(1, { state: 'MERGED', headRefName: 'main', isCrossRepository: true }), 2: PR(2) }, { tips: { main: 'sha1' } });
+  assert.equal((await mergeOne(2, ARGS([2]), { gh: f.gh })).ok, true);
+  // …and here ONLY the default-branch skip (same-repo main→release backport, main unmoved)
+  f = fakeGh({ 1: PR(1, { state: 'MERGED', headRefName: 'main', baseRefName: 'release' }), 2: PR(2) }, { tips: { main: 'sha1' } });
   assert.equal((await mergeOne(2, ARGS([2]), { gh: f.gh })).ok, true);
   // a release branch that once was a merged PR's head but has moved on (re-created / new commits)
   f = fakeGh({ 5: PR(5, { state: 'MERGED', headRefName: 'release' }), 6: PR(6, { baseRefName: 'release' }) }, { tips: { release: 'newer' } });
@@ -172,4 +176,23 @@ test('baseIsMergedHead: no false positives — default branch, fork PRs, re-crea
   // base branch already deleted → not "stacked" here (GitHub will refuse the merge on its own)
   f = fakeGh({ 5: PR(5, { state: 'MERGED', headRefName: 'gone' }), 6: PR(6, { baseRefName: 'gone' }) });
   assert.equal((await mergeOne(6, ARGS([6]), { gh: f.gh })).ok, true);
+});
+
+test('mergeOne: UNKNOWN wait is bounded; merge_method passes through; open-PR list uses the 1000 limit; gh failure in the stacked check refuses', async () => {
+  let f = fakeGh({ 3: PR(3) }, { unknownFor: { 3: 99 } });
+  let views = 0;
+  const gh = (a) => { if (a[1] === 'view') views++; return f.gh(a); };
+  const r = await mergeOne(3, ARGS([3]), { gh, sleep: async () => {}, unknownTries: 2 });
+  assert.equal(views, 3);
+  assert.match(r.text, /not finished computing/);
+  f = fakeGh({ 3: PR(3) });
+  await mergeOne(3, ARGS([3], { method: 'rebase' }), { gh: f.gh });
+  assert.ok(f.calls.find((c) => c[2] === 'PUT').includes('merge_method=rebase'));
+  const list = f.calls.find((c) => c[0] === 'pr' && c[1] === 'list' && c.includes('open'));
+  assert.equal(list[list.indexOf('--limit') + 1], '1000');
+  f = fakeGh({ 3: PR(3, { baseRefName: 'release' }) });
+  const failing = (a) => { if (a.includes('merged')) throw Object.assign(new Error('x'), { stderr: 'rate limited' }); return f.gh(a); };
+  const r2 = await mergeOne(3, ARGS([3]), { gh: failing });
+  assert.match(r2.text, /cannot check its base branch release: rate limited/);
+  assert.equal(f.calls.some((c) => c[2] === 'PUT'), false);
 });

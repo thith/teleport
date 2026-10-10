@@ -1028,3 +1028,46 @@ test('matchProcsByName: full name via session name or persona; emoji/case ignore
   assert.match(matchProcsByName('Cú', rows, persona).error, /no claude process named/);
   assert.equal(normalizeAgentName(' 🐍  Rắn   3 '), 'rắn 3');
 });
+
+test('acquireResumeLock: one lock per session (different uuids don\'t block each other); cooldown counts from the failure', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kps-'));
+  const OTHER = '00000000-0000-4000-8000-0000000000bb';
+  const a = await acquireResumeLock(GIUN, { dir, platform: 'linux' });
+  const b = await acquireResumeLock(OTHER, { dir, platform: 'linux' });
+  assert.ok(a.release && b.release, 'per-session names');
+  b.release();
+  // begin at t0, fail at t0+100s → still refused at t0+150s (cooldown from failure)
+  const t0 = Date.now();
+  a.beginLaunch();
+  const marker = path.join(dir, `resume-${GIUN}.failed`);
+  fs.utimesSync(marker, new Date(t0), new Date(t0));
+  fs.utimesSync(marker, new Date(t0 + 100_000), new Date(t0 + 100_000)); // what markFailed does at t0+100s
+  a.release();
+  assert.match((await acquireResumeLock(GIUN, { dir, platform: 'linux', now: () => t0 + 150_000 })).error, /failed/);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('resumeLockSecret: rejects a symlink, a dangling symlink, and a group-readable secret', () => {
+  for (const setup of [
+    (d) => { fs.writeFileSync(path.join(d, 'real'), 'x'.repeat(64), { mode: 0o600 }); fs.symlinkSync(path.join(d, 'real'), path.join(d, '.resume-lock-secret')); },
+    (d) => fs.symlinkSync(path.join(d, 'nowhere'), path.join(d, '.resume-lock-secret')),
+    (d) => { fs.writeFileSync(path.join(d, '.resume-lock-secret'), 'x'.repeat(64)); fs.chmodSync(path.join(d, '.resume-lock-secret'), 0o640); },
+  ]) {
+    const d = fs.mkdtempSync(path.join(os.tmpdir(), 'ksec2-'));
+    setup(d);
+    assert.throws(() => resumeLockSecret(d), /not a regular file|readable by others/);
+    fs.rmSync(d, { recursive: true, force: true });
+  }
+});
+
+test('performResume: screen appearing while the stuck launcher is killed → ok, guard cleared', async () => {
+  let up = false; const ev = [];
+  const child = { exitCode: null, signalCode: null, kill: () => { up = true; ev.push('kill'); } };
+  const { deps } = fakeDeps({
+    run: () => ({ child }), screenExists: () => up,
+    acquireLock: () => ({ release: () => ev.push('release'), beginLaunch: () => ({ ok: true }), launchSucceeded: () => ev.push('succeeded'), markFailed: () => ev.push('failed') }),
+  });
+  const r = await performResume({ sessionId: GIUN, cwd: '/w/umipay' }, deps);
+  assert.equal(r.ok, true);
+  assert.deepEqual(ev, ['kill', 'succeeded', 'release']);
+});
