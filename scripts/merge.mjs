@@ -65,6 +65,24 @@ export function assessPr(pr, { force = false } = {}) {
   return { ok: true };
 }
 
+/** `refs/heads/<branch>` API path with every segment URL-encoded (`#`, `%`, `?`… can't redirect it). Pure. */
+export function branchRefPath(branch) {
+  return String(branch).split('/').map(encodeURIComponent).join('/');
+}
+
+/**
+ * May the merged PR's head branch be deleted? Never the default branch, never a
+ * branch another OPEN PR uses as its head or base. Unknown (lookups failed) →
+ * keep it. Pure → { ok } | { keep: reason }.
+ */
+export function branchDeletable(branch, { defaultBranch, openPrs, selfNumber }) {
+  if (!defaultBranch || !Array.isArray(openPrs)) return { keep: 'could not check whether other PRs use it' };
+  if (branch === defaultBranch) return { keep: 'it is the default branch' };
+  const users = openPrs.filter((p) => p.number !== selfNumber && (p.headRefName === branch || p.baseRefName === branch));
+  if (users.length) return { keep: `still used by open PR ${users.map((p) => `#${p.number}`).join(', ')}` };
+  return { ok: true };
+}
+
 const gh = (args, opts = {}) => String(execFileSync('gh', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], ...opts }));
 const ghError = (e) => String(e?.stderr || e?.message || e).trim().split('\n').slice(-3).join(' ');
 
@@ -84,10 +102,17 @@ if (isMainModule(import.meta.url)) {
   } catch (e) { console.log(`❌ merge of PR #${pr.number} failed: ${ghError(e)}\n${pr.url}`); process.exit(1); }
   let branchNote = '';
   if (!args.keepBranch && !pr.isCrossRepository) {
-    try {
-      gh(['api', '-X', 'DELETE', `repos/{owner}/{repo}/git/refs/heads/${pr.headRefName}`]);
-      branchNote = `\n🧹 deleted branch ${pr.headRefName} on GitHub (local checkout untouched).`;
-    } catch (e) { branchNote = `\n⚠️ merged, but deleting branch ${pr.headRefName} failed: ${ghError(e)}`; }
+    let defaultBranch = null, openPrs = null;
+    try { defaultBranch = JSON.parse(gh(['repo', 'view', '--json', 'defaultBranchRef'])).defaultBranchRef?.name || null; } catch {}
+    try { openPrs = JSON.parse(gh(['pr', 'list', '--state', 'open', '--limit', '200', '--json', 'number,headRefName,baseRefName'])); } catch {}
+    const d = branchDeletable(pr.headRefName, { defaultBranch, openPrs, selfNumber: pr.number });
+    if (d.keep) branchNote = `\nℹ️ kept branch ${pr.headRefName}: ${d.keep}.`;
+    else {
+      try {
+        gh(['api', '-X', 'DELETE', `repos/{owner}/{repo}/git/refs/heads/${branchRefPath(pr.headRefName)}`]);
+        branchNote = `\n🧹 deleted branch ${pr.headRefName} on GitHub (local checkout untouched).`;
+      } catch (e) { branchNote = `\n⚠️ merged, but deleting branch ${pr.headRefName} failed: ${ghError(e)}`; }
+    }
   }
   console.log(`✅ merged PR #${pr.number} "${pr.title}" into ${pr.baseRefName} (${args.method}).${branchNote}\n${pr.url}`);
 }

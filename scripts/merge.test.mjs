@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { parseMergeArgs, summarizeChecks, assessPr, DEFAULT_MERGE_METHOD } from './merge.mjs';
+import { parseMergeArgs, summarizeChecks, assessPr, DEFAULT_MERGE_METHOD, branchRefPath, branchDeletable } from './merge.mjs';
 
 test('parseMergeArgs: pr number (#N ok), method, flags; errors on junk / two methods / missing pr', () => {
   assert.deepEqual(parseMergeArgs(['12']), { pr: 12, method: DEFAULT_MERGE_METHOD, keepBranch: false, force: false });
@@ -41,4 +41,20 @@ test('assessPr: refuses closed/merged, draft, conflicts, failing checks; pending
   assert.match(assessPr({ ...base, mergeStateStatus: 'BLOCKED' }).error, /blocked/);
   assert.deepEqual(assessPr({ ...base, mergeStateStatus: 'BLOCKED' }, { force: true }), { ok: true });
   assert.match(assessPr(null).error, /not found/);
+});
+
+test('branchRefPath: every segment encoded — # % ? { } cannot redirect the ref', () => {
+  assert.equal(branchRefPath('feat/resume-ps-killpid'), 'feat/resume-ps-killpid');
+  assert.equal(branchRefPath('release#fix'), 'release%23fix');
+  assert.equal(branchRefPath('a/b?x=1/%zz/{owner}'), 'a/b%3Fx%3D1/%25zz/%7Bowner%7D');
+});
+
+test('branchDeletable: never the default branch or a branch another open PR uses; unknown → keep', () => {
+  const openPrs = [{ number: 5, headRefName: 'feat/x', baseRefName: 'main' }, { number: 6, headRefName: 'feat/y', baseRefName: 'release' }];
+  assert.deepEqual(branchDeletable('feat/x', { defaultBranch: 'main', openPrs, selfNumber: 5 }), { ok: true });
+  assert.match(branchDeletable('main', { defaultBranch: 'main', openPrs, selfNumber: 9 }).keep, /default branch/);
+  assert.match(branchDeletable('release', { defaultBranch: 'main', openPrs, selfNumber: 9 }).keep, /open PR #6/);
+  assert.match(branchDeletable('feat/x', { defaultBranch: 'main', openPrs, selfNumber: 9 }).keep, /open PR #5/);
+  assert.match(branchDeletable('feat/x', { defaultBranch: null, openPrs, selfNumber: 5 }).keep, /could not check/);
+  assert.match(branchDeletable('feat/x', { defaultBranch: 'main', openPrs: null, selfNumber: 5 }).keep, /could not check/);
 });

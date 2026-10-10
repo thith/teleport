@@ -583,7 +583,15 @@ export async function acquireResumeLock(sessionId, {
   } catch { /* no marker */ }
   return {
     ...lock,
-    markFailed: () => { try { fs.mkdirSync(dir, { recursive: true }); fs.writeFileSync(marker, `${process.pid} ${now()}\n`); } catch {} },
+    // Written BEFORE launching (fail closed: no marker → no launch), removed only
+    // after the screen is verified. A launch that failed or crashed leaves it, and
+    // the cooldown check above then blocks a premature retry.
+    beginLaunch: () => {
+      try { fs.mkdirSync(dir, { recursive: true }); fs.writeFileSync(marker, `${process.pid} ${now()}\n`); return { ok: true }; }
+      catch (e) { return { error: `cannot record the launch (${e.message}) — refusing to launch without the retry guard.` }; }
+    },
+    launchSucceeded: () => { try { fs.unlinkSync(marker); } catch {} },
+    markFailed: () => { try { fs.utimesSync(marker, new Date(now()), new Date(now())); } catch {} },
   };
 }
 
@@ -699,13 +707,16 @@ export async function performResume({ sessionId, cwd, permissionMode = DEFAULT_P
       transcriptDirs: transcriptDirs(plan.sessionId),
     });
     if (pre.error) return { error: pre.error, plan };
+    const begun = lock.beginLaunch ? lock.beginLaunch() : { ok: true };
+    if (begun.error) return { error: begun.error, plan };
     const launched = run(plan);
     // Poll (the login shell takes seconds to exec screen) — same as a fresh spawn.
+    const up = () => { lock.launchSucceeded?.(); return { ok: true, plan }; };
     for (let waited = 0; waited < timeoutMs; waited += pollMs) {
-      if (screenExists(plan.sessionName)) return { ok: true, plan };
+      if (screenExists(plan.sessionName)) return up();
       await sleep(Math.min(pollMs, timeoutMs - waited));
     }
-    if (screenExists(plan.sessionName)) return { ok: true, plan };
+    if (screenExists(plan.sessionName)) return up();
     // Timed out. The launcher (login shell → screen) may still be starting; if
     // we just released the lock it could create a writer AFTER a retry launched
     // another. So stop it first, then look one last time.
@@ -713,11 +724,11 @@ export async function performResume({ sessionId, cwd, permissionMode = DEFAULT_P
     if (child && child.exitCode == null && child.signalCode == null) {
       try { child.kill('SIGKILL'); } catch {}
       await sleep(pollMs);
-      if (screenExists(plan.sessionName)) return { ok: true, plan };
+      if (screenExists(plan.sessionName)) return up();
     }
     // We can't prove nothing is still starting (screen forks its server; a killed
-    // front-end doesn't stop an already-forked one): set the cooldown so a retry
-    // waits until a late session would be visible to its preflight.
+    // front-end doesn't stop an already-forked one): the launch marker stays (its
+    // mtime refreshed), so a retry waits until a late session would be visible.
     lock.markFailed?.();
     return { error: `screen session "${plan.sessionName}" not found after ${timeoutMs / 1000}s (claude or screen may have errored). Check /ls before retrying — a retry is blocked for ${RESUME_COOLDOWN_MS / 1000}s in case it is still starting.`, plan, launchFailed: true };
   } finally {

@@ -926,7 +926,7 @@ test('acquireResumeLock: failed-launch cooldown refuses until it expires, and fr
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'klock-'));
   const name = `\0teleport-test-${process.pid}-${Math.random()}`;
   const a = await acquireResumeLock(GIUN, { dir, platform: 'linux', name });
-  a.markFailed(); a.release();
+  a.beginLaunch(); a.markFailed(); a.release();
   await new Promise((r) => setTimeout(r, 20));
   assert.match((await acquireResumeLock(GIUN, { dir, platform: 'linux', name })).error, /failed .*ago/);
   const later = await acquireResumeLock(GIUN, { dir, platform: 'linux', name, now: () => Date.now() + 200_000 });
@@ -949,4 +949,37 @@ test('acquireResumeFileLock: an OLD lock with no parseable holder is still not e
   assert.match(acquireResumeFileLock(GIUN, { dir, isAlive: () => false, now: () => Date.now() + RESUME_LOCK_STALE_MS + 1000 }).error, /in progress/);
   assert.equal(fs.readFileSync(file, 'utf8'), '');
   fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('acquireResumeLock: launch marker — written before launch (fail closed), removed on success, kept on failure', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'klock-'));
+  const name = () => `\0teleport-test-${process.pid}-${Math.random()}`;
+  const marker = path.join(dir, `resume-${GIUN}.failed`);
+  const a = await acquireResumeLock(GIUN, { dir, platform: 'linux', name: name() });
+  assert.deepEqual(a.beginLaunch(), { ok: true });
+  assert.ok(fs.existsSync(marker));
+  a.launchSucceeded(); a.release();
+  assert.equal(fs.existsSync(marker), false, 'success clears the guard');
+  const b = await acquireResumeLock(GIUN, { dir, platform: 'linux', name: name() });
+  assert.ok(b.release, 'no cooldown after a success');
+  b.beginLaunch(); b.markFailed(); b.release();
+  assert.match((await acquireResumeLock(GIUN, { dir, platform: 'linux', name: name() })).error, /failed .*ago/);
+  // unwritable dir → beginLaunch refuses
+  const ro = path.join(dir, 'ro'); fs.mkdirSync(ro); fs.chmodSync(ro, 0o500);
+  const c = await acquireResumeLock(GIUN, { dir: ro, platform: 'linux', name: name() });
+  if (process.getuid?.() !== 0) assert.match(c.beginLaunch().error, /refusing to launch/);
+  c.release(); fs.chmodSync(ro, 0o700);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('performResume: no launch when beginLaunch fails; launchSucceeded on a verified screen', async () => {
+  const events = [];
+  let { deps, log } = fakeDeps({ acquireLock: () => ({ release: () => events.push('release'), beginLaunch: () => ({ error: 'disk full' }) }) });
+  const r1 = await performResume({ sessionId: GIUN, cwd: '/w/umipay' }, deps);
+  assert.match(r1.error, /disk full/);
+  assert.equal(log.ran.length, 0);
+  ({ deps, log } = fakeDeps({ acquireLock: () => ({ release: () => events.push('release'), beginLaunch: () => { events.push('begin'); return { ok: true }; }, launchSucceeded: () => events.push('succeeded') }) }));
+  const r2 = await performResume({ sessionId: GIUN, cwd: '/w/umipay' }, deps);
+  assert.equal(r2.ok, true);
+  assert.deepEqual(events.slice(-3), ['begin', 'succeeded', 'release']);
 });
