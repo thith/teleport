@@ -552,15 +552,31 @@ export const RESUME_COOLDOWN_MS = 120_000;
 
 /**
  * Per-install secret (0600 file) mixed into the abstract socket name: abstract
- * sockets have no permissions, so a predictable name would let ANOTHER local user
- * squat it and block every resume. Returns the secret or throws.
+ * sockets have no permissions, so a predictable name would let another local user
+ * squat it in advance and block every resume. (Accepted residual: a user who
+ * watches /proc/net/unix while a resume is running can learn that one name and
+ * squat it afterwards. That only BLOCKS resumes — it can never make one proceed
+ * wrongly — and teleport hosts are single-user dev boxes.)
+ * Published atomically (private temp file + link, which never replaces a winner),
+ * and an existing secret is only accepted if it is ours, a regular file, and not
+ * readable by group/others. Returns the secret or throws.
  */
-export function resumeLockSecret(dir) {
+export function resumeLockSecret(dir, { uid = process.getuid?.() } = {}) {
   const file = path.join(dir, '.resume-lock-secret');
   fs.mkdirSync(dir, { recursive: true });
-  try { fs.writeFileSync(file, crypto.randomBytes(32).toString('hex'), { flag: 'wx', mode: 0o600 }); } catch (e) { if (e.code !== 'EEXIST') throw e; }
+  if (!fs.existsSync(file)) {
+    const tmp = `${file}.${process.pid}.${crypto.randomUUID()}`;
+    try {
+      fs.writeFileSync(tmp, crypto.randomBytes(32).toString('hex'), { flag: 'wx', mode: 0o600 });
+      try { fs.linkSync(tmp, file); } catch (e) { if (e.code !== 'EEXIST') throw e; } // lost the race → use the winner
+    } finally { try { fs.unlinkSync(tmp); } catch {} }
+  }
+  const st = fs.lstatSync(file);
+  if (!st.isFile()) throw new Error(`resume lock secret ${file} is not a regular file`);
+  if (uid != null && st.uid !== uid) throw new Error(`resume lock secret ${file} is not owned by this user`);
+  if (st.mode & 0o077) throw new Error(`resume lock secret ${file} is readable by others (mode ${(st.mode & 0o777).toString(8)}) — delete it so a fresh one is made`);
   const secret = fs.readFileSync(file, 'utf8').trim();
-  if (secret.length < 32) throw new Error(`resume lock secret ${file} is malformed`);
+  if (secret.length < 32) throw new Error(`resume lock secret ${file} is malformed — delete it so a fresh one is made`);
   return secret;
 }
 

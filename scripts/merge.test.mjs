@@ -60,6 +60,7 @@ test('branchDeletable: never the default branch or a branch another open PR uses
   assert.match(branchDeletable('feat/x', { defaultBranch: 'main', openPrs, selfNumber: 9 }).keep, /open PR #5/);
   assert.match(branchDeletable('feat/x', { defaultBranch: null, openPrs, selfNumber: 5 }).keep, /could not check/);
   assert.match(branchDeletable('feat/x', { defaultBranch: 'main', openPrs: null, selfNumber: 5 }).keep, /could not check/);
+  assert.match(branchDeletable('feat/x', { defaultBranch: 'main', openPrs, selfNumber: 5, limit: 2 }).keep, /too many open PRs/, 'a full page may be truncated → keep');
 });
 
 // Fake gh: a tiny in-memory GitHub.

@@ -84,8 +84,11 @@ export function branchRefPath(branch) {
  * branch another OPEN PR uses as its head or base. Unknown (lookups failed) →
  * keep it. Pure → { ok } | { keep: reason }.
  */
-export function branchDeletable(branch, { defaultBranch, openPrs, selfNumber }) {
+export const OPEN_PR_LIST_LIMIT = 1000;
+export function branchDeletable(branch, { defaultBranch, openPrs, selfNumber, limit = OPEN_PR_LIST_LIMIT }) {
   if (!defaultBranch || !Array.isArray(openPrs)) return { keep: 'could not check whether other PRs use it' };
+  // A full page may be truncated: an unseen PR could still use the branch.
+  if (openPrs.length >= limit) return { keep: `too many open PRs (≥${limit}) to be sure no other PR uses it` };
   if (branch === defaultBranch) return { keep: 'it is the default branch' };
   const users = openPrs.filter((p) => p.number !== selfNumber && (p.headRefName === branch || p.baseRefName === branch));
   if (users.length) return { keep: `still used by open PR ${users.map((p) => `#${p.number}`).join(', ')}` };
@@ -121,7 +124,7 @@ export async function mergeOne(number, { method, keepBranch, force }, {
   if (!keepBranch && !pr.isCrossRepository) {
     let defaultBranch = null, openPrs = null;
     try { defaultBranch = JSON.parse(gh(['repo', 'view', '--json', 'defaultBranchRef'])).defaultBranchRef?.name || null; } catch {}
-    try { openPrs = JSON.parse(gh(['pr', 'list', '--state', 'open', '--limit', '200', '--json', 'number,headRefName,baseRefName'])); } catch {}
+    try { openPrs = JSON.parse(gh(['pr', 'list', '--state', 'open', '--limit', String(OPEN_PR_LIST_LIMIT), '--json', 'number,headRefName,baseRefName'])); } catch {}
     const d = branchDeletable(pr.headRefName, { defaultBranch, openPrs, selfNumber: pr.number });
     if (d.keep) branchNote = `\nℹ️ kept branch ${pr.headRefName}: ${d.keep}.`;
     else {

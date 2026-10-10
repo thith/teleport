@@ -998,7 +998,11 @@ test('resumeLockSecret: created once with mode 0600, stable; the lock name depen
   const l2 = await acquireResumeLock(GIUN, { dir: d2, platform: 'linux' });
   assert.ok(l2.release, 'different secret → different name');
   l1.release(); l2.release();
-  fs.writeFileSync(path.join(d2, '.resume-lock-secret'), 'short');
+  fs.writeFileSync(path.join(d2, '.resume-lock-secret'), 'short', { mode: 0o600 });
+  fs.chmodSync(path.join(d2, '.resume-lock-secret'), 0o600);
   assert.match((await acquireResumeLock(GIUN, { dir: d2, platform: 'linux' })).error, /malformed/);
+  fs.chmodSync(path.join(d2, '.resume-lock-secret'), 0o644);
+  assert.match((await acquireResumeLock(GIUN, { dir: d2, platform: 'linux' })).error, /readable by others/);
+  assert.equal(fs.readdirSync(dir).filter((f) => f.startsWith('.resume-lock-secret.')).length, 0, 'no temp files left');
   fs.rmSync(dir, { recursive: true, force: true }); fs.rmSync(d2, { recursive: true, force: true });
 });
