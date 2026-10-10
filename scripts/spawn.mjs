@@ -539,55 +539,73 @@ export function checkResumePreflight({ sessionId, sessionName, cwd, procs, procs
  * Cross-process lock for one resume, so two concurrent `/spawn --resume-session`
  * (or `/kill pid: --restart`) of the same uuid can't both pass the preflight
  * before either screen exists (the daemon dispatches fire-and-forget).
- *  - Atomic create (`wx`); the file holds `<pid> <random token>`.
- *  - A lock is stale ONLY when its holder pid is dead (age never evicts a live
- *    holder — a slow login shell is still a live launch). pid reuse can only make
- *    a dead lock look alive → a false "busy", the safe direction.
- *  - Stale recovery is serialized by an atomic rename-aside: of N contenders that
- *    saw the same dead lock, exactly one rename succeeds; if what got moved is not
- *    the dead lock it inspected (a successor's fresh lock), it is linked back
- *    (link fails if a newer lock exists) and the caller reports busy.
- *  - release() unlinks only if the file still holds OUR token.
+ *
+ *  - The lock is only ever CREATED with `wx` (atomic), holding `<pid> <token>`.
+ *  - It is stale only when its holder pid is dead AND it is older than
+ *    `staleMs`. The age floor covers an abnormal exit (daemon timeout, crash)
+ *    that leaves a launch still starting: nobody may take over until that launch
+ *    has had time to show up (and then the preflight sees it).
+ *  - Breaking a stale lock is serialized by a second `wx` guard file
+ *    (`.breaking`). Under the guard the breaker re-reads the lock and unlinks it
+ *    only if it still holds the exact dead content it judged — nobody else can
+ *    remove it meanwhile (only guard holders unlink others' locks, and a live
+ *    owner's lock is never judged stale) — then tries the normal `wx` create;
+ *    losing that create to a plain acquirer is just "busy". A live owner's lock is
+ *    never moved or removed by anyone else, so there is at most one owner.
+ *  - A guard left by a crashed breaker is itself broken by the same rule (dead pid
+ *    + older than `staleMs`); it is held for microseconds, so that is rare.
+ *  - release() unlinks only our own token (a live owner's lock can't be replaced).
  * Returns { file, release } or { error }.
  */
+export const RESUME_LOCK_STALE_MS = 120_000;
 export function acquireResumeLock(sessionId, {
   dir = path.join(path.dirname(fileURLToPath(import.meta.url)), 'tmp'),
   pid = process.pid, isAlive = pidAliveLocal, token = crypto.randomUUID(),
+  staleMs = RESUME_LOCK_STALE_MS, now = Date.now,
 } = {}) {
   const file = path.join(dir, `resume-${sessionId}.lock`);
+  const guard = `${file}.breaking`;
   const mine = `${pid} ${token}\n`;
   const busy = { error: `another resume of ${sessionId} is in progress (lock ${path.basename(file)}).` };
   fs.mkdirSync(dir, { recursive: true });
   const read = (f) => { try { return fs.readFileSync(f, 'utf8'); } catch { return null; } };
-  for (let attempt = 0; attempt < 3; attempt++) {
-    try {
-      fs.writeFileSync(file, mine, { flag: 'wx' });
-      let released = false;
-      return {
-        file,
-        release: () => {
-          if (released) return;
-          released = true;
-          if (read(file) === mine) { try { fs.unlinkSync(file); } catch {} }
-        },
-      };
-    } catch (e) {
-      if (e.code !== 'EEXIST') return { error: `cannot create resume lock: ${e.message}` };
+  const create = (f, body) => { try { fs.writeFileSync(f, body, { flag: 'wx' }); return true; } catch (e) { if (e.code === 'EEXIST') return false; throw e; } };
+  const isStale = (f, body) => {
+    const holder = Number.parseInt(body, 10);
+    if (Number.isInteger(holder) && holder > 0 && isAlive(holder)) return false;
+    try { return now() - fs.statSync(f).mtimeMs >= staleMs; } catch { return false; }
+  };
+  try {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      if (create(file, mine)) {
+        let released = false;
+        return {
+          file,
+          release: () => {
+            if (released) return;
+            released = true;
+            if (read(file) === mine) { try { fs.unlinkSync(file); } catch {} }
+          },
+        };
+      }
+      const seen = read(file);
+      if (seen == null) continue;          // released meanwhile → retry the create
+      if (!isStale(file, seen)) return busy;
+      // Stale: break it under the guard.
+      if (!create(guard, mine)) {
+        const g = read(guard);
+        if (g == null || !isStale(guard, g)) return busy; // another breaker is at work
+        if (read(guard) === g) { try { fs.unlinkSync(guard); } catch {} } // crashed breaker
+        continue;
+      }
+      try {
+        if (read(file) === seen) { try { fs.unlinkSync(file); } catch {} }
+      } finally {
+        if (read(guard) === mine) { try { fs.unlinkSync(guard); } catch {} }
+      }
     }
-    const seen = read(file);
-    if (seen == null) continue; // vanished → retry the create
-    const holder = Number.parseInt(seen, 10);
-    if (Number.isInteger(holder) && holder > 0 && isAlive(holder)) return busy;
-    const aside = `${file}.stale.${pid}.${crypto.randomUUID()}`;
-    try { fs.renameSync(file, aside); } catch { continue; } // another contender moved it first
-    const moved = read(aside);
-    if (moved !== seen) {
-      // We moved a successor's fresh lock, not the dead one: put it back.
-      try { fs.linkSync(aside, file); } catch {}
-      try { fs.unlinkSync(aside); } catch {}
-      return busy;
-    }
-    try { fs.unlinkSync(aside); } catch {}
+  } catch (e) {
+    return { error: `cannot create resume lock: ${e.message}` };
   }
   return busy;
 }
@@ -617,6 +635,7 @@ export async function performResume({ sessionId, cwd, permissionMode = DEFAULT_P
   // Held until the screen is verified — see acquireResumeLock.
   const lock = heldLock || acquireLock(plan.sessionId);
   if (lock.error) return { error: lock.error, plan };
+  let launchFailed = false;
   try {
     let procs = null, procsError = null;
     try { procs = listProcs(); } catch (e) { procsError = e?.message ?? String(e); }
@@ -641,11 +660,15 @@ export async function performResume({ sessionId, cwd, permissionMode = DEFAULT_P
       try { child.kill('SIGKILL'); } catch {}
       await sleep(pollMs);
       if (screenExists(plan.sessionName)) return { ok: true, plan };
-      return { error: `screen session "${plan.sessionName}" not up after ${timeoutMs / 1000}s — the stuck launcher was killed, nothing was resumed. Check your login shell, then retry.`, plan };
     }
-    return { error: `screen session "${plan.sessionName}" not found after ${timeoutMs / 1000}s (claude or screen may have errored). Check: screen -ls`, plan };
+    // We can't prove nothing is still starting (screen forks its server; a killed
+    // front-end doesn't stop an already-forked one). So a failed launch KEEPS the
+    // lock: it goes stale only once we're gone AND it's older than the lock's age
+    // floor — by then a late session is visible to the next preflight.
+    launchFailed = true;
+    return { error: `screen session "${plan.sessionName}" not found after ${timeoutMs / 1000}s (claude or screen may have errored). Check /ls before retrying — a retry is blocked for ${RESUME_LOCK_STALE_MS / 1000}s in case it is still starting.`, plan, launchFailed: true };
   } finally {
-    if (!heldLock) lock.release();
+    if (!heldLock && !launchFailed) lock.release();
   }
 }
 
@@ -909,8 +932,15 @@ if (isDirectRun) {
         console.error(`[spawn] --mode needs one of: ${PERMISSION_MODES.join(', ')} (default ${DEFAULT_PERMISSION_MODE}).`); process.exit(1);
       }
       if (!hasBinary('claude') || !hasBinary('screen')) { console.error('[spawn] --restart needs `claude` and `screen` on PATH.'); process.exit(1); }
+      // Bracket the snapshot with two start fingerprints: the row we keep is
+      // bound to THIS process only if the pid kept the same identity throughout.
+      const startBefore = inspectPid(killPid.pid)?.start ?? null;
       let procs = null, procsError = null;
       try { procs = listClaudeProcs({ strict: true }); } catch (e) { procsError = e.message; }
+      const startAfter = inspectPid(killPid.pid)?.start ?? null;
+      if (!procsError && (startBefore == null || startBefore !== startAfter)) {
+        procsError = 'cannot establish the identity of this PID (start time unknown or changed)';
+      }
       const pre = procs?.find((row) => row.pid === killPid.pid) || null;
       // Take the session's resume lock NOW and hold it through kill + resume, so
       // a lock held elsewhere is a refusal BEFORE the kill, not after it.
@@ -925,7 +955,7 @@ if (isDirectRun) {
         process.on('exit', restartLock.release);
       }
       preRow = pre;
-      preStart = inspectPid(killPid.pid)?.start ?? null;
+      preStart = startBefore;
       const sessionName = pre?.sessionId && !pre.guessed ? buildSpawnPlan({ interactive: true, resumeSessionId: pre.sessionId }).sessionName : null;
       // A target living in its OWN tele-<hashtag> screen: that screen dies with it,
       // so it is not a conflict — we wait for it to go after the kill.
@@ -969,6 +999,8 @@ if (isDirectRun) {
         }
         const res = rc2.error ? rc2 : await performResume({ sessionId: t.sessionId, cwd: t.cwd, permissionMode: restartMode }, { heldLock: restartLock });
         appendKillAudit({ pid: killPid.pid, fromId, result: res.error ? 'restart-failed' : 'restarted', reason: res.error, sessionId: t?.sessionId ?? null, screen: res.plan?.sessionName ?? null });
+        // A failed launch keeps the lock on purpose (see performResume).
+        if (res.launchFailed) process.off('exit', restartLock.release);
         if (res.error) {
           console.error(`[spawn] ❌ killed, but restart failed: ${res.error}`);
           if (t?.sessionId && !t.guessed) console.error(`[spawn] retry: /spawn <project> --resume-session ${t.sessionId}`);
@@ -1054,6 +1086,7 @@ if (isDirectRun) {
   }
   if (resume.found) {
     const res = await performResume({ sessionId: resume.sessionId, cwd: process.cwd(), permissionMode });
+    // (on a failed launch performResume leaves its lock in place on purpose)
     if (res.error) { console.error(`[spawn] refusing to resume / FAILED: ${res.error}`); process.exit(1); }
     const { plan } = res;
     console.log(`[spawn] resumed session ${plan.sessionId} in screen "${plan.sessionName}" → topic #${plan.sessionName.replace(/^tele-/, '')} (subscription billing).`);
