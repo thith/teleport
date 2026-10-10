@@ -53,7 +53,7 @@ When the user asks to **spawn / start / launch** a Claude agent — e.g. "spawn 
 **List / attach / kill running agents:**
 - **"list agents / which agents are running"** → `node ../teleport/scripts/spawn.mjs --list` (prints each `tele-<hashtag>`
   session + its topic hashtag) in two sections: **📺 Screen** (each `tele-*` screen with the claude PID inside) then
-  **🖥 Terminal** (`claude` processes opened by hand) — every line with PID, cwd, uptime, the **full session id** and
+  **🖥 Terminal** (`claude` processes opened by hand) — every line with PID, folder name, uptime, the **full session id** and
   `#hashtag`; daemon: `/ls`).
 - **"attach / open / xem agent <id>"** → `node ../teleport/scripts/spawn.mjs --attach <id>` — re-attaches your terminal
   to that interactive `claude` session (it runs `screen -U -d -r tele-<id>`; `-U` = UTF-8 so

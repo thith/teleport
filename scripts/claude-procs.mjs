@@ -195,9 +195,10 @@ export function formatAgentList({ screens = [], procs = [], personaOf = () => nu
   const sess = (r) => (r.sessionId
     ? `  session ${r.sessionId}${r.guessed ? ' (đoán)' : ''}${r.hashtag ? ` · #${r.hashtag}` : ''}`
     : '  session ?');
-  const procLine = (r, { withTty }) => [
+  // No tty column (Thi: only useful at the keyboard). r.tty stays in the row/audit.
+  const procLine = (r) => [
     `PID ${r.pid}`, r.name ? `${r.name}${r.status ? ` (${r.status})` : ''}` : (r.status ? `(${r.status})` : null),
-    short(r.cwd) ?? '?', withTty ? (r.tty ?? null) : null, r.etime,
+    short(r.cwd) ?? '?', r.etime,
   ].filter(Boolean).join(' · ');
 
   const inScreen = new Map(); // screen name → claude rows inside it
@@ -214,11 +215,11 @@ export function formatAgentList({ screens = [], procs = [], personaOf = () => nu
     const persona = name.startsWith('tele-') ? personaOf(name.slice(5)) : null;
     const rows = inScreen.get(name) || [];
     lines.push(`• ${[name, persona].filter(Boolean).join(' · ')}${rows.length ? '' : ' · (không thấy claude bên trong)'}`);
-    for (const r of rows) { lines.push(`  ${procLine(r, { withTty: false })}`); lines.push(sess(r)); }
+    for (const r of rows) { lines.push(`  ${procLine(r)}`); lines.push(sess(r)); }
   }
   lines.push('', `🖥 Terminal (${terminal.length})`);
   if (!terminal.length) lines.push('  (không có)');
-  for (const r of terminal) { lines.push(`• ${procLine(r, { withTty: true })}`); lines.push(sess(r)); }
+  for (const r of terminal) { lines.push(`• ${procLine(r)}`); lines.push(sess(r)); }
   lines.push('', 'Dừng (chỉ owner): /kill pid:<PID> · screen: /kill <hashtag>');
   lines.push('Chạy lại trong screen: /spawn <project> --resume-session <session>');
   return lines.join('\n');
