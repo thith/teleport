@@ -568,7 +568,14 @@ export function resumeLockSecret(dir, { uid = process.getuid?.() } = {}) {
     const tmp = `${file}.${process.pid}.${crypto.randomUUID()}`;
     try {
       fs.writeFileSync(tmp, crypto.randomBytes(32).toString('hex'), { flag: 'wx', mode: 0o600 });
-      try { fs.linkSync(tmp, file); } catch (e) { if (e.code !== 'EEXIST') throw e; } // lost the race → use the winner
+      try { fs.linkSync(tmp, file); } catch (e) {
+        if (e.code !== 'EEXIST') {
+          // No hardlinks on this filesystem → plain exclusive create (a racing
+          // reader may briefly see it empty and get a "malformed" refusal; retry).
+          try { fs.writeFileSync(file, fs.readFileSync(tmp), { flag: 'wx', mode: 0o600 }); }
+          catch (e2) { if (e2.code !== 'EEXIST') throw e2; }
+        }
+      }
     } finally { try { fs.unlinkSync(tmp); } catch {} }
   }
   const st = fs.lstatSync(file);

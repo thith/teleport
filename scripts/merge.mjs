@@ -95,6 +95,25 @@ export function branchDeletable(branch, { defaultBranch, openPrs, selfNumber, li
   return { ok: true };
 }
 
+/**
+ * Is `base` still sitting exactly on the head commit of an already-merged
+ * SAME-REPO PR (i.e. a stacked PR's dead base)? `gh pr list --head` matches by
+ * name only — fork PRs from their own `main`, or a branch deleted and re-created
+ * under the same name, must not count — so we require: not the default branch,
+ * the merged PR is not cross-repo, and the base branch tip == that PR's head sha.
+ */
+export function baseIsMergedHead(base, gh) {
+  const defaultBranch = JSON.parse(gh(['repo', 'view', '--json', 'defaultBranchRef'])).defaultBranchRef?.name;
+  if (base === defaultBranch) return false;
+  const merged = JSON.parse(gh(['pr', 'list', '--state', 'merged', '--head', base, '--limit', '50', '--json', 'number,headRefOid,isCrossRepository']));
+  const sameRepo = merged.filter((p) => !p.isCrossRepository);
+  if (!sameRepo.length) return false;
+  let tip;
+  try { tip = JSON.parse(gh(['api', `repos/{owner}/{repo}/branches/${branchRefPath(base)}`])).commit?.sha; }
+  catch { return false; } // base branch gone → GitHub itself will refuse the merge
+  return sameRepo.some((p) => p.headRefOid === tip);
+}
+
 const PR_FIELDS = 'number,title,url,state,isDraft,mergeable,mergeStateStatus,statusCheckRollup,headRefName,headRefOid,baseRefName,isCrossRepository';
 const ghError = (e) => String(e?.stderr || e?.message || e).trim().split('\n').slice(-3).join(' ');
 
@@ -119,12 +138,14 @@ export async function mergeOne(number, { method, keepBranch, force }, {
   if (pr.number !== number) return { error: true, text: `❌ asked for PR #${number} but GitHub returned #${pr.number} — refusing.` };
   const ok = assessPr(pr, { force });
   if (ok.error) return { error: true, text: `❌ PR #${pr.number} "${pr.title}": ${ok.error}\n${pr.url}` };
-  // Stacked PR: its base is the head of a PR that is already merged (earlier in
-  // this batch, or before). Merging now lands it on that dead branch, not on the
-  // real target — retarget it first. --force does not override this.
+  // Stacked PR: its base is the head of a PR that is already merged. Merging now
+  // lands it on that dead branch, not on the real target — retarget it first.
+  // Merged earlier in THIS batch = certain (no override); merged before and the
+  // branch hasn't moved since = strong evidence, overridable with --force (a
+  // maintained branch merged moments ago, e.g. release → main).
   let baseMerged = mergedHeads.includes(pr.baseRefName);
-  if (!baseMerged) {
-    try { baseMerged = JSON.parse(gh(['pr', 'list', '--state', 'merged', '--head', pr.baseRefName, '--limit', '1', '--json', 'number'])).length > 0; }
+  if (!baseMerged && !force) {
+    try { baseMerged = baseIsMergedHead(pr.baseRefName, gh); }
     catch (e) { return { error: true, text: `❌ PR #${pr.number}: cannot check its base branch ${pr.baseRefName}: ${ghError(e)}` }; }
   }
   if (baseMerged) return { error: true, text: `❌ PR #${pr.number} "${pr.title}": its base ${pr.baseRefName} is the branch of an already-merged PR (stacked PR) — retarget it (gh pr edit ${pr.number} --base <target>) first.\n${pr.url}` };
@@ -146,7 +167,8 @@ export async function mergeOne(number, { method, keepBranch, force }, {
       } catch (e) { branchNote = `\n⚠️ merged, but deleting branch ${pr.headRefName} failed: ${ghError(e)}`; }
     }
   }
-  return { ok: true, head: pr.headRefName, text: `✅ merged PR #${pr.number} "${pr.title}" into ${pr.baseRefName} (${method}).${branchNote}\n${pr.url}` };
+  // Only same-repo heads can be the base of another PR here (a fork's `main` is not ours).
+  return { ok: true, head: pr.isCrossRepository ? null : pr.headRefName, text: `✅ merged PR #${pr.number} "${pr.title}" into ${pr.baseRefName} (${method}).${branchNote}\n${pr.url}` };
 }
 
 /** Merge PRs in order; stop at the first failure and say what was / wasn't merged. */

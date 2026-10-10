@@ -31,7 +31,7 @@ Quyền: **admin**. Gửi trong DM với bot, hoặc trong topic nhóm thêm ti�
 
 1. Xác định đúng **folder thật** của repo chứa PR (`readlink -f be` → `~/Projects/umipay-be` → project = `umipay-be`), rồi liệt kê PR đang mở: `gh -R <owner/repo> pr list --json number,title,isDraft,headRefName,baseRefName`.
 2. Với mỗi PR định merge, kiểm tra: không phải draft, CI xanh (`gh pr checks <n>`), không conflict.
-3. **PR xếp chồng** (base của PR B là branch của PR A): sau khi A merge, B sẽ bị **từ chối** (merge vào đó thì code không vào được main). Phải retarget B trước: `gh pr edit <B> --base main`, rồi mới merge B.
+3. **PR xếp chồng** (base của PR B là branch của PR A): sau khi A merge, B sẽ bị **từ chối** (merge vào đó thì code không vào được main). Phải retarget B trước: `gh pr edit <B> --base main`, rồi mới merge B. (Nếu A và B nằm trong cùng một lệnh thì không thể ép bằng `--force`. Nếu A đã merge từ trước mà branch của nó vẫn được dùng tiếp, ví dụ `release`, thì `--force` cho qua.)
 4. **Thứ tự**: nếu các PR đụng chung file hoặc phụ thuộc nhau thì xếp PR nền trước. Sau mỗi lần merge, PR sau có thể bị conflict, khi đó lệnh tự từ chối và báo lại.
 5. Trả về danh sách lệnh, mỗi lệnh một dòng (để copy), kèm một dòng ghi chú cho mỗi PR. Ví dụ:
 

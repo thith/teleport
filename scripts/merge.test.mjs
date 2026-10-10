@@ -64,7 +64,7 @@ test('branchDeletable: never the default branch or a branch another open PR uses
 });
 
 // Fake gh: a tiny in-memory GitHub.
-function fakeGh(prs, { defaultBranch = 'main', unknownFor = {} } = {}) {
+function fakeGh(prs, { defaultBranch = 'main', unknownFor = {}, tips = {} } = {}) {
   const calls = [];
   const gh = (args) => {
     calls.push(args);
@@ -74,11 +74,16 @@ function fakeGh(prs, { defaultBranch = 'main', unknownFor = {} } = {}) {
       if (unknownFor[args[2]] > 0) { unknownFor[args[2]]--; return JSON.stringify({ ...p, mergeable: 'UNKNOWN' }); }
       return JSON.stringify(p);
     }
-    if (args[0] === 'api' && args[2] === 'PUT') { const n = args[3].match(/pulls\/(\d+)/)[1]; prs[n].state = 'MERGED'; return '{}'; }
+    if (args[0] === 'api' && args[2] === 'PUT') { const n = args[3].match(/pulls\/(\d+)/)[1]; prs[n].state = 'MERGED'; tips[prs[n].headRefName] = prs[n].headRefOid; return '{}'; }
     if (args[0] === 'repo') return JSON.stringify({ defaultBranchRef: { name: defaultBranch } });
     if (args[0] === 'pr' && args[1] === 'list' && args.includes('merged')) {
       const head = args[args.indexOf('--head') + 1];
-      return JSON.stringify(Object.values(prs).filter((p) => p.state === 'MERGED' && p.headRefName === head).map((p) => ({ number: p.number })));
+      return JSON.stringify(Object.values(prs).filter((p) => p.state === 'MERGED' && p.headRefName === head).map((p) => ({ number: p.number, headRefOid: p.headRefOid, isCrossRepository: p.isCrossRepository })));
+    }
+    if (args[0] === 'api' && /\/branches\//.test(args[1] || '')) {
+      const name = decodeURIComponent(args[1].split('/branches/')[1]);
+      if (name in tips) return JSON.stringify({ commit: { sha: tips[name] } });
+      throw Object.assign(new Error('x'), { stderr: 'Branch not found' });
     }
     if (args[0] === 'pr' && args[1] === 'list') return JSON.stringify(Object.values(prs).filter((p) => p.state === 'OPEN'));
     if (args[0] === 'api' && args[2] === 'DELETE') return '';
@@ -142,8 +147,29 @@ test('mergeMany: stacked PR (base = head of a PR merged earlier in the batch) is
   assert.match(r.text, /kept branch feat\/10: still used by open PR #11/);
 });
 
-test('mergeOne: stacked on a PR merged BEFORE this command → refused too (even with --force)', async () => {
-  const { gh } = fakeGh({ 10: PR(10, { state: 'MERGED' }), 11: PR(11, { baseRefName: 'feat/10' }) });
-  const r = await mergeOne(11, ARGS([11], { force: true }), { gh });
-  assert.match(r.text, /stacked PR/);
+test('mergeOne: stacked on a PR merged BEFORE this command → refused; --force overrides (historical evidence only)', async () => {
+  const { gh } = fakeGh({ 10: PR(10, { state: 'MERGED' }), 11: PR(11, { baseRefName: 'feat/10' }) }, { tips: { 'feat/10': 'sha10' } });
+  assert.match((await mergeOne(11, ARGS([11]), { gh })).text, /stacked PR/);
+  assert.equal((await mergeOne(11, ARGS([11], { force: true }), { gh })).ok, true);
+});
+
+test('mergeMany: in-batch stacked refusal is NOT overridable by --force; a fork PR\'s head never poisons the batch', async () => {
+  let f = fakeGh({ 10: PR(10), 11: PR(11, { baseRefName: 'feat/10' }) });
+  assert.match((await mergeMany(ARGS([10, 11], { force: true }), { gh: f.gh, sleep: async () => {} })).text, /stacked PR/);
+  // contributor:main → upstream main, then an unrelated PR into main
+  f = fakeGh({ 1: PR(1, { headRefName: 'main', isCrossRepository: true }), 2: PR(2) });
+  const r = await mergeMany(ARGS([1, 2]), { gh: f.gh, sleep: async () => {} });
+  assert.equal(r.ok, true, r.text);
+});
+
+test('baseIsMergedHead: no false positives — default branch, fork PRs, re-created branch, deleted branch', async () => {
+  // a fork once merged a PR from ITS `main`: must not block PRs into our main
+  let f = fakeGh({ 1: PR(1, { state: 'MERGED', headRefName: 'main', isCrossRepository: true }), 2: PR(2) }, { tips: { main: 'x' } });
+  assert.equal((await mergeOne(2, ARGS([2]), { gh: f.gh })).ok, true);
+  // a release branch that once was a merged PR's head but has moved on (re-created / new commits)
+  f = fakeGh({ 5: PR(5, { state: 'MERGED', headRefName: 'release' }), 6: PR(6, { baseRefName: 'release' }) }, { tips: { release: 'newer' } });
+  assert.equal((await mergeOne(6, ARGS([6]), { gh: f.gh })).ok, true);
+  // base branch already deleted → not "stacked" here (GitHub will refuse the merge on its own)
+  f = fakeGh({ 5: PR(5, { state: 'MERGED', headRefName: 'gone' }), 6: PR(6, { baseRefName: 'gone' }) });
+  assert.equal((await mergeOne(6, ARGS([6]), { gh: f.gh })).ok, true);
 });
