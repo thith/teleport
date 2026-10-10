@@ -11,6 +11,7 @@
   "start":    { "run": "start.mjs",   "args": [],                "needsProject": false, "minRole": "public",     "desc": "onboarding help" },
   "cswap":    { "run": "cswap.mjs",   "args": [],                "needsProject": false, "minRole": "maintainer", "desc": "Claude account switcher: /cswap = list accounts, /cswap <n> = switch to account n" },
   "help":     { "run": "help.mjs",    "args": [],                "needsProject": false, "minRole": "public",     "desc": "list all commands + their sample syntax" },
+  "merge":    { "run": "merge.mjs",   "args": [],                "needsProject": true,  "minRole": "admin",      "desc": "merge a GitHub PR of <project>: /merge <project> <pr#> [--squash|--merge|--rebase] [--keep-branch] [--force] (default squash; via the API, local checkout untouched)" },
   "restartd": { "run": "restartd.mjs", "args": [],              "needsProject": false, "minRole": "admin",      "desc": "restart the daemon (systemd service); refuses while agents share its cgroup unless KillMode=process or --force" },
   "reload":   { "builtin": true,                                    "minRole": "admin",      "desc": "re-read commands.json + projects.json without restarting the daemon" },
   "w":        { "alias": "whisper" },
