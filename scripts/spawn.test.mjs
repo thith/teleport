@@ -803,3 +803,25 @@ test('checkRestartPreflight: pre-kill catches every knowable post-kill refusal; 
   assert.match(checkRestartPreflight(t, { ...base, procs: null, procsError: 'ps failed' }).error, /ps failed/);
   assert.match(checkRestartPreflight({ ...t, guessed: true }, { ...base, procs: [t] }).error, /only a guess/);
 });
+
+test('performResume (default deps): a failing ps is a refusal, launched cwd is the target cwd', async () => {
+  const { deps } = fakeDeps();
+  delete deps.listProcs; delete deps.run;
+  // ps throws → listClaudeProcs({ strict: true }) throws → refused, nothing spawned
+  let spawned = 0;
+  const r1 = await performResume({ sessionId: GIUN, cwd: '/w/umipay' }, {
+    ...deps, exec: () => { throw new Error('ps missing'); }, spawnFn: () => { spawned++; return { unref() {} }; },
+  });
+  assert.match(r1.error, /ps failed/);
+  assert.equal(spawned, 0);
+  // working ps, no holder → runSpawn is called with cwd = the target cwd
+  const calls = [];
+  let up = false;
+  const r2 = await performResume({ sessionId: GIUN, cwd: '/w/umipay' }, {
+    ...deps, screenExists: () => up,
+    exec: () => ' 1 0 1000 ? 00:01 init /sbin/init\n',
+    spawnFn: (cmd, args, opts) => { calls.push(opts); up = true; return { unref() {} }; },
+  });
+  assert.equal(r2.ok, true);
+  assert.equal(calls[0].cwd, '/w/umipay');
+});

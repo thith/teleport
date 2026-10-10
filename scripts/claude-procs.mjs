@@ -352,10 +352,16 @@ export async function killClaudePid(pid, {
   describe = (p) => listClaudeProcs({ uid }).find((r) => r.pid === p) || null,
   sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
   graceMs = KILL_PID_GRACE_MS, pollMs = 500, selfPid = process.pid,
+  // Start fingerprint the CALLER saw earlier (`--restart` snapshots the target
+  // before its pre-kill checks): a pid reused since then is refused too.
+  expectStart = null,
 } = {}) {
   const first = inspect(pid);
   const chk = checkKillTarget(pid, first, { uid, selfPid });
   if (chk.error) return { ok: false, exited: false, error: chk.error };
+  if (expectStart != null && first.start !== expectStart) {
+    return { ok: false, exited: false, error: `PID ${pid} không còn là tiến trình đã kiểm tra (pid bị dùng lại) — không gửi tín hiệu.` };
+  }
   // describe() is slow (full ps scan + file reads), so do it BEFORE the final
   // check, then re-inspect immediately before signalling: same uid, still
   // `claude`, and the same start time — a pid that died and got reused in

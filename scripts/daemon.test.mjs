@@ -391,6 +391,9 @@ test('reloadDaemonState: returns fresh state; invalid config → { error } (old 
   const base = { daemonUserId: '5', loadRegistry: () => ({ x: {} }), resolveOwner: () => '5', resolveCatchAll: () => ['-100'] };
   const r = reloadDaemonState({ ...base, readConfig: () => good });
   assert.deepEqual(r, { projectsConfig: good, registry: { x: {} }, ownerChanged: false });
+  let seenCfg;
+  reloadDaemonState({ ...base, readConfig: () => good, loadRegistry: (cfg) => { seenCfg = cfg; return { x: {} }; } });
+  assert.equal(seenCfg, good, 'registry must be built from the NEW projects.json (_commands overrides)');
   assert.match(reloadDaemonState({ ...base, readConfig: () => { throw new Error('Unexpected token'); } }).error, /Unexpected token/);
   assert.ok(reloadDaemonState({ ...base, readConfig: () => good, resolveCatchAll: () => ['123'] }).error); // catch-all must be a group
   assert.equal(reloadDaemonState({ ...base, readConfig: () => good, resolveOwner: () => '6' }).ownerChanged, true);

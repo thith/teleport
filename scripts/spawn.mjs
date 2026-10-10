@@ -39,7 +39,7 @@ import { formatPersona } from './persona.mjs';
 import { peekPersona } from './persona-store.mjs';
 import {
   listClaudeProcs, findProcForSession, findUnidentifiedProcs, cwdToProjectSlug, PROJECTS_DIR,
-  formatAgentList, parseKillPidArg, killClaudePid, KILL_PID_GRACE_MS,
+  formatAgentList, parseKillPidArg, killClaudePid, KILL_PID_GRACE_MS, inspectPid,
 } from './claude-procs.mjs';
 import { readProjectsConfig, resolveDaemonUserId } from './projects-config.mjs';
 
@@ -606,10 +606,11 @@ export async function performResume({ sessionId, cwd, permissionMode = DEFAULT_P
   // keeps it to the end) — then we neither acquire nor release it here.
   heldLock = null,
   acquireLock = acquireResumeLock,
-  listProcs = () => listClaudeProcs({ strict: true }),
+  exec = execFileSync, spawnFn = cpSpawn,
+  listProcs = () => listClaudeProcs({ strict: true, exec }),
   screenExists = (n) => screenSessionExists(n),
   transcriptDirs = (id) => findTranscriptDirs(id),
-  run = (plan) => runSpawn(plan, { cwd }),
+  run = (plan) => runSpawn(plan, { cwd, spawnFn }),
   sleep = sleepMs, timeoutMs = SPAWN_VERIFY_TIMEOUT_MS, pollMs = SPAWN_VERIFY_POLL_MS,
 } = {}) {
   const plan = buildSpawnPlan({ interactive: true, permissionMode, resumeSessionId: sessionId });
@@ -899,6 +900,7 @@ if (isDirectRun) {
     let restartMode = DEFAULT_PERMISSION_MODE;
     let restartLock = null;
     let restartSessionId = null;
+    let preRow = null, preStart = null, ownScreen = false;
     if (restart) {
       // Everything a restart needs is checked BEFORE the kill: never leave the
       // agent dead because the resume half was doomed from the start.
@@ -922,11 +924,16 @@ if (isDirectRun) {
         }
         process.on('exit', restartLock.release);
       }
+      preRow = pre;
+      preStart = inspectPid(killPid.pid)?.start ?? null;
       const sessionName = pre?.sessionId && !pre.guessed ? buildSpawnPlan({ interactive: true, resumeSessionId: pre.sessionId }).sessionName : null;
+      // A target living in its OWN tele-<hashtag> screen: that screen dies with it,
+      // so it is not a conflict — we wait for it to go after the kill.
+      ownScreen = Boolean(sessionName && pre?.screen === sessionName);
       const rc = procsError
         ? { error: `cannot restart: ${procsError}.` }
         : checkRestartPreflight(pre, {
-          procs, screenExists: sessionName ? screenSessionExists(sessionName) : false,
+          procs, screenExists: sessionName && !ownScreen ? screenSessionExists(sessionName) : false,
           transcriptDirs: pre?.sessionId ? findTranscriptDirs(pre.sessionId) : [],
         });
       if (rc.error) {
@@ -936,8 +943,10 @@ if (isDirectRun) {
       }
     }
     console.log(`[spawn] SIGTERM → PID ${killPid.pid}, waiting up to ${KILL_PID_GRACE_MS / 1000}s…`);
-    const r = await killClaudePid(killPid.pid);
-    const t = r.target;
+    const r = await killClaudePid(killPid.pid, restart ? { expectStart: preStart } : {});
+    // The kill-time describe() is lenient (a transient ps failure → null); the
+    // pre-kill row of the SAME process (start fingerprint checked) is the fallback.
+    const t = r.target ?? (restart ? preRow : null);
     appendKillAudit({
       pid: killPid.pid, fromId, restart, result: r.error ? 'refused' : r.exited ? 'exited' : 'still-alive',
       reason: r.error, sessionId: t?.sessionId ?? null, sessionGuessed: t?.guessed ?? false,
@@ -953,6 +962,11 @@ if (isDirectRun) {
         const rc = checkRestartTarget(t, { transcriptDirs: t?.sessionId ? findTranscriptDirs(t.sessionId) : [] });
         // The kill-time row must still be the session we locked before killing.
         const rc2 = rc.error ? rc : (restartLock && t.sessionId === restartSessionId ? rc : { error: 'session changed between the pre-kill check and the kill.' });
+        if (!rc2.error && ownScreen) {
+          // Its old screen exits with it; give it a moment so the preflight's
+          // "screen already exists" check doesn't trip on the dying session.
+          for (let w = 0; w < 5000 && screenSessionExists(buildSpawnPlan({ interactive: true, resumeSessionId: t.sessionId }).sessionName); w += 250) await sleepMs(250);
+        }
         const res = rc2.error ? rc2 : await performResume({ sessionId: t.sessionId, cwd: t.cwd, permissionMode: restartMode }, { heldLock: restartLock });
         appendKillAudit({ pid: killPid.pid, fromId, result: res.error ? 'restart-failed' : 'restarted', reason: res.error, sessionId: t?.sessionId ?? null, screen: res.plan?.sessionName ?? null });
         if (res.error) {

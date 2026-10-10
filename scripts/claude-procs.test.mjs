@@ -276,7 +276,9 @@ function procFixture(entries) {
 test('inspectPid (/proc): uid from the Uid line (not Gid), comm trimmed, start = stat field 22; gone → null', () => {
   const dir = procFixture({ 123: { comm: 'claude', uid: 1001, gid: 1000, start: '777' } });
   assert.deepEqual(inspectPid(123, { procDir: dir }), { uid: 1001, comm: 'claude', start: '777' });
-  assert.equal(inspectPid(999, { procDir: dir, exec: () => { throw new Error('must not fall back to ps'); } }), null);
+  let psCalls = 0;
+  assert.equal(inspectPid(999, { procDir: dir, exec: () => { psCalls++; return ' 1000 claude Mon Oct  6 09:00:00 2026'; } }), null);
+  assert.equal(psCalls, 0, '/proc present but no entry → gone, never a ps fallback');
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
@@ -313,4 +315,48 @@ test('killClaudePid: a bad pid is refused BEFORE the slow describe() scan', asyn
   const r = await killClaudePid(500, { uid: 1000, inspect: () => null, describe: () => { described++; return null; }, kill: () => {} });
   assert.equal(r.ok, false);
   assert.equal(described, 0);
+});
+
+test('listClaudeProcs (/proc extras): stale session file dropped by procStart; cwd symlink + STY used', () => {
+  const proc = fs.mkdtempSync(path.join(os.tmpdir(), 'procx-'));
+  const sdir = fs.mkdtempSync(path.join(os.tmpdir(), 'sessx-'));
+  const mk = (pid, { start, cwd, sty }) => {
+    const d = path.join(proc, String(pid)); fs.mkdirSync(d);
+    fs.writeFileSync(path.join(d, 'stat'), STAT(start));
+    fs.symlinkSync(cwd, path.join(d, 'cwd'));
+    fs.writeFileSync(path.join(d, 'environ'), sty ? `A=1\0STY=99.${sty}\0` : 'A=1\0');
+  };
+  mk(830318, { start: '5943432', cwd: '/w/live' });
+  mk(1129421, { start: '42', cwd: '/w/scr', sty: 'tele-i0744244' });
+  // 830318's file is from an earlier process with the same pid (different procStart)
+  fs.writeFileSync(path.join(sdir, '830318.json'), JSON.stringify({ pid: 830318, sessionId: SID, cwd: '/w/old', procStart: '111' }));
+  fs.writeFileSync(path.join(sdir, '1129421.json'), JSON.stringify({ pid: 1129421, sessionId: SID2, cwd: '/w/scr', procStart: '42' }));
+  const rows = listClaudeProcs({ uid: 1000, exec: () => PS, sessionsDir: sdir, procDir: proc, projectsDir: '/nonexistent-proj' });
+  const a = rows.find((r) => r.pid === 830318);
+  assert.equal(a.sessionId, null, 'stale file must be dropped');
+  assert.equal(a.cwd, '/w/live', 'falls back to /proc cwd');
+  const b = rows.find((r) => r.pid === 1129421);
+  assert.equal(b.sessionId, SID2);
+  assert.equal(b.screen, 'tele-i0744244');
+  fs.rmSync(proc, { recursive: true, force: true }); fs.rmSync(sdir, { recursive: true, force: true });
+});
+
+test('killClaudePid: describe() runs BEFORE the final re-inspect (race window stays narrow)', async () => {
+  const order = [];
+  await killClaudePid(500, {
+    uid: 1000, alive: () => false, sleep: async () => {}, kill: () => order.push('kill'),
+    inspect: () => { order.push('inspect'); return { uid: 1000, comm: 'claude', start: '1' }; },
+    describe: () => { order.push('describe'); return null; },
+  });
+  assert.deepEqual(order, ['inspect', 'describe', 'inspect', 'kill']);
+});
+
+test('killClaudePid: expectStart (caller snapshot) mismatch → refused, no signal', async () => {
+  const sent = [];
+  const r = await killClaudePid(500, {
+    uid: 1000, expectStart: '100', describe: () => null, kill: (p, s) => sent.push(s),
+    inspect: () => ({ uid: 1000, comm: 'claude', start: '200' }),
+  });
+  assert.match(r.error, /pid bị dùng lại/);
+  assert.equal(sent.length, 0);
 });
