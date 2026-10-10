@@ -451,7 +451,7 @@ test('handlePrLinks: runs merge.mjs --preview (no merge) and offers buttons only
   assert.deepEqual(calls[0].argv, ['/s/merge.mjs', L1, '--preview']);
   // configured spec.args (e.g. a deployment that forces --rebase) are previewed too
   const c2 = [];
-  await handlePrLinks([L1], { chat: { id: 1 }, from: { id: 1 } }, { ...ctx(async (b, argv) => { c2.push(argv); return { stdout: 'ok' }; }), registry: { merge: { ...MREG.merge, args: ['--rebase'] } } });
+  await handlePrLinks([L1], { chat: { id: 1 }, from: { id: 1 } }, { ...ctx(async (b, argv) => { c2.push(argv); return { stdout: 'ok' }; }), registry: { merge: { ...MREG.merge, args: ['--rebase'] } }, store: new Map(), sendButtons: async () => {} });
   assert.deepEqual(c2[0], ['/s/merge.mjs', '--rebase', L1, '--preview']);
   assert.equal(calls[0].opts.cwd, '/w');
   assert.equal(buttons.length, 1);
