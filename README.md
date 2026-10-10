@@ -153,10 +153,10 @@ It's driven by **one owner user** (`_config.daemonUserId`) and is a thin, **regi
 
 | Command | Role | What |
 |---|---|---|
-| `/spawn <project>` | maintainer | launch an interactive agent in `<project>` |
+| `/spawn <project> [--resume-session <uuid> [--hashtag <h>]]` | maintainer | launch an interactive agent in `<project>`; with `--resume-session`, `claude --resume <uuid>` an existing session (e.g. a hand-opened one whose listener died) in screen `tele-<hashtag>` — refuses while a live process still holds it |
 | `/headless <project>` | maintainer | launch a headless agent in `<project>` |
-| `/kill <id>` | maintainer | kill an agent by id/hashtag |
-| `/ls` | member | list running agents |
+| `/kill <id>` · `/kill pid:<PID>` | maintainer · **owner** | kill a `tele-*` screen agent by hashtag · SIGTERM one `claude` process of this user by PID (owner only, uid + `comm=claude` checked, no SIGKILL, audited) |
+| `/ls` | member | list running agents: `tele-*` screens + every `claude` process (pid, cwd, tty, uptime, screen/terminal, session id, `#hashtag`) |
 | `/run <project> <script> [args]` | maintainer | run a `package.json` script — auto-detects npm/pnpm/yarn, validates the script, runs `<pm> run <script> -- <args>` (remote exec) |
 | `/whisper #<hash> <text>` | admin | discreet steer into a topic (also accepts a persona name or convoId as the target) — alias `/w` |
 | `/instruct #<hash> <text>` | admin | official *private* instruction to a topic — nothing hits the group; the agent replies to you via DM (reply to continue) — alias `/i` |

@@ -7,7 +7,8 @@ import { fileURLToPath } from 'node:url';
 // Isolate the persona pin store so `--list` persona mapping DERIVES instead of
 // reading machine-local pins (resolved at call-time from TELE_PERSONA_STORE).
 process.env.TELE_PERSONA_STORE = path.join(os.tmpdir(), `teleport-persona-store-spawn-${process.pid}.jsonl`);
-import { buildSpawnPlan, genSessionSeed, runSpawn, childLaunch, loginSeedEnv, wrapInLoginShell, scrubClaudeEnv, SEED_PATH, hasBinary, screenSessionExists, normalizeSessionName, parseScreenSessions, listSpawnSessions, resolveKillId, resolveAttachId, resolveAttachTarget, formatSessionList, resolveMode, SPAWN_PROMPT, PERMISSION_MODES, DEFAULT_PERMISSION_MODE, USAGE, personaByHashtag, gracefulKill, KILL_GRACE_MS } from './spawn.mjs';
+import { buildSpawnPlan, genSessionSeed, runSpawn, childLaunch, loginSeedEnv, wrapInLoginShell, scrubClaudeEnv, SEED_PATH, hasBinary, screenSessionExists, normalizeSessionName, parseScreenSessions, listSpawnSessions, resolveKillId, resolveAttachId, resolveAttachTarget, formatSessionList, resolveMode, SPAWN_PROMPT, PERMISSION_MODES, DEFAULT_PERMISSION_MODE, USAGE, personaByHashtag, gracefulKill, KILL_GRACE_MS, RESUME_PROMPT, resolveResumeSession, checkResumePreflight, findTranscriptDirs, checkPidKillAuth, resolveKillPid, appendKillAudit } from './spawn.mjs';
+import fs from 'node:fs';
 import { uuidToConvoInt } from './convo-registry.mjs';
 import { shortConvoHash } from './convo-hash.mjs';
 import { personaForConvo } from './persona.mjs';
@@ -493,7 +494,7 @@ const hasFlagToken = (usage, flag) =>
 test('USAGE documents every flag, mode, and the hard-coded prompt (drift guard)', () => {
   // Each user-facing flag / alias must appear in --help as a standalone token so
   // the text can't drift away from the direct-run dispatch.
-  for (const flag of ['-i', '--interactive', '--mode', '--list', '--ls', '--attach', '--resume', '--kill', '--quit', '--help', '-h']) {
+  for (const flag of ['-i', '--interactive', '--mode', '--list', '--ls', '--attach', '--resume', '--kill', '--quit', '--help', '-h', '--resume-session', '--hashtag', 'pid:']) {
     assert.ok(hasFlagToken(USAGE, flag), `USAGE missing standalone flag ${flag}`);
   }
   // Sanity-check the guard itself distinguishes a short alias from its long form:
@@ -538,4 +539,95 @@ test('loginSeedEnv: keeps session sockets the login shell cannot rebuild (ssh-ag
   assert.equal(env.DBUS_SESSION_BUS_ADDRESS, 'unix:x');
   assert.equal(env.DISPLAY, ':0');
   assert.equal(env.CLAUDECODE, undefined);
+});
+
+// ── --resume-session / --kill pid: ───────────────────────────────────────────
+const GIUN = '971e709e-2629-4d22-9943-40a52ee04a6b'; // hashtag #a7611284 (verified live)
+
+test('buildSpawnPlan resume: screen tele-<uuid hashtag>, claude --resume <uuid> + RESUME_PROMPT', () => {
+  const plan = buildSpawnPlan({ interactive: true, resumeSessionId: GIUN, permissionMode: 'auto' });
+  assert.equal(plan.mode, 'interactive');
+  assert.equal(plan.resumed, true);
+  assert.equal(plan.sessionName, 'tele-a7611284');
+  assert.deepEqual(plan.command, ['screen', '-U', '-dmS', 'tele-a7611284', 'claude', '--permission-mode', 'auto', '--resume', GIUN, RESUME_PROMPT]);
+  assert.ok(!plan.command.includes('--session-id'));
+  assert.equal(plan.teardown, 'screen -S tele-a7611284 -X quit');
+  assert.match(RESUME_PROMPT, /Listening for replies/);
+  assert.match(RESUME_PROMPT, /--first-run/);
+});
+
+test('buildSpawnPlan resume: implies interactive, validates uuid + mode', () => {
+  assert.equal(buildSpawnPlan({ resumeSessionId: GIUN }).mode, 'interactive');
+  assert.throws(() => buildSpawnPlan({ resumeSessionId: 'x; rm -rf ~' }), /must be a UUID/);
+  assert.throws(() => buildSpawnPlan({ resumeSessionId: GIUN, permissionMode: 'yolo' }), /invalid permission mode/);
+});
+
+test('buildSpawnPlan: non-resume plans unchanged (default prompt)', () => {
+  assert.equal(buildSpawnPlan().command.at(-1), SPAWN_PROMPT);
+  assert.equal(buildSpawnPlan({ interactive: true, seed: genSessionSeed(() => FIXED_UUID) }).command.at(-1), SPAWN_PROMPT);
+});
+
+test('resolveResumeSession: parse, derive hashtag, cross-check --hashtag', () => {
+  assert.deepEqual(resolveResumeSession(['-i']), { found: false });
+  assert.deepEqual(resolveResumeSession(['--resume-session', GIUN]), { found: true, sessionId: GIUN, hashtag: 'a7611284' });
+  assert.deepEqual(resolveResumeSession([`--resume-session=${GIUN}`]), { found: true, sessionId: GIUN, hashtag: 'a7611284' });
+  for (const h of ['a7611284', '#a7611284', 'tele-a7611284', '#A7611284']) {
+    assert.equal(resolveResumeSession(['--resume-session', GIUN, '--hashtag', h]).sessionId, GIUN, h);
+  }
+  assert.match(resolveResumeSession(['--resume-session', GIUN, '--hashtag', 'a7611280']).error, /does not match/);
+  assert.match(resolveResumeSession(['--resume-session', GIUN, '--hashtag']).error, /--hashtag needs/);
+  assert.match(resolveResumeSession(['--resume-session']).error, /needs exactly one/);
+  assert.match(resolveResumeSession(['--resume-session', '--mode', 'auto']).error, /needs exactly one/);
+  assert.match(resolveResumeSession(['--resume-session', GIUN, '--resume-session', GIUN]).error, /needs exactly one/);
+  assert.match(resolveResumeSession(['--resume-session', 'abc']).error, /not a UUID/);
+  // `--resume` (attach alias) is NOT `--resume-session`
+  assert.deepEqual(resolveResumeSession(['--resume', GIUN]), { found: false });
+  assert.deepEqual(resolveAttachId(['--resume-session', GIUN]), { found: false, raw: null });
+});
+
+test('checkResumePreflight: refuses a live holder, an existing screen, a foreign/missing transcript', () => {
+  const base = { sessionId: GIUN, sessionName: 'tele-a7611284', cwd: '/home/u/Projects/umipay', screenExists: false, transcriptDirs: ['-home-u-Projects-umipay'] };
+  assert.deepEqual(checkResumePreflight({ ...base, procs: [] }), { ok: true });
+  const held = checkResumePreflight({ ...base, procs: [{ pid: 830318, sessionId: GIUN, cwd: '/home/u/Projects/umipay', guessed: false }] });
+  assert.match(held.error, /still held by live claude PID 830318/);
+  assert.match(held.error, /\/kill pid:830318/);
+  assert.match(checkResumePreflight({ ...base, procs: [{ pid: 9, sessionId: GIUN, guessed: true }] }).error, /guessed/);
+  assert.match(checkResumePreflight({ ...base, procs: [], screenExists: true }).error, /already exists/);
+  assert.match(checkResumePreflight({ ...base, procs: [], cwd: '/home/u/Projects/teleport' }).error, /belongs to another folder \(-home-u-Projects-umipay\)/);
+  assert.match(checkResumePreflight({ ...base, procs: [], transcriptDirs: [] }).error, /no transcript/);
+});
+
+test('findTranscriptDirs: lists project dirs holding <uuid>.jsonl', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'spawn-proj-'));
+  fs.mkdirSync(path.join(dir, '-w-a')); fs.mkdirSync(path.join(dir, '-w-b'));
+  fs.writeFileSync(path.join(dir, '-w-b', `${GIUN}.jsonl`), '{}');
+  assert.deepEqual(findTranscriptDirs(GIUN, dir), ['-w-b']);
+  assert.deepEqual(findTranscriptDirs(GIUN, path.join(dir, 'missing')), []);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('checkPidKillAuth: owner only, daemon only, needs a configured owner', () => {
+  assert.deepEqual(checkPidKillAuth({ fromId: '144', daemonUserId: '144' }), { ok: true });
+  assert.match(checkPidKillAuth({ fromId: '7', daemonUserId: '144' }).error, /owner-only/);
+  assert.match(checkPidKillAuth({ fromId: '', daemonUserId: '144' }).error, /daemon-only/);
+  assert.match(checkPidKillAuth({ fromId: '144', daemonUserId: null }).error, /no daemon owner/);
+});
+
+test('resolveKillPid: pid:<N>, split "pid: N", bad targets; hashtag kills untouched', () => {
+  assert.deepEqual(resolveKillPid(['--kill', 'pid:830318']), { found: true, pid: 830318 });
+  assert.deepEqual(resolveKillPid(['--kill', 'pid:', '830318']), { found: true, pid: 830318 });
+  assert.deepEqual(resolveKillPid(['--quit', 'PID:42']), { found: true, pid: 42 });
+  assert.match(resolveKillPid(['--kill', 'pid:abc']).error, /bad pid target/);
+  assert.match(resolveKillPid(['--kill', 'pid:']).error, /bad pid target/);
+  assert.deepEqual(resolveKillPid(['--kill', 'a7611284']), { found: false });
+  assert.deepEqual(resolveKillPid(['--list']), { found: false });
+});
+
+test('appendKillAudit: one JSON line per call with a timestamp', () => {
+  const f = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'audit-')), 'sub', 'a.jsonl');
+  appendKillAudit({ pid: 1, result: 'denied' }, f);
+  appendKillAudit({ pid: 2, result: 'exited' }, f);
+  const lines = fs.readFileSync(f, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+  assert.deepEqual(lines.map((l) => [l.pid, l.result]), [[1, 'denied'], [2, 'exited']]);
+  assert.ok(lines.every((l) => !Number.isNaN(Date.parse(l.ts))));
 });

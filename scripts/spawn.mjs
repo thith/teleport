@@ -28,6 +28,7 @@
 
 import { spawn as cpSpawn, execFileSync } from 'node:child_process';
 import crypto from 'node:crypto';
+import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isMainModule } from './is-direct-run.mjs';
@@ -36,6 +37,11 @@ import { shortConvoHash } from './convo-hash.mjs';
 import { readTopicsStore } from './topics-store.mjs';
 import { formatPersona } from './persona.mjs';
 import { peekPersona } from './persona-store.mjs';
+import {
+  listClaudeProcs, findProcForSession, cwdToProjectSlug, PROJECTS_DIR,
+  formatProcRows, parseKillPidArg, killClaudePid, KILL_PID_GRACE_MS,
+} from './claude-procs.mjs';
+import { readProjectsConfig, resolveDaemonUserId } from './projects-config.mjs';
 
 export const SPAWN_PROMPT = 'Find and read process.md and review-guide.md if present in this project, then Telegram me and wait for instructions';
 
@@ -43,6 +49,12 @@ export const SPAWN_PROMPT = 'Find and read process.md and review-guide.md if pre
 // ALWAYS sets one — defaulting to `auto`, the new autonomous mode (NOT the old
 // blanket auto-accept `acceptEdits`/`bypassPermissions`), so a Telegram-driven
 // agent can act without prompting for every permission. Override via `--mode`.
+// Seed for `--resume-session`: the resumed agent already has its whole context
+// (persona, convo, task) — it only lost its Telegram listener when the old
+// process died. So: re-arm the listener FIRST (with --first-run so a prompt left
+// claimed by the dead life is re-surfaced), then work the queue.
+export const RESUME_PROMPT = 'Teleport resumed this session in a screen (spawn --resume-session) — your previous process and its Telegram listener are gone. Right now: re-read ../teleport/rules/telegram-guide.md section "Listening for replies" and restart your Monitor listener for your existing convo (the canonical command, which passes --first-run on its first poll so anything left pending is re-surfaced). Then handle whatever is queued, and post one short "back online" line in your topic.';
+
 export const PERMISSION_MODES = ['default', 'auto', 'acceptEdits', 'bypassPermissions', 'dontAsk', 'plan'];
 export const DEFAULT_PERMISSION_MODE = 'auto';
 
@@ -56,9 +68,12 @@ export const USAGE = `spawn.mjs — spawn a new agent instance that reports to T
 
 Usage:
   node spawn.mjs [-i|--interactive] [--mode <mode>]   spawn an agent (headless by default)
+  node spawn.mjs --resume-session <uuid> [--hashtag <h>] [--mode <mode>]
+                                                      resume an existing Claude session in a screen
   node spawn.mjs --list | --ls                        list running agent sessions
   node spawn.mjs --attach|--resume [<id>]             re-attach your terminal to a session
   node spawn.mjs --kill|--quit <id>                   gracefully tear a session down
+  node spawn.mjs --kill pid:<PID>                     SIGTERM one claude process (daemon owner only)
   node spawn.mjs --help | -h                          show this help
 
 Spawn modes:
@@ -69,12 +84,26 @@ Spawn modes:
   --mode <mode>      permission mode for the spawned agent (also --mode=<mode>).
                      One of: ${PERMISSION_MODES.join(', ')}. Default: ${DEFAULT_PERMISSION_MODE}.
 
+Resume (interactive/screen; for a hand-opened session whose listener died):
+  --resume-session <uuid>  \`claude --resume <uuid>\` in screen \`tele-<hashtag>\` (hashtag
+                     derived from the uuid). Refuses while a live claude process
+                     still holds that session (stop it first: daemon /kill pid:<PID>)
+                     or when the transcript isn't in this project folder.
+  --hashtag <h>      optional cross-check: must equal the uuid's hashtag.
+                     NB: \`--resume\` (no suffix) is the --attach alias, not this.
+
 Manage sessions (interactive/screen only):
-  --list, --ls       show running \`tele-*\` sessions with persona, pid, and topic.
+  --list, --ls       show running \`tele-*\` sessions with persona, pid, and topic,
+                     then EVERY claude process of this user (pid, cwd, tty, uptime,
+                     screen or terminal, session id + #hashtag) — incl. hand-opened ones.
   --attach [<id>]    re-attach; <id> = 3-char tail (116), #hashtag, or tele-name.
     (--resume)       Omit <id> when exactly one session is live. Detach: Ctrl-A D.
   --kill <id>        send /exit, wait up to ${KILL_GRACE_MS / 1000}s, then force-quit.
     (--quit)         Needs the FULL hashtag (no shortcuts — it's destructive).
+  --kill pid:<PID>   SIGTERM a \`claude\` process of this user, wait up to ${KILL_PID_GRACE_MS / 1000}s,
+                     never SIGKILL. Only via the daemon, only for its owner
+                     (TELE_FROM_ID must equal projects.json _config.daemonUserId);
+                     audited to scripts/tmp/kill-pid-audit.jsonl.
 
 The prompt is HARD-CODED ("${SPAWN_PROMPT}"): the new
 instance greets you in its own Telegram persona topic and waits for work there.
@@ -110,12 +139,32 @@ export function genSessionSeed(genUuid = () => crypto.randomUUID()) {
  * Pure: compute the launch plan. No side effects, so it's unit-testable.
  * Returns `{ mode, sessionName, command: [...], teardown }`.
  */
-export function buildSpawnPlan({ interactive = false, sessionName, sessionId, seed, prompt = SPAWN_PROMPT, permissionMode = DEFAULT_PERMISSION_MODE } = {}) {
+export function buildSpawnPlan({ interactive = false, sessionName, sessionId, seed, prompt, permissionMode = DEFAULT_PERMISSION_MODE, resumeSessionId } = {}) {
   // Every spawn is launched with an EXPLICIT `--permission-mode` (never left to
   // the CLI default) so the agent's autonomy is deliberate, not incidental.
   if (!PERMISSION_MODES.includes(permissionMode)) {
     throw new Error(`spawn: invalid permission mode ${JSON.stringify(permissionMode)} (allowed: ${PERMISSION_MODES.join(', ')})`);
   }
+  if (resumeSessionId != null) {
+    // Resume is always interactive (screen): the session's convoId — hence its
+    // hashtag, persona and topic — is derived from the UUID, and `claude --resume`
+    // keeps that UUID, so the screen name lines up with the agent's #hashtag.
+    if (!UUID_RE.test(resumeSessionId)) {
+      throw new Error(`spawn: invalid --resume-session ${JSON.stringify(resumeSessionId)} (must be a UUID)`);
+    }
+    const convoId = uuidToConvoInt(resumeSessionId);
+    if (convoId == null) throw new Error(`spawn: cannot derive a hashtag from ${resumeSessionId}`);
+    const name = `tele-${shortConvoHash(convoId)}`;
+    return {
+      mode: 'interactive',
+      sessionName: name,
+      sessionId: resumeSessionId,
+      resumed: true,
+      command: ['screen', '-U', '-dmS', name, 'claude', '--permission-mode', permissionMode, '--resume', resumeSessionId, prompt ?? RESUME_PROMPT],
+      teardown: `screen -S ${name} -X quit`,
+    };
+  }
+  prompt ??= SPAWN_PROMPT;
   if (interactive) {
     // Auto path: derive name + forced session-id from a seed so the screen name
     // matches the Telegram hashtag. Explicit `sessionName` (power-user override)
@@ -416,6 +465,109 @@ export function resolveMode(argv) {
   return (!raw || raw.startsWith('-')) ? null : raw;
 }
 
+/**
+ * Resolve `--resume-session <uuid>` and the optional `--hashtag <h>` from argv.
+ * Pure → testable. Returns:
+ *   { found: false }                       — no --resume-session flag
+ *   { found: true, error }                 — missing/invalid value, or hashtag mismatch
+ *   { found: true, sessionId, hashtag }    — hashtag = the one derived from the uuid
+ * `--hashtag` accepts `a7611284`, `#a7611284` or `tele-a7611284`; it is a typo
+ * guard (a wrong uuid would resume the wrong agent), never a rename.
+ */
+export function resolveResumeSession(argv) {
+  const value = (flag) => {
+    const hits = argv.filter((a) => a === flag || a.startsWith(`${flag}=`));
+    if (hits.length === 0) return { present: false };
+    if (hits.length > 1) return { present: true, raw: null };
+    if (hits[0].startsWith(`${flag}=`)) return { present: true, raw: hits[0].slice(flag.length + 1) || null };
+    const raw = argv[argv.indexOf(flag) + 1];
+    return { present: true, raw: !raw || raw.startsWith('-') ? null : raw };
+  };
+  const rs = value('--resume-session');
+  if (!rs.present) return { found: false };
+  if (!rs.raw) return { found: true, error: '--resume-session needs exactly one session UUID.' };
+  if (!UUID_RE.test(rs.raw)) return { found: true, error: `--resume-session: not a UUID: ${JSON.stringify(rs.raw)}` };
+  const convoId = uuidToConvoInt(rs.raw);
+  const hashtag = convoId == null ? null : shortConvoHash(convoId);
+  if (!hashtag) return { found: true, error: `--resume-session: cannot derive a hashtag from ${rs.raw}` };
+  const ht = value('--hashtag');
+  if (ht.present) {
+    if (!ht.raw) return { found: true, error: '--hashtag needs exactly one value.' };
+    const given = ht.raw.trim().replace(/^#/, '').replace(/^tele-/, '').toLowerCase();
+    if (given !== hashtag.toLowerCase()) {
+      return { found: true, error: `--hashtag #${given} does not match session ${rs.raw} (its hashtag is #${hashtag}) — check the session id.` };
+    }
+  }
+  return { found: true, sessionId: rs.raw, hashtag };
+}
+
+/**
+ * Preflight for a resume, all inputs injected. Refuses (returns { error }) when:
+ *  - a live claude process still holds the session (two processes appending to
+ *    one transcript = corruption; stop it first with the daemon's /kill pid:);
+ *  - a screen with the target name already exists;
+ *  - the transcript isn't in THIS project's folder (`claude --resume <id>` looks
+ *    in the cwd's project dir) — names the project it IS in when found elsewhere.
+ * `procs` = listClaudeProcs() rows; `transcriptDirs` = project-dir names that
+ * contain `<sessionId>.jsonl`.
+ */
+export function checkResumePreflight({ sessionId, sessionName, cwd, procs, screenExists, transcriptDirs }) {
+  const holder = findProcForSession(sessionId, procs);
+  if (holder) {
+    return { error: `session ${sessionId} is still held by live claude PID ${holder.pid}${holder.guessed ? ' (guessed from its newest transcript)' : ''}${holder.cwd ? ` in ${holder.cwd}` : ''}. Stop it first (owner: /kill pid:${holder.pid}), then resume.` };
+  }
+  if (screenExists) return { error: `a screen session "${sessionName}" already exists (try: spawn.mjs --attach ${sessionName}).` };
+  const slug = cwdToProjectSlug(cwd);
+  if (!transcriptDirs.includes(slug)) {
+    if (transcriptDirs.length) return { error: `session ${sessionId} belongs to another folder (${transcriptDirs.join(', ')}), not ${cwd} — resume it from that project.` };
+    return { error: `no transcript for session ${sessionId} under ~/.claude/projects/ — wrong id?` };
+  }
+  return { ok: true };
+}
+
+/** Project dirs under ~/.claude/projects that hold `<sessionId>.jsonl`. */
+export function findTranscriptDirs(sessionId, projectsDir = PROJECTS_DIR) {
+  const out = [];
+  let dirs = [];
+  try { dirs = fs.readdirSync(projectsDir); } catch { return out; }
+  for (const d of dirs) {
+    try { if (fs.statSync(path.join(projectsDir, d, `${sessionId}.jsonl`)).isFile()) out.push(d); } catch {}
+  }
+  return out;
+}
+
+/**
+ * Owner gate for `--kill pid:`. The daemon passes the sender's Telegram id as
+ * TELE_FROM_ID; only the daemon owner may kill by pid. Pure → { ok } | { error }.
+ * (Advisory like every TELE_FROM_* input: it stops a non-owner going through the
+ * daemon, not a local process that forges the env — same bound as whisper.)
+ */
+export function checkPidKillAuth({ fromId, daemonUserId }) {
+  if (!daemonUserId) return { error: 'no daemon owner configured (projects.json `_config.daemonUserId`) — pid kills disabled.' };
+  if (!fromId) return { error: '`--kill pid:` is daemon-only: send `/kill pid:<PID>` to the daemon (owner only).' };
+  if (String(fromId) !== String(daemonUserId)) return { error: '`/kill pid:` is owner-only.' };
+  return { ok: true };
+}
+
+/** The `pid:<N>` target after --kill/--quit, tolerating `pid: N` split into two tokens. */
+export function resolveKillPid(argv) {
+  const i = argv.findIndex((a) => a === '--kill' || a === '--quit');
+  if (i === -1 || !/^pid:/i.test(argv[i + 1] ?? '')) return { found: false };
+  const raw = argv[i + 1] === 'pid:' || /^pid:$/i.test(argv[i + 1]) ? `pid:${argv[i + 2] ?? ''}` : argv[i + 1];
+  const pid = parseKillPidArg(raw);
+  return pid ? { found: true, pid } : { found: true, error: `bad pid target ${JSON.stringify(raw)} — use pid:<PID> (see /ls).` };
+}
+
+export const KILL_PID_AUDIT_FILE = path.join(path.dirname(fileURLToPath(import.meta.url)), 'tmp', 'kill-pid-audit.jsonl');
+
+/** Append one audit line; never throws (an audit failure must not mask the result). */
+export function appendKillAudit(entry, file = KILL_PID_AUDIT_FILE) {
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.appendFileSync(file, JSON.stringify({ ts: new Date().toISOString(), ...entry }) + '\n');
+  } catch (e) { console.error(`[spawn] audit write failed: ${e?.message ?? e}`); }
+}
+
 /** How long to wait for the screen session to appear, and how often to look. */
 export const SPAWN_VERIFY_TIMEOUT_MS = 15_000;
 export const SPAWN_VERIFY_POLL_MS = 250;
@@ -561,18 +713,58 @@ if (isDirectRun) {
 
   // --list / --ls: show our spawned screen sessions (name == convo hashtag).
   if (argv.includes('--list') || argv.includes('--ls')) {
-    if (!hasBinary('screen')) { console.error('[spawn] `screen` not found on PATH.'); process.exit(1); }
-    const sessions = listSpawnSessions();
-    if (!sessions.length) { console.log('[spawn] no agent sessions (tele-*) running.'); process.exit(0); }
-    console.log(`[spawn] ${sessions.length} agent session(s):`);
-    const pmap = personaByHashtag();
-    for (const s of sessions) {
-      const hashtag = s.name.replace(/^tele-/, '');
-      const persona = pmap[hashtag];
-      const label = persona ? `${formatPersona(persona)}  ` : '';
-      console.log(`  ${label}${s.name}  (pid ${s.pid})  → topic #${hashtag}`);
+    const sessions = hasBinary('screen') ? listSpawnSessions() : null;
+    if (sessions === null) console.log('[spawn] `screen` not found on PATH — no tele-* sessions to list.');
+    else if (!sessions.length) console.log('[spawn] no agent sessions (tele-*) running.');
+    else {
+      console.log(`[spawn] ${sessions.length} agent session(s):`);
+      const pmap = personaByHashtag();
+      for (const s of sessions) {
+        const hashtag = s.name.replace(/^tele-/, '');
+        const persona = pmap[hashtag];
+        const label = persona ? `${formatPersona(persona)}  ` : '';
+        console.log(`  ${label}${s.name}  (pid ${s.pid})  → topic #${hashtag}`);
+      }
     }
+    // Every claude process of this user — including hand-opened terminal sessions
+    // that the screen list above can't see (the reason /ls grew this section).
+    console.log('');
+    console.log(formatProcRows(listClaudeProcs()));
     process.exit(0);
+  }
+
+  // --kill pid:<PID>: owner-only SIGTERM of one claude process (via the daemon).
+  const killPid = resolveKillPid(argv);
+  if (killPid.found) {
+    if (killPid.error) { console.error(`[spawn] ${killPid.error}`); process.exit(1); }
+    const fromId = process.env.TELE_FROM_ID || '';
+    // projects.json only — no env fallback, so the owner id can't be overridden
+    // from the environment the request arrives with.
+    const daemonUserId = resolveDaemonUserId(readProjectsConfig(path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'projects.json')), { env: {} });
+    const auth = checkPidKillAuth({ fromId, daemonUserId });
+    if (auth.error) {
+      appendKillAudit({ pid: killPid.pid, fromId, result: 'denied', reason: auth.error });
+      console.error(`[spawn] ❌ ${auth.error}`);
+      process.exit(1);
+    }
+    console.log(`[spawn] SIGTERM → PID ${killPid.pid}, waiting up to ${KILL_PID_GRACE_MS / 1000}s…`);
+    const r = await killClaudePid(killPid.pid);
+    const t = r.target;
+    appendKillAudit({
+      pid: killPid.pid, fromId, result: r.error ? 'refused' : r.exited ? 'exited' : 'still-alive',
+      reason: r.error, sessionId: t?.sessionId ?? null, sessionGuessed: t?.guessed ?? false,
+      cwd: t?.cwd ?? null, name: t?.name ?? null, tty: t?.tty ?? null,
+    });
+    if (r.error) { console.error(`[spawn] ❌ ${r.error}`); process.exit(1); }
+    const who = [t?.name, t?.cwd, t?.sessionId ? `session ${t.sessionId}${t.guessed ? ' (guessed)' : ''}` : null].filter(Boolean).join(' · ');
+    if (r.exited) {
+      console.log(`[spawn] ✅ PID ${killPid.pid} exited${who ? ` (${who})` : ''}.`);
+      // Only suggest a resume for a session we KNOW (session file), never a guess.
+      if (t?.sessionId && !t.guessed) console.log(`[spawn] resume it in a screen: /spawn <project> --resume-session ${t.sessionId}`);
+      process.exit(0);
+    }
+    console.error(`[spawn] ⚠️ PID ${killPid.pid} still alive after ${KILL_PID_GRACE_MS / 1000}s (SIGTERM sent, no SIGKILL by design). Check /ls, retry later.`);
+    process.exit(1);
   }
 
   // --kill <id>: id may be `d1331668`, `#d1331668`, or `tele-d1331668`.
@@ -624,7 +816,9 @@ if (isDirectRun) {
     }
   }
 
-  const interactive = argv.includes('--interactive') || argv.includes('-i');
+  const resume = resolveResumeSession(argv);
+  if (resume.found && resume.error) { console.error(`[spawn] ${resume.error}`); process.exit(1); }
+  const interactive = resume.found || argv.includes('--interactive') || argv.includes('-i');
   // Permission mode: always explicit (default `auto`), overridable via `--mode`.
   const permissionMode = resolveMode(argv);
   if (permissionMode === null || !PERMISSION_MODES.includes(permissionMode)) {
@@ -640,7 +834,15 @@ if (isDirectRun) {
     console.error('[spawn] interactive mode needs `screen` (or install tmux + switch backend). Not found on PATH.');
     process.exit(1);
   }
-  const plan = buildSpawnPlan({ interactive, permissionMode });
+  const plan = buildSpawnPlan({ interactive, permissionMode, resumeSessionId: resume.found ? resume.sessionId : undefined });
+  if (plan.resumed) {
+    const pre = checkResumePreflight({
+      sessionId: plan.sessionId, sessionName: plan.sessionName, cwd: process.cwd(),
+      procs: listClaudeProcs(), screenExists: screenSessionExists(plan.sessionName),
+      transcriptDirs: findTranscriptDirs(plan.sessionId),
+    });
+    if (pre.error) { console.error(`[spawn] refusing to resume: ${pre.error}`); process.exit(1); }
+  }
   const result = runSpawn(plan);
   if (plan.mode === 'interactive') {
     // Verify the screen session actually came up — `screen -dmS` returns 0 even if
@@ -663,7 +865,9 @@ if (isDirectRun) {
       process.exit(1);
     }
     console.log(`[spawn] interactive agent launched in screen session "${plan.sessionName}" (subscription billing).`);
-    if (plan.sessionId) {
+    if (plan.resumed) {
+      console.log(`[spawn] resumed session ${plan.sessionId} → topic #${plan.sessionName.replace(/^tele-/, '')}; it will re-arm its Telegram listener and post in its existing topic.`);
+    } else if (plan.sessionId) {
       // The session name IS the convo hashtag → it matches the #tag the agent
       // shows in its Telegram topic, so you can map screen ⇄ topic at a glance.
       console.log(`[spawn] forced session-id ${plan.sessionId} → topic hashtag #${plan.sessionName.replace(/^tele-/, '')}.`);

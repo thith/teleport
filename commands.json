@@ -1,8 +1,8 @@
 {
-  "spawn":    { "run": "spawn.mjs",   "args": ["--interactive"], "needsProject": true,  "minRole": "maintainer", "desc": "launch an interactive agent in <project>" },
+  "spawn":    { "run": "spawn.mjs",   "args": ["--interactive"], "needsProject": true,  "minRole": "maintainer", "desc": "launch an interactive agent in <project>; /spawn <project> --resume-session <uuid> [--hashtag <h>] resumes a session (e.g. a hand-opened one) in a screen, listener re-armed" },
   "headless": { "run": "spawn.mjs",   "args": [],                "needsProject": true,  "minRole": "maintainer", "desc": "launch a headless agent in <project>" },
-  "kill":     { "run": "spawn.mjs",   "args": ["--kill"],        "needsProject": false, "minRole": "maintainer", "desc": "kill an agent by id/hashtag" },
-  "ls":       { "run": "spawn.mjs",   "args": ["--list"],        "needsProject": false, "minRole": "member",     "desc": "list running agents" },
+  "kill":     { "run": "spawn.mjs",   "args": ["--kill"],        "needsProject": false, "minRole": "maintainer", "desc": "kill an agent: /kill <hashtag> (tele-* screen) or /kill pid:<PID> (any claude process of yours, owner only, SIGTERM)" },
+  "ls":       { "run": "spawn.mjs",   "args": ["--list"],        "needsProject": false, "minRole": "member",     "desc": "list running agents: tele-* screens + every claude process (pid, cwd, tty, screen/terminal, session id, #hashtag)" },
   "run":      { "run": "run.mjs",     "args": [],                "needsProject": true,  "minRole": "maintainer", "desc": "run a package.json script: /run <project> <script> [args]" },
   "whisper":  { "run": "whisper.mjs", "args": [],                "needsProject": false, "minRole": "admin",      "wantsReplyText": true, "desc": "discreet steer into a topic: /whisper #<hash> <text> (or reply to a previous whisper)" },
   "instruct": { "run": "instruct.mjs","args": [],                "needsProject": false, "minRole": "admin",      "wantsReplyText": true, "desc": "official private instruction to a topic; agent replies via DM: /instruct #<hash> <text> (or reply to continue)" },
