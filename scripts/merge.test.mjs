@@ -1,17 +1,18 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { parseMergeArgs, summarizeChecks, assessPr, DEFAULT_MERGE_METHOD, branchRefPath, branchDeletable, mergeOne, mergeMany } from './merge.mjs';
+import { parsePrUrl, parseMergeArgs, summarizeChecks, assessPr, DEFAULT_MERGE_METHOD, branchRefPath, branchDeletable, mergeOne, mergeMany } from './merge.mjs';
 
 test('parseMergeArgs: pr number (#N ok), method, flags; errors on junk / two methods / missing pr', () => {
-  assert.deepEqual(parseMergeArgs(['12']), { prs: [12], method: DEFAULT_MERGE_METHOD, keepBranch: false, force: false });
+  assert.deepEqual(parseMergeArgs(['12']), { project: null, targets: [{ repo: null, number: 12 }], method: DEFAULT_MERGE_METHOD, keepBranch: false, force: false });
   assert.equal(DEFAULT_MERGE_METHOD, 'squash');
-  assert.deepEqual(parseMergeArgs(['#7', '--rebase', '--keep-branch', '--force']), { prs: [7], method: 'rebase', keepBranch: true, force: true });
-  assert.deepEqual(parseMergeArgs(['12', '13', '#15']).prs, [12, 13, 15]);
+  assert.deepEqual(parseMergeArgs(['#7', '--rebase', '--keep-branch', '--force']), { project: null, targets: [{ repo: null, number: 7 }], method: 'rebase', keepBranch: true, force: true });
+  assert.deepEqual(parseMergeArgs(['12', '13', '#15']).targets.map((t) => t.number), [12, 13, 15]);
   assert.match(parseMergeArgs(['12', '12']).error, /twice/);
   assert.match(parseMergeArgs(['7', '--squash', '--merge']).error, /pick one/);
   assert.match(parseMergeArgs([]).error, /usage/);
   assert.match(parseMergeArgs(['0']).error, /usage/);
   assert.match(parseMergeArgs(['7', '--admin']).error, /unexpected/);
+  assert.match(parseMergeArgs(['7', 'umipay']).error, /unexpected/, 'project only as the first token');
 });
 
 test('summarizeChecks: check runs + commit statuses → failing / pending', () => {
@@ -92,7 +93,7 @@ function fakeGh(prs, { defaultBranch = 'main', unknownFor = {}, tips = {} } = {}
   return { gh, calls };
 }
 const PR = (n, extra = {}) => ({ number: n, title: `t${n}`, url: `u${n}`, state: 'OPEN', isDraft: false, mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', statusCheckRollup: [], headRefName: `feat/${n}`, headRefOid: `sha${n}`, baseRefName: 'main', isCrossRepository: false, ...extra });
-const ARGS = (prs, o = {}) => ({ prs, method: 'squash', keepBranch: false, force: false, ...o });
+const ARGS = (prs, o = {}) => ({ targets: prs.map((number) => ({ repo: null, number })), method: 'squash', keepBranch: false, force: false, ...o });
 
 test('mergeOne: pins sha, encodes the branch, deletes it; waits out UNKNOWN', async () => {
   const { gh, calls } = fakeGh({ 3: PR(3, { headRefName: 'release#fix' }) }, { unknownFor: { 3: 2 } });
@@ -203,4 +204,31 @@ test('baseIsMergedHead: a transient error reading the base tip refuses (not trea
   const r = await mergeOne(6, ARGS([6]), { gh });
   assert.match(r.text, /cannot check its base branch feat\/5: HTTP 502/);
   assert.equal(f.calls.some((c) => c[2] === 'PUT'), false);
+});
+
+test('parsePrUrl / parseMergeArgs: PR URLs carry their repo; project form still works', () => {
+  assert.deepEqual(parsePrUrl('https://github.com/thith/teleport/pull/3'), { repo: 'thith/teleport', number: 3 });
+  assert.deepEqual(parsePrUrl('https://github.com/icetea-labs/dpay/pull/12/files'), { repo: 'icetea-labs/dpay', number: 12 });
+  assert.equal(parsePrUrl('https://github.com/a/b/issues/3'), null);
+  assert.equal(parsePrUrl('https://evil.com/a/b/pull/3'), null);
+  assert.equal(parsePrUrl('https://github.com/../b/pull/3'), null);
+  const p = parseMergeArgs(['https://github.com/thith/teleport/pull/3', 'https://github.com/icetea-labs/dpay/pull/12', '--rebase']);
+  assert.deepEqual(p.targets, [{ repo: 'thith/teleport', number: 3 }, { repo: 'icetea-labs/dpay', number: 12 }]);
+  assert.equal(p.project, null);
+  assert.deepEqual(parseMergeArgs(['umipay-be', '12', '13']).project, 'umipay-be');
+  assert.match(parseMergeArgs(['https://github.com/a/b/pull/3', 'https://github.com/a/b/pull/3']).error, /twice/);
+  assert.equal(parseMergeArgs(['https://github.com/a/b/pull/3', 'https://github.com/a/c/pull/3']).targets.length, 2, 'same number, different repos');
+});
+
+test('mergeOne with a URL target: every gh call is pinned to that repo (-R / repos/<owner>/<name>)', async () => {
+  const { gh, calls } = fakeGh({ 3: PR(3) });
+  const r = await mergeOne({ repo: 'thith/teleport', number: 3 }, ARGS([3]), { gh });
+  assert.equal(r.ok, true, r.text);
+  assert.match(r.text, /merged PR thith\/teleport#3/);
+  for (const c of calls) {
+    if (c[0] === 'pr') assert.ok(c.includes('-R') && c[c.indexOf('-R') + 1] === 'thith/teleport', c.join(' '));
+    if (c[0] === 'repo') assert.equal(c[2], 'thith/teleport');
+    if (c[0] === 'api') assert.ok(c.some((x) => x.startsWith('repos/thith/teleport/')), c.join(' '));
+  }
+  assert.equal(calls.some((c) => c.some((x) => String(x).includes('{owner}'))), false);
 });

@@ -6,7 +6,10 @@ Gửi file này cho agent đang làm trong project và nhờ nó: *"Soạn lện
 
 ```
 /merge <project> <số PR> [<số PR> …] [--squash|--merge|--rebase] [--keep-branch] [--force]
+/merge <URL PR> [<URL PR> …] [--squash|--merge|--rebase] [--keep-branch] [--force]
 ```
+
+Dạng URL (ví dụ `https://github.com/thith/teleport/pull/3`) tự lấy repo từ URL, không cần `<project>`, và có thể trộn PR của nhiều repo trong một lệnh.
 
 | Phần | Ý nghĩa |
 |---|---|

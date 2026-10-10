@@ -1,4 +1,5 @@
-// `/merge <project> <pr#> [<pr#> …] [--squash|--merge|--rebase] [--keep-branch] [--force]`
+// `/merge <project> <pr#> [<pr#> …]` or `/merge <PR URL> [<PR URL> …]`
+//   [--squash|--merge|--rebase] [--keep-branch] [--force]
 // — a daemon command (admin): merge GitHub PRs of the project's repo, in the
 // order given, stopping at the first one that can't be merged.
 //
@@ -14,34 +15,59 @@
 // After a merge the head branch is deleted on GitHub (same-repo PRs only)
 // unless --keep-branch.
 
+import fs from 'node:fs';
+import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { isMainModule } from './is-direct-run.mjs';
 
 export const MERGE_METHODS = ['squash', 'merge', 'rebase'];
 export const DEFAULT_MERGE_METHOD = 'squash';
 
-const USAGE_LINE = 'usage: /merge <project> <pr#> [<pr#> …] [--squash|--merge|--rebase] [--keep-branch] [--force]';
+const USAGE_LINE = 'usage: /merge <project> <pr#> [<pr#> …] | /merge <PR URL> [<PR URL> …]  [--squash|--merge|--rebase] [--keep-branch] [--force]';
 
-/** argv (after the project token) → { prs, method, keepBranch, force } | { error }. Pure. */
+/** A GitHub PR URL → { repo: 'owner/name', number } | null. Pure. */
+export function parsePrUrl(s) {
+  const m = String(s).match(/^https?:\/\/github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/pull\/(\d+)(?:[/?#].*)?$/);
+  if (!m || m[1] === '.' || m[1] === '..' || m[2] === '.' || m[2] === '..') return null;
+  const number = Number(m[3]);
+  return Number.isSafeInteger(number) && number > 0 ? { repo: `${m[1]}/${m[2]}`, number } : null;
+}
+
+/**
+ * argv → { project, targets: [{ repo, number }], method, keepBranch, force } | { error }. Pure.
+ *  - a PR URL carries its own repo (`repo: 'owner/name'`);
+ *  - a bare number belongs to the project's repo (`repo: null`); the project is
+ *    the first token when it is neither a number, a URL nor a flag — or, when the
+ *    daemon already dropped it (older registry: needsProject), the cwd.
+ */
 export function parseMergeArgs(argv) {
-  const prs = [];
-  let method = null, keepBranch = false, force = false;
-  for (const a of argv) {
+  const targets = [];
+  let project = null, method = null, keepBranch = false, force = false;
+  argv.forEach((a, idx) => {
+    if (targets.error) return;
     if (/^--(squash|merge|rebase)$/.test(a)) {
       const m = a.slice(2);
-      if (method && method !== m) return { error: `pick one merge method (--${method} or --${m}).` };
+      if (method && method !== m) { targets.error = `pick one merge method (--${method} or --${m}).`; return; }
       method = m;
     } else if (a === '--keep-branch') keepBranch = true;
     else if (a === '--force') force = true;
     else if (/^#?\d+$/.test(a)) {
       const n = Number(a.replace('#', ''));
-      if (!Number.isSafeInteger(n) || n < 1) return { error: USAGE_LINE };
-      if (prs.includes(n)) return { error: `PR #${n} listed twice.` };
-      prs.push(n);
-    } else return { error: `unexpected argument ${JSON.stringify(a)}. ${USAGE_LINE}` };
+      if (!Number.isSafeInteger(n) || n < 1) { targets.error = USAGE_LINE; return; }
+      targets.push({ repo: null, number: n });
+    } else if (parsePrUrl(a)) targets.push(parsePrUrl(a));
+    else if (idx === 0 && /^[A-Za-z0-9._-]+$/.test(a)) project = a;
+    else targets.error = `unexpected argument ${JSON.stringify(a)}. ${USAGE_LINE}`;
+  });
+  if (targets.error) return { error: targets.error };
+  if (!targets.length) return { error: USAGE_LINE };
+  const seen = new Set();
+  for (const t of targets) {
+    const k = `${t.repo || ''}#${t.number}`;
+    if (seen.has(k)) return { error: `PR ${t.repo ? `${t.repo}` : ''}#${t.number} listed twice.` };
+    seen.add(k);
   }
-  if (!prs.length) return { error: USAGE_LINE };
-  return { prs, method: method || DEFAULT_MERGE_METHOD, keepBranch, force };
+  return { project, targets, method: method || DEFAULT_MERGE_METHOD, keepBranch, force };
 }
 
 const FAILING = new Set(['FAILURE', 'ERROR', 'CANCELLED', 'TIMED_OUT', 'ACTION_REQUIRED', 'STARTUP_FAILURE']);
@@ -102,14 +128,25 @@ export function branchDeletable(branch, { defaultBranch, openPrs, selfNumber, li
  * under the same name, must not count — so we require: not the default branch,
  * the merged PR is not cross-repo, and the base branch tip == that PR's head sha.
  */
-export function baseIsMergedHead(base, gh) {
-  const defaultBranch = JSON.parse(gh(['repo', 'view', '--json', 'defaultBranchRef'])).defaultBranchRef?.name;
+/** gh argv/paths for one repo: `repo` = 'owner/name', or null for the cwd's repo. */
+export function repoCtx(repo) {
+  return {
+    api: repo ? `repos/${repo}` : 'repos/{owner}/{repo}',
+    R: repo ? ['-R', repo] : [],
+    view: repo ? ['repo', 'view', repo] : ['repo', 'view'],
+    label: repo ? `${repo}#` : '#',
+  };
+}
+
+export function baseIsMergedHead(base, gh, repo = null) {
+  const c = repoCtx(repo);
+  const defaultBranch = JSON.parse(gh([...c.view, '--json', 'defaultBranchRef'])).defaultBranchRef?.name;
   if (base === defaultBranch) return false;
-  const merged = JSON.parse(gh(['pr', 'list', '--state', 'merged', '--head', base, '--limit', '50', '--json', 'number,headRefOid,isCrossRepository']));
+  const merged = JSON.parse(gh(['pr', 'list', ...c.R, '--state', 'merged', '--head', base, '--limit', '50', '--json', 'number,headRefOid,isCrossRepository']));
   const sameRepo = merged.filter((p) => !p.isCrossRepository);
   if (!sameRepo.length) return false;
   let tip;
-  try { tip = JSON.parse(gh(['api', `repos/{owner}/{repo}/branches/${branchRefPath(base)}`])).commit?.sha; }
+  try { tip = JSON.parse(gh(['api', `${c.api}/branches/${branchRefPath(base)}`])).commit?.sha; }
   catch (e) {
     // Only a confirmed "no such branch" means it's gone (GitHub will refuse the
     // merge itself); any other failure is unknown → let the caller refuse.
@@ -128,77 +165,92 @@ const ghError = (e) => String(e?.stderr || e?.message || e).trim().split('\n').s
  * mergeable=UNKNOWN — normal right after a previous merge in the same batch.
  * Returns { ok, text } | { error, text }.
  */
-export async function mergeOne(number, { method, keepBranch, force }, {
+export async function mergeOne(target, { method, keepBranch, force }, {
   gh, sleep = (ms) => new Promise((r) => setTimeout(r, ms)), unknownTries = 5, unknownWaitMs = 2000,
   mergedHeads = [],
 }) {
+  const { number, repo = null } = typeof target === 'number' ? { number: target } : target;
+  const c = repoCtx(repo);
   let pr;
   for (let i = 0; ; i++) {
-    try { pr = JSON.parse(gh(['pr', 'view', String(number), '--json', PR_FIELDS])); }
-    catch (e) { return { error: true, text: `❌ cannot read PR #${number}: ${ghError(e)}` }; }
+    try { pr = JSON.parse(gh(['pr', 'view', String(number), ...c.R, '--json', PR_FIELDS])); }
+    catch (e) { return { error: true, text: `❌ cannot read PR ${c.label}${number}: ${ghError(e)}` }; }
     if (pr.mergeable !== 'UNKNOWN' || i >= unknownTries) break;
     await sleep(unknownWaitMs);
   }
   // Never act on a different PR than the one asked for (e.g. a CLI fallback).
-  if (pr.number !== number) return { error: true, text: `❌ asked for PR #${number} but GitHub returned #${pr.number} — refusing.` };
+  if (pr.number !== number) return { error: true, text: `❌ asked for PR ${c.label}${number} but GitHub returned #${pr.number} — refusing.` };
   const ok = assessPr(pr, { force });
-  if (ok.error) return { error: true, text: `❌ PR #${pr.number} "${pr.title}": ${ok.error}\n${pr.url}` };
+  if (ok.error) return { error: true, text: `❌ PR ${c.label}${pr.number} "${pr.title}": ${ok.error}\n${pr.url}` };
   // Stacked PR: its base is the head of a PR that is already merged. Merging now
   // lands it on that dead branch, not on the real target — retarget it first.
   // Merged earlier in THIS batch = certain (no override); merged before and the
   // branch hasn't moved since = strong evidence, overridable with --force (a
   // maintained branch merged moments ago, e.g. release → main).
-  let baseMerged = mergedHeads.includes(pr.baseRefName);
+  let baseMerged = mergedHeads.includes(`${repo || ''}:${pr.baseRefName}`);
   if (!baseMerged && !force) {
-    try { baseMerged = baseIsMergedHead(pr.baseRefName, gh); }
-    catch (e) { return { error: true, text: `❌ PR #${pr.number}: cannot check its base branch ${pr.baseRefName}: ${ghError(e)}` }; }
+    try { baseMerged = baseIsMergedHead(pr.baseRefName, gh, repo); }
+    catch (e) { return { error: true, text: `❌ PR ${c.label}${pr.number}: cannot check its base branch ${pr.baseRefName}: ${ghError(e)}` }; }
   }
-  if (baseMerged) return { error: true, text: `❌ PR #${pr.number} "${pr.title}": its base ${pr.baseRefName} is the branch of an already-merged PR (stacked PR) — retarget it (gh pr edit ${pr.number} --base <target>) first.\n${pr.url}` };
+  if (baseMerged) return { error: true, text: `❌ PR ${c.label}${pr.number} "${pr.title}": its base ${pr.baseRefName} is the branch of an already-merged PR (stacked PR) — retarget it (gh pr edit ${pr.number} --base <target>) first.\n${pr.url}` };
   try {
-    gh(['api', '-X', 'PUT', `repos/{owner}/{repo}/pulls/${pr.number}/merge`,
+    gh(['api', '-X', 'PUT', `${c.api}/pulls/${pr.number}/merge`,
       '-f', `merge_method=${method}`, '-f', `sha=${pr.headRefOid}`]);
-  } catch (e) { return { error: true, text: `❌ merge of PR #${pr.number} failed: ${ghError(e)}\n${pr.url}` }; }
+  } catch (e) { return { error: true, text: `❌ merge of PR ${c.label}${pr.number} failed: ${ghError(e)}\n${pr.url}` }; }
   let branchNote = '';
   if (!keepBranch && !pr.isCrossRepository) {
     let defaultBranch = null, openPrs = null;
-    try { defaultBranch = JSON.parse(gh(['repo', 'view', '--json', 'defaultBranchRef'])).defaultBranchRef?.name || null; } catch {}
-    try { openPrs = JSON.parse(gh(['pr', 'list', '--state', 'open', '--limit', String(OPEN_PR_LIST_LIMIT), '--json', 'number,headRefName,baseRefName'])); } catch {}
+    try { defaultBranch = JSON.parse(gh([...c.view, '--json', 'defaultBranchRef'])).defaultBranchRef?.name || null; } catch {}
+    try { openPrs = JSON.parse(gh(['pr', 'list', ...c.R, '--state', 'open', '--limit', String(OPEN_PR_LIST_LIMIT), '--json', 'number,headRefName,baseRefName'])); } catch {}
     const d = branchDeletable(pr.headRefName, { defaultBranch, openPrs, selfNumber: pr.number });
     if (d.keep) branchNote = `\nℹ️ kept branch ${pr.headRefName}: ${d.keep}.`;
     else {
       try {
-        gh(['api', '-X', 'DELETE', `repos/{owner}/{repo}/git/refs/heads/${branchRefPath(pr.headRefName)}`]);
+        gh(['api', '-X', 'DELETE', `${c.api}/git/refs/heads/${branchRefPath(pr.headRefName)}`]);
         branchNote = `\n🧹 deleted branch ${pr.headRefName} on GitHub (local checkout untouched).`;
       } catch (e) { branchNote = `\n⚠️ merged, but deleting branch ${pr.headRefName} failed: ${ghError(e)}`; }
     }
   }
   // Only same-repo heads can be the base of another PR here (a fork's `main` is not ours).
-  return { ok: true, head: pr.isCrossRepository ? null : pr.headRefName, text: `✅ merged PR #${pr.number} "${pr.title}" into ${pr.baseRefName} (${method}).${branchNote}\n${pr.url}` };
+  return { ok: true, head: pr.isCrossRepository ? null : `${repo || ''}:${pr.headRefName}`, text: `✅ merged PR ${c.label}${pr.number} "${pr.title}" into ${pr.baseRefName} (${method}).${branchNote}\n${pr.url}` };
 }
 
 /** Merge PRs in order; stop at the first failure and say what was / wasn't merged. */
 export async function mergeMany(args, deps) {
   const lines = [], merged = [], mergedHeads = [];
-  for (const n of args.prs) {
-    const r = await mergeOne(n, args, { ...deps, mergedHeads });
+  const targets = args.targets || args.prs.map((number) => ({ repo: null, number }));
+  const name = (t) => `${repoCtx(t.repo).label}${t.number}`;
+  for (const [i, t] of targets.entries()) {
+    const r = await mergeOne(t, args, { ...deps, mergedHeads });
     if (r.head) mergedHeads.push(r.head);
     lines.push(r.text);
     if (r.error) {
-      const rest = args.prs.slice(args.prs.indexOf(n) + 1);
-      if (args.prs.length > 1) lines.push(`⏹ stopped. merged: ${merged.length ? merged.map((x) => `#${x}`).join(', ') : 'none'}${rest.length ? ` · not attempted: ${rest.map((x) => `#${x}`).join(', ')}` : ''}`);
+      const rest = targets.slice(i + 1);
+      if (targets.length > 1) lines.push(`⏹ stopped. merged: ${merged.length ? merged.map(name).join(', ') : 'none'}${rest.length ? ` · not attempted: ${rest.map(name).join(', ')}` : ''}`);
       return { ok: false, text: lines.join('\n\n') };
     }
-    merged.push(n);
+    merged.push(t);
   }
   return { ok: true, text: lines.join('\n\n') };
 }
 
-const ghCli = (args) => String(execFileSync('gh', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }));
+const ghCli = (cwd) => (args) => String(execFileSync('gh', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], cwd }));
 
 if (isMainModule(import.meta.url)) {
   const args = parseMergeArgs(process.argv.slice(2));
   if (args.error) { console.log(`❌ ${args.error}`); process.exit(1); }
-  const r = await mergeMany(args, { gh: ghCli });
+  // Bare numbers need a repo: the named project folder (resolved + contained like
+  // /spawn), else the cwd (an older daemon registry already cd'ed into it).
+  let cwd = process.cwd();
+  if (args.project) {
+    const { resolveSpawnCwd } = await import('./daemon.mjs');
+    const r = resolveSpawnCwd(args.project);
+    if (r.error) { console.log(`❌ ${r.error}`); process.exit(1); }
+    cwd = r.cwd;
+  } else if (args.targets.some((t) => !t.repo) && !fs.existsSync(path.join(cwd, '.git'))) {
+    console.log(`❌ PR numbers need a project: /merge <project> <pr#> — or give PR URLs.`); process.exit(1);
+  }
+  const r = await mergeMany(args, { gh: ghCli(cwd) });
   console.log(r.text);
   process.exit(r.ok ? 0 : 1);
 }
