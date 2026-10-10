@@ -29,6 +29,7 @@
 import { spawn as cpSpawn, execFileSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import net from 'node:net';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isMainModule } from './is-direct-run.mjs';
@@ -536,7 +537,58 @@ export function checkResumePreflight({ sessionId, sessionName, cwd, procs, procs
 }
 
 /**
- * Cross-process lock for one resume, so two concurrent `/spawn --resume-session`
+ * Resume lock (async). On Linux it is KERNEL-backed: listening on an
+ * abstract-namespace unix socket `\0teleport-resume-<uuid>` succeeds for exactly
+ * one process and is released by the kernel when that process exits — however it
+ * exits — so there are no stale locks and no takeover races. Elsewhere (macOS)
+ * it falls back to the file lock below.
+ *
+ * A launch that never showed up can't be proven dead (screen forks its server),
+ * so performResume calls `markFailed()`: a cooldown marker that makes the next
+ * acquire refuse for `cooldownMs`, by when a late session is visible to the
+ * preflight. Returns { release, markFailed } or { error }.
+ */
+export const RESUME_COOLDOWN_MS = 120_000;
+export async function acquireResumeLock(sessionId, {
+  dir = path.join(path.dirname(fileURLToPath(import.meta.url)), 'tmp'),
+  platform = process.platform, cooldownMs = RESUME_COOLDOWN_MS, now = Date.now,
+  name = `\0teleport-resume-${sessionId}`,
+  fileLock = (id) => acquireResumeFileLock(id, { dir }),
+} = {}) {
+  const marker = path.join(dir, `resume-${sessionId}.failed`);
+  let lock;
+  if (platform === 'linux') {
+    lock = await new Promise((resolve) => {
+      const server = net.createServer();
+      server.once('error', (e) => resolve(e.code === 'EADDRINUSE'
+        ? { error: `another resume of ${sessionId} is in progress.` }
+        : { error: `cannot take the resume lock: ${e.message}` }));
+      server.listen(name, () => {
+        server.unref(); // never keeps the process alive; the kernel frees it on exit
+        let released = false;
+        resolve({ release: () => { if (!released) { released = true; server.close(); } } });
+      });
+    });
+  } else {
+    lock = fileLock(sessionId);
+  }
+  if (lock.error) return lock;
+  // Cooldown after a failed launch (checked while holding the lock).
+  try {
+    const age = now() - fs.statSync(marker).mtimeMs;
+    if (age < cooldownMs) {
+      lock.release();
+      return { error: `a resume of ${sessionId} failed ${Math.round(age / 1000)}s ago and may still be starting — check /ls, retry after ${Math.ceil((cooldownMs - age) / 1000)}s.` };
+    }
+  } catch { /* no marker */ }
+  return {
+    ...lock,
+    markFailed: () => { try { fs.mkdirSync(dir, { recursive: true }); fs.writeFileSync(marker, `${process.pid} ${now()}\n`); } catch {} },
+  };
+}
+
+/**
+ * File lock fallback (non-Linux): one resume per session, so two concurrent `/spawn --resume-session`
  * (or `/kill pid: --restart`) of the same uuid can't both pass the preflight
  * before either screen exists (the daemon dispatches fire-and-forget).
  *
@@ -558,7 +610,7 @@ export function checkResumePreflight({ sessionId, sessionName, cwd, procs, procs
  * Returns { file, release } or { error }.
  */
 export const RESUME_LOCK_STALE_MS = 120_000;
-export function acquireResumeLock(sessionId, {
+export function acquireResumeFileLock(sessionId, {
   dir = path.join(path.dirname(fileURLToPath(import.meta.url)), 'tmp'),
   pid = process.pid, isAlive = pidAliveLocal, token = crypto.randomUUID(),
   staleMs = RESUME_LOCK_STALE_MS, now = Date.now,
@@ -572,7 +624,10 @@ export function acquireResumeLock(sessionId, {
   const create = (f, body) => { try { fs.writeFileSync(f, body, { flag: 'wx' }); return true; } catch (e) { if (e.code === 'EEXIST') return false; throw e; } };
   const isStale = (f, body) => {
     const holder = Number.parseInt(body, 10);
-    if (Number.isInteger(holder) && holder > 0 && isAlive(holder)) return false;
+    // No parseable holder (a creator between O_EXCL and write, or garbage) is
+    // UNKNOWN, never stale — eviction needs a pid we can prove dead.
+    if (!(Number.isInteger(holder) && holder > 0)) return false;
+    if (isAlive(holder)) return false;
     try { return now() - fs.statSync(f).mtimeMs >= staleMs; } catch { return false; }
   };
   try {
@@ -633,9 +688,8 @@ export async function performResume({ sessionId, cwd, permissionMode = DEFAULT_P
 } = {}) {
   const plan = buildSpawnPlan({ interactive: true, permissionMode, resumeSessionId: sessionId });
   // Held until the screen is verified — see acquireResumeLock.
-  const lock = heldLock || acquireLock(plan.sessionId);
+  const lock = heldLock || await acquireLock(plan.sessionId);
   if (lock.error) return { error: lock.error, plan };
-  let launchFailed = false;
   try {
     let procs = null, procsError = null;
     try { procs = listProcs(); } catch (e) { procsError = e?.message ?? String(e); }
@@ -662,13 +716,12 @@ export async function performResume({ sessionId, cwd, permissionMode = DEFAULT_P
       if (screenExists(plan.sessionName)) return { ok: true, plan };
     }
     // We can't prove nothing is still starting (screen forks its server; a killed
-    // front-end doesn't stop an already-forked one). So a failed launch KEEPS the
-    // lock: it goes stale only once we're gone AND it's older than the lock's age
-    // floor — by then a late session is visible to the next preflight.
-    launchFailed = true;
-    return { error: `screen session "${plan.sessionName}" not found after ${timeoutMs / 1000}s (claude or screen may have errored). Check /ls before retrying — a retry is blocked for ${RESUME_LOCK_STALE_MS / 1000}s in case it is still starting.`, plan, launchFailed: true };
+    // front-end doesn't stop an already-forked one): set the cooldown so a retry
+    // waits until a late session would be visible to its preflight.
+    lock.markFailed?.();
+    return { error: `screen session "${plan.sessionName}" not found after ${timeoutMs / 1000}s (claude or screen may have errored). Check /ls before retrying — a retry is blocked for ${RESUME_COOLDOWN_MS / 1000}s in case it is still starting.`, plan, launchFailed: true };
   } finally {
-    if (!heldLock && !launchFailed) lock.release();
+    if (!heldLock) lock.release();
   }
 }
 
@@ -997,7 +1050,7 @@ if (isDirectRun) {
       // a lock held elsewhere is a refusal BEFORE the kill, not after it.
       if (pre?.sessionId && !pre.guessed) {
         restartSessionId = pre.sessionId;
-        restartLock = acquireResumeLock(pre.sessionId);
+        restartLock = await acquireResumeLock(pre.sessionId);
         if (restartLock.error) {
           appendKillAudit({ pid: killPid.pid, fromId, result: 'refused', reason: restartLock.error, restart: true });
           console.error(`[spawn] ❌ cannot restart: ${restartLock.error} Nothing was killed.`);
@@ -1050,8 +1103,6 @@ if (isDirectRun) {
         }
         const res = rc2.error ? rc2 : await performResume({ sessionId: t.sessionId, cwd: t.cwd, permissionMode: restartMode }, { heldLock: restartLock });
         appendKillAudit({ pid: killPid.pid, fromId, result: res.error ? 'restart-failed' : 'restarted', reason: res.error, sessionId: t?.sessionId ?? null, screen: res.plan?.sessionName ?? null });
-        // A failed launch keeps the lock on purpose (see performResume).
-        if (res.launchFailed) process.off('exit', restartLock.release);
         if (res.error) {
           console.error(`[spawn] ❌ killed, but restart failed: ${res.error}`);
           if (t?.sessionId && !t.guessed) console.error(`[spawn] retry: /spawn <project> --resume-session ${t.sessionId}`);
@@ -1137,7 +1188,6 @@ if (isDirectRun) {
   }
   if (resume.found) {
     const res = await performResume({ sessionId: resume.sessionId, cwd: process.cwd(), permissionMode });
-    // (on a failed launch performResume leaves its lock in place on purpose)
     if (res.error) { console.error(`[spawn] refusing to resume / FAILED: ${res.error}`); process.exit(1); }
     const { plan } = res;
     console.log(`[spawn] resumed session ${plan.sessionId} in screen "${plan.sessionName}" → topic #${plan.sessionName.replace(/^tele-/, '')} (subscription billing).`);

@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 // Isolate the persona pin store so `--list` persona mapping DERIVES instead of
 // reading machine-local pins (resolved at call-time from TELE_PERSONA_STORE).
 process.env.TELE_PERSONA_STORE = path.join(os.tmpdir(), `teleport-persona-store-spawn-${process.pid}.jsonl`);
-import { buildSpawnPlan, genSessionSeed, runSpawn, childLaunch, loginSeedEnv, wrapInLoginShell, scrubClaudeEnv, SEED_PATH, hasBinary, screenSessionExists, normalizeSessionName, parseScreenSessions, listSpawnSessions, resolveKillId, resolveAttachId, resolveAttachTarget, formatSessionList, resolveMode, SPAWN_PROMPT, PERMISSION_MODES, DEFAULT_PERMISSION_MODE, USAGE, personaByHashtag, gracefulKill, KILL_GRACE_MS, RESUME_PROMPT, resolveResumeSession, checkResumePreflight, findTranscriptDirs, checkPidKillAuth, resolveKillPid, appendKillAudit, acquireResumeLock, performResume, checkRestartTarget, checkRestartPreflight, RESUME_LOCK_STALE_MS, inSystemdService, escapeServiceCgroup, SYSTEMD_SCOPE_PREFIX } from './spawn.mjs';
+import { buildSpawnPlan, genSessionSeed, runSpawn, childLaunch, loginSeedEnv, wrapInLoginShell, scrubClaudeEnv, SEED_PATH, hasBinary, screenSessionExists, normalizeSessionName, parseScreenSessions, listSpawnSessions, resolveKillId, resolveAttachId, resolveAttachTarget, formatSessionList, resolveMode, SPAWN_PROMPT, PERMISSION_MODES, DEFAULT_PERMISSION_MODE, USAGE, personaByHashtag, gracefulKill, KILL_GRACE_MS, RESUME_PROMPT, resolveResumeSession, checkResumePreflight, findTranscriptDirs, checkPidKillAuth, resolveKillPid, appendKillAudit, acquireResumeLock, acquireResumeFileLock, performResume, checkRestartTarget, checkRestartPreflight, RESUME_LOCK_STALE_MS, inSystemdService, escapeServiceCgroup, SYSTEMD_SCOPE_PREFIX } from './spawn.mjs';
 import fs from 'node:fs';
 import { uuidToConvoInt } from './convo-registry.mjs';
 import { shortConvoHash } from './convo-hash.mjs';
@@ -643,70 +643,70 @@ test('checkResumePreflight: failed process scan or an unidentified claude in the
   assert.deepEqual(checkResumePreflight({ ...base, procs: [{ pid: 7, sessionId: null, cwd: '/w/other' }] }), { ok: true });
 });
 
-test('acquireResumeLock: exclusive while the holder lives; release is idempotent', () => {
+test('acquireResumeFileLock: exclusive while the holder lives; release is idempotent', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rlock-'));
-  const a = acquireResumeLock(GIUN, { dir });
+  const a = acquireResumeFileLock(GIUN, { dir });
   assert.ok(a.release);
-  assert.match(acquireResumeLock(GIUN, { dir }).error, /in progress/); // holder = us, alive
+  assert.match(acquireResumeFileLock(GIUN, { dir }).error, /in progress/); // holder = us, alive
   a.release(); a.release();
-  assert.ok(acquireResumeLock(GIUN, { dir }).release);
+  assert.ok(acquireResumeFileLock(GIUN, { dir }).release);
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
-test('acquireResumeLock: stale = holder pid dead (and old); a live old lock is NOT evicted', () => {
+test('acquireResumeFileLock: stale = holder pid dead (and old); a live old lock is NOT evicted', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rlock-'));
   const file = path.join(dir, `resume-${GIUN}.lock`);
   fs.writeFileSync(file, '424242 deadbeef\n');
   const old = new Date(Date.now() - 3600_000); fs.utimesSync(file, old, old);
-  assert.match(acquireResumeLock(GIUN, { dir, isAlive: () => true }).error, /in progress/); // old but alive
-  const b = acquireResumeLock(GIUN, { dir, isAlive: (p) => p !== 424242 });                 // holder dead
+  assert.match(acquireResumeFileLock(GIUN, { dir, isAlive: () => true }).error, /in progress/); // old but alive
+  const b = acquireResumeFileLock(GIUN, { dir, isAlive: (p) => p !== 424242 });                 // holder dead
   assert.ok(b.release, 'dead holder → taken over');
   assert.equal(fs.readdirSync(dir).filter((f) => f.includes('.stale.')).length, 0, 'aside file cleaned');
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
-test('acquireResumeLock: release never removes a successor\'s lock', () => {
+test('acquireResumeFileLock: release never removes a successor\'s lock', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rlock-'));
   const file = path.join(dir, `resume-${GIUN}.lock`);
-  const a = acquireResumeLock(GIUN, { dir, token: 'A' });
+  const a = acquireResumeFileLock(GIUN, { dir, token: 'A' });
   fs.writeFileSync(file, '999 B\n'); // pretend A's lock was (wrongly) replaced by B
   a.release();
   assert.equal(fs.readFileSync(file, 'utf8'), '999 B\n');
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
-test('acquireResumeLock: a dead holder younger than staleMs is NOT taken over (a launch may still be starting)', () => {
+test('acquireResumeFileLock: a dead holder younger than staleMs is NOT taken over (a launch may still be starting)', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rlock-'));
   fs.writeFileSync(path.join(dir, `resume-${GIUN}.lock`), '424242 dead\n'); // fresh mtime
-  assert.match(acquireResumeLock(GIUN, { dir, isAlive: () => false }).error, /in progress/);
-  assert.ok(acquireResumeLock(GIUN, { dir, isAlive: () => false, now: () => Date.now() + RESUME_LOCK_STALE_MS + 1000 }).release);
+  assert.match(acquireResumeFileLock(GIUN, { dir, isAlive: () => false }).error, /in progress/);
+  assert.ok(acquireResumeFileLock(GIUN, { dir, isAlive: () => false, now: () => Date.now() + RESUME_LOCK_STALE_MS + 1000 }).release);
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
-test('acquireResumeLock: breaking is serialized by the guard; a live breaker blocks, a crashed one is cleared', () => {
+test('acquireResumeFileLock: breaking is serialized by the guard; a live breaker blocks, a crashed one is cleared', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rlock-'));
   const file = path.join(dir, `resume-${GIUN}.lock`);
   const later = () => Date.now() + RESUME_LOCK_STALE_MS + 1000;
   fs.writeFileSync(file, '424242 dead\n');
   fs.writeFileSync(`${file}.breaking`, '777 breaker\n');
   // breaker 777 alive → busy, and the dead lock is left alone
-  assert.match(acquireResumeLock(GIUN, { dir, now: later, isAlive: (p) => p === 777 }).error, /in progress/);
+  assert.match(acquireResumeFileLock(GIUN, { dir, now: later, isAlive: (p) => p === 777 }).error, /in progress/);
   assert.equal(fs.readFileSync(file, 'utf8'), '424242 dead\n');
   // breaker dead + old → guard cleared, dead lock broken, we own it
-  const r = acquireResumeLock(GIUN, { dir, now: later, isAlive: () => false, token: 'ME' });
+  const r = acquireResumeFileLock(GIUN, { dir, now: later, isAlive: () => false, token: 'ME' });
   assert.ok(r.release);
   assert.equal(fs.readFileSync(file, 'utf8'), `${process.pid} ME\n`);
   assert.equal(fs.existsSync(`${file}.breaking`), false);
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
-test('acquireResumeLock: a breaker never removes a lock that changed after it judged it stale', () => {
+test('acquireResumeFileLock: a breaker never removes a lock that changed after it judged it stale', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rlock-'));
   const file = path.join(dir, `resume-${GIUN}.lock`);
   fs.writeFileSync(file, '424242 dead\n');
   let swapped = false;
   // While B judges the dead lock, the dead lock is released and C acquires a fresh one.
-  const b = acquireResumeLock(GIUN, {
+  const b = acquireResumeFileLock(GIUN, {
     dir, token: 'B', now: () => Date.now() + RESUME_LOCK_STALE_MS + 1000,
     isAlive: (p) => {
       if (p === 424242 && !swapped) { swapped = true; fs.unlinkSync(file); fs.writeFileSync(file, '555 C\n'); }
@@ -759,18 +759,18 @@ test('performResume: lock busy / preflight refusal / ps failure → never launch
   assert.equal(log.released, 1);
 });
 
-test('performResume: timeout with the launcher still running → launcher killed, lock kept', async () => {
+test('performResume: timeout with the launcher still running → launcher killed, cooldown set', async () => {
   const order = [];
   const child = { exitCode: null, signalCode: null, kill: (sig) => { order.push(`kill:${sig}`); } };
   const { deps } = fakeDeps({
     run: () => ({ child }),
-    acquireLock: () => ({ release: () => order.push('release') }),
+    acquireLock: () => ({ release: () => order.push('release'), markFailed: () => order.push('markFailed') }),
   });
   const r = await performResume({ sessionId: GIUN, cwd: '/w/umipay' }, deps);
   assert.match(r.error, /not found after/);
   assert.equal(r.launchFailed, true);
-  // launcher killed, and the lock is KEPT (it might still be starting a writer)
-  assert.deepEqual(order, ['kill:SIGKILL']);
+  // launcher killed, cooldown set (it might still be starting a writer), then released
+  assert.deepEqual(order, ['kill:SIGKILL', 'markFailed', 'release']);
 });
 
 test('performResume: heldLock is used as-is and NOT released (the caller owns it)', async () => {
@@ -782,27 +782,29 @@ test('performResume: heldLock is used as-is and NOT released (the caller owns it
   assert.equal(released, 0);
 });
 
-test('performResume: screen never appears → error after timeout, lock kept (blocks a premature retry)', async () => {
+test('performResume: screen never appears → error after timeout, cooldown marked (blocks a premature retry)', async () => {
+  let marked = 0;
   const { deps, log } = fakeDeps({ run: (plan) => { log.ran.push(plan); } });
-  const r = await performResume({ sessionId: GIUN, cwd: '/w/umipay' }, deps);
+  const r = await performResume({ sessionId: GIUN, cwd: '/w/umipay' }, { ...deps, acquireLock: () => ({ release: () => { log.released++; }, markFailed: () => { marked++; } }) });
   assert.match(r.error, /not found after/);
   assert.equal(r.launchFailed, true);
   assert.equal(log.ran.length, 1);
-  assert.equal(log.released, 0);
+  assert.equal(marked, 1);
+  assert.equal(log.released, 1);
 });
 
 test('performResume: the lock is held while preflight + launch run (concurrent resume blocked)', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rlock2-'));
   let second;
   const { deps } = fakeDeps({
-    acquireLock: (id) => acquireResumeLock(id, { dir }),
-    run: () => { second = acquireResumeLock(GIUN, { dir }); },
+    acquireLock: (id) => acquireResumeFileLock(id, { dir }),
+    run: () => { second = acquireResumeFileLock(GIUN, { dir }); },
     screenExists: () => second !== undefined,
   });
   const r = await performResume({ sessionId: GIUN, cwd: '/w/umipay' }, deps);
   assert.equal(r.ok, true);
   assert.match(second.error, /in progress/);
-  assert.ok(acquireResumeLock(GIUN, { dir }).release, 'released after');
+  assert.ok(acquireResumeFileLock(GIUN, { dir }).release, 'released after');
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
@@ -879,13 +881,13 @@ test('runSpawn: the escape wrapper is applied to the (login-shell) launch comman
   assert.ok(calls[0].includes('screen'));
 });
 
-test('acquireResumeLock: an empty / garbage lock (creator between O_EXCL and write) is NOT stale while fresh', () => {
+test('acquireResumeFileLock: an empty / garbage lock (creator between O_EXCL and write) is NOT stale while fresh', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rlock-'));
   const file = path.join(dir, `resume-${GIUN}.lock`);
   for (const body of ['', 'garbage\n']) {
     fs.writeFileSync(file, body);
     let asked = 0;
-    assert.match(acquireResumeLock(GIUN, { dir, isAlive: () => { asked++; return false; } }).error, /in progress/, JSON.stringify(body));
+    assert.match(acquireResumeFileLock(GIUN, { dir, isAlive: () => { asked++; return false; } }).error, /in progress/, JSON.stringify(body));
     assert.equal(fs.readFileSync(file, 'utf8'), body, 'left untouched');
     assert.equal(asked, 0, 'no pid to ask about');
   }
@@ -904,4 +906,47 @@ test('escapeServiceCgroup: the DEFAULT probe runs `systemd-run --user --scope �
   assert.deepEqual(calls, [['systemd-run', '--user', '--scope', '--quiet', '--collect', '--', 'true']]);
   assert.deepEqual(out, [...SYSTEMD_SCOPE_PREFIX, 'x']);
   assert.deepEqual(escapeServiceCgroup(['x'], {}, { cgroup: '0::/a/teleport-daemon.service', run: () => { throw new Error('no bus'); } }), ['x']);
+});
+
+test('acquireResumeLock (linux, kernel-backed): exclusive, freed on release, unique per session', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'klock-'));
+  const name = `\0teleport-test-${process.pid}-${Math.random()}`;
+  const a = await acquireResumeLock(GIUN, { dir, platform: 'linux', name });
+  assert.ok(a.release);
+  assert.match((await acquireResumeLock(GIUN, { dir, platform: 'linux', name })).error, /in progress/);
+  a.release(); a.release();
+  await new Promise((r) => setTimeout(r, 20));
+  const b = await acquireResumeLock(GIUN, { dir, platform: 'linux', name });
+  assert.ok(b.release, 'free again after release');
+  b.release();
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('acquireResumeLock: failed-launch cooldown refuses until it expires, and frees the lock it took', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'klock-'));
+  const name = `\0teleport-test-${process.pid}-${Math.random()}`;
+  const a = await acquireResumeLock(GIUN, { dir, platform: 'linux', name });
+  a.markFailed(); a.release();
+  await new Promise((r) => setTimeout(r, 20));
+  assert.match((await acquireResumeLock(GIUN, { dir, platform: 'linux', name })).error, /failed .*ago/);
+  const later = await acquireResumeLock(GIUN, { dir, platform: 'linux', name, now: () => Date.now() + 200_000 });
+  assert.ok(later.release, 'cooldown over; and the refused attempt did not leave the lock held');
+  later.release();
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('acquireResumeLock: non-linux falls back to the file lock', async () => {
+  let used = 0;
+  const r = await acquireResumeLock(GIUN, { dir: os.tmpdir(), platform: 'darwin', fileLock: () => { used++; return { release() {} }; } });
+  assert.equal(used, 1);
+  assert.ok(r.release && r.markFailed);
+});
+
+test('acquireResumeFileLock: an OLD lock with no parseable holder is still not evicted', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rlock-'));
+  const file = path.join(dir, `resume-${GIUN}.lock`);
+  fs.writeFileSync(file, '');
+  assert.match(acquireResumeFileLock(GIUN, { dir, isAlive: () => false, now: () => Date.now() + RESUME_LOCK_STALE_MS + 1000 }).error, /in progress/);
+  assert.equal(fs.readFileSync(file, 'utf8'), '');
+  fs.rmSync(dir, { recursive: true, force: true });
 });
