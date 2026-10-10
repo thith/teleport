@@ -449,6 +449,10 @@ test('handlePrLinks: runs merge.mjs --preview (no merge) and offers buttons only
     sendText: async (c, t) => texts.push(t), sendButtons: async (c, t, b) => buttons.push({ c, t, b }), runner });
   await handlePrLinks([L1], { chat: { id: 1 }, from: { id: 1 } }, ctx(async (bin, argv, opts) => { calls.push({ argv, opts }); return { stdout: '🔎 PR #3 ready' }; }));
   assert.deepEqual(calls[0].argv, ['/s/merge.mjs', L1, '--preview']);
+  // configured spec.args (e.g. a deployment that forces --rebase) are previewed too
+  const c2 = [];
+  await handlePrLinks([L1], { chat: { id: 1 }, from: { id: 1 } }, { ...ctx(async (b, argv) => { c2.push(argv); return { stdout: 'ok' }; }), registry: { merge: { ...MREG.merge, args: ['--rebase'] } } });
+  assert.deepEqual(c2[0], ['/s/merge.mjs', '--rebase', L1, '--preview']);
   assert.equal(calls[0].opts.cwd, '/w');
   assert.equal(buttons.length, 1);
   assert.match(buttons[0].t, /🔎 PR #3 ready[\s\S]*Merge this PR\?/);

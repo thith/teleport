@@ -443,7 +443,7 @@ export async function handlePrLinks(links, msg, {
   if (!roleMeets(role, spec.minRole)) { await sendText(daemonUserId, `❌ merge cần quyền ${spec.minRole} (bạn: ${role}).`); return; }
   let out, ok = true;
   try {
-    const r = await runner(process.execPath, [path.join(scriptsDir, spec.run), ...links, '--preview'], {
+    const r = await runner(process.execPath, [path.join(scriptsDir, spec.run), ...spec.args, ...links, '--preview'], {
       cwd: parentDir, env: childEnv(msg.from, role, secretEnvKeys), timeout: COMMAND_TIMEOUT_MS, maxBuffer: COMMAND_MAX_BUFFER,
     });
     out = (r.stdout || '').trim();
