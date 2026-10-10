@@ -15,5 +15,6 @@
   "restartd": { "run": "restartd.mjs", "args": [],              "needsProject": false, "minRole": "admin",      "desc": "restart the daemon (systemd service); refuses while agents share its cgroup unless KillMode=process or --force" },
   "reload":   { "builtin": true,                                    "minRole": "admin",      "desc": "re-read commands.json + projects.json without restarting the daemon" },
   "w":        { "alias": "whisper" },
-  "i":        { "alias": "instruct" }
+  "i":        { "alias": "instruct" },
+  "m":        { "alias": "merge" }
 }
