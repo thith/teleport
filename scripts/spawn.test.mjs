@@ -878,3 +878,22 @@ test('runSpawn: the escape wrapper is applied to the (login-shell) launch comman
   assert.equal(calls[0][0], 'WRAP');
   assert.ok(calls[0].includes('screen'));
 });
+
+test('acquireResumeLock: an empty / garbage lock (creator between O_EXCL and write) is NOT stale while fresh', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rlock-'));
+  const file = path.join(dir, `resume-${GIUN}.lock`);
+  for (const body of ['', 'garbage\n']) {
+    fs.writeFileSync(file, body);
+    let asked = 0;
+    assert.match(acquireResumeLock(GIUN, { dir, isAlive: () => { asked++; return false; } }).error, /in progress/, JSON.stringify(body));
+    assert.equal(fs.readFileSync(file, 'utf8'), body, 'left untouched');
+    assert.equal(asked, 0, 'no pid to ask about');
+  }
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('runSpawn (interactive): returns the launcher child so performResume can stop a stuck launch', () => {
+  const child = { unref() {} };
+  const r = runSpawn(buildSpawnPlan({ interactive: true, seed: genSessionSeed(() => FIXED_UUID) }), { spawnFn: () => child, escape: (c) => c });
+  assert.equal(r.child, child);
+});
