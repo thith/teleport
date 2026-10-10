@@ -53,7 +53,7 @@ import {
   partitionOrphans, pruneCache, runHeartbeatReminders,
   isDmControlMessage, stripDmControlPrefix,
 } from './tele-listen.mjs';
-import { loadCommands, resolveCommand, roleMeets, tokenizeArgs } from './commands.mjs';
+import { loadCommands, resolveCommand, roleMeets, tokenizeArgs, COMMANDS_FILE } from './commands.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ENV_FILE = path.join(__dirname, '..', '.env');
@@ -166,6 +166,7 @@ export function reloadDaemonState({ daemonUserId, readConfig, loadRegistry, reso
   try {
     projectsConfig = readConfig();
     registry = loadRegistry(projectsConfig);
+    if (!registry || typeof registry !== 'object' || !Object.keys(registry).length) throw new Error('command registry is empty');
     validateDaemonConfig({ projectsConfig, catchAllIds: resolveCatchAll(projectsConfig), daemonUserId });
   } catch (e) {
     return { error: e instanceof Error ? e.message : String(e) };
@@ -173,6 +174,14 @@ export function reloadDaemonState({ daemonUserId, readConfig, loadRegistry, reso
   const newOwner = resolveOwner(projectsConfig);
   const ownerChanged = newOwner != null && String(newOwner) !== String(daemonUserId);
   return { projectsConfig, registry, ownerChanged };
+}
+
+/** Parse a JSON object file or THROW (no silent `{}` fallback — see /reload). */
+export function readJsonStrict(file, label = path.basename(file)) {
+  let v;
+  try { v = JSON.parse(fs.readFileSync(file, 'utf8')); } catch (e) { throw new Error(`${label}: ${e instanceof Error ? e.message : e}`); }
+  if (!v || typeof v !== 'object' || Array.isArray(v)) throw new Error(`${label}: not a JSON object`);
+  return v;
 }
 
 // ── Process lifecycle ─────────────────────────────────────────────────────────
@@ -270,8 +279,10 @@ async function main() {
   const reload = () => {
     const r = reloadDaemonState({
       daemonUserId,
-      readConfig: () => readProjectsConfig(PROJECTS_FILE),
-      loadRegistry: (cfg) => loadCommands({ projectsConfig: cfg }),
+      // STRICT readers: the normal ones swallow a JSON error into `{}`, which
+      // would "successfully" wipe roles + commands (and lock out /reload itself).
+      readConfig: () => readJsonStrict(PROJECTS_FILE, 'projects.json'),
+      loadRegistry: (cfg) => { readJsonStrict(COMMANDS_FILE, 'commands.json'); return loadCommands({ projectsConfig: cfg }); },
       resolveOwner: (cfg) => resolveDaemonUserId(cfg, { env: process.env, envFile: env }),
       resolveCatchAll: (cfg) => parseAdminChatIds(resolveDefaultChatId(cfg, { env: process.env, envFile: env }) || ''),
     });

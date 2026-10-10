@@ -643,18 +643,55 @@ test('checkResumePreflight: failed process scan or an unidentified claude in the
   assert.deepEqual(checkResumePreflight({ ...base, procs: [{ pid: 7, sessionId: null, cwd: '/w/other' }] }), { ok: true });
 });
 
-test('acquireResumeLock: exclusive, released, stale lock broken', () => {
+test('acquireResumeLock: exclusive while the holder lives; release is idempotent', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rlock-'));
   const a = acquireResumeLock(GIUN, { dir });
   assert.ok(a.release);
-  assert.match(acquireResumeLock(GIUN, { dir }).error, /in progress/);
-  a.release(); a.release(); // idempotent
-  const b = acquireResumeLock(GIUN, { dir });
-  assert.ok(b.release);
-  // stale: pretend the lock is older than staleMs
-  const c = acquireResumeLock(GIUN, { dir, staleMs: 1000, now: () => Date.now() + 5000 });
-  assert.ok(c.release, 'stale lock should be broken');
-  c.release();
+  assert.match(acquireResumeLock(GIUN, { dir }).error, /in progress/); // holder = us, alive
+  a.release(); a.release();
+  assert.ok(acquireResumeLock(GIUN, { dir }).release);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('acquireResumeLock: stale = holder pid dead (age irrelevant); a live old lock is NOT evicted', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rlock-'));
+  const file = path.join(dir, `resume-${GIUN}.lock`);
+  fs.writeFileSync(file, '424242 deadbeef\n');
+  const old = new Date(Date.now() - 3600_000); fs.utimesSync(file, old, old);
+  assert.match(acquireResumeLock(GIUN, { dir, isAlive: () => true }).error, /in progress/); // old but alive
+  const b = acquireResumeLock(GIUN, { dir, isAlive: (p) => p !== 424242 });                 // holder dead
+  assert.ok(b.release, 'dead holder → taken over');
+  assert.equal(fs.readdirSync(dir).filter((f) => f.includes('.stale.')).length, 0, 'aside file cleaned');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('acquireResumeLock: release never removes a successor\'s lock', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rlock-'));
+  const file = path.join(dir, `resume-${GIUN}.lock`);
+  const a = acquireResumeLock(GIUN, { dir, token: 'A' });
+  fs.writeFileSync(file, '999 B\n'); // pretend A's lock was (wrongly) replaced by B
+  a.release();
+  assert.equal(fs.readFileSync(file, 'utf8'), '999 B\n');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('acquireResumeLock: two contenders racing on the same dead lock → exactly one wins', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rlock-'));
+  const file = path.join(dir, `resume-${GIUN}.lock`);
+  fs.writeFileSync(file, '424242 dead\n');
+  // B inspects the dead lock, then A completes a full takeover before B acts:
+  // simulate by letting B's isAlive run A's acquire first (A sees the dead lock too).
+  let a;
+  const b = acquireResumeLock(GIUN, {
+    dir, pid: 2, token: 'B',
+    isAlive: (p) => {
+      if (p === 424242 && !a) { a = acquireResumeLock(GIUN, { dir, pid: 1, token: 'A', isAlive: (q) => q === 1 || q === 2 }); }
+      return p === 1 || p === 2;
+    },
+  });
+  assert.ok(a.release, 'A took the dead lock');
+  assert.match(b.error, /in progress/, 'B must not also win');
+  assert.equal(fs.readFileSync(file, 'utf8'), '1 A\n', "A's lock survives B's attempt");
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
@@ -697,6 +734,27 @@ test('performResume: lock busy / preflight refusal / ps failure → never launch
   assert.match((await performResume({ sessionId: GIUN, cwd: '/w/umipay' }, deps)).error, /ps failed/);
   assert.equal(log.ran.length, 0);
   assert.equal(log.released, 1);
+});
+
+test('performResume: timeout with the launcher still running → launcher killed BEFORE the lock is released', async () => {
+  const order = [];
+  const child = { exitCode: null, signalCode: null, kill: (sig) => { order.push(`kill:${sig}`); } };
+  const { deps } = fakeDeps({
+    run: () => ({ child }),
+    acquireLock: () => ({ release: () => order.push('release') }),
+  });
+  const r = await performResume({ sessionId: GIUN, cwd: '/w/umipay' }, deps);
+  assert.match(r.error, /stuck launcher was killed/);
+  assert.deepEqual(order, ['kill:SIGKILL', 'release']);
+});
+
+test('performResume: heldLock is used as-is and NOT released (the caller owns it)', async () => {
+  let acquired = 0, released = 0;
+  const { deps } = fakeDeps({ acquireLock: () => { acquired++; return { release() {} }; } });
+  const r = await performResume({ sessionId: GIUN, cwd: '/w/umipay' }, { ...deps, heldLock: { release: () => { released++; } } });
+  assert.equal(r.ok, true);
+  assert.equal(acquired, 0);
+  assert.equal(released, 0);
 });
 
 test('performResume: screen never appears → error after timeout, lock released', async () => {

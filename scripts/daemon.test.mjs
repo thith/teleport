@@ -6,7 +6,7 @@ import path from 'node:path';
 import {
   parseDaemonCommand, resolveSpawnCwd, dispatchCommand, handleControlMessages,
   validateDaemonConfig, resolveSenderRole, acquireSingleton, releaseSingleton, daemonStatus,
-  reloadDaemonState,
+  reloadDaemonState, readJsonStrict,
 } from './daemon.mjs';
 
 test('parseDaemonCommand: extracts command + rest, strips @botname, lowercases', () => {
@@ -394,4 +394,23 @@ test('reloadDaemonState: returns fresh state; invalid config → { error } (old 
   assert.match(reloadDaemonState({ ...base, readConfig: () => { throw new Error('Unexpected token'); } }).error, /Unexpected token/);
   assert.ok(reloadDaemonState({ ...base, readConfig: () => good, resolveCatchAll: () => ['123'] }).error); // catch-all must be a group
   assert.equal(reloadDaemonState({ ...base, readConfig: () => good, resolveOwner: () => '6' }).ownerChanged, true);
+});
+
+test('readJsonStrict: throws on missing / corrupt / non-object (no silent {} like readProjectsConfig)', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rjs-'));
+  const f = (name, body) => { const p = path.join(dir, name); fs.writeFileSync(p, body); return p; };
+  assert.deepEqual(readJsonStrict(f('ok.json', '{"a":1}')), { a: 1 });
+  assert.throws(() => readJsonStrict(f('bad.json', '{"a":'), 'projects.json'), /projects\.json:/);
+  assert.throws(() => readJsonStrict(f('arr.json', '[1]')), /not a JSON object/);
+  assert.throws(() => readJsonStrict(path.join(dir, 'missing.json')), /ENOENT/);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('reloadDaemonState: a corrupt projects.json (strict reader) or an empty registry keeps the old state', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rld-'));
+  const bad = path.join(dir, 'projects.json'); fs.writeFileSync(bad, '{ broken');
+  const base = { daemonUserId: '5', loadRegistry: () => ({ x: {} }), resolveOwner: () => '5', resolveCatchAll: () => [] };
+  assert.match(reloadDaemonState({ ...base, readConfig: () => readJsonStrict(bad, 'projects.json') }).error, /projects\.json/);
+  assert.match(reloadDaemonState({ ...base, readConfig: () => ({}), loadRegistry: () => ({}) }).error, /registry is empty/);
+  fs.rmSync(dir, { recursive: true, force: true });
 });

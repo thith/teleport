@@ -179,7 +179,7 @@ export function buildProcRows({ psRows, uid, sessions = new Map(), procExtras = 
 }
 
 /**
- * Render `/ls` for Telegram (plain text), in two sections:
+ * Render `/ls` for Telegram (plain text; cwd shown as its folder name), in two sections:
  *   📺 Screen   — every `tele-*` screen (spawned agents) plus any other screen that
  *                 hosts a claude, each with the claude PID inside (if found);
  *   🖥 Terminal — claude processes opened by hand (no screen).
@@ -190,7 +190,8 @@ export function buildProcRows({ psRows, uid, sessions = new Map(), procExtras = 
  *   personaOf(hashtag) → label | null — topic persona for a tele-* screen
  */
 export function formatAgentList({ screens = [], procs = [], personaOf = () => null, home = os.homedir() } = {}) {
-  const short = (p) => (p && home && (p === home || p.startsWith(home + '/')) ? '~' + p.slice(home.length) : p);
+  // Folder name only (Thi: "chỉ hiện tên folder") — the full path is noise on a phone.
+  const short = (p) => (p ? (p === home ? '~' : path.basename(p)) : null);
   const sess = (r) => (r.sessionId
     ? `  session ${r.sessionId}${r.guessed ? ' (đoán)' : ''}${r.hashtag ? ` · #${r.hashtag}` : ''}`
     : '  session ?');
