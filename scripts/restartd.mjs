@@ -53,28 +53,33 @@ export function claudesInCgroup(cgroupPath, { root = '/sys/fs/cgroup', procDir =
   return out;
 }
 
-if (isMainModule(import.meta.url)) {
-  const force = process.argv.includes('--force');
-  // We are a child of the daemon: its cgroup is ours.
-  const svc = serviceFromCgroup(read(`/proc/${process.ppid}/cgroup`) || read('/proc/self/cgroup'));
-  if (!svc) {
-    console.log('❌ the daemon is not running as a systemd service — restart it by hand (node scripts/daemon.mjs --stop, then start it again).');
-    process.exit(1);
-  }
+/**
+ * Restart the daemon's systemd unit if it is safe. `ppid` = the daemon (we are
+ * its child). Returns { ok, message } | { error }. Shared by `/restartd` and the
+ * temporary `/kill --restartd` bridge in spawn.mjs (for a daemon whose registry
+ * predates `restartd`).
+ */
+export function runRestartd({ force = false, ppid = process.ppid } = {}) {
+  const svc = serviceFromCgroup(read(`/proc/${ppid}/cgroup`) || read('/proc/self/cgroup'));
+  if (!svc) return { error: 'the daemon is not running as a systemd service — restart it by hand (node scripts/daemon.mjs --stop, then start it again).' };
   let killMode = '';
   try { killMode = String(execFileSync('systemctl', ['--user', 'show', svc.unit, '-p', 'KillMode', '--value'], { encoding: 'utf8' })).trim(); } catch {}
   const claudes = claudesInCgroup(svc.cgroupPath);
   if (claudes == null && killMode !== 'process' && !force) {
-    console.log(`❌ cannot inspect the cgroup of ${svc.unit} to make sure no agent would be killed — use /restartd --force if you are sure.`);
-    process.exit(1);
+    return { error: `cannot inspect the cgroup of ${svc.unit} to make sure no agent would be killed — use --force if you are sure.` };
   }
   const safe = checkRestartSafety({ killMode, claudes: claudes || [], force });
-  if (safe.error) { console.log(`❌ ${safe.error}`); process.exit(1); }
+  if (safe.error) return safe;
   try {
     execFileSync('systemctl', ['--user', '--no-block', 'restart', svc.unit], { stdio: 'ignore' });
   } catch (e) {
-    console.log(`❌ systemctl restart ${svc.unit} failed: ${e?.message ?? e}`);
-    process.exit(1);
+    return { error: `systemctl restart ${svc.unit} failed: ${e?.message ?? e}` };
   }
-  console.log(`🔄 restarting ${svc.unit} (KillMode=${killMode || '?'})… check with /help or /ls in a few seconds.`);
+  return { ok: true, message: `🔄 restarting ${svc.unit} (KillMode=${killMode || '?'})… check with /help or /ls in a few seconds.` };
+}
+
+if (isMainModule(import.meta.url)) {
+  const r = runRestartd({ force: process.argv.includes('--force') });
+  console.log(r.error ? `❌ ${r.error}` : r.message);
+  process.exit(r.error ? 1 : 0);
 }

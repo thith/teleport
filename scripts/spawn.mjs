@@ -937,6 +937,21 @@ if (isDirectRun) {
     process.exit(0);
   }
 
+  // TEMPORARY bridge (remove once every daemon has `restartd` in its registry):
+  // `/kill --restartd [--force]` reaches us through the old `/kill` entry, so a
+  // running daemon can be restarted from Telegram without editing its config.
+  // Owner only, same gate as pid kills.
+  if (argv.includes('--restartd')) {
+    const fromId = process.env.TELE_FROM_ID || '';
+    const daemonUserId = resolveDaemonUserId(readProjectsConfig(path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'projects.json')), { env: {} });
+    const auth = checkPidKillAuth({ fromId, daemonUserId });
+    if (auth.error) { console.error(`[spawn] ❌ ${auth.error.replace('`--kill pid:`', '`--restartd`').replace('`/kill pid:`', '`/kill --restartd`')}`); process.exit(1); }
+    const { runRestartd } = await import('./restartd.mjs');
+    const r = runRestartd({ force: argv.includes('--force') });
+    console.log(r.error ? `[spawn] ❌ ${r.error}` : `[spawn] ${r.message}`);
+    process.exit(r.error ? 1 : 0);
+  }
+
   // --kill pid:<PID>: owner-only SIGTERM of one claude process (via the daemon).
   const killPid = resolveKillPid(argv);
   if (killPid.found) {
