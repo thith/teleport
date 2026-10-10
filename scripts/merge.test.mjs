@@ -196,3 +196,11 @@ test('mergeOne: UNKNOWN wait is bounded; merge_method passes through; open-PR li
   assert.match(r2.text, /cannot check its base branch release: rate limited/);
   assert.equal(f.calls.some((c) => c[2] === 'PUT'), false);
 });
+
+test('baseIsMergedHead: a transient error reading the base tip refuses (not treated as a deleted branch)', async () => {
+  const f = fakeGh({ 5: PR(5, { state: 'MERGED', headRefName: 'feat/5' }), 6: PR(6, { baseRefName: 'feat/5' }) }, { tips: { 'feat/5': 'sha5' } });
+  const gh = (a) => { if (/\/branches\//.test(a[1] || '')) throw Object.assign(new Error('x'), { stderr: 'HTTP 502: Bad Gateway' }); return f.gh(a); };
+  const r = await mergeOne(6, ARGS([6]), { gh });
+  assert.match(r.text, /cannot check its base branch feat\/5: HTTP 502/);
+  assert.equal(f.calls.some((c) => c[2] === 'PUT'), false);
+});

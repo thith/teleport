@@ -169,6 +169,7 @@ export function buildProcRows({ psRows, uid, sessions = new Map(), procExtras = 
     out.push({
       pid: r.pid, tty: r.tty, etime: r.etime, cwd,
       screen: extra.sty ?? screenFromAncestors(r.pid, byPid),
+      procStart: extra.procStart ?? null, // pid-reuse fingerprint of THIS process
       sessionId, guessed,
       hashtag: hashtagForSession(sessionId),
       name: sess?.name ?? null,

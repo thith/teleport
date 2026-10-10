@@ -338,6 +338,7 @@ test('listClaudeProcs (/proc extras): stale session file dropped by procStart; c
   const b = rows.find((r) => r.pid === 1129421);
   assert.equal(b.sessionId, SID2);
   assert.equal(b.screen, 'tele-i0744244');
+  assert.equal(b.procStart, '42', 'rows carry their start fingerprint');
   fs.rmSync(proc, { recursive: true, force: true }); fs.rmSync(sdir, { recursive: true, force: true });
 });
 

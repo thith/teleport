@@ -1016,14 +1016,15 @@ test('resolveKillPid: name: — quoted (one token) or unquoted (words up to the 
 
 test('matchProcsByName: full name via session name or persona; emoji/case ignored; ambiguity refused', () => {
   const rows = [
-    { pid: 1, name: '🐍 Rắn 3', hashtag: 'a' }, { pid: 2, name: '🐍 Rắn', hashtag: 'b' },
+    { pid: 1, name: '🐍 Rắn 3', hashtag: 'a', procStart: '111' }, { pid: 2, name: '🐍 Rắn', hashtag: 'b' },
     { pid: 3, name: '🧚 UmiApp', hashtag: 'c' }, { pid: 4, name: 'digesty-a7', hashtag: 'd' }, { pid: 5, name: null, hashtag: 'e' },
   ];
   const persona = (r) => ({ c: '🧚 Tiên', d: '🦛 Hà Mã', e: '🦛 Hà Mã' })[r.hashtag] || null;
-  assert.deepEqual(matchProcsByName('Rắn 3', rows, persona), { pid: 1 });
-  assert.deepEqual(matchProcsByName('rắn', rows, persona), { pid: 2 }, 'full name, not substring of "Rắn 3"');
-  assert.deepEqual(matchProcsByName('🧚 tiên', rows, persona), { pid: 3 }, 'persona works too');
-  assert.deepEqual(matchProcsByName('UmiApp', rows, persona), { pid: 3 });
+  assert.deepEqual(matchProcsByName('Rắn 3', rows, persona), { pid: 1, start: '111' }, 'carries the start fingerprint');
+  assert.equal(matchProcsByName('rắn', rows, persona).pid, 2, 'full name, not substring of "Rắn 3"');
+  assert.equal(matchProcsByName('🧚 tiên', rows, persona).pid, 3, 'persona works too');
+  assert.equal(matchProcsByName('UmiApp', rows, persona).pid, 3);
+  assert.equal(matchProcsByName('UmiApp', rows, persona).start, null);
   assert.match(matchProcsByName('Hà Mã', rows, persona).error, /matches 2 processes: PID 4 \(digesty-a7\), PID 5/);
   assert.match(matchProcsByName('Cú', rows, persona).error, /no claude process named/);
   assert.equal(normalizeAgentName(' 🐍  Rắn   3 '), 'rắn 3');

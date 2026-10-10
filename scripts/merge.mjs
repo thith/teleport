@@ -110,7 +110,12 @@ export function baseIsMergedHead(base, gh) {
   if (!sameRepo.length) return false;
   let tip;
   try { tip = JSON.parse(gh(['api', `repos/{owner}/{repo}/branches/${branchRefPath(base)}`])).commit?.sha; }
-  catch { return false; } // base branch gone → GitHub itself will refuse the merge
+  catch (e) {
+    // Only a confirmed "no such branch" means it's gone (GitHub will refuse the
+    // merge itself); any other failure is unknown → let the caller refuse.
+    if (/not found|HTTP 404/i.test(String(e?.stderr || e?.message || ''))) return false;
+    throw e;
+  }
   return sameRepo.some((p) => p.headRefOid === tip);
 }
 

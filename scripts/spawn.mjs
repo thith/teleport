@@ -872,7 +872,7 @@ export function matchProcsByName(name, rows, personaOf = () => null) {
   if (!q) return { error: 'empty name.' };
   const hits = rows.filter((r) => [r.name, personaOf(r)].some((n) => n && normalizeAgentName(n) === q));
   const label = (r) => `PID ${r.pid}${r.name ? ` (${r.name})` : ''}`;
-  if (hits.length === 1) return { pid: hits[0].pid };
+  if (hits.length === 1) return { pid: hits[0].pid, start: hits[0].procStart ?? null };
   if (!hits.length) return { error: `no claude process named "${name}" (see /ls for names).` };
   return { error: `"${name}" matches ${hits.length} processes: ${hits.map(label).join(', ')} — use /kill pid:<PID>.` };
 }
@@ -1115,8 +1115,12 @@ if (isDirectRun) {
       const pmap = personaByHashtag();
       const m = matchProcsByName(killPid.name, listClaudeProcs(), (r) => (r.hashtag && pmap[r.hashtag] ? formatPersona(pmap[r.hashtag]) : null));
       if (m.error) { appendKillAudit({ name: killPid.name, fromId, result: 'refused', reason: m.error }); console.error(`[spawn] ❌ ${m.error}`); process.exit(1); }
+      // The name picked THIS process: keep its start fingerprint so a pid reused
+      // by another claude before the kill is refused (with or without --restart).
+      if (m.start == null) { appendKillAudit({ name: killPid.name, pid: m.pid, fromId, result: 'refused', reason: 'no start fingerprint' }); console.error(`[spawn] ❌ cannot establish the identity of PID ${m.pid} (start time unknown) — use /kill pid:${m.pid}.`); process.exit(1); }
       console.log(`[spawn] name "${killPid.name}" → PID ${m.pid}`);
       killPid.pid = m.pid;
+      killPid.start = m.start;
     }
     const restart = argv.includes('--restart');
     let restartMode = DEFAULT_PERMISSION_MODE;
@@ -1155,6 +1159,10 @@ if (isDirectRun) {
       }
       preRow = pre;
       preStart = startBefore;
+      if (killPid.start != null && startBefore !== killPid.start) {
+        console.error(`[spawn] ❌ PID ${killPid.pid} is no longer the process named "${killPid.name}" (pid reused). Nothing was killed.`);
+        process.exit(1);
+      }
       const sessionName = pre?.sessionId && !pre.guessed ? buildSpawnPlan({ interactive: true, resumeSessionId: pre.sessionId }).sessionName : null;
       // A target living in its OWN tele-<hashtag> screen: that screen dies with it,
       // so it is not a conflict — we wait for it to go after the kill.
@@ -1172,7 +1180,8 @@ if (isDirectRun) {
       }
     }
     console.log(`[spawn] SIGTERM → PID ${killPid.pid}, waiting up to ${KILL_PID_GRACE_MS / 1000}s…`);
-    const r = await killClaudePid(killPid.pid, restart ? { expectStart: preStart } : {});
+    const expectStart = restart ? preStart : (killPid.start ?? null);
+    const r = await killClaudePid(killPid.pid, expectStart != null ? { expectStart } : {});
     // The kill-time describe() is lenient (a transient ps failure → null); the
     // pre-kill row of the SAME process (start fingerprint checked) is the fallback.
     const t = r.target ?? (restart ? preRow : null);
