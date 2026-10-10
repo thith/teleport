@@ -250,3 +250,18 @@ test('mergeMany after canonicalization: mixing a number and a URL of the same re
   assert.match(r.text, /stacked PR/);
   assert.equal(calls.filter((c) => c[2] === 'PUT').length, 1);
 });
+
+test('preview: checks everything, never PUTs/DELETEs; batch preview still flags an in-batch stack', async () => {
+  let f = fakeGh({ 3: PR(3) });
+  const r = await mergeMany({ ...ARGS([3]), preview: true }, { gh: f.gh, sleep: async () => {} });
+  assert.equal(r.ok, true);
+  assert.match(r.text, /🔎 PR #3 "t3"\nfeat\/3 → main · checks: none · ready to squash/);
+  assert.equal(f.calls.some((c) => c[0] === 'api' && (c[2] === 'PUT' || c[2] === 'DELETE')), false);
+  f = fakeGh({ 10: PR(10), 11: PR(11, { baseRefName: 'feat/10' }) });
+  const s2 = await mergeMany({ ...ARGS([10, 11]), preview: true }, { gh: f.gh, sleep: async () => {} });
+  assert.equal(s2.ok, false);
+  assert.match(s2.text, /stacked PR/);
+  assert.match(s2.text, /⏹ #11 can't be merged/);
+  assert.equal(f.calls.some((c) => c[2] === 'PUT'), false);
+  assert.equal(parseMergeArgs(['https://github.com/a/b/pull/1', '--preview']).preview, true);
+});
