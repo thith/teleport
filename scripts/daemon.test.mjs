@@ -475,7 +475,7 @@ test('handleMergeButton: Merge dispatches /merge <links> once; Cancel and expire
   const store = new Map([['aaaaaaaaaaaaaaaa', { links: [L1], createdAt: Date.now() }], ['bbbbbbbbbbbbbbbb', { links: [L1], createdAt: Date.now() }]]);
   const take = (t) => takeMergeButton(t, { store });
   const ev = [], dispatched = [];
-  const ctx = { answerButton: async (id, t) => ev.push(`answer:${t || ''}`), editButtonsMessage: async (c, m, t) => ev.push(`edit:${t.split('\n').pop()}`) };
+  const ctx = { registry: MREG, answerButton: async (id, t) => ev.push(`answer:${t || ''}`), editButtonsMessage: async (c, m, t) => ev.push(`edit:${t.split('\n').pop()}`) };
   const cq = (data) => ({ id: 'q', data, from: { id: 1 }, message: { chat: { id: 1 }, message_id: 5, text: 'preview' } });
   const dispatch = async (parsed) => dispatched.push(parsed);
   await handleMergeButton(cq('mg:aaaaaaaaaaaaaaaa'), ctx, { take, dispatch });
@@ -545,7 +545,7 @@ test('handlePrLinks: not mergeable but still open → only [Close] [Huỷ]; Merg
   assert.match(buttons[0].t, /❌ conflicts[\s\S]*Can't merge — close this PR without merging\?/);
   const tok = buttons[0].b[0].callback_data.slice(3);
   const dispatched = [];
-  const ctx = { answerButton: async () => {}, editButtonsMessage: async () => {} };
+  const ctx = { registry: MREG, answerButton: async () => {}, editButtonsMessage: async () => {} };
   const take = (t) => takeMergeButton(t, { store });
   const cq = (data) => ({ id: 'q', data, from: { id: 1 }, message: { chat: { id: 1 }, message_id: 5, text: 'p' } });
   await handleMergeButton(cq(`mg:${tok}`), ctx, { take: (t) => ({ ...store.get(t), _: take }), dispatch: async (p) => dispatched.push(p) });
