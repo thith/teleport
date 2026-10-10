@@ -52,8 +52,9 @@ import {
   DEFAULT_TMP_DIR, botScopedFiles, fetchUpdates, appendToCache, readCacheSinceOffset,
   readOffset, writeOffset, resolveStartOffset, acquirePollLock, releasePollLock,
   partitionOrphans, pruneCache, runHeartbeatReminders,
-  isDmControlMessage, stripDmControlPrefix,
+  isDmControlMessage, stripDmControlPrefix, prLinksOnly, PR_LINK_RE,
 } from './tele-listen.mjs';
+export { prLinksOnly, PR_LINK_RE };
 import { loadCommands, resolveCommand, roleMeets, tokenizeArgs, COMMANDS_FILE } from './commands.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -403,15 +404,8 @@ export function handleControlMessages(mine, ctx) {
 
 // ── Paste a PR link → preview + [✅ Merge] [✖ Cancel] ─────────────────────────
 
-export const PR_LINK_RE = /^https?:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/pull\/\d+(?:[/?#]\S*)?$/;
 export const MERGE_BUTTON_TTL_MS = 15 * 60 * 1000;
-
-/** The message's links if it is NOTHING but GitHub PR URLs (deduped), else null. Pure. */
-export function prLinksOnly(text) {
-  const tokens = String(text ?? '').trim().split(/\s+/).filter(Boolean);
-  if (!tokens.length || !tokens.every((t) => PR_LINK_RE.test(t))) return null;
-  return [...new Set(tokens)];
-}
+export const PREVIEW_INLINE_MAX = 3500;
 
 // token → { links, chatId, createdAt }. In memory on purpose: a daemon restart
 // simply expires pending confirmations (the button then says so).
@@ -460,7 +454,12 @@ export async function handlePrLinks(links, msg, {
   if (!ok) { await sendText(msg.chat.id, out); return; } // something can't be merged → no buttons
   const tok = crypto.randomBytes(8).toString('hex');
   store.set(tok, { links, chatId: msg.chat.id, createdAt: Date.now() });
-  await sendButtons(msg.chat.id, `${out}\n\nMerge ${links.length > 1 ? `these ${links.length} PRs (in order)` : 'this PR'}?`,
+  // Keep the button message well under Telegram's 4096 chars (status edits are
+  // appended later): a long batch preview goes out first as its own message.
+  const ask = `Merge ${links.length > 1 ? `these ${links.length} PRs (in order)` : 'this PR'}?`;
+  let body = `${out}\n\n${ask}`;
+  if (body.length > PREVIEW_INLINE_MAX) { await sendText(msg.chat.id, out); body = `🔎 ${links.length} PR(s) ready — details above.\n\n${ask}`; }
+  await sendButtons(msg.chat.id, body,
     [{ text: '✅ Merge', callback_data: `mg:${tok}` }, { text: '✖ Huỷ', callback_data: `mc:${tok}` }]);
 }
 

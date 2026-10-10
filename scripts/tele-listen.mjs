@@ -191,8 +191,13 @@ export function writeOffset(updateId, offsetFile = DEFAULT_OFFSET_FILE) {
   atomicWriteFileSync(offsetFile, String(updateId + 1));
 }
 
+// Update types every harvester asks for EXPLICITLY: Telegram otherwise reuses
+// whatever an earlier getUpdates/webhook set, which could silently drop the
+// daemon's inline-button presses (callback_query).
+export const ALLOWED_UPDATES = ['message', 'edited_message', 'callback_query'];
+
 export async function fetchUpdates(token, offset) {
-  const url = `${TELEGRAM_API}${token}/getUpdates?offset=${offset}&timeout=0&limit=100`;
+  const url = `${TELEGRAM_API}${token}/getUpdates?offset=${offset}&timeout=0&limit=100&allowed_updates=${encodeURIComponent(JSON.stringify(ALLOWED_UPDATES))}`;
   const res = await fetch(url);
   const body = await res.json().catch(() => ({}));
   if (!res.ok || !body.ok) {
@@ -1073,11 +1078,24 @@ export function buildCombinedPromptData(messages, botId = null, convoId = null, 
   return out;
 }
 
+// A message that is ONLY GitHub PR link(s): in the owner's private chat the
+// daemon turns it into a merge preview with buttons (daemon.mjs handlePrLinks).
+export const PR_LINK_RE = /^https?:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/pull\/\d+(?:[/?#]\S*)?$/;
+/** The message's links if it is NOTHING but GitHub PR URLs (deduped), else null. Pure. */
+export function prLinksOnly(text) {
+  const tokens = String(text ?? '').trim().split(/\s+/).filter(Boolean);
+  if (!tokens.length || !tokens.every((t) => PR_LINK_RE.test(t))) return null;
+  return [...new Set(tokens)];
+}
+
 export function findOrphanMessages(updates, adminIds, systemMsgIds = new Set()) {
   return updates.filter((u) => {
     const msg = updateMessage(u);
     if (!hasUserContent(msg)) return false;
     if (msg.chat.type !== 'private') return false;
+    // Link-only DMs are daemon input (merge preview), never orphans — they must
+    // reach the shared cache.
+    if (prLinksOnly(msg.text)) return false;
     if (adminIds.length > 0 && !adminIds.includes(String(msg.chat.id))) return false;
     // Replies to system messages (warnings the bot itself sent) are still orphans
     // from any agent's perspective — no Monitor filter will match. Treat them as

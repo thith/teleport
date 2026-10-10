@@ -496,3 +496,31 @@ test('handleControlMessages: a private link-only message → preview with button
   await new Promise((r) => setTimeout(r, 20));
   assert.equal(buttons.length, 1);
 });
+
+test('handlePrLinks: a long batch preview is sent separately; the button message stays short', async () => {
+  const texts = [], buttons = [];
+  const long = '🔎 PR\n'.repeat(800);
+  await handlePrLinks([L1], { chat: { id: 1 }, from: { id: 1 } }, { daemonUserId: '1', projectsConfig: OWNER_CFG, registry: MREG, store: new Map(),
+    sendText: async (c, t) => texts.push(t), sendButtons: async (c, t) => buttons.push(t), runner: async () => ({ stdout: long }) });
+  assert.equal(texts[0], long.trim());
+  assert.ok(buttons[0].length < 200);
+  assert.match(buttons[0], /details above/);
+});
+
+test('partitionOrphans: a link-only private DM is never an orphan (reaches the cache even with no group ids)', async () => {
+  const { partitionOrphans } = await import('./tele-listen.mjs');
+  const u = { update_id: 1, message: { message_id: 1, chat: { id: 1, type: 'private' }, from: { id: 1 }, text: L1 } };
+  const plain = { update_id: 2, message: { message_id: 2, chat: { id: 1, type: 'private' }, from: { id: 1 }, text: 'hello' } };
+  const r = partitionOrphans([u, plain], []);
+  assert.deepEqual(r.nonOrphan.map((x) => x.update_id), [1]);
+  assert.deepEqual(r.orphans.map((o) => o.update.update_id), [2]);
+});
+
+test('fetchUpdates asks for message, edited_message and callback_query explicitly', async () => {
+  const { fetchUpdates, ALLOWED_UPDATES } = await import('./tele-listen.mjs');
+  assert.deepEqual(ALLOWED_UPDATES, ['message', 'edited_message', 'callback_query']);
+  const orig = globalThis.fetch; let url;
+  globalThis.fetch = async (u) => { url = u; return { ok: true, json: async () => ({ ok: true, result: [] }) }; };
+  try { await fetchUpdates('T', 5); } finally { globalThis.fetch = orig; }
+  assert.match(decodeURIComponent(url), /allowed_updates=\["message","edited_message","callback_query"\]/);
+});
