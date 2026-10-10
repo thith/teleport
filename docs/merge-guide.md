@@ -26,6 +26,14 @@ Quyền: **admin**. Gửi trong DM với bot, hoặc trong topic nhóm thêm ti�
 
 Trong **DM riêng với bot**, dán tin nhắn **chỉ gồm** link PR (một hoặc nhiều, cách nhau bởi dấu cách/xuống dòng). Daemon kiểm tra như `/merge` nhưng chưa merge gì, rồi trả về tóm tắt kèm nút **[✅ Merge] [✖ Huỷ]**. Bấm Merge là merge (mỗi nút chỉ dùng được một lần, hết hạn sau 15 phút). Dán link trong topic nhóm, hoặc tin có kèm chữ khác, thì không có tác dụng.
 
+## Đóng PR (không merge)
+
+```
+/m <URL PR> [<URL PR> …] --close
+```
+
+Đóng PR đang mở mà không merge, **giữ nguyên branch** để còn mở lại được. Khi dán link vào DM với bot: PR merge được thì có nút **[✅ Merge] [🚫 Close] [✖ Huỷ]**; PR còn mở nhưng không merge được (conflict, CI fail…) thì chỉ có **[🚫 Close] [✖ Huỷ]**.
+
 ## Daemon kiểm tra gì trước khi merge
 
 - PR phải **đang mở**, không phải draft, không có conflict. Nếu GitHub chưa tính xong trạng thái conflict (thường xảy ra ngay sau lần merge trước trong cùng lệnh), lệnh tự đợi vài giây.

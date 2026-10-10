@@ -455,11 +455,11 @@ test('handlePrLinks: runs merge.mjs --preview (no merge) and offers buttons only
   assert.deepEqual(c2[0], ['/s/merge.mjs', '--rebase', L1, '--preview']);
   assert.equal(calls[0].opts.cwd, '/w');
   assert.equal(buttons.length, 1);
-  assert.match(buttons[0].t, /🔎 PR #3 ready[\s\S]*Merge this PR\?/);
-  assert.deepEqual(buttons[0].b.map((x) => x.text), ['✅ Merge', '✖ Huỷ']);
+  assert.match(buttons[0].t, /🔎 PR #3 ready[\s\S]*Merge or close this PR\?/);
+  assert.deepEqual(buttons[0].b.map((x) => x.text), ['✅ Merge', '🚫 Close', '✖ Huỷ']);
   assert.match(buttons[0].b[0].callback_data, /^mg:[0-9a-f]{16}$/);
   assert.equal(store.size, 1);
-  // not mergeable → plain text, no buttons, nothing stored
+  // not mergeable AND not closable → plain text, no buttons, nothing stored
   await handlePrLinks([L1], { chat: { id: 1 }, from: { id: 1 } }, ctx(async () => { throw Object.assign(new Error('x'), { stdout: '❌ PR #3: draft' }); }));
   assert.equal(buttons.length, 1);
   assert.match(texts.at(-1), /draft/);
@@ -534,4 +534,22 @@ test('startupGreeting / gitShortHead: the owner hears about every (re)start, wit
   assert.doesNotMatch(startupGreeting({ pid: 42, commit: null, commands: 3 }), /code/);
   assert.equal(gitShortHead(() => 'deadbee\n'), 'deadbee');
   assert.equal(gitShortHead(() => { throw new Error('not a repo'); }), null);
+});
+
+test('handlePrLinks: not mergeable but still open → only [Close] [Huỷ]; Merge press on it is refused; Close dispatches --close', async () => {
+  const buttons = [], store = new Map();
+  const runner = async (bin, argv) => { if (argv.includes('--close')) return { stdout: 'open' }; throw Object.assign(new Error('x'), { stdout: '❌ conflicts' }); };
+  await handlePrLinks([L1], { chat: { id: 1 }, from: { id: 1 } }, { daemonUserId: '1', projectsConfig: OWNER_CFG, registry: MREG, store,
+    sendText: async () => {}, sendButtons: async (c, t, b) => buttons.push({ t, b }), runner, scriptsDir: '/s', parentDir: '/w' });
+  assert.deepEqual(buttons[0].b.map((x) => x.text), ['🚫 Close', '✖ Huỷ']);
+  assert.match(buttons[0].t, /❌ conflicts[\s\S]*Can't merge — close this PR without merging\?/);
+  const tok = buttons[0].b[0].callback_data.slice(3);
+  const dispatched = [];
+  const ctx = { answerButton: async () => {}, editButtonsMessage: async () => {} };
+  const take = (t) => takeMergeButton(t, { store });
+  const cq = (data) => ({ id: 'q', data, from: { id: 1 }, message: { chat: { id: 1 }, message_id: 5, text: 'p' } });
+  await handleMergeButton(cq(`mg:${tok}`), ctx, { take: (t) => ({ ...store.get(t), _: take }), dispatch: async (p) => dispatched.push(p) });
+  assert.equal(dispatched.length, 0, 'forged Merge on a close-only preview is refused');
+  await handleMergeButton(cq(`cl:${tok}`), ctx, { take, dispatch: async (p) => dispatched.push(p) });
+  assert.deepEqual(dispatched, [{ cmd: 'merge', rest: `${L1} --close` }]);
 });

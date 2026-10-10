@@ -88,6 +88,7 @@ function fakeGh(prs, { defaultBranch = 'main', unknownFor = {}, tips = {} } = {}
     }
     if (args[0] === 'pr' && args[1] === 'list') return JSON.stringify(Object.values(prs).filter((p) => p.state === 'OPEN'));
     if (args[0] === 'api' && args[2] === 'DELETE') return '';
+    if (args[0] === 'api' && args[2] === 'PATCH') { const n = args[3].match(/pulls\/(\d+)$/)[1]; prs[n].state = 'CLOSED'; return '{}'; }
     throw new Error('unexpected ' + args.join(' '));
   };
   return { gh, calls };
@@ -264,4 +265,22 @@ test('preview: checks everything, never PUTs/DELETEs; batch preview still flags 
   assert.match(s2.text, /⏹ #11 can't be merged/);
   assert.equal(f.calls.some((c) => c[2] === 'PUT'), false);
   assert.equal(parseMergeArgs(['https://github.com/a/b/pull/1', '--preview']).preview, true);
+});
+
+test('--close: closes open PRs without merging (branch kept); refuses merged/closed; preview changes nothing; batch stops at first failure', async () => {
+  let f = fakeGh({ 5: PR(5) });
+  const r = await mergeMany({ ...ARGS([5]), close: true }, { gh: f.gh });
+  assert.equal(r.ok, true, r.text);
+  assert.match(r.text, /🚫 closed PR #5 "t5" without merging \(branch kept\)/);
+  assert.deepEqual(f.calls.find((c) => c[2] === 'PATCH'), ['api', '-X', 'PATCH', 'repos/{owner}/{repo}/pulls/5', '-f', 'state=closed']);
+  assert.equal(f.calls.some((c) => c[2] === 'PUT' || c[2] === 'DELETE'), false);
+  f = fakeGh({ 5: PR(5, { state: 'MERGED' }), 6: PR(6) });
+  const r2 = await mergeMany({ ...ARGS([5, 6]), close: true }, { gh: f.gh });
+  assert.match(r2.text, /merged, not open[\s\S]*stopped\. closed: none · not attempted: #6/);
+  assert.equal(f.calls.some((c) => c[2] === 'PATCH'), false);
+  f = fakeGh({ 5: PR(5, { mergeable: 'CONFLICTING' }) });
+  const p = await mergeMany({ ...ARGS([5]), close: true, preview: true }, { gh: f.gh });
+  assert.match(p.text, /is open — can be closed/, 'a conflicting PR can still be closed');
+  assert.equal(f.calls.some((c) => c[0] === 'api'), false);
+  assert.equal(parseMergeArgs(['https://github.com/a/b/pull/1', '--close']).close, true);
 });
