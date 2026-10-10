@@ -74,7 +74,8 @@ Usage:
   node spawn.mjs --list | --ls                        list running agent sessions
   node spawn.mjs --attach|--resume [<id>]             re-attach your terminal to a session
   node spawn.mjs --kill|--quit <id>                   gracefully tear a session down
-  node spawn.mjs --kill pid:<PID> [--restart]         SIGTERM one claude process (daemon owner only);
+  node spawn.mjs --kill pid:<PID>|name:<name> [--restart]
+                                                      SIGTERM one claude process (daemon owner only);
                                                       --restart then resumes its session in a screen
   node spawn.mjs --help | -h                          show this help
 
@@ -102,6 +103,8 @@ Manage sessions (interactive/screen only):
     (--resume)       Omit <id> when exactly one session is live. Detach: Ctrl-A D.
   --kill <id>        send /exit, wait up to ${KILL_GRACE_MS / 1000}s, then force-quit.
     (--quit)         Needs the FULL hashtag (no shortcuts — it's destructive).
+  --kill name:<name> same, picking the process by its session name or Telegram persona
+                     (full name, emoji/case ignored; must match exactly one — see --list).
   --kill pid:<PID>   SIGTERM a \`claude\` process of this user, wait up to ${KILL_PID_GRACE_MS / 1000}s,
                      never SIGKILL. Only via the daemon, only for its owner
                      (TELE_FROM_ID must equal projects.json _config.daemonUserId);
@@ -840,10 +843,38 @@ export function checkPidKillAuth({ fromId, daemonUserId }) {
 /** The `pid:<N>` target after --kill/--quit, tolerating `pid: N` split into two tokens. */
 export function resolveKillPid(argv) {
   const i = argv.findIndex((a) => a === '--kill' || a === '--quit');
+  // `name:<persona or session name>` — the words after `name:` up to the next
+  // --flag (so both `name:"Rắn 3"` and unquoted `name:Rắn 3` work).
+  if (i !== -1 && /^name:/i.test(argv[i + 1] ?? '')) {
+    const words = [argv[i + 1].slice(5)];
+    for (let j = i + 2; j < argv.length && !argv[j].startsWith('--'); j++) words.push(argv[j]);
+    const name = words.join(' ').trim();
+    return name ? { found: true, name } : { found: true, error: 'name: needs a name, e.g. name:"Rắn 3" (see /ls).' };
+  }
   if (i === -1 || !/^pid:/i.test(argv[i + 1] ?? '')) return { found: false };
   const raw = argv[i + 1] === 'pid:' || /^pid:$/i.test(argv[i + 1]) ? `pid:${argv[i + 2] ?? ''}` : argv[i + 1];
   const pid = parseKillPidArg(raw);
   return pid ? { found: true, pid } : { found: true, error: `bad pid target ${JSON.stringify(raw)} — use pid:<PID> (see /ls).` };
+}
+
+/** Name → comparable form: drop emoji/symbols, collapse spaces, lowercase. Pure. */
+export function normalizeAgentName(s) {
+  return String(s ?? '').normalize('NFC').replace(/[^\p{L}\p{N}\s]/gu, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+/**
+ * Resolve `name:` to exactly one live claude process: a FULL-name match (case,
+ * emoji and punctuation ignored) against the session name or the Telegram persona
+ * shown in /ls. 0 or ≥2 matches → { error } listing candidates. Pure.
+ */
+export function matchProcsByName(name, rows, personaOf = () => null) {
+  const q = normalizeAgentName(name);
+  if (!q) return { error: 'empty name.' };
+  const hits = rows.filter((r) => [r.name, personaOf(r)].some((n) => n && normalizeAgentName(n) === q));
+  const label = (r) => `PID ${r.pid}${r.name ? ` (${r.name})` : ''}`;
+  if (hits.length === 1) return { pid: hits[0].pid };
+  if (!hits.length) return { error: `no claude process named "${name}" (see /ls for names).` };
+  return { error: `"${name}" matches ${hits.length} processes: ${hits.map(label).join(', ')} — use /kill pid:<PID>.` };
 }
 
 export const KILL_PID_AUDIT_FILE = path.join(path.dirname(fileURLToPath(import.meta.url)), 'tmp', 'kill-pid-audit.jsonl');
@@ -1075,9 +1106,17 @@ if (isDirectRun) {
     const daemonUserId = resolveDaemonUserId(readProjectsConfig(path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'projects.json')), { env: {} });
     const auth = checkPidKillAuth({ fromId, daemonUserId });
     if (auth.error) {
-      appendKillAudit({ pid: killPid.pid, fromId, result: 'denied', reason: auth.error });
+      appendKillAudit({ pid: killPid.pid ?? null, name: killPid.name ?? null, fromId, result: 'denied', reason: auth.error });
       console.error(`[spawn] ❌ ${auth.error}`);
       process.exit(1);
+    }
+    if (killPid.name) {
+      // Owner only from here (no process list for anyone else).
+      const pmap = personaByHashtag();
+      const m = matchProcsByName(killPid.name, listClaudeProcs(), (r) => (r.hashtag && pmap[r.hashtag] ? formatPersona(pmap[r.hashtag]) : null));
+      if (m.error) { appendKillAudit({ name: killPid.name, fromId, result: 'refused', reason: m.error }); console.error(`[spawn] ❌ ${m.error}`); process.exit(1); }
+      console.log(`[spawn] name "${killPid.name}" → PID ${m.pid}`);
+      killPid.pid = m.pid;
     }
     const restart = argv.includes('--restart');
     let restartMode = DEFAULT_PERMISSION_MODE;

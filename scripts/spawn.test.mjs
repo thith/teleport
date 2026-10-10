@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 // Isolate the persona pin store so `--list` persona mapping DERIVES instead of
 // reading machine-local pins (resolved at call-time from TELE_PERSONA_STORE).
 process.env.TELE_PERSONA_STORE = path.join(os.tmpdir(), `teleport-persona-store-spawn-${process.pid}.jsonl`);
-import { buildSpawnPlan, genSessionSeed, runSpawn, childLaunch, loginSeedEnv, wrapInLoginShell, scrubClaudeEnv, SEED_PATH, hasBinary, screenSessionExists, normalizeSessionName, parseScreenSessions, listSpawnSessions, resolveKillId, resolveAttachId, resolveAttachTarget, formatSessionList, resolveMode, SPAWN_PROMPT, PERMISSION_MODES, DEFAULT_PERMISSION_MODE, USAGE, personaByHashtag, gracefulKill, KILL_GRACE_MS, RESUME_PROMPT, resolveResumeSession, checkResumePreflight, findTranscriptDirs, checkPidKillAuth, resolveKillPid, appendKillAudit, acquireResumeLock, acquireResumeFileLock, performResume, checkRestartTarget, checkRestartPreflight, RESUME_LOCK_STALE_MS, resumeLockSecret, inSystemdService, escapeServiceCgroup, SYSTEMD_SCOPE_PREFIX } from './spawn.mjs';
+import { buildSpawnPlan, genSessionSeed, runSpawn, childLaunch, loginSeedEnv, wrapInLoginShell, scrubClaudeEnv, SEED_PATH, hasBinary, screenSessionExists, normalizeSessionName, parseScreenSessions, listSpawnSessions, resolveKillId, resolveAttachId, resolveAttachTarget, formatSessionList, resolveMode, SPAWN_PROMPT, PERMISSION_MODES, DEFAULT_PERMISSION_MODE, USAGE, personaByHashtag, gracefulKill, KILL_GRACE_MS, RESUME_PROMPT, resolveResumeSession, checkResumePreflight, findTranscriptDirs, checkPidKillAuth, resolveKillPid, normalizeAgentName, matchProcsByName, appendKillAudit, acquireResumeLock, acquireResumeFileLock, performResume, checkRestartTarget, checkRestartPreflight, RESUME_LOCK_STALE_MS, resumeLockSecret, inSystemdService, escapeServiceCgroup, SYSTEMD_SCOPE_PREFIX } from './spawn.mjs';
 import fs from 'node:fs';
 import { uuidToConvoInt } from './convo-registry.mjs';
 import { shortConvoHash } from './convo-hash.mjs';
@@ -494,7 +494,7 @@ const hasFlagToken = (usage, flag) =>
 test('USAGE documents every flag, mode, and the hard-coded prompt (drift guard)', () => {
   // Each user-facing flag / alias must appear in --help as a standalone token so
   // the text can't drift away from the direct-run dispatch.
-  for (const flag of ['-i', '--interactive', '--mode', '--list', '--ls', '--attach', '--resume', '--kill', '--quit', '--help', '-h', '--resume-session', '--hashtag', 'pid:', '--restart']) {
+  for (const flag of ['-i', '--interactive', '--mode', '--list', '--ls', '--attach', '--resume', '--kill', '--quit', '--help', '-h', '--resume-session', '--hashtag', 'pid:', 'name:', '--restart']) {
     assert.ok(hasFlagToken(USAGE, flag), `USAGE missing standalone flag ${flag}`);
   }
   // Sanity-check the guard itself distinguishes a short alias from its long form:
@@ -1005,4 +1005,26 @@ test('resumeLockSecret: created once with mode 0600, stable; the lock name depen
   assert.match((await acquireResumeLock(GIUN, { dir: d2, platform: 'linux' })).error, /readable by others/);
   assert.equal(fs.readdirSync(dir).filter((f) => f.startsWith('.resume-lock-secret.')).length, 0, 'no temp files left');
   fs.rmSync(dir, { recursive: true, force: true }); fs.rmSync(d2, { recursive: true, force: true });
+});
+
+test('resolveKillPid: name: — quoted (one token) or unquoted (words up to the next flag)', () => {
+  assert.deepEqual(resolveKillPid(['--kill', 'name:Rắn 3', '--restart']), { found: true, name: 'Rắn 3' });
+  assert.deepEqual(resolveKillPid(['--kill', 'name:Rắn', '3', '--restart']), { found: true, name: 'Rắn 3' });
+  assert.deepEqual(resolveKillPid(['--kill', 'name:', 'Giun']), { found: true, name: 'Giun' });
+  assert.match(resolveKillPid(['--kill', 'name:']).error, /needs a name/);
+});
+
+test('matchProcsByName: full name via session name or persona; emoji/case ignored; ambiguity refused', () => {
+  const rows = [
+    { pid: 1, name: '🐍 Rắn 3', hashtag: 'a' }, { pid: 2, name: '🐍 Rắn', hashtag: 'b' },
+    { pid: 3, name: '🧚 UmiApp', hashtag: 'c' }, { pid: 4, name: 'digesty-a7', hashtag: 'd' }, { pid: 5, name: null, hashtag: 'e' },
+  ];
+  const persona = (r) => ({ c: '🧚 Tiên', d: '🦛 Hà Mã', e: '🦛 Hà Mã' })[r.hashtag] || null;
+  assert.deepEqual(matchProcsByName('Rắn 3', rows, persona), { pid: 1 });
+  assert.deepEqual(matchProcsByName('rắn', rows, persona), { pid: 2 }, 'full name, not substring of "Rắn 3"');
+  assert.deepEqual(matchProcsByName('🧚 tiên', rows, persona), { pid: 3 }, 'persona works too');
+  assert.deepEqual(matchProcsByName('UmiApp', rows, persona), { pid: 3 });
+  assert.match(matchProcsByName('Hà Mã', rows, persona).error, /matches 2 processes: PID 4 \(digesty-a7\), PID 5/);
+  assert.match(matchProcsByName('Cú', rows, persona).error, /no claude process named/);
+  assert.equal(normalizeAgentName(' 🐍  Rắn   3 '), 'rắn 3');
 });
