@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 // Isolate the persona pin store so `--list` persona mapping DERIVES instead of
 // reading machine-local pins (resolved at call-time from TELE_PERSONA_STORE).
 process.env.TELE_PERSONA_STORE = path.join(os.tmpdir(), `teleport-persona-store-spawn-${process.pid}.jsonl`);
-import { buildSpawnPlan, genSessionSeed, runSpawn, childLaunch, loginSeedEnv, wrapInLoginShell, scrubClaudeEnv, SEED_PATH, hasBinary, screenSessionExists, normalizeSessionName, parseScreenSessions, listSpawnSessions, resolveKillId, resolveAttachId, resolveAttachTarget, formatSessionList, resolveMode, SPAWN_PROMPT, PERMISSION_MODES, DEFAULT_PERMISSION_MODE, USAGE, personaByHashtag, gracefulKill, KILL_GRACE_MS, RESUME_PROMPT, resolveResumeSession, checkResumePreflight, findTranscriptDirs, checkPidKillAuth, resolveKillPid, appendKillAudit, acquireResumeLock, performResume, checkRestartTarget } from './spawn.mjs';
+import { buildSpawnPlan, genSessionSeed, runSpawn, childLaunch, loginSeedEnv, wrapInLoginShell, scrubClaudeEnv, SEED_PATH, hasBinary, screenSessionExists, normalizeSessionName, parseScreenSessions, listSpawnSessions, resolveKillId, resolveAttachId, resolveAttachTarget, formatSessionList, resolveMode, SPAWN_PROMPT, PERMISSION_MODES, DEFAULT_PERMISSION_MODE, USAGE, personaByHashtag, gracefulKill, KILL_GRACE_MS, RESUME_PROMPT, resolveResumeSession, checkResumePreflight, findTranscriptDirs, checkPidKillAuth, resolveKillPid, appendKillAudit, acquireResumeLock, performResume, checkRestartTarget, checkRestartPreflight } from './spawn.mjs';
 import fs from 'node:fs';
 import { uuidToConvoInt } from './convo-registry.mjs';
 import { shortConvoHash } from './convo-hash.mjs';
@@ -730,4 +730,18 @@ test('checkRestartTarget: needs a real (non-guessed) session id, a cwd and its t
   assert.match(checkRestartTarget({ ...t, guessed: true }, { transcriptDirs: ['-w-umipay'] }).error, /only a guess/);
   assert.match(checkRestartTarget({ ...t, cwd: null }, { transcriptDirs: ['-w-umipay'] }).error, /working directory/);
   assert.match(checkRestartTarget(t, { transcriptDirs: ['-w-other'] }).error, /no transcript/);
+});
+
+test('checkRestartPreflight: pre-kill catches every knowable post-kill refusal; ignores the target itself', () => {
+  const t = { pid: 830318, sessionId: GIUN, guessed: false, cwd: '/w/umipay' };
+  const base = { screenExists: false, transcriptDirs: ['-w-umipay'] };
+  // the target holds its own session — that must NOT block (it is about to be killed)
+  assert.deepEqual(checkRestartPreflight(t, { ...base, procs: [t] }), { ok: true });
+  // another unidentified claude in the same cwd → refuse before killing
+  assert.match(checkRestartPreflight(t, { ...base, procs: [t, { pid: 9, sessionId: null, cwd: '/w/umipay' }] }).error, /PID 9/);
+  // a second live holder of the same session → refuse
+  assert.match(checkRestartPreflight(t, { ...base, procs: [t, { pid: 10, sessionId: GIUN, cwd: '/w/umipay' }] }).error, /still held by live claude PID 10/);
+  assert.match(checkRestartPreflight(t, { ...base, procs: [t], screenExists: true }).error, /already exists/);
+  assert.match(checkRestartPreflight(t, { ...base, procs: null, procsError: 'ps failed' }).error, /ps failed/);
+  assert.match(checkRestartPreflight({ ...t, guessed: true }, { ...base, procs: [t] }).error, /only a guess/);
 });

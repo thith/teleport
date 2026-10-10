@@ -618,6 +618,24 @@ export function checkRestartTarget(target, { transcriptDirs }) {
   return { ok: true };
 }
 
+/**
+ * Full pre-kill check for `--restart`: the target itself (checkRestartTarget) AND
+ * every refusal the post-kill resume would hit (checkResumePreflight with the
+ * target pid excluded — it is about to die): an unidentified claude in the same
+ * cwd, an existing screen, a failed ps. So "killed, but restart failed" can only
+ * come from something that changed in between, never from a knowable refusal. Pure.
+ */
+export function checkRestartPreflight(target, { procs, procsError = null, screenExists, transcriptDirs }) {
+  const rc = checkRestartTarget(target, { transcriptDirs });
+  if (rc.error) return rc;
+  const plan = buildSpawnPlan({ interactive: true, resumeSessionId: target.sessionId });
+  return checkResumePreflight({
+    sessionId: target.sessionId, sessionName: plan.sessionName, cwd: target.cwd,
+    procs: Array.isArray(procs) ? procs.filter((r) => r.pid !== target.pid) : procs, procsError,
+    screenExists, transcriptDirs,
+  });
+}
+
 /** Project dirs under ~/.claude/projects that hold `<sessionId>.jsonl`. */
 export function findTranscriptDirs(sessionId, projectsDir = PROJECTS_DIR) {
   const out = [];
@@ -841,8 +859,16 @@ if (isDirectRun) {
         console.error(`[spawn] --mode needs one of: ${PERMISSION_MODES.join(', ')} (default ${DEFAULT_PERMISSION_MODE}).`); process.exit(1);
       }
       if (!hasBinary('claude') || !hasBinary('screen')) { console.error('[spawn] --restart needs `claude` and `screen` on PATH.'); process.exit(1); }
-      const pre = listClaudeProcs().find((row) => row.pid === killPid.pid) || null;
-      const rc = checkRestartTarget(pre, { transcriptDirs: pre?.sessionId ? findTranscriptDirs(pre.sessionId) : [] });
+      let procs = null, procsError = null;
+      try { procs = listClaudeProcs({ strict: true }); } catch (e) { procsError = e.message; }
+      const pre = procs?.find((row) => row.pid === killPid.pid) || null;
+      const sessionName = pre?.sessionId && !pre.guessed ? buildSpawnPlan({ interactive: true, resumeSessionId: pre.sessionId }).sessionName : null;
+      const rc = procsError
+        ? { error: `cannot restart: ${procsError}.` }
+        : checkRestartPreflight(pre, {
+          procs, screenExists: sessionName ? screenSessionExists(sessionName) : false,
+          transcriptDirs: pre?.sessionId ? findTranscriptDirs(pre.sessionId) : [],
+        });
       if (rc.error) {
         appendKillAudit({ pid: killPid.pid, fromId, result: 'refused', reason: rc.error, restart: true });
         console.error(`[spawn] ❌ ${rc.error} Nothing was killed.`);

@@ -82,10 +82,14 @@ Monitor listener** (with `--first-run`) — exactly: *you were just restarted �
 (`mailbox.mjs check`) → re-arm the Telegram Monitor → greet in your topic*, then work its queue. It keeps its persona,
 convo and topic. Run it from the
 **session's project** (its transcript must be in that folder). It **refuses** while a live `claude` process still
-holds the session (two writers = corrupt transcript) — stop that one first:
+holds the session (two writers = corrupt transcript), when a `claude` in the same folder has **no session file**
+(it might be the holder — a transcript guess is never proof), when `ps` fails (unknown ≠ nothing running), or while
+another resume of the same session is in progress (per-session lock) — stop the holder first:
 - **`/kill pid:<PID>`** (daemon, **owner only**) — SIGTERM one `claude` process of this user (PID from `/ls`); checks
   uid + `comm == claude`, waits ≤10s, never SIGKILLs, audits to `scripts/tmp/kill-pid-audit.jsonl`. Agents do **not**
   run this themselves (the owner gate is TELE_FROM_ID from the daemon; forging it is out of contract).
+  The owner id comes from `projects.json` `_config.daemonUserId` only (the deprecated `.env DAEMON_CHAT_ID` is not
+  read here → "no daemon owner configured").
 - **`/kill pid:<PID> --restart`** = both in one: SIGTERM, wait for exit, then resume that session in screen
   `tele-<hashtag>` in its **old cwd**. Everything the restart needs (a session id from the session file — never a
   guess — and its transcript) is checked **before** killing, so a doomed restart kills nothing.

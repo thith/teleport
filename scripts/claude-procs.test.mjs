@@ -7,6 +7,7 @@ import {
   parsePsOutput, parseSessionFile, cwdToProjectSlug, hashtagForSession, styFromEnviron,
   procStartFromStat, screenFromAncestors, buildProcRows, formatAgentList, parseKillPidArg, findUnidentifiedProcs,
   checkKillTarget, killClaudePid, findProcForSession, etimeToSeconds, guessSessionFromTranscripts,
+  inspectPid, readPs, listClaudeProcs,
 } from './claude-procs.mjs';
 
 const SID = '971e709e-2629-4d22-9943-40a52ee04a6b'; // hashtag #a7611284 (verified live)
@@ -256,4 +257,59 @@ test('findProcForSession: exact or guessed holder counts', () => {
   assert.equal(findProcForSession(SID, rows).pid, 1);
   assert.equal(findProcForSession(SID2, rows).pid, 2);
   assert.equal(findProcForSession('x', rows), null);
+});
+
+// ── Side-effecting layer with fixtures (the real kill gate) ───────────────────
+const STAT = (start) => `123 (claude) S 1 123 123 0 -1 4194560 1 2 3 4 5 6 7 8 20 0 12 0 ${start} 100 200`;
+function procFixture(entries) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'procfx-'));
+  for (const [pid, e] of Object.entries(entries)) {
+    const d = path.join(dir, pid); fs.mkdirSync(d);
+    fs.writeFileSync(path.join(d, 'comm'), `${e.comm}\n`);
+    fs.writeFileSync(path.join(d, 'status'), `Name:\t${e.comm}\nUid:\t${e.uid}\t${e.uid}\t${e.uid}\t${e.uid}\nGid:\t${e.gid}\t${e.gid}\t${e.gid}\t${e.gid}\n`);
+    fs.writeFileSync(path.join(d, 'stat'), STAT(e.start));
+  }
+  return dir;
+}
+
+test('inspectPid (/proc): uid from the Uid line (not Gid), comm trimmed, start = stat field 22; gone → null', () => {
+  const dir = procFixture({ 123: { comm: 'claude', uid: 1001, gid: 1000, start: '777' } });
+  assert.deepEqual(inspectPid(123, { procDir: dir }), { uid: 1001, comm: 'claude', start: '777' });
+  assert.equal(inspectPid(999, { procDir: dir, exec: () => { throw new Error('must not fall back to ps'); } }), null);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('inspectPid (no /proc): ps -p fallback with lstart as the start fingerprint', () => {
+  const calls = [];
+  const exec = (bin, args) => { calls.push([bin, ...args]); return ' 501 /Applications/claude Mon Oct  6 09:00:00 2026\n'; };
+  assert.deepEqual(inspectPid(42, { procDir: '/nonexistent-proc', exec }), { uid: 501, comm: 'claude', start: 'Mon Oct  6 09:00:00 2026' });
+  assert.deepEqual(calls[0], ['ps', '-p', '42', '-o', 'uid=,comm=,lstart=']);
+  assert.equal(inspectPid(42, { procDir: '/nonexistent-proc', exec: () => { throw new Error('no such pid'); } }), null);
+});
+
+test('readPs: null on failure or empty output (unknown ≠ nothing running)', () => {
+  assert.equal(readPs(() => { throw new Error('ps missing'); }), null);
+  assert.equal(readPs(() => ''), null);
+  assert.equal(readPs(() => PS).length, 6);
+});
+
+test('listClaudeProcs: strict throws on ps failure, lenient → []; session file must match its pid', () => {
+  const failing = () => { throw new Error('ps missing'); };
+  assert.throws(() => listClaudeProcs({ uid: 1000, exec: failing, strict: true }), /ps failed/);
+  assert.deepEqual(listClaudeProcs({ uid: 1000, exec: failing }), []);
+  const sdir = fs.mkdtempSync(path.join(os.tmpdir(), 'sessfx-'));
+  // 830318.json claims to be pid 1 → must be ignored
+  fs.writeFileSync(path.join(sdir, '830318.json'), JSON.stringify({ pid: 1, sessionId: SID, cwd: '/w' }));
+  fs.writeFileSync(path.join(sdir, '1129421.json'), JSON.stringify({ pid: 1129421, sessionId: SID2, cwd: '/w/d', name: 'a7' }));
+  const rows = listClaudeProcs({ uid: 1000, exec: () => PS, sessionsDir: sdir, procDir: '/nonexistent-proc', projectsDir: '/nonexistent-proj' });
+  assert.equal(rows.find((r) => r.pid === 830318).sessionId, null);
+  assert.equal(rows.find((r) => r.pid === 1129421).sessionId, SID2);
+  fs.rmSync(sdir, { recursive: true, force: true });
+});
+
+test('killClaudePid: a bad pid is refused BEFORE the slow describe() scan', async () => {
+  let described = 0;
+  const r = await killClaudePid(500, { uid: 1000, inspect: () => null, describe: () => { described++; return null; }, kill: () => {} });
+  assert.equal(r.ok, false);
+  assert.equal(described, 0);
 });
