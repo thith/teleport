@@ -1,15 +1,16 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { parseMergeArgs, summarizeChecks, assessPr, DEFAULT_MERGE_METHOD, branchRefPath, branchDeletable } from './merge.mjs';
+import { parseMergeArgs, summarizeChecks, assessPr, DEFAULT_MERGE_METHOD, branchRefPath, branchDeletable, mergeOne, mergeMany } from './merge.mjs';
 
 test('parseMergeArgs: pr number (#N ok), method, flags; errors on junk / two methods / missing pr', () => {
-  assert.deepEqual(parseMergeArgs(['12']), { pr: 12, method: DEFAULT_MERGE_METHOD, keepBranch: false, force: false });
+  assert.deepEqual(parseMergeArgs(['12']), { prs: [12], method: DEFAULT_MERGE_METHOD, keepBranch: false, force: false });
   assert.equal(DEFAULT_MERGE_METHOD, 'squash');
-  assert.deepEqual(parseMergeArgs(['#7', '--rebase', '--keep-branch', '--force']), { pr: 7, method: 'rebase', keepBranch: true, force: true });
+  assert.deepEqual(parseMergeArgs(['#7', '--rebase', '--keep-branch', '--force']), { prs: [7], method: 'rebase', keepBranch: true, force: true });
+  assert.deepEqual(parseMergeArgs(['12', '13', '#15']).prs, [12, 13, 15]);
+  assert.match(parseMergeArgs(['12', '12']).error, /twice/);
   assert.match(parseMergeArgs(['7', '--squash', '--merge']).error, /pick one/);
   assert.match(parseMergeArgs([]).error, /usage/);
   assert.match(parseMergeArgs(['0']).error, /usage/);
-  assert.match(parseMergeArgs(['7', '8']).error, /unexpected/);
   assert.match(parseMergeArgs(['7', '--admin']).error, /unexpected/);
 });
 
@@ -41,6 +42,8 @@ test('assessPr: refuses closed/merged, draft, conflicts, failing checks; pending
   assert.match(assessPr({ ...base, mergeStateStatus: 'BLOCKED' }).error, /blocked/);
   assert.deepEqual(assessPr({ ...base, mergeStateStatus: 'BLOCKED' }, { force: true }), { ok: true });
   assert.match(assessPr(null).error, /not found/);
+  assert.match(assessPr({ ...base, mergeable: 'UNKNOWN' }).error, /not finished/);
+  assert.deepEqual(assessPr({ ...base, mergeable: 'UNKNOWN' }, { force: true }), { ok: true });
 });
 
 test('branchRefPath: every segment encoded — # % ? { } cannot redirect the ref', () => {
@@ -57,4 +60,62 @@ test('branchDeletable: never the default branch or a branch another open PR uses
   assert.match(branchDeletable('feat/x', { defaultBranch: 'main', openPrs, selfNumber: 9 }).keep, /open PR #5/);
   assert.match(branchDeletable('feat/x', { defaultBranch: null, openPrs, selfNumber: 5 }).keep, /could not check/);
   assert.match(branchDeletable('feat/x', { defaultBranch: 'main', openPrs: null, selfNumber: 5 }).keep, /could not check/);
+});
+
+// Fake gh: a tiny in-memory GitHub.
+function fakeGh(prs, { defaultBranch = 'main', unknownFor = {} } = {}) {
+  const calls = [];
+  const gh = (args) => {
+    calls.push(args);
+    if (args[0] === 'pr' && args[1] === 'view') {
+      const p = prs[args[2]];
+      if (!p) throw Object.assign(new Error('x'), { stderr: 'no such PR' });
+      if (unknownFor[args[2]] > 0) { unknownFor[args[2]]--; return JSON.stringify({ ...p, mergeable: 'UNKNOWN' }); }
+      return JSON.stringify(p);
+    }
+    if (args[0] === 'api' && args[2] === 'PUT') { const n = args[3].match(/pulls\/(\d+)/)[1]; prs[n].state = 'MERGED'; return '{}'; }
+    if (args[0] === 'repo') return JSON.stringify({ defaultBranchRef: { name: defaultBranch } });
+    if (args[0] === 'pr' && args[1] === 'list') return JSON.stringify(Object.values(prs).filter((p) => p.state === 'OPEN'));
+    if (args[0] === 'api' && args[2] === 'DELETE') return '';
+    throw new Error('unexpected ' + args.join(' '));
+  };
+  return { gh, calls };
+}
+const PR = (n, extra = {}) => ({ number: n, title: `t${n}`, url: `u${n}`, state: 'OPEN', isDraft: false, mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', statusCheckRollup: [], headRefName: `feat/${n}`, headRefOid: `sha${n}`, baseRefName: 'main', isCrossRepository: false, ...extra });
+const ARGS = (prs, o = {}) => ({ prs, method: 'squash', keepBranch: false, force: false, ...o });
+
+test('mergeOne: pins sha, encodes the branch, deletes it; waits out UNKNOWN', async () => {
+  const { gh, calls } = fakeGh({ 3: PR(3, { headRefName: 'release#fix' }) }, { unknownFor: { 3: 2 } });
+  let slept = 0;
+  const r = await mergeOne(3, ARGS([3]), { gh, sleep: async () => { slept++; } });
+  assert.equal(r.ok, true, r.text);
+  assert.equal(slept, 2);
+  assert.deepEqual(calls.find((c) => c[2] === 'PUT'), ['api', '-X', 'PUT', 'repos/{owner}/{repo}/pulls/3/merge', '-f', 'merge_method=squash', '-f', 'sha=sha3']);
+  assert.deepEqual(calls.find((c) => c[2] === 'DELETE'), ['api', '-X', 'DELETE', 'repos/{owner}/{repo}/git/refs/heads/release%23fix']);
+});
+
+test('mergeOne: keep-branch / cross-repo → no delete; refused PR → nothing merged', async () => {
+  let f = fakeGh({ 3: PR(3) });
+  await mergeOne(3, ARGS([3], { keepBranch: true }), { gh: f.gh });
+  assert.equal(f.calls.some((c) => c[2] === 'DELETE'), false);
+  f = fakeGh({ 3: PR(3, { isCrossRepository: true }) });
+  await mergeOne(3, ARGS([3]), { gh: f.gh });
+  assert.equal(f.calls.some((c) => c[2] === 'DELETE'), false);
+  f = fakeGh({ 3: PR(3, { isDraft: true }) });
+  const r = await mergeOne(3, ARGS([3]), { gh: f.gh });
+  assert.equal(r.error, true);
+  assert.equal(f.calls.some((c) => c[2] === 'PUT'), false);
+});
+
+test('mergeMany: in order, stops at the first failure, reports merged / not attempted', async () => {
+  const { gh, calls } = fakeGh({ 1: PR(1), 2: PR(2, { mergeable: 'CONFLICTING' }), 3: PR(3) });
+  const r = await mergeMany(ARGS([1, 2, 3]), { gh, sleep: async () => {} });
+  assert.equal(r.ok, false);
+  assert.match(r.text, /merged PR #1/);
+  assert.match(r.text, /PR #2 "t2": PR has merge conflicts/);
+  assert.match(r.text, /stopped\. merged: #1 · not attempted: #3/);
+  assert.equal(calls.filter((c) => c[2] === 'PUT').length, 1);
+  const ok = await mergeMany(ARGS([1]), { gh: fakeGh({ 1: PR(1) }).gh });
+  assert.equal(ok.ok, true);
+  assert.doesNotMatch(ok.text, /stopped/);
 });

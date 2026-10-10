@@ -1,5 +1,6 @@
-// `/merge <project> <pr#> [--squash|--merge|--rebase] [--keep-branch] [--force]`
-// — a daemon command (admin): merge a GitHub PR of the project's repo.
+// `/merge <project> <pr#> [<pr#> …] [--squash|--merge|--rebase] [--keep-branch] [--force]`
+// — a daemon command (admin): merge GitHub PRs of the project's repo, in the
+// order given, stopping at the first one that can't be merged.
 //
 // It merges through the GitHub API (`gh api … /pulls/<n>/merge`), NOT
 // `gh pr merge`: the latter also switches/deletes branches in the LOCAL checkout,
@@ -19,9 +20,12 @@ import { isMainModule } from './is-direct-run.mjs';
 export const MERGE_METHODS = ['squash', 'merge', 'rebase'];
 export const DEFAULT_MERGE_METHOD = 'squash';
 
-/** argv (after the project token) → { pr, method, keepBranch, force } | { error }. Pure. */
+const USAGE_LINE = 'usage: /merge <project> <pr#> [<pr#> …] [--squash|--merge|--rebase] [--keep-branch] [--force]';
+
+/** argv (after the project token) → { prs, method, keepBranch, force } | { error }. Pure. */
 export function parseMergeArgs(argv) {
-  let pr = null, method = null, keepBranch = false, force = false;
+  const prs = [];
+  let method = null, keepBranch = false, force = false;
   for (const a of argv) {
     if (/^--(squash|merge|rebase)$/.test(a)) {
       const m = a.slice(2);
@@ -29,11 +33,15 @@ export function parseMergeArgs(argv) {
       method = m;
     } else if (a === '--keep-branch') keepBranch = true;
     else if (a === '--force') force = true;
-    else if (/^#?\d+$/.test(a) && pr == null) pr = Number(a.replace('#', ''));
-    else return { error: `unexpected argument ${JSON.stringify(a)}. Usage: /merge <project> <pr#> [--squash|--merge|--rebase] [--keep-branch] [--force]` };
+    else if (/^#?\d+$/.test(a)) {
+      const n = Number(a.replace('#', ''));
+      if (!Number.isSafeInteger(n) || n < 1) return { error: USAGE_LINE };
+      if (prs.includes(n)) return { error: `PR #${n} listed twice.` };
+      prs.push(n);
+    } else return { error: `unexpected argument ${JSON.stringify(a)}. ${USAGE_LINE}` };
   }
-  if (!pr || !Number.isSafeInteger(pr) || pr < 1) return { error: 'usage: /merge <project> <pr#> [--squash|--merge|--rebase] [--keep-branch] [--force]' };
-  return { pr, method: method || DEFAULT_MERGE_METHOD, keepBranch, force };
+  if (!prs.length) return { error: USAGE_LINE };
+  return { prs, method: method || DEFAULT_MERGE_METHOD, keepBranch, force };
 }
 
 const FAILING = new Set(['FAILURE', 'ERROR', 'CANCELLED', 'TIMED_OUT', 'ACTION_REQUIRED', 'STARTUP_FAILURE']);
@@ -58,6 +66,7 @@ export function assessPr(pr, { force = false } = {}) {
   if (pr.state !== 'OPEN') return { error: `PR is ${String(pr.state).toLowerCase()}, not open.` };
   if (pr.isDraft) return { error: 'PR is a draft.' };
   if (pr.mergeable === 'CONFLICTING') return { error: 'PR has merge conflicts.' };
+  if (pr.mergeable === 'UNKNOWN' && !force) return { error: 'GitHub has not finished computing mergeability — retry in a moment, or --force.' };
   const { failing, pending } = summarizeChecks(pr.statusCheckRollup);
   if (failing.length) return { error: `failing checks: ${failing.join(', ')}.` };
   if (pending.length && !force) return { error: `checks still running: ${pending.join(', ')} (wait, or --force).` };
@@ -83,25 +92,33 @@ export function branchDeletable(branch, { defaultBranch, openPrs, selfNumber }) 
   return { ok: true };
 }
 
-const gh = (args, opts = {}) => String(execFileSync('gh', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], ...opts }));
+const PR_FIELDS = 'number,title,url,state,isDraft,mergeable,mergeStateStatus,statusCheckRollup,headRefName,headRefOid,baseRefName,isCrossRepository';
 const ghError = (e) => String(e?.stderr || e?.message || e).trim().split('\n').slice(-3).join(' ');
 
-if (isMainModule(import.meta.url)) {
-  const args = parseMergeArgs(process.argv.slice(2));
-  if (args.error) { console.log(`❌ ${args.error}`); process.exit(1); }
+/**
+ * Merge one PR. `gh(args)` returns stdout or throws (injectable for tests).
+ * Waits (up to `unknownTries` × `unknownWaitMs`) while GitHub still reports
+ * mergeable=UNKNOWN — normal right after a previous merge in the same batch.
+ * Returns { ok, text } | { error, text }.
+ */
+export async function mergeOne(number, { method, keepBranch, force }, {
+  gh, sleep = (ms) => new Promise((r) => setTimeout(r, ms)), unknownTries = 5, unknownWaitMs = 2000,
+}) {
   let pr;
-  try {
-    pr = JSON.parse(gh(['pr', 'view', String(args.pr), '--json',
-      'number,title,url,state,isDraft,mergeable,mergeStateStatus,statusCheckRollup,headRefName,headRefOid,baseRefName,isCrossRepository']));
-  } catch (e) { console.log(`❌ cannot read PR #${args.pr}: ${ghError(e)}`); process.exit(1); }
-  const ok = assessPr(pr, { force: args.force });
-  if (ok.error) { console.log(`❌ PR #${pr.number} "${pr.title}": ${ok.error}\n${pr.url}`); process.exit(1); }
+  for (let i = 0; ; i++) {
+    try { pr = JSON.parse(gh(['pr', 'view', String(number), '--json', PR_FIELDS])); }
+    catch (e) { return { error: true, text: `❌ cannot read PR #${number}: ${ghError(e)}` }; }
+    if (pr.mergeable !== 'UNKNOWN' || i >= unknownTries) break;
+    await sleep(unknownWaitMs);
+  }
+  const ok = assessPr(pr, { force });
+  if (ok.error) return { error: true, text: `❌ PR #${pr.number} "${pr.title}": ${ok.error}\n${pr.url}` };
   try {
     gh(['api', '-X', 'PUT', `repos/{owner}/{repo}/pulls/${pr.number}/merge`,
-      '-f', `merge_method=${args.method}`, '-f', `sha=${pr.headRefOid}`]);
-  } catch (e) { console.log(`❌ merge of PR #${pr.number} failed: ${ghError(e)}\n${pr.url}`); process.exit(1); }
+      '-f', `merge_method=${method}`, '-f', `sha=${pr.headRefOid}`]);
+  } catch (e) { return { error: true, text: `❌ merge of PR #${pr.number} failed: ${ghError(e)}\n${pr.url}` }; }
   let branchNote = '';
-  if (!args.keepBranch && !pr.isCrossRepository) {
+  if (!keepBranch && !pr.isCrossRepository) {
     let defaultBranch = null, openPrs = null;
     try { defaultBranch = JSON.parse(gh(['repo', 'view', '--json', 'defaultBranchRef'])).defaultBranchRef?.name || null; } catch {}
     try { openPrs = JSON.parse(gh(['pr', 'list', '--state', 'open', '--limit', '200', '--json', 'number,headRefName,baseRefName'])); } catch {}
@@ -114,5 +131,31 @@ if (isMainModule(import.meta.url)) {
       } catch (e) { branchNote = `\n⚠️ merged, but deleting branch ${pr.headRefName} failed: ${ghError(e)}`; }
     }
   }
-  console.log(`✅ merged PR #${pr.number} "${pr.title}" into ${pr.baseRefName} (${args.method}).${branchNote}\n${pr.url}`);
+  return { ok: true, text: `✅ merged PR #${pr.number} "${pr.title}" into ${pr.baseRefName} (${method}).${branchNote}\n${pr.url}` };
+}
+
+/** Merge PRs in order; stop at the first failure and say what was / wasn't merged. */
+export async function mergeMany(args, deps) {
+  const lines = [], merged = [];
+  for (const n of args.prs) {
+    const r = await mergeOne(n, args, deps);
+    lines.push(r.text);
+    if (r.error) {
+      const rest = args.prs.slice(args.prs.indexOf(n) + 1);
+      if (args.prs.length > 1) lines.push(`⏹ stopped. merged: ${merged.length ? merged.map((x) => `#${x}`).join(', ') : 'none'}${rest.length ? ` · not attempted: ${rest.map((x) => `#${x}`).join(', ')}` : ''}`);
+      return { ok: false, text: lines.join('\n\n') };
+    }
+    merged.push(n);
+  }
+  return { ok: true, text: lines.join('\n\n') };
+}
+
+const ghCli = (args) => String(execFileSync('gh', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }));
+
+if (isMainModule(import.meta.url)) {
+  const args = parseMergeArgs(process.argv.slice(2));
+  if (args.error) { console.log(`❌ ${args.error}`); process.exit(1); }
+  const r = await mergeMany(args, { gh: ghCli });
+  console.log(r.text);
+  process.exit(r.ok ? 0 : 1);
 }

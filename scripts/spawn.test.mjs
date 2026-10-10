@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 // Isolate the persona pin store so `--list` persona mapping DERIVES instead of
 // reading machine-local pins (resolved at call-time from TELE_PERSONA_STORE).
 process.env.TELE_PERSONA_STORE = path.join(os.tmpdir(), `teleport-persona-store-spawn-${process.pid}.jsonl`);
-import { buildSpawnPlan, genSessionSeed, runSpawn, childLaunch, loginSeedEnv, wrapInLoginShell, scrubClaudeEnv, SEED_PATH, hasBinary, screenSessionExists, normalizeSessionName, parseScreenSessions, listSpawnSessions, resolveKillId, resolveAttachId, resolveAttachTarget, formatSessionList, resolveMode, SPAWN_PROMPT, PERMISSION_MODES, DEFAULT_PERMISSION_MODE, USAGE, personaByHashtag, gracefulKill, KILL_GRACE_MS, RESUME_PROMPT, resolveResumeSession, checkResumePreflight, findTranscriptDirs, checkPidKillAuth, resolveKillPid, appendKillAudit, acquireResumeLock, acquireResumeFileLock, performResume, checkRestartTarget, checkRestartPreflight, RESUME_LOCK_STALE_MS, inSystemdService, escapeServiceCgroup, SYSTEMD_SCOPE_PREFIX } from './spawn.mjs';
+import { buildSpawnPlan, genSessionSeed, runSpawn, childLaunch, loginSeedEnv, wrapInLoginShell, scrubClaudeEnv, SEED_PATH, hasBinary, screenSessionExists, normalizeSessionName, parseScreenSessions, listSpawnSessions, resolveKillId, resolveAttachId, resolveAttachTarget, formatSessionList, resolveMode, SPAWN_PROMPT, PERMISSION_MODES, DEFAULT_PERMISSION_MODE, USAGE, personaByHashtag, gracefulKill, KILL_GRACE_MS, RESUME_PROMPT, resolveResumeSession, checkResumePreflight, findTranscriptDirs, checkPidKillAuth, resolveKillPid, appendKillAudit, acquireResumeLock, acquireResumeFileLock, performResume, checkRestartTarget, checkRestartPreflight, RESUME_LOCK_STALE_MS, resumeLockSecret, inSystemdService, escapeServiceCgroup, SYSTEMD_SCOPE_PREFIX } from './spawn.mjs';
 import fs from 'node:fs';
 import { uuidToConvoInt } from './convo-registry.mjs';
 import { shortConvoHash } from './convo-hash.mjs';
@@ -982,4 +982,23 @@ test('performResume: no launch when beginLaunch fails; launchSucceeded on a veri
   const r2 = await performResume({ sessionId: GIUN, cwd: '/w/umipay' }, deps);
   assert.equal(r2.ok, true);
   assert.deepEqual(events.slice(-3), ['begin', 'succeeded', 'release']);
+});
+
+test('resumeLockSecret: created once with mode 0600, stable; the lock name depends on it (unguessable by other users)', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ksec-'));
+  const a = resumeLockSecret(dir);
+  assert.equal(resumeLockSecret(dir), a);
+  assert.equal(fs.statSync(path.join(dir, '.resume-lock-secret')).mode & 0o777, 0o600);
+  assert.ok(a.length >= 32);
+  // default name derives from the secret: two dirs (secrets) never collide, same dir does
+  const d2 = fs.mkdtempSync(path.join(os.tmpdir(), 'ksec-'));
+  const l1 = await acquireResumeLock(GIUN, { dir, platform: 'linux' });
+  assert.ok(l1.release);
+  assert.match((await acquireResumeLock(GIUN, { dir, platform: 'linux' })).error, /in progress/);
+  const l2 = await acquireResumeLock(GIUN, { dir: d2, platform: 'linux' });
+  assert.ok(l2.release, 'different secret → different name');
+  l1.release(); l2.release();
+  fs.writeFileSync(path.join(d2, '.resume-lock-secret'), 'short');
+  assert.match((await acquireResumeLock(GIUN, { dir: d2, platform: 'linux' })).error, /malformed/);
+  fs.rmSync(dir, { recursive: true, force: true }); fs.rmSync(d2, { recursive: true, force: true });
 });

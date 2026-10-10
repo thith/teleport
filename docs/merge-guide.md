@@ -5,13 +5,13 @@ Gửi file này cho agent đang làm trong project và nhờ nó: *"Soạn lện
 ## Cú pháp
 
 ```
-/merge <project> <số PR> [--squash|--merge|--rebase] [--keep-branch] [--force]
+/merge <project> <số PR> [<số PR> …] [--squash|--merge|--rebase] [--keep-branch] [--force]
 ```
 
 | Phần | Ý nghĩa |
 |---|---|
 | `<project>` | **Tên folder thật** của repo, nằm cạnh `teleport` trong `~/Projects`. Repo GitHub lấy từ `git remote` của folder đó. Với workspace umbrella (ví dụ `umipay` gom `be/`, `fe/`, `hub/`, `landing/` bằng symlink), phải dùng **folder thật của repo con** (đích của symlink, ví dụ `umipay-be`), không dùng `umipay/be`. Không phải tên repo GitHub, không phải đường dẫn. |
-| `<số PR>` | Số PR trên GitHub, viết `12` hoặc `#12`. Mỗi lệnh merge **một** PR. |
+| `<số PR>` | Số PR trên GitHub, viết `12` hoặc `#12`. Có thể ghi **nhiều PR**: chúng được merge lần lượt theo thứ tự đã ghi, gặp PR không merge được thì **dừng** và báo PR nào đã merge, PR nào chưa thử. Các PR trong một lệnh phải cùng một repo. |
 | `--squash` | Mặc định: gộp thành 1 commit. |
 | `--merge` / `--rebase` | Merge commit thường / rebase. Chỉ chọn một. |
 | `--keep-branch` | Giữ branch trên GitHub sau khi merge (mặc định là xoá). |
@@ -21,7 +21,7 @@ Quyền: **admin**. Gửi trong DM với bot, hoặc trong topic nhóm thêm ti�
 
 ## Daemon kiểm tra gì trước khi merge
 
-- PR phải **đang mở**, không phải draft, không có conflict.
+- PR phải **đang mở**, không phải draft, không có conflict. Nếu GitHub chưa tính xong trạng thái conflict (thường xảy ra ngay sau lần merge trước trong cùng lệnh), lệnh tự đợi vài giây.
 - Không có check CI nào **fail**. Còn check đang chạy thì phải đợi, hoặc dùng `--force`.
 - Merge ghim đúng commit vừa kiểm tra. Nếu có người push thêm giữa chừng, GitHub từ chối, chỉ cần gửi lại lệnh.
 - Merge qua GitHub API: **không đụng tới checkout local** của project.
@@ -35,12 +35,9 @@ Quyền: **admin**. Gửi trong DM với bot, hoặc trong topic nhóm thêm ti�
 4. Trả về danh sách lệnh, mỗi lệnh một dòng (để copy), kèm một dòng ghi chú cho mỗi PR. Ví dụ:
 
 ```
-/merge umipay 2
+/merge umipay 2 3
 ```
-```
-/merge umipay 3
-```
-(#2 KYT docs. #3 môi trường dev, không đụng file của #2.)
+(#2 KYT docs trước, rồi #3 môi trường dev. #3 không đụng file của #2.) PR ở repo khác thì viết lệnh riêng.
 
 5. **Không** tự gửi lệnh cho daemon và không đặt `--force` khi chưa nói rõ lý do.
 

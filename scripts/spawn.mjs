@@ -549,15 +549,34 @@ export function checkResumePreflight({ sessionId, sessionName, cwd, procs, procs
  * preflight. Returns { release, markFailed } or { error }.
  */
 export const RESUME_COOLDOWN_MS = 120_000;
+
+/**
+ * Per-install secret (0600 file) mixed into the abstract socket name: abstract
+ * sockets have no permissions, so a predictable name would let ANOTHER local user
+ * squat it and block every resume. Returns the secret or throws.
+ */
+export function resumeLockSecret(dir) {
+  const file = path.join(dir, '.resume-lock-secret');
+  fs.mkdirSync(dir, { recursive: true });
+  try { fs.writeFileSync(file, crypto.randomBytes(32).toString('hex'), { flag: 'wx', mode: 0o600 }); } catch (e) { if (e.code !== 'EEXIST') throw e; }
+  const secret = fs.readFileSync(file, 'utf8').trim();
+  if (secret.length < 32) throw new Error(`resume lock secret ${file} is malformed`);
+  return secret;
+}
+
 export async function acquireResumeLock(sessionId, {
   dir = path.join(path.dirname(fileURLToPath(import.meta.url)), 'tmp'),
   platform = process.platform, cooldownMs = RESUME_COOLDOWN_MS, now = Date.now,
-  name = `\0teleport-resume-${sessionId}`,
+  name = null,
   fileLock = (id) => acquireResumeFileLock(id, { dir }),
 } = {}) {
   const marker = path.join(dir, `resume-${sessionId}.failed`);
   let lock;
   if (platform === 'linux') {
+    if (!name) {
+      try { name = `\0teleport-resume-${crypto.createHash('sha256').update(`${resumeLockSecret(dir)}:${sessionId}`).digest('hex').slice(0, 40)}`; }
+      catch (e) { return { error: `cannot prepare the resume lock: ${e.message}` }; }
+    }
     lock = await new Promise((resolve) => {
       const server = net.createServer();
       server.once('error', (e) => resolve(e.code === 'EADDRINUSE'

@@ -162,7 +162,7 @@ It's driven by **one owner user** (`_config.daemonUserId`) and is a thin, **regi
 | `/instruct #<hash> <text>` | admin | official *private* instruction to a topic — nothing hits the group; the agent replies to you via DM (reply to continue) — alias `/i` |
 | `/pending` | member | convos waiting on an admin reply |
 | `/start` | public | onboarding help |
-| `/merge <project> <pr#> [--squash\|--merge\|--rebase] [--keep-branch] [--force]` | admin | merge a GitHub PR through the API (default squash, pinned to the checked head sha; refuses closed/draft/conflicting/failing — `--force` only skips pending checks / a BLOCKED state); deletes the head branch on GitHub; never touches the local checkout |
+| `/merge <project> <pr#> [<pr#> …] [--squash\|--merge\|--rebase] [--keep-branch] [--force]` | admin | merge GitHub PRs in order (stops at the first failure) through the API (default squash, pinned to the checked head sha; refuses closed/draft/conflicting/failing — `--force` only skips pending checks / a BLOCKED state); deletes the head branch on GitHub; never touches the local checkout |
 | `/restartd [--force]` | admin | restart the daemon when it runs as a systemd user service; refuses while `claude` agents still share its cgroup (unless `KillMode=process` or `--force`). Agents spawned/resumed now get their own `systemd-run --scope`, so they survive daemon restarts |
 | `/reload` | admin | re-read `commands.json` + `projects.json` without restarting (in-process built-in; owner id / heartbeat groups still need a restart) |
 
