@@ -704,7 +704,10 @@ export function acquireResumeFileLock(sessionId, {
         continue;
       }
       try {
-        if (read(file) === seen) { try { fs.unlinkSync(file); } catch {} }
+        // Re-check we still own the guard right before the destructive step: a
+        // straggler that cleared a "crashed" guard may have taken ours (narrows
+        // the window; this file lock is only the non-Linux fallback).
+        if (read(guard) === mine && read(file) === seen) { try { fs.unlinkSync(file); } catch {} }
       } finally {
         if (read(guard) === mine) { try { fs.unlinkSync(guard); } catch {} }
       }

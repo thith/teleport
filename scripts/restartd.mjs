@@ -59,19 +59,22 @@ export function claudesInCgroup(cgroupPath, { root = '/sys/fs/cgroup', procDir =
  * temporary `/kill --restartd` bridge in spawn.mjs (for a daemon whose registry
  * predates `restartd`).
  */
-export function runRestartd({ force = false, ppid = process.ppid } = {}) {
-  const svc = serviceFromCgroup(read(`/proc/${ppid}/cgroup`) || read('/proc/self/cgroup'));
+export function runRestartd({
+  force = false, ppid = process.ppid,
+  readFile = read, exec = execFileSync, listClaudes = (cg) => claudesInCgroup(cg),
+} = {}) {
+  const svc = serviceFromCgroup(readFile(`/proc/${ppid}/cgroup`) || readFile('/proc/self/cgroup'));
   if (!svc) return { error: 'the daemon is not running as a systemd service — restart it by hand (node scripts/daemon.mjs --stop, then start it again).' };
   let killMode = '';
-  try { killMode = String(execFileSync('systemctl', ['--user', 'show', svc.unit, '-p', 'KillMode', '--value'], { encoding: 'utf8' })).trim(); } catch {}
-  const claudes = claudesInCgroup(svc.cgroupPath);
+  try { killMode = String(exec('systemctl', ['--user', 'show', svc.unit, '-p', 'KillMode', '--value'], { encoding: 'utf8' })).trim(); } catch {}
+  const claudes = listClaudes(svc.cgroupPath);
   if (claudes == null && killMode !== 'process' && !force) {
     return { error: `cannot inspect the cgroup of ${svc.unit} to make sure no agent would be killed — use --force if you are sure.` };
   }
   const safe = checkRestartSafety({ killMode, claudes: claudes || [], force });
   if (safe.error) return safe;
   try {
-    execFileSync('systemctl', ['--user', '--no-block', 'restart', svc.unit], { stdio: 'ignore' });
+    exec('systemctl', ['--user', '--no-block', 'restart', svc.unit], { stdio: 'ignore' });
   } catch (e) {
     return { error: `systemctl restart ${svc.unit} failed: ${e?.message ?? e}` };
   }

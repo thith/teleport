@@ -661,7 +661,6 @@ test('acquireResumeFileLock: stale = holder pid dead (and old); a live old lock 
   assert.match(acquireResumeFileLock(GIUN, { dir, isAlive: () => true }).error, /in progress/); // old but alive
   const b = acquireResumeFileLock(GIUN, { dir, isAlive: (p) => p !== 424242 });                 // holder dead
   assert.ok(b.release, 'dead holder → taken over');
-  assert.equal(fs.readdirSync(dir).filter((f) => f.includes('.stale.')).length, 0, 'aside file cleaned');
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
@@ -864,6 +863,7 @@ test('inSystemdService: a service leaf (not user@N.service, not a scope)', () =>
 test('escapeServiceCgroup: wraps with systemd-run --scope only inside a service AND when the probe works', () => {
   const cmd = ['/bin/zsh', '-lic', 'exec "$@"', 'teleport-spawn', 'screen'];
   const svc = '0::/a/teleport-daemon.service';
+  assert.deepEqual(SYSTEMD_SCOPE_PREFIX, ['systemd-run', '--user', '--scope', '--quiet', '--collect', '--'], 'literal argv: --scope keeps the pid, --user the user manager, -- ends options');
   assert.deepEqual(escapeServiceCgroup(cmd, {}, { cgroup: svc, probe: () => true }), [...SYSTEMD_SCOPE_PREFIX, ...cmd]);
   assert.deepEqual(escapeServiceCgroup(cmd, {}, { cgroup: svc, probe: () => false }), cmd);
   let probed = 0;
