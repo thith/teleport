@@ -567,3 +567,15 @@ test('a deployment arg --close never turns Merge into close (preview and dispatc
     { take: (t) => takeMergeButton(t, { store }), dispatch: async (p, f, c) => { seen = { p, args: c.registry.merge.args }; } });
   assert.deepEqual(seen, { p: { cmd: 'merge', rest: L1 }, args: [] });
 });
+
+test('the --close strip also holds when merge is an alias to a command with --close', async () => {
+  const store = new Map([['cccccccccccccccc', { links: [L1], createdAt: Date.now(), canMerge: true }]]);
+  const reg = { merge: { alias: 'closer' }, closer: { run: 'merge.mjs', args: ['--close', '--rebase'], minRole: 'admin' } };
+  let seen;
+  await handleMergeButton({ id: 'q', data: 'mg:cccccccccccccccc', from: { id: 1 }, message: { chat: { id: 1 }, message_id: 1, text: 'p' } },
+    { registry: reg, answerButton: async () => {}, editButtonsMessage: async () => {} },
+    { take: (t) => takeMergeButton(t, { store }), dispatch: async (p, f, c) => { seen = c.registry.merge; } });
+  assert.deepEqual(seen.args, ['--rebase']);
+  assert.equal(seen.run, 'merge.mjs');
+  assert.equal(seen.alias, undefined);
+});

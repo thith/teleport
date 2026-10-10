@@ -512,8 +512,10 @@ export async function handleMergeButton(cq, ctx, { take = takeMergeButton, dispa
   // Same path as typing /merge <links> [--close]: registry spec, role gate, all
   // checks — but the operation is the button's: strip a deployment `--close`
   // from the spec args so Merge can never close.
-  const raw = ctx.registry && ctx.registry.merge;
-  const registry = raw && Array.isArray(raw.args) ? { ...ctx.registry, merge: { ...raw, args: raw.args.filter((a) => a !== '--close') } } : ctx.registry;
+  // Resolve first (merge may be an alias), then pin the resolved spec without --close.
+  const resolved = resolveCommand('merge', ctx.registry);
+  if (!resolved) { await ctx.answerButton(cq.id, 'merge is not configured.'); return; }
+  const registry = { ...ctx.registry, merge: { ...resolved, args: resolved.args.filter((a) => a !== '--close') } };
   await dispatch({ cmd: 'merge', rest: entry.links.join(' ') + (closing ? ' --close' : '') }, cq.from || {}, { ...ctx, registry });
 }
 
