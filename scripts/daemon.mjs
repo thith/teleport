@@ -454,32 +454,40 @@ export async function handlePrLinks(links, msg, {
 }) {
   const spec = resolveCommand('merge', registry);
   if (!spec || !sendButtons) return;
+  // The button chooses the operation: never let a deployment arg (`--close`)
+  // turn the Merge preview into a close check.
+  const baseArgs = spec.args.filter((a) => a !== '--close');
   const role = resolveSenderRole(projectsConfig, msg.from && msg.from.id);
   if (!roleMeets(role, spec.minRole)) { await sendText(daemonUserId, `❌ merge cần quyền ${spec.minRole} (bạn: ${role}).`); return; }
-  let out, ok = true;
-  try {
-    const r = await runner(process.execPath, [path.join(scriptsDir, spec.run), ...spec.args, ...links, '--preview'], {
-      cwd: parentDir, env: childEnv(msg.from, role, secretEnvKeys), timeout: COMMAND_TIMEOUT_MS, maxBuffer: COMMAND_MAX_BUFFER,
-    });
-    out = (r.stdout || '').trim();
-  } catch (e) {
-    ok = false;
-    out = ((e.stdout || '') + (e.stderr ? `\n${e.stderr}` : '')).trim() || `❌ ${e.message || e}`;
-  }
-  if (!ok) { await sendText(msg.chat.id, out); return; } // something can't be merged → no buttons
+  const run = async (extra) => {
+    try {
+      const r = await runner(process.execPath, [path.join(scriptsDir, spec.run), ...baseArgs, ...links, ...extra], {
+        cwd: parentDir, env: childEnv(msg.from, role, secretEnvKeys), timeout: COMMAND_TIMEOUT_MS, maxBuffer: COMMAND_MAX_BUFFER,
+      });
+      return { ok: true, out: (r.stdout || '').trim() };
+    } catch (e) { return { ok: false, out: ((e.stdout || '') + (e.stderr ? `\n${e.stderr}` : '')).trim() || `❌ ${e.message || e}` }; }
+  };
+  const { ok: canMerge, out } = await run(['--preview']);
+  // Not mergeable → maybe still closable (all open): offer only [Close] [Cancel].
+  if (!canMerge && !(await run(['--close', '--preview'])).ok) { await sendText(msg.chat.id, out); return; }
   const tok = crypto.randomBytes(8).toString('hex');
-  store.set(tok, { links, chatId: msg.chat.id, createdAt: Date.now() });
+  store.set(tok, { links, chatId: msg.chat.id, createdAt: Date.now(), canMerge });
   // Keep the button message well under Telegram's 4096 chars (status edits are
   // appended later): a long batch preview goes out first as its own message.
-  const ask = `Merge ${links.length > 1 ? `these ${links.length} PRs (in order)` : 'this PR'}?`;
+  const what = links.length > 1 ? `these ${links.length} PRs (in order)` : 'this PR';
+  const ask = canMerge ? `Merge or close ${what}?` : `Can't merge — close ${what} without merging?`;
   let body = `${out}\n\n${ask}`;
   if (body.length > PREVIEW_INLINE_MAX) { await sendText(msg.chat.id, out); body = `🔎 ${links.length} PR(s) ready — details above.\n\n${ask}`; }
   await sendButtons(msg.chat.id, body,
-    [{ text: '✅ Merge', callback_data: `mg:${tok}` }, { text: '✖ Huỷ', callback_data: `mc:${tok}` }]);
+    [
+      ...(canMerge ? [{ text: '✅ Merge', callback_data: `mg:${tok}` }] : []),
+      { text: '🚫 Close', callback_data: `cl:${tok}` },
+      { text: '✖ Huỷ', callback_data: `mc:${tok}` },
+    ]);
 }
 
 export async function handleMergeButton(cq, ctx, { take = takeMergeButton, dispatch = dispatchCommand } = {}) {
-  const m = String(cq.data || '').match(/^(mg|mc):([0-9a-f]{16})$/);
+  const m = String(cq.data || '').match(/^(mg|cl|mc):([0-9a-f]{16})$/);
   if (!m) { await ctx.answerButton(cq.id); return; }
   const entry = take(m[2]);
   const chatId = cq.message?.chat?.id, messageId = cq.message?.message_id;
@@ -494,10 +502,21 @@ export async function handleMergeButton(cq, ctx, { take = takeMergeButton, dispa
     await ctx.editButtonsMessage(chatId, messageId, `${original}\n\n✖ Đã huỷ.`);
     return;
   }
-  await ctx.answerButton(cq.id, 'Đang merge…');
-  await ctx.editButtonsMessage(chatId, messageId, `${original}\n\n⏳ Đang merge…`);
-  // Same path as typing /merge <links>: registry spec, role gate, all checks.
-  await dispatch({ cmd: 'merge', rest: entry.links.join(' ') }, cq.from || {}, ctx);
+  if (m[1] === 'mg' && entry.canMerge === false) { // never offered — refuse a forged press
+    await ctx.answerButton(cq.id, 'Không merge được PR này.');
+    return;
+  }
+  const closing = m[1] === 'cl';
+  await ctx.answerButton(cq.id, closing ? 'Đang đóng…' : 'Đang merge…');
+  await ctx.editButtonsMessage(chatId, messageId, `${original}\n\n⏳ ${closing ? 'Đang đóng PR…' : 'Đang merge…'}`);
+  // Same path as typing /merge <links> [--close]: registry spec, role gate, all
+  // checks — but the operation is the button's: strip a deployment `--close`
+  // from the spec args so Merge can never close.
+  // Resolve first (merge may be an alias), then pin the resolved spec without --close.
+  const resolved = resolveCommand('merge', ctx.registry);
+  if (!resolved) { await ctx.answerButton(cq.id, 'merge is not configured.'); return; }
+  const registry = { ...ctx.registry, merge: { ...resolved, args: resolved.args.filter((a) => a !== '--close') } };
+  await dispatch({ cmd: 'merge', rest: entry.links.join(' ') + (closing ? ' --close' : '') }, cq.from || {}, { ...ctx, registry });
 }
 
 // Generic registry dispatcher. Resolves `/cmd` to a command spec, gates by

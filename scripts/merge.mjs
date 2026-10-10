@@ -1,4 +1,4 @@
-// `/merge <project> <pr#> [<pr#> …]` or `/merge <PR URL> [<PR URL> …]`
+// `/merge <project> <pr#> [<pr#> …]` or `/merge <PR URL> [<PR URL> …]`  (`--close`: close without merging)
 //   [--squash|--merge|--rebase] [--keep-branch] [--force]
 // — a daemon command (admin): merge GitHub PRs of the project's repo, in the
 // order given, stopping at the first one that can't be merged.
@@ -23,7 +23,7 @@ import { isMainModule } from './is-direct-run.mjs';
 export const MERGE_METHODS = ['squash', 'merge', 'rebase'];
 export const DEFAULT_MERGE_METHOD = 'squash';
 
-const USAGE_LINE = 'usage: /merge <project> <pr#> [<pr#> …] | /merge <PR URL> [<PR URL> …]  [--squash|--merge|--rebase] [--keep-branch] [--force]';
+const USAGE_LINE = 'usage: /merge <project> <pr#> [<pr#> …] | /merge <PR URL> [<PR URL> …]  [--squash|--merge|--rebase] [--keep-branch] [--force] | … --close';
 
 /** A GitHub PR URL → { repo: 'owner/name', number } | null. Pure. */
 export function parsePrUrl(s) {
@@ -42,13 +42,14 @@ export function parsePrUrl(s) {
  */
 export function parseMergeArgs(argv) {
   const targets = [];
-  let project = null, method = null, keepBranch = false, force = false, preview = false;
+  let project = null, method = null, keepBranch = false, force = false, preview = false, close = false, methodConflict = null;
   argv.forEach((a, idx) => {
     if (targets.error) return;
     if (a === '--preview') { preview = true; return; }
+    if (a === '--close') { close = true; return; }
     if (/^--(squash|merge|rebase)$/.test(a)) {
       const m = a.slice(2);
-      if (method && method !== m) { targets.error = `pick one merge method (--${method} or --${m}).`; return; }
+      if (method && method !== m) { methodConflict = `pick one merge method (--${method} or --${m}).`; return; }
       method = m;
     } else if (a === '--keep-branch') keepBranch = true;
     else if (a === '--force') force = true;
@@ -61,6 +62,7 @@ export function parseMergeArgs(argv) {
     else targets.error = `unexpected argument ${JSON.stringify(a)}. ${USAGE_LINE}`;
   });
   if (targets.error) return { error: targets.error };
+  if (methodConflict && !close) return { error: methodConflict }; // merge options are irrelevant to --close
   if (!targets.length) return { error: USAGE_LINE };
   const seen = new Set();
   for (const t of targets) {
@@ -68,7 +70,7 @@ export function parseMergeArgs(argv) {
     if (seen.has(k)) return { error: `PR ${t.repo ? `${t.repo}` : ''}#${t.number} listed twice.` };
     seen.add(k);
   }
-  return { project, targets, method: method || DEFAULT_MERGE_METHOD, keepBranch, force, ...(preview ? { preview } : {}) };
+  return { project, targets, method: method || DEFAULT_MERGE_METHOD, keepBranch, force, ...(preview ? { preview } : {}), ...(close ? { close } : {}) };
 }
 
 const FAILING = new Set(['FAILURE', 'ERROR', 'CANCELLED', 'TIMED_OUT', 'ACTION_REQUIRED', 'STARTUP_FAILURE']);
@@ -246,20 +248,38 @@ export function canonicalizeTargets(targets, resolveRepo) {
   return { targets: out };
 }
 
-/** Merge PRs in order; stop at the first failure and say what was / wasn't merged. */
+/**
+ * Close one PR WITHOUT merging (`--close`): it must be open; its branch is kept
+ * so it can be reopened. `preview` checks only. Returns { ok, text } | { error, text }.
+ */
+export async function closeOne(target, { preview = false }, { gh }) {
+  const { number, repo = null } = typeof target === 'number' ? { number: target } : target;
+  const c = repoCtx(repo);
+  let pr;
+  try { pr = JSON.parse(gh(['pr', 'view', String(number), ...c.R, '--json', 'number,title,url,state'])); }
+  catch (e) { return { error: true, text: `❌ cannot read PR ${c.label}${number}: ${ghError(e)}` }; }
+  if (pr.number !== number) return { error: true, text: `❌ asked for PR ${c.label}${number} but GitHub returned #${pr.number} — refusing.` };
+  if (pr.state !== 'OPEN') return { error: true, text: `❌ PR ${c.label}${pr.number} "${pr.title}": PR is ${String(pr.state).toLowerCase()}, not open.\n${pr.url}` };
+  if (preview) return { ok: true, text: `🔎 PR ${c.label}${pr.number} "${pr.title}" is open — can be closed.\n${pr.url}` };
+  try { gh(['api', '-X', 'PATCH', `${c.api}/pulls/${pr.number}`, '-f', 'state=closed']); }
+  catch (e) { return { error: true, text: `❌ closing PR ${c.label}${pr.number} failed: ${ghError(e)}\n${pr.url}` }; }
+  return { ok: true, text: `🚫 closed PR ${c.label}${pr.number} "${pr.title}" without merging (branch kept).\n${pr.url}` };
+}
+
+/** Merge (or --close) PRs in order; stop at the first failure and say what was / wasn't done. */
 export async function mergeMany(args, deps) {
   const lines = [], merged = [], mergedHeads = [];
   const targets = args.targets || args.prs.map((number) => ({ repo: null, number }));
   const name = (t) => `${repoCtx(t.repo).label}${t.number}`;
   for (const [i, t] of targets.entries()) {
-    const r = await mergeOne(t, args, { ...deps, mergedHeads });
+    const r = args.close ? await closeOne(t, args, deps) : await mergeOne(t, args, { ...deps, mergedHeads });
     if (r.head) mergedHeads.push(r.head);
     lines.push(r.text);
     if (r.error) {
       const rest = targets.slice(i + 1);
       if (targets.length > 1) lines.push(args.preview
         ? `⏹ ${name(t)} can't be merged${rest.length ? ` (not checked: ${rest.map(name).join(', ')})` : ''}.`
-        : `⏹ stopped. merged: ${merged.length ? merged.map(name).join(', ') : 'none'}${rest.length ? ` · not attempted: ${rest.map(name).join(', ')}` : ''}`);
+        : `⏹ stopped. ${args.close ? 'closed' : 'merged'}: ${merged.length ? merged.map(name).join(', ') : 'none'}${rest.length ? ` · not attempted: ${rest.map(name).join(', ')}` : ''}`);
       return { ok: false, text: lines.join('\n\n') };
     }
     merged.push(t);

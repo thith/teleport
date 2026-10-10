@@ -455,11 +455,11 @@ test('handlePrLinks: runs merge.mjs --preview (no merge) and offers buttons only
   assert.deepEqual(c2[0], ['/s/merge.mjs', '--rebase', L1, '--preview']);
   assert.equal(calls[0].opts.cwd, '/w');
   assert.equal(buttons.length, 1);
-  assert.match(buttons[0].t, /🔎 PR #3 ready[\s\S]*Merge this PR\?/);
-  assert.deepEqual(buttons[0].b.map((x) => x.text), ['✅ Merge', '✖ Huỷ']);
+  assert.match(buttons[0].t, /🔎 PR #3 ready[\s\S]*Merge or close this PR\?/);
+  assert.deepEqual(buttons[0].b.map((x) => x.text), ['✅ Merge', '🚫 Close', '✖ Huỷ']);
   assert.match(buttons[0].b[0].callback_data, /^mg:[0-9a-f]{16}$/);
   assert.equal(store.size, 1);
-  // not mergeable → plain text, no buttons, nothing stored
+  // not mergeable AND not closable → plain text, no buttons, nothing stored
   await handlePrLinks([L1], { chat: { id: 1 }, from: { id: 1 } }, ctx(async () => { throw Object.assign(new Error('x'), { stdout: '❌ PR #3: draft' }); }));
   assert.equal(buttons.length, 1);
   assert.match(texts.at(-1), /draft/);
@@ -475,7 +475,7 @@ test('handleMergeButton: Merge dispatches /merge <links> once; Cancel and expire
   const store = new Map([['aaaaaaaaaaaaaaaa', { links: [L1], createdAt: Date.now() }], ['bbbbbbbbbbbbbbbb', { links: [L1], createdAt: Date.now() }]]);
   const take = (t) => takeMergeButton(t, { store });
   const ev = [], dispatched = [];
-  const ctx = { answerButton: async (id, t) => ev.push(`answer:${t || ''}`), editButtonsMessage: async (c, m, t) => ev.push(`edit:${t.split('\n').pop()}`) };
+  const ctx = { registry: MREG, answerButton: async (id, t) => ev.push(`answer:${t || ''}`), editButtonsMessage: async (c, m, t) => ev.push(`edit:${t.split('\n').pop()}`) };
   const cq = (data) => ({ id: 'q', data, from: { id: 1 }, message: { chat: { id: 1 }, message_id: 5, text: 'preview' } });
   const dispatch = async (parsed) => dispatched.push(parsed);
   await handleMergeButton(cq('mg:aaaaaaaaaaaaaaaa'), ctx, { take, dispatch });
@@ -534,4 +534,48 @@ test('startupGreeting / gitShortHead: the owner hears about every (re)start, wit
   assert.doesNotMatch(startupGreeting({ pid: 42, commit: null, commands: 3 }), /code/);
   assert.equal(gitShortHead(() => 'deadbee\n'), 'deadbee');
   assert.equal(gitShortHead(() => { throw new Error('not a repo'); }), null);
+});
+
+test('handlePrLinks: not mergeable but still open → only [Close] [Huỷ]; Merge press on it is refused; Close dispatches --close', async () => {
+  const buttons = [], store = new Map();
+  const runner = async (bin, argv) => { if (argv.includes('--close')) return { stdout: 'open' }; throw Object.assign(new Error('x'), { stdout: '❌ conflicts' }); };
+  await handlePrLinks([L1], { chat: { id: 1 }, from: { id: 1 } }, { daemonUserId: '1', projectsConfig: OWNER_CFG, registry: MREG, store,
+    sendText: async () => {}, sendButtons: async (c, t, b) => buttons.push({ t, b }), runner, scriptsDir: '/s', parentDir: '/w' });
+  assert.deepEqual(buttons[0].b.map((x) => x.text), ['🚫 Close', '✖ Huỷ']);
+  assert.match(buttons[0].t, /❌ conflicts[\s\S]*Can't merge — close this PR without merging\?/);
+  const tok = buttons[0].b[0].callback_data.slice(3);
+  const dispatched = [];
+  const ctx = { registry: MREG, answerButton: async () => {}, editButtonsMessage: async () => {} };
+  const take = (t) => takeMergeButton(t, { store });
+  const cq = (data) => ({ id: 'q', data, from: { id: 1 }, message: { chat: { id: 1 }, message_id: 5, text: 'p' } });
+  await handleMergeButton(cq(`mg:${tok}`), ctx, { take: (t) => ({ ...store.get(t), _: take }), dispatch: async (p) => dispatched.push(p) });
+  assert.equal(dispatched.length, 0, 'forged Merge on a close-only preview is refused');
+  await handleMergeButton(cq(`cl:${tok}`), ctx, { take, dispatch: async (p) => dispatched.push(p) });
+  assert.deepEqual(dispatched, [{ cmd: 'merge', rest: `${L1} --close` }]);
+});
+
+test('a deployment arg --close never turns Merge into close (preview and dispatch)', async () => {
+  const argvs = [], buttons = [], store = new Map();
+  const reg = { merge: { run: 'merge.mjs', args: ['--close'], needsProject: false, minRole: 'admin' } };
+  await handlePrLinks([L1], { chat: { id: 1 }, from: { id: 1 } }, { daemonUserId: '1', projectsConfig: OWNER_CFG, registry: reg, store,
+    sendText: async () => {}, sendButtons: async (c, t, b) => buttons.push(b), runner: async (bin, argv) => { argvs.push(argv); return { stdout: 'ok' }; }, scriptsDir: '/s', parentDir: '/w' });
+  assert.deepEqual(argvs[0], ['/s/merge.mjs', L1, '--preview'], 'merge preview without the deployment --close');
+  const tok = buttons[0][0].callback_data.slice(3);
+  let seen;
+  await handleMergeButton({ id: 'q', data: `mg:${tok}`, from: { id: 1 }, message: { chat: { id: 1 }, message_id: 1, text: 'p' } },
+    { registry: reg, answerButton: async () => {}, editButtonsMessage: async () => {} },
+    { take: (t) => takeMergeButton(t, { store }), dispatch: async (p, f, c) => { seen = { p, args: c.registry.merge.args }; } });
+  assert.deepEqual(seen, { p: { cmd: 'merge', rest: L1 }, args: [] });
+});
+
+test('the --close strip also holds when merge is an alias to a command with --close', async () => {
+  const store = new Map([['cccccccccccccccc', { links: [L1], createdAt: Date.now(), canMerge: true }]]);
+  const reg = { merge: { alias: 'closer' }, closer: { run: 'merge.mjs', args: ['--close', '--rebase'], minRole: 'admin' } };
+  let seen;
+  await handleMergeButton({ id: 'q', data: 'mg:cccccccccccccccc', from: { id: 1 }, message: { chat: { id: 1 }, message_id: 1, text: 'p' } },
+    { registry: reg, answerButton: async () => {}, editButtonsMessage: async () => {} },
+    { take: (t) => takeMergeButton(t, { store }), dispatch: async (p, f, c) => { seen = c.registry.merge; } });
+  assert.deepEqual(seen.args, ['--rebase']);
+  assert.equal(seen.run, 'merge.mjs');
+  assert.equal(seen.alias, undefined);
 });
