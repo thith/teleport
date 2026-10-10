@@ -897,3 +897,11 @@ test('runSpawn (interactive): returns the launcher child so performResume can st
   const r = runSpawn(buildSpawnPlan({ interactive: true, seed: genSessionSeed(() => FIXED_UUID) }), { spawnFn: () => child, escape: (c) => c });
   assert.equal(r.child, child);
 });
+
+test('escapeServiceCgroup: the DEFAULT probe runs `systemd-run --user --scope … -- true` (not systemd-run twice)', () => {
+  const calls = [];
+  const out = escapeServiceCgroup(['x'], { E: 1 }, { cgroup: '0::/a/teleport-daemon.service', run: (bin, args, opts) => { calls.push([bin, ...args]); assert.deepEqual(opts.env, { E: 1 }); } });
+  assert.deepEqual(calls, [['systemd-run', '--user', '--scope', '--quiet', '--collect', '--', 'true']]);
+  assert.deepEqual(out, [...SYSTEMD_SCOPE_PREFIX, 'x']);
+  assert.deepEqual(escapeServiceCgroup(['x'], {}, { cgroup: '0::/a/teleport-daemon.service', run: () => { throw new Error('no bus'); } }), ['x']);
+});

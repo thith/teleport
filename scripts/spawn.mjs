@@ -867,7 +867,11 @@ export function inSystemdService(cgroupText) {
 export const SYSTEMD_SCOPE_PREFIX = ['systemd-run', '--user', '--scope', '--quiet', '--collect', '--'];
 export function escapeServiceCgroup(command, env, {
   cgroup = (() => { try { return fs.readFileSync('/proc/self/cgroup', 'utf8'); } catch { return ''; } })(),
-  probe = () => { try { execFileSync('systemd-run', [...SYSTEMD_SCOPE_PREFIX, 'true'], { env, stdio: 'ignore', timeout: 10_000 }); return true; } catch { return false; } },
+  run = execFileSync,
+  probe = () => {
+    const [bin, ...args] = SYSTEMD_SCOPE_PREFIX;
+    try { run(bin, [...args, 'true'], { env, stdio: 'ignore', timeout: 10_000 }); return true; } catch { return false; }
+  },
 } = {}) {
   if (!inSystemdService(cgroup) || !probe()) return command;
   return [...SYSTEMD_SCOPE_PREFIX, ...command];
