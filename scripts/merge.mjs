@@ -215,6 +215,30 @@ export async function mergeOne(target, { method, keepBranch, force }, {
   return { ok: true, head: pr.isCrossRepository ? null : `${repo || ''}:${pr.headRefName}`, text: `✅ merged PR ${c.label}${pr.number} "${pr.title}" into ${pr.baseRefName} (${method}).${branchNote}\n${pr.url}` };
 }
 
+/**
+ * Give every target a canonical `owner/name` (bare numbers → the project repo,
+ * resolved once via `resolveRepo()`), lower-cased for identity, then reject
+ * duplicates. After this all gh calls are pinned with -R and the in-batch
+ * stacked tracking can't be split by mixing forms or letter case.
+ * Returns { targets } | { error }.
+ */
+export function canonicalizeTargets(targets, resolveRepo) {
+  let projectRepo = null;
+  if (targets.some((t) => !t.repo)) {
+    try { projectRepo = resolveRepo(); } catch (e) { return { error: `cannot resolve the project's GitHub repo: ${ghError(e)}` }; }
+    if (!projectRepo) return { error: "cannot resolve the project's GitHub repo." };
+  }
+  const out = [], seen = new Set();
+  for (const t of targets) {
+    const repo = String(t.repo || projectRepo).toLowerCase();
+    const key = `${repo}#${t.number}`;
+    if (seen.has(key)) return { error: `PR ${key} listed twice.` };
+    seen.add(key);
+    out.push({ repo, number: t.number });
+  }
+  return { targets: out };
+}
+
 /** Merge PRs in order; stop at the first failure and say what was / wasn't merged. */
 export async function mergeMany(args, deps) {
   const lines = [], merged = [], mergedHeads = [];
@@ -240,17 +264,24 @@ if (isMainModule(import.meta.url)) {
   const args = parseMergeArgs(process.argv.slice(2));
   if (args.error) { console.log(`❌ ${args.error}`); process.exit(1); }
   // Bare numbers need a repo: the named project folder (resolved + contained like
-  // /spawn), else the cwd (an older daemon registry already cd'ed into it).
+  // /spawn), else — only with the older registry, where the daemon already cd'ed
+  // into the project — the cwd. Never the workspace root itself.
+  const { resolveSpawnCwd, PARENT_DIR } = await import('./daemon.mjs');
   let cwd = process.cwd();
   if (args.project) {
-    const { resolveSpawnCwd } = await import('./daemon.mjs');
     const r = resolveSpawnCwd(args.project);
     if (r.error) { console.log(`❌ ${r.error}`); process.exit(1); }
     cwd = r.cwd;
-  } else if (args.targets.some((t) => !t.repo) && !fs.existsSync(path.join(cwd, '.git'))) {
-    console.log(`❌ PR numbers need a project: /merge <project> <pr#> — or give PR URLs.`); process.exit(1);
+  } else if (args.targets.some((t) => !t.repo)) {
+    const real = (p) => { try { return fs.realpathSync(p); } catch { return p; } };
+    const parent = real(PARENT_DIR), here = real(cwd);
+    const inProject = here !== parent && here.startsWith(parent + path.sep) && fs.existsSync(path.join(here, '.git'));
+    if (!inProject) { console.log('❌ PR numbers need a project: /merge <project> <pr#> — or give PR URLs.'); process.exit(1); }
   }
-  const r = await mergeMany(args, { gh: ghCli(cwd) });
+  const gh = ghCli(cwd);
+  const canon = canonicalizeTargets(args.targets, () => JSON.parse(gh(['repo', 'view', '--json', 'nameWithOwner'])).nameWithOwner);
+  if (canon.error) { console.log(`❌ ${canon.error}`); process.exit(1); }
+  const r = await mergeMany({ ...args, targets: canon.targets }, { gh });
   console.log(r.text);
   process.exit(r.ok ? 0 : 1);
 }

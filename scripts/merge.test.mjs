@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { parsePrUrl, parseMergeArgs, summarizeChecks, assessPr, DEFAULT_MERGE_METHOD, branchRefPath, branchDeletable, mergeOne, mergeMany } from './merge.mjs';
+import { parsePrUrl, parseMergeArgs, canonicalizeTargets, summarizeChecks, assessPr, DEFAULT_MERGE_METHOD, branchRefPath, branchDeletable, mergeOne, mergeMany } from './merge.mjs';
 
 test('parseMergeArgs: pr number (#N ok), method, flags; errors on junk / two methods / missing pr', () => {
   assert.deepEqual(parseMergeArgs(['12']), { project: null, targets: [{ repo: null, number: 12 }], method: DEFAULT_MERGE_METHOD, keepBranch: false, force: false });
@@ -231,4 +231,22 @@ test('mergeOne with a URL target: every gh call is pinned to that repo (-R / rep
     if (c[0] === 'api') assert.ok(c.some((x) => x.startsWith('repos/thith/teleport/')), c.join(' '));
   }
   assert.equal(calls.some((c) => c.some((x) => String(x).includes('{owner}'))), false);
+});
+
+test('canonicalizeTargets: numbers get the project repo, everything lower-cased; cross-form / case duplicates caught', () => {
+  const r = canonicalizeTargets([{ repo: null, number: 1 }, { repo: 'Thith/Teleport', number: 2 }], () => 'thith/teleport');
+  assert.deepEqual(r.targets, [{ repo: 'thith/teleport', number: 1 }, { repo: 'thith/teleport', number: 2 }]);
+  assert.match(canonicalizeTargets([{ repo: null, number: 1 }, { repo: 'THITH/teleport', number: 1 }], () => 'thith/teleport').error, /listed twice/);
+  let called = 0;
+  canonicalizeTargets([{ repo: 'a/b', number: 1 }], () => { called++; return 'x/y'; });
+  assert.equal(called, 0, 'no lookup when every target has a repo');
+  assert.match(canonicalizeTargets([{ repo: null, number: 1 }], () => { throw new Error('no remote'); }).error, /cannot resolve/);
+});
+
+test('mergeMany after canonicalization: mixing a number and a URL of the same repo keeps the in-batch stacked guard', async () => {
+  const { gh, calls } = fakeGh({ 1: PR(1, { headRefName: 'stack' }), 2: PR(2, { baseRefName: 'stack' }) });
+  const { targets } = canonicalizeTargets([{ repo: null, number: 1 }, { repo: 'Thith/Teleport', number: 2 }], () => 'thith/teleport');
+  const r = await mergeMany({ targets, method: 'squash', keepBranch: true, force: true }, { gh, sleep: async () => {} });
+  assert.match(r.text, /stacked PR/);
+  assert.equal(calls.filter((c) => c[2] === 'PUT').length, 1);
 });
