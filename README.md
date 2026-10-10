@@ -153,15 +153,18 @@ It's driven by **one owner user** (`_config.daemonUserId`) and is a thin, **regi
 
 | Command | Role | What |
 |---|---|---|
-| `/spawn <project>` | maintainer | launch an interactive agent in `<project>` |
+| `/spawn <project> [--resume-session <uuid> [--hashtag <h>]]` | maintainer | launch an interactive agent in `<project>`; with `--resume-session`, `claude --resume <uuid>` an existing session (e.g. a hand-opened one whose listener died) in screen `tele-<hashtag>` — refuses while a live process still holds it |
 | `/headless <project>` | maintainer | launch a headless agent in `<project>` |
-| `/kill <id>` | maintainer | kill an agent by id/hashtag |
-| `/ls` | member | list running agents |
+| `/kill <id>` · `/kill pid:<PID>\|name:<name> [--restart]` | maintainer · **owner** | kill a `tele-*` screen agent by hashtag · SIGTERM one `claude` process of this user by PID or by its session name / Telegram persona (full name, must match exactly one) (owner only, uid + `comm=claude` + start time re-checked, no SIGKILL, audited); `--restart` then resumes that session in a screen in its old cwd |
+| `/ls` | member | list running agents in two sections — 📺 screens (with the claude inside), then 🖥 hand-opened terminal `claude` processes — each with pid, folder, uptime, full session id, `#hashtag` |
 | `/run <project> <script> [args]` | maintainer | run a `package.json` script — auto-detects npm/pnpm/yarn, validates the script, runs `<pm> run <script> -- <args>` (remote exec) |
 | `/whisper #<hash> <text>` | admin | discreet steer into a topic (also accepts a persona name or convoId as the target) — alias `/w` |
 | `/instruct #<hash> <text>` | admin | official *private* instruction to a topic — nothing hits the group; the agent replies to you via DM (reply to continue) — alias `/i` |
 | `/pending` | member | convos waiting on an admin reply |
 | `/start` | public | onboarding help |
+| `/merge <project> <pr#> [<pr#> …]` · `/merge <PR URL> […]` `[--squash\|--merge\|--rebase] [--keep-branch] [--force]` | admin | merge GitHub PRs in order (stops at the first failure) through the API (default squash, pinned to the checked head sha; refuses closed/draft/conflicting/failing — `--force` only skips pending checks / a BLOCKED state); deletes the head branch on GitHub; never touches the local checkout |
+| `/restartd [--force]` | admin | restart the daemon when it runs as a systemd user service; refuses while `claude` agents still share its cgroup (unless `KillMode=process` or `--force`). Agents spawned/resumed now get their own `systemd-run --scope`, so they survive daemon restarts |
+| `/reload` | admin | re-read `commands.json` + `projects.json` without restarting (in-process built-in; owner id / heartbeat groups still need a restart) |
 
 A command can also be a **short alias** of another: `{ "w": { "alias": "whisper" } }` in `commands.json` (or a per-deployment `_commands` override) makes `/w` run `/whisper` with the *target's* script, `minRole`, and reply behaviour — the alias adds only the short name and can't weaken the gate. `/w`→`/whisper` and `/i`→`/instruct` ship by default.
 

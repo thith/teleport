@@ -26,7 +26,8 @@
 // the project when needsProject, else the workspace root), passing the sender's
 // identity via env (TELE_FROM_*) and relaying the script's stdout back to the DM.
 // Built-ins (spawn/headless/kill/ls/run/whisper/instruct/pending/broadcast/start)
-// live in teleport's own commands.json so it stays self-sufficient. Plus the
+// live in teleport's own commands.json so it stays self-sufficient. The one
+// in-process built-in is `/reload` (re-reads the registry; see reloadDaemonState). Plus the
 // heartbeat auto-reminder
 // pass (moved here from tele-listen).
 
@@ -52,7 +53,7 @@ import {
   partitionOrphans, pruneCache, runHeartbeatReminders,
   isDmControlMessage, stripDmControlPrefix,
 } from './tele-listen.mjs';
-import { loadCommands, resolveCommand, roleMeets, tokenizeArgs } from './commands.mjs';
+import { loadCommands, resolveCommand, roleMeets, tokenizeArgs, COMMANDS_FILE } from './commands.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ENV_FILE = path.join(__dirname, '..', '.env');
@@ -81,6 +82,7 @@ export function parseDaemonCommand(text) {
 // buffer cap aborts the child. Output is relayed whole — teleport's send layer
 // auto-attaches a .md document when it's too long for one Telegram message.
 export const COMMAND_TIMEOUT_MS = 5 * 60 * 1000;
+export const RELOAD_COMMAND = 'reload';
 export const COMMAND_MAX_BUFFER = 8 * 1024 * 1024;
 
 // Resolve `<folder>` (positional first token when needsProject) to a sibling
@@ -153,6 +155,35 @@ export function validateDaemonConfig({ projectsConfig, catchAllIds, daemonUserId
   }
 }
 
+// `/reload` (built-in, admin): re-read projects.json + the command registry so a
+// new/changed commands.json entry or `_commands` override takes effect without a
+// restart. It must live IN the daemon (a child script can't swap the parent's
+// in-memory registry). Validates the new config first and returns { error } —
+// keeping the old state — if it's invalid. The owner id and the heartbeat group
+// list are startup-only: a changed daemonUserId is reported, not applied.
+export function reloadDaemonState({ daemonUserId, readConfig, loadRegistry, resolveOwner, resolveCatchAll }) {
+  let projectsConfig, registry;
+  try {
+    projectsConfig = readConfig();
+    registry = loadRegistry(projectsConfig);
+    if (!registry || typeof registry !== 'object' || !Object.keys(registry).length) throw new Error('command registry is empty');
+    validateDaemonConfig({ projectsConfig, catchAllIds: resolveCatchAll(projectsConfig), daemonUserId });
+  } catch (e) {
+    return { error: e instanceof Error ? e.message : String(e) };
+  }
+  const newOwner = resolveOwner(projectsConfig);
+  const ownerChanged = newOwner != null && String(newOwner) !== String(daemonUserId);
+  return { projectsConfig, registry, ownerChanged };
+}
+
+/** Parse a JSON object file or THROW (no silent `{}` fallback — see /reload). */
+export function readJsonStrict(file, label = path.basename(file)) {
+  let v;
+  try { v = JSON.parse(fs.readFileSync(file, 'utf8')); } catch (e) { throw new Error(`${label}: ${e instanceof Error ? e.message : e}`); }
+  if (!v || typeof v !== 'object' || Array.isArray(v)) throw new Error(`${label}: not a JSON object`);
+  return v;
+}
+
 // ── Process lifecycle ─────────────────────────────────────────────────────────
 
 function pidAlive(pid) {
@@ -201,8 +232,8 @@ async function main() {
   // `.env` FILE themselves (e.g. send-telegram), so stripping is always safe.
   const secretEnvKeys = [...new Set([...Object.keys(env), 'REPORT_BOT_TOKEN'])];
   const botId = extractBotId(token);
-  const projectsConfig = readProjectsConfig(PROJECTS_FILE);
-  const registry = loadCommands({ projectsConfig });
+  let projectsConfig = readProjectsConfig(PROJECTS_FILE);
+  let registry = loadCommands({ projectsConfig });
   // Config lives in projects.json `_config` (env only for secrets); env names
   // remain a deprecated fallback during migration.
   const daemonUserId = resolveDaemonUserId(projectsConfig, { env: process.env, envFile: env }) || '';
@@ -244,6 +275,21 @@ async function main() {
     try { await sendTextToAdmin(token, chatId, text, { raw: false, plain: true }); } catch (e) { console.error(`[daemon] send failed: ${e?.message ?? e}`); }
   };
 
+  // `/reload`: swap in a fresh registry + projects config (see reloadDaemonState).
+  const reload = () => {
+    const r = reloadDaemonState({
+      daemonUserId,
+      // STRICT readers: the normal ones swallow a JSON error into `{}`, which
+      // would "successfully" wipe roles + commands (and lock out /reload itself).
+      readConfig: () => readJsonStrict(PROJECTS_FILE, 'projects.json'),
+      loadRegistry: (cfg) => { readJsonStrict(COMMANDS_FILE, 'commands.json'); return loadCommands({ projectsConfig: cfg }); },
+      resolveOwner: (cfg) => resolveDaemonUserId(cfg, { env: process.env, envFile: env }),
+      resolveCatchAll: (cfg) => parseAdminChatIds(resolveDefaultChatId(cfg, { env: process.env, envFile: env }) || ''),
+    });
+    if (!r.error) { projectsConfig = r.projectsConfig; registry = r.registry; }
+    return r;
+  };
+
   let lastHeartbeat = 0;
   // eslint-disable-next-line no-constant-condition
   while (true) {
@@ -279,7 +325,7 @@ async function main() {
         return isDmControlMessage(msg.text);
       });
       if (mine.length) {
-        handleControlMessages(mine, { token, daemonUserId, projectsConfig, registry, sendText, secretEnvKeys });
+        handleControlMessages(mine, { token, daemonUserId, projectsConfig, registry, sendText, secretEnvKeys, reload });
       }
       if (updates.length) writeOffset(Math.max(...updates.map((u) => u.update_id)), daemonOffsetFile);
 
@@ -337,8 +383,20 @@ export function handleControlMessages(mine, ctx) {
 // the gate; `runner`/`scriptsDir`/`parentDir` are injectable for tests.
 export async function dispatchCommand(parsed, from, {
   daemonUserId, projectsConfig, registry, sendText, secretEnvKeys = [],
-  runner = execFileP, scriptsDir = __dirname, parentDir = PARENT_DIR,
+  runner = execFileP, scriptsDir = __dirname, parentDir = PARENT_DIR, reload = null,
 }, replyText = null, messageId = null) {
+  // Built-in: handled in-process, never via the registry (a `_commands` entry
+  // named `reload` can't shadow it). Admin-only.
+  if (parsed.cmd === RELOAD_COMMAND && reload) {
+    const role = resolveSenderRole(projectsConfig, from && from.id);
+    if (!roleMeets(role, 'admin')) { await sendText(daemonUserId, `❌ /${RELOAD_COMMAND} cần quyền admin (bạn: ${role}).`); return; }
+    const r = reload();
+    if (r.error) { await sendText(daemonUserId, `❌ /${RELOAD_COMMAND}: config lỗi, giữ cấu hình cũ — ${r.error}`); return; }
+    const n = Object.keys(r.registry).length;
+    await sendText(daemonUserId, `🔄 Đã đọc lại commands.json + projects.json (${n} lệnh).`
+      + (r.ownerChanged ? '\n⚠️ daemonUserId đã đổi trong projects.json — chỉ có hiệu lực sau khi restart daemon.' : ''));
+    return;
+  }
   const spec = resolveCommand(parsed.cmd, registry);
   if (!spec) return; // not a known command → stay quiet
   const role = resolveSenderRole(projectsConfig, from && from.id);

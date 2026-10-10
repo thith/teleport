@@ -7,7 +7,8 @@ import { fileURLToPath } from 'node:url';
 // Isolate the persona pin store so `--list` persona mapping DERIVES instead of
 // reading machine-local pins (resolved at call-time from TELE_PERSONA_STORE).
 process.env.TELE_PERSONA_STORE = path.join(os.tmpdir(), `teleport-persona-store-spawn-${process.pid}.jsonl`);
-import { buildSpawnPlan, genSessionSeed, runSpawn, childLaunch, loginSeedEnv, wrapInLoginShell, scrubClaudeEnv, SEED_PATH, hasBinary, screenSessionExists, normalizeSessionName, parseScreenSessions, listSpawnSessions, resolveKillId, resolveAttachId, resolveAttachTarget, formatSessionList, resolveMode, SPAWN_PROMPT, PERMISSION_MODES, DEFAULT_PERMISSION_MODE, USAGE, personaByHashtag, gracefulKill, KILL_GRACE_MS } from './spawn.mjs';
+import { buildSpawnPlan, genSessionSeed, runSpawn, childLaunch, loginSeedEnv, wrapInLoginShell, scrubClaudeEnv, SEED_PATH, hasBinary, screenSessionExists, normalizeSessionName, parseScreenSessions, listSpawnSessions, resolveKillId, resolveAttachId, resolveAttachTarget, formatSessionList, resolveMode, SPAWN_PROMPT, PERMISSION_MODES, DEFAULT_PERMISSION_MODE, USAGE, personaByHashtag, gracefulKill, KILL_GRACE_MS, RESUME_PROMPT, resolveResumeSession, checkResumePreflight, findTranscriptDirs, checkPidKillAuth, resolveKillPid, normalizeAgentName, matchProcsByName, appendKillAudit, acquireResumeLock, acquireResumeFileLock, performResume, checkRestartTarget, checkRestartPreflight, RESUME_LOCK_STALE_MS, resumeLockSecret, inSystemdService, escapeServiceCgroup, SYSTEMD_SCOPE_PREFIX } from './spawn.mjs';
+import fs from 'node:fs';
 import { uuidToConvoInt } from './convo-registry.mjs';
 import { shortConvoHash } from './convo-hash.mjs';
 import { personaForConvo } from './persona.mjs';
@@ -493,7 +494,7 @@ const hasFlagToken = (usage, flag) =>
 test('USAGE documents every flag, mode, and the hard-coded prompt (drift guard)', () => {
   // Each user-facing flag / alias must appear in --help as a standalone token so
   // the text can't drift away from the direct-run dispatch.
-  for (const flag of ['-i', '--interactive', '--mode', '--list', '--ls', '--attach', '--resume', '--kill', '--quit', '--help', '-h']) {
+  for (const flag of ['-i', '--interactive', '--mode', '--list', '--ls', '--attach', '--resume', '--kill', '--quit', '--help', '-h', '--resume-session', '--hashtag', 'pid:', 'name:', '--restart']) {
     assert.ok(hasFlagToken(USAGE, flag), `USAGE missing standalone flag ${flag}`);
   }
   // Sanity-check the guard itself distinguishes a short alias from its long form:
@@ -538,4 +539,536 @@ test('loginSeedEnv: keeps session sockets the login shell cannot rebuild (ssh-ag
   assert.equal(env.DBUS_SESSION_BUS_ADDRESS, 'unix:x');
   assert.equal(env.DISPLAY, ':0');
   assert.equal(env.CLAUDECODE, undefined);
+});
+
+// ── --resume-session / --kill pid: ───────────────────────────────────────────
+const GIUN = '971e709e-2629-4d22-9943-40a52ee04a6b'; // hashtag #a7611284 (verified live)
+
+test('buildSpawnPlan resume: screen tele-<uuid hashtag>, claude --resume <uuid> + RESUME_PROMPT', () => {
+  const plan = buildSpawnPlan({ interactive: true, resumeSessionId: GIUN, permissionMode: 'auto' });
+  assert.equal(plan.mode, 'interactive');
+  assert.equal(plan.resumed, true);
+  assert.equal(plan.sessionName, 'tele-a7611284');
+  assert.deepEqual(plan.command, ['screen', '-U', '-dmS', 'tele-a7611284', 'claude', '--permission-mode', 'auto', '--resume', GIUN, RESUME_PROMPT]);
+  assert.ok(!plan.command.includes('--session-id'));
+  assert.equal(plan.teardown, 'screen -S tele-a7611284 -X quit');
+  assert.match(RESUME_PROMPT, /restarted/);
+  assert.match(RESUME_PROMPT, /mailbox\.mjs check/);
+  assert.match(RESUME_PROMPT, /Listening for replies/);
+  assert.match(RESUME_PROMPT, /--first-run/);
+  assert.match(RESUME_PROMPT, /greeting in your Telegram topic/);
+});
+
+test('buildSpawnPlan resume: implies interactive, validates uuid + mode', () => {
+  assert.equal(buildSpawnPlan({ resumeSessionId: GIUN }).mode, 'interactive');
+  assert.throws(() => buildSpawnPlan({ resumeSessionId: 'x; rm -rf ~' }), /must be a UUID/);
+  assert.throws(() => buildSpawnPlan({ resumeSessionId: GIUN, permissionMode: 'yolo' }), /invalid permission mode/);
+});
+
+test('buildSpawnPlan: non-resume plans unchanged (default prompt)', () => {
+  assert.equal(buildSpawnPlan().command.at(-1), SPAWN_PROMPT);
+  assert.equal(buildSpawnPlan({ interactive: true, seed: genSessionSeed(() => FIXED_UUID) }).command.at(-1), SPAWN_PROMPT);
+});
+
+test('resolveResumeSession: parse, derive hashtag, cross-check --hashtag', () => {
+  assert.deepEqual(resolveResumeSession(['-i']), { found: false });
+  assert.deepEqual(resolveResumeSession(['--resume-session', GIUN]), { found: true, sessionId: GIUN, hashtag: 'a7611284' });
+  assert.deepEqual(resolveResumeSession([`--resume-session=${GIUN}`]), { found: true, sessionId: GIUN, hashtag: 'a7611284' });
+  for (const h of ['a7611284', '#a7611284', 'tele-a7611284', '#A7611284']) {
+    assert.equal(resolveResumeSession(['--resume-session', GIUN, '--hashtag', h]).sessionId, GIUN, h);
+  }
+  assert.match(resolveResumeSession(['--resume-session', GIUN, '--hashtag', 'a7611280']).error, /does not match/);
+  assert.match(resolveResumeSession(['--resume-session', GIUN, '--hashtag']).error, /--hashtag needs/);
+  assert.match(resolveResumeSession(['--resume-session']).error, /needs exactly one/);
+  assert.match(resolveResumeSession(['--resume-session', '--mode', 'auto']).error, /needs exactly one/);
+  assert.match(resolveResumeSession(['--resume-session', GIUN, '--resume-session', GIUN]).error, /needs exactly one/);
+  assert.match(resolveResumeSession(['--resume-session', 'abc']).error, /not a UUID/);
+  // `--resume` (attach alias) is NOT `--resume-session`
+  assert.deepEqual(resolveResumeSession(['--resume', GIUN]), { found: false });
+  assert.deepEqual(resolveAttachId(['--resume-session', GIUN]), { found: false, raw: null });
+});
+
+test('checkResumePreflight: refuses a live holder, an existing screen, a foreign/missing transcript', () => {
+  const base = { sessionId: GIUN, sessionName: 'tele-a7611284', cwd: '/home/u/Projects/umipay', screenExists: false, transcriptDirs: ['-home-u-Projects-umipay'] };
+  assert.deepEqual(checkResumePreflight({ ...base, procs: [] }), { ok: true });
+  const held = checkResumePreflight({ ...base, procs: [{ pid: 830318, sessionId: GIUN, cwd: '/home/u/Projects/umipay', guessed: false }] });
+  assert.match(held.error, /still held by live claude PID 830318/);
+  assert.match(held.error, /\/kill pid:830318/);
+  assert.match(checkResumePreflight({ ...base, procs: [{ pid: 9, sessionId: GIUN, guessed: true }] }).error, /guessed/);
+  assert.match(checkResumePreflight({ ...base, procs: [], screenExists: true }).error, /already exists/);
+  assert.match(checkResumePreflight({ ...base, procs: [], cwd: '/home/u/Projects/teleport' }).error, /belongs to another folder \(-home-u-Projects-umipay\)/);
+  assert.match(checkResumePreflight({ ...base, procs: [], transcriptDirs: [] }).error, /no transcript/);
+});
+
+test('findTranscriptDirs: lists project dirs holding <uuid>.jsonl', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'spawn-proj-'));
+  fs.mkdirSync(path.join(dir, '-w-a')); fs.mkdirSync(path.join(dir, '-w-b'));
+  fs.writeFileSync(path.join(dir, '-w-b', `${GIUN}.jsonl`), '{}');
+  assert.deepEqual(findTranscriptDirs(GIUN, dir), ['-w-b']);
+  assert.deepEqual(findTranscriptDirs(GIUN, path.join(dir, 'missing')), []);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('checkPidKillAuth: owner only, daemon only, needs a configured owner', () => {
+  assert.deepEqual(checkPidKillAuth({ fromId: '144', daemonUserId: '144' }), { ok: true });
+  assert.match(checkPidKillAuth({ fromId: '7', daemonUserId: '144' }).error, /owner-only/);
+  assert.match(checkPidKillAuth({ fromId: '', daemonUserId: '144' }).error, /daemon-only/);
+  assert.match(checkPidKillAuth({ fromId: '144', daemonUserId: null }).error, /no daemon owner/);
+});
+
+test('resolveKillPid: pid:<N>, split "pid: N", bad targets; hashtag kills untouched', () => {
+  assert.deepEqual(resolveKillPid(['--kill', 'pid:830318']), { found: true, pid: 830318 });
+  assert.deepEqual(resolveKillPid(['--kill', 'pid:', '830318']), { found: true, pid: 830318 });
+  assert.deepEqual(resolveKillPid(['--quit', 'PID:42']), { found: true, pid: 42 });
+  assert.match(resolveKillPid(['--kill', 'pid:abc']).error, /bad pid target/);
+  assert.match(resolveKillPid(['--kill', 'pid:']).error, /bad pid target/);
+  assert.deepEqual(resolveKillPid(['--kill', 'a7611284']), { found: false });
+  assert.deepEqual(resolveKillPid(['--list']), { found: false });
+});
+
+test('appendKillAudit: one JSON line per call with a timestamp', () => {
+  const f = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'audit-')), 'sub', 'a.jsonl');
+  appendKillAudit({ pid: 1, result: 'denied' }, f);
+  appendKillAudit({ pid: 2, result: 'exited' }, f);
+  const lines = fs.readFileSync(f, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+  assert.deepEqual(lines.map((l) => [l.pid, l.result]), [[1, 'denied'], [2, 'exited']]);
+  assert.ok(lines.every((l) => !Number.isNaN(Date.parse(l.ts))));
+});
+
+test('checkResumePreflight: failed process scan or an unidentified claude in the same cwd → refuse', () => {
+  const base = { sessionId: GIUN, sessionName: 'tele-a7611284', cwd: '/w/umipay', screenExists: false, transcriptDirs: ['-w-umipay'] };
+  assert.match(checkResumePreflight({ ...base, procs: null, procsError: 'ps failed' }).error, /cannot verify.*ps failed/);
+  assert.match(checkResumePreflight({ ...base, procs: undefined }).error, /cannot verify/);
+  assert.match(checkResumePreflight({ ...base, procs: [{ pid: 7, sessionId: null, cwd: '/w/umipay' }] }).error, /PID 7.*no session file/);
+  assert.deepEqual(checkResumePreflight({ ...base, procs: [{ pid: 7, sessionId: null, cwd: '/w/other' }] }), { ok: true });
+});
+
+test('acquireResumeFileLock: exclusive while the holder lives; release is idempotent', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rlock-'));
+  const a = acquireResumeFileLock(GIUN, { dir });
+  assert.ok(a.release);
+  assert.match(acquireResumeFileLock(GIUN, { dir }).error, /in progress/); // holder = us, alive
+  a.release(); a.release();
+  assert.ok(acquireResumeFileLock(GIUN, { dir }).release);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('acquireResumeFileLock: stale = holder pid dead (and old); a live old lock is NOT evicted', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rlock-'));
+  const file = path.join(dir, `resume-${GIUN}.lock`);
+  fs.writeFileSync(file, '424242 deadbeef\n');
+  const old = new Date(Date.now() - 3600_000); fs.utimesSync(file, old, old);
+  assert.match(acquireResumeFileLock(GIUN, { dir, isAlive: () => true }).error, /in progress/); // old but alive
+  const b = acquireResumeFileLock(GIUN, { dir, isAlive: (p) => p !== 424242 });                 // holder dead
+  assert.ok(b.release, 'dead holder → taken over');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('acquireResumeFileLock: release never removes a successor\'s lock', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rlock-'));
+  const file = path.join(dir, `resume-${GIUN}.lock`);
+  const a = acquireResumeFileLock(GIUN, { dir, token: 'A' });
+  fs.writeFileSync(file, '999 B\n'); // pretend A's lock was (wrongly) replaced by B
+  a.release();
+  assert.equal(fs.readFileSync(file, 'utf8'), '999 B\n');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('acquireResumeFileLock: a dead holder younger than staleMs is NOT taken over (a launch may still be starting)', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rlock-'));
+  fs.writeFileSync(path.join(dir, `resume-${GIUN}.lock`), '424242 dead\n'); // fresh mtime
+  assert.match(acquireResumeFileLock(GIUN, { dir, isAlive: () => false }).error, /in progress/);
+  assert.ok(acquireResumeFileLock(GIUN, { dir, isAlive: () => false, now: () => Date.now() + RESUME_LOCK_STALE_MS + 1000 }).release);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('acquireResumeFileLock: breaking is serialized by the guard; a live breaker blocks, a crashed one is cleared', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rlock-'));
+  const file = path.join(dir, `resume-${GIUN}.lock`);
+  const later = () => Date.now() + RESUME_LOCK_STALE_MS + 1000;
+  fs.writeFileSync(file, '424242 dead\n');
+  fs.writeFileSync(`${file}.breaking`, '777 breaker\n');
+  // breaker 777 alive → busy, and the dead lock is left alone
+  assert.match(acquireResumeFileLock(GIUN, { dir, now: later, isAlive: (p) => p === 777 }).error, /in progress/);
+  assert.equal(fs.readFileSync(file, 'utf8'), '424242 dead\n');
+  // breaker dead + old → guard cleared, dead lock broken, we own it
+  const r = acquireResumeFileLock(GIUN, { dir, now: later, isAlive: () => false, token: 'ME' });
+  assert.ok(r.release);
+  assert.equal(fs.readFileSync(file, 'utf8'), `${process.pid} ME\n`);
+  assert.equal(fs.existsSync(`${file}.breaking`), false);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('acquireResumeFileLock: a breaker never removes a lock that changed after it judged it stale', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rlock-'));
+  const file = path.join(dir, `resume-${GIUN}.lock`);
+  fs.writeFileSync(file, '424242 dead\n');
+  let swapped = false;
+  // While B judges the dead lock, the dead lock is released and C acquires a fresh one.
+  const b = acquireResumeFileLock(GIUN, {
+    dir, token: 'B', now: () => Date.now() + RESUME_LOCK_STALE_MS + 1000,
+    isAlive: (p) => {
+      if (p === 424242 && !swapped) { swapped = true; fs.unlinkSync(file); fs.writeFileSync(file, '555 C\n'); }
+      return p === 555;
+    },
+  });
+  assert.match(b.error, /in progress/);
+  assert.equal(fs.readFileSync(file, 'utf8'), '555 C\n', "C's live lock survives");
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+// performResume with every side effect faked.
+const fakeDeps = (over = {}) => {
+  const log = { ran: [], released: 0 };
+  let up = false;
+  const deps = {
+    acquireLock: () => ({ release: () => { log.released++; } }),
+    listProcs: () => [],
+    screenExists: () => up,
+    transcriptDirs: () => ['-w-umipay'],
+    run: (plan) => { log.ran.push(plan); up = true; },
+    sleep: async () => {}, timeoutMs: 1000, pollMs: 250,
+    ...over,
+  };
+  return { deps, log };
+};
+
+test('performResume: happy path launches the resume plan in cwd and releases the lock', async () => {
+  const { deps, log } = fakeDeps();
+  const r = await performResume({ sessionId: GIUN, cwd: '/w/umipay', permissionMode: 'plan' }, deps);
+  assert.equal(r.ok, true);
+  assert.equal(log.ran.length, 1);
+  assert.deepEqual(log.ran[0].command.slice(4, 9), ['claude', '--permission-mode', 'plan', '--resume', GIUN]);
+  assert.equal(log.released, 1);
+});
+
+test('performResume: lock busy / preflight refusal / ps failure → never launches; lock always released', async () => {
+  let { deps, log } = fakeDeps({ acquireLock: () => ({ error: 'another resume in progress' }) });
+  assert.match((await performResume({ sessionId: GIUN, cwd: '/w/umipay' }, deps)).error, /in progress/);
+  assert.equal(log.ran.length, 0);
+
+  ({ deps, log } = fakeDeps({ listProcs: () => [{ pid: 830318, sessionId: GIUN, cwd: '/w/umipay' }] }));
+  assert.match((await performResume({ sessionId: GIUN, cwd: '/w/umipay' }, deps)).error, /still held/);
+  assert.equal(log.ran.length, 0);
+  assert.equal(log.released, 1);
+
+  ({ deps, log } = fakeDeps({ listProcs: () => { throw new Error('ps failed'); } }));
+  assert.match((await performResume({ sessionId: GIUN, cwd: '/w/umipay' }, deps)).error, /ps failed/);
+  assert.equal(log.ran.length, 0);
+  assert.equal(log.released, 1);
+});
+
+test('performResume: timeout with the launcher still running → launcher killed, cooldown set', async () => {
+  const order = [];
+  const child = { exitCode: null, signalCode: null, kill: (sig) => { order.push(`kill:${sig}`); } };
+  const { deps } = fakeDeps({
+    run: () => ({ child }),
+    acquireLock: () => ({ release: () => order.push('release'), markFailed: () => order.push('markFailed') }),
+  });
+  const r = await performResume({ sessionId: GIUN, cwd: '/w/umipay' }, deps);
+  assert.match(r.error, /not found after/);
+  assert.equal(r.launchFailed, true);
+  // launcher killed, cooldown set (it might still be starting a writer), then released
+  assert.deepEqual(order, ['kill:SIGKILL', 'markFailed', 'release']);
+});
+
+test('performResume: heldLock is used as-is and NOT released (the caller owns it)', async () => {
+  let acquired = 0, released = 0;
+  const { deps } = fakeDeps({ acquireLock: () => { acquired++; return { release() {} }; } });
+  const r = await performResume({ sessionId: GIUN, cwd: '/w/umipay' }, { ...deps, heldLock: { release: () => { released++; } } });
+  assert.equal(r.ok, true);
+  assert.equal(acquired, 0);
+  assert.equal(released, 0);
+});
+
+test('performResume: screen never appears → error after timeout, cooldown marked (blocks a premature retry)', async () => {
+  let marked = 0;
+  const { deps, log } = fakeDeps({ run: (plan) => { log.ran.push(plan); } });
+  const r = await performResume({ sessionId: GIUN, cwd: '/w/umipay' }, { ...deps, acquireLock: () => ({ release: () => { log.released++; }, markFailed: () => { marked++; } }) });
+  assert.match(r.error, /not found after/);
+  assert.equal(r.launchFailed, true);
+  assert.equal(log.ran.length, 1);
+  assert.equal(marked, 1);
+  assert.equal(log.released, 1);
+});
+
+test('performResume: the lock is held while preflight + launch run (concurrent resume blocked)', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rlock2-'));
+  let second;
+  const { deps } = fakeDeps({
+    acquireLock: (id) => acquireResumeFileLock(id, { dir }),
+    run: () => { second = acquireResumeFileLock(GIUN, { dir }); },
+    screenExists: () => second !== undefined,
+  });
+  const r = await performResume({ sessionId: GIUN, cwd: '/w/umipay' }, deps);
+  assert.equal(r.ok, true);
+  assert.match(second.error, /in progress/);
+  assert.ok(acquireResumeFileLock(GIUN, { dir }).release, 'released after');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('checkRestartTarget: needs a real (non-guessed) session id, a cwd and its transcript there', () => {
+  const t = { pid: 1, sessionId: GIUN, guessed: false, cwd: '/w/umipay' };
+  assert.deepEqual(checkRestartTarget(t, { transcriptDirs: ['-w-umipay'] }), { ok: true });
+  assert.match(checkRestartTarget(null, { transcriptDirs: [] }).error, /no session id/);
+  assert.match(checkRestartTarget({ ...t, sessionId: null }, { transcriptDirs: [] }).error, /no session id/);
+  assert.match(checkRestartTarget({ ...t, guessed: true }, { transcriptDirs: ['-w-umipay'] }).error, /only a guess/);
+  assert.match(checkRestartTarget({ ...t, cwd: null }, { transcriptDirs: ['-w-umipay'] }).error, /working directory/);
+  assert.match(checkRestartTarget(t, { transcriptDirs: ['-w-other'] }).error, /no transcript/);
+});
+
+test('checkRestartPreflight: pre-kill catches every knowable post-kill refusal; ignores the target itself', () => {
+  const t = { pid: 830318, sessionId: GIUN, guessed: false, cwd: '/w/umipay' };
+  const base = { screenExists: false, transcriptDirs: ['-w-umipay'] };
+  // the target holds its own session — that must NOT block (it is about to be killed)
+  assert.deepEqual(checkRestartPreflight(t, { ...base, procs: [t] }), { ok: true });
+  // another unidentified claude in the same cwd → refuse before killing
+  assert.match(checkRestartPreflight(t, { ...base, procs: [t, { pid: 9, sessionId: null, cwd: '/w/umipay' }] }).error, /PID 9/);
+  // a second live holder of the same session → refuse
+  assert.match(checkRestartPreflight(t, { ...base, procs: [t, { pid: 10, sessionId: GIUN, cwd: '/w/umipay' }] }).error, /still held by live claude PID 10/);
+  assert.match(checkRestartPreflight(t, { ...base, procs: [t], screenExists: true }).error, /already exists/);
+  assert.match(checkRestartPreflight(t, { ...base, procs: null, procsError: 'ps failed' }).error, /ps failed/);
+  assert.match(checkRestartPreflight({ ...t, guessed: true }, { ...base, procs: [t] }).error, /only a guess/);
+});
+
+test('performResume (default deps): a failing ps is a refusal, launched cwd is the target cwd', async () => {
+  const { deps } = fakeDeps();
+  delete deps.listProcs; delete deps.run;
+  // ps throws → listClaudeProcs({ strict: true }) throws → refused, nothing spawned
+  let spawned = 0;
+  const r1 = await performResume({ sessionId: GIUN, cwd: '/w/umipay' }, {
+    ...deps, exec: () => { throw new Error('ps missing'); }, spawnFn: () => { spawned++; return { unref() {} }; },
+  });
+  assert.match(r1.error, /ps failed/);
+  assert.equal(spawned, 0);
+  // working ps, no holder → runSpawn is called with cwd = the target cwd
+  const calls = [];
+  let up = false;
+  const r2 = await performResume({ sessionId: GIUN, cwd: '/w/umipay' }, {
+    ...deps, screenExists: () => up,
+    exec: () => ' 1 0 1000 ? 00:01 init /sbin/init\n',
+    spawnFn: (cmd, args, opts) => { calls.push(opts); up = true; return { unref() {} }; },
+  });
+  assert.equal(r2.ok, true);
+  assert.equal(calls[0].cwd, '/w/umipay');
+});
+
+test('inSystemdService: a service leaf (not user@N.service, not a scope)', () => {
+  assert.equal(inSystemdService('0::/user.slice/user-1000.slice/user@1000.service/app.slice/teleport-daemon.service\n'), true);
+  assert.equal(inSystemdService('0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-org.gnome.Terminal.slice/vte-spawn-x.scope'), false);
+  assert.equal(inSystemdService('0::/user.slice/user-1000.slice/user@1000.service'), false);
+  assert.equal(inSystemdService(''), false);
+});
+
+test('escapeServiceCgroup: wraps with systemd-run --scope only inside a service AND when the probe works', () => {
+  const cmd = ['/bin/zsh', '-lic', 'exec "$@"', 'teleport-spawn', 'screen'];
+  const svc = '0::/a/teleport-daemon.service';
+  assert.deepEqual(SYSTEMD_SCOPE_PREFIX, ['systemd-run', '--user', '--scope', '--quiet', '--collect', '--'], 'literal argv: --scope keeps the pid, --user the user manager, -- ends options');
+  assert.deepEqual(escapeServiceCgroup(cmd, {}, { cgroup: svc, probe: () => true }), [...SYSTEMD_SCOPE_PREFIX, ...cmd]);
+  assert.deepEqual(escapeServiceCgroup(cmd, {}, { cgroup: svc, probe: () => false }), cmd);
+  let probed = 0;
+  assert.deepEqual(escapeServiceCgroup(cmd, {}, { cgroup: '0::/a/x.scope', probe: () => { probed++; return true; } }), cmd);
+  assert.equal(probed, 0, 'no probe outside a service');
+});
+
+test('runSpawn: the escape wrapper is applied to the (login-shell) launch command', () => {
+  const calls = [];
+  runSpawn(buildSpawnPlan({ interactive: true, seed: genSessionSeed(() => FIXED_UUID) }), {
+    spawnFn: (c, a) => { calls.push([c, ...a]); return { unref() {} }; },
+    escape: (command) => ['WRAP', ...command],
+  });
+  assert.equal(calls[0][0], 'WRAP');
+  assert.ok(calls[0].includes('screen'));
+});
+
+test('acquireResumeFileLock: an empty / garbage lock (creator between O_EXCL and write) is NOT stale while fresh', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rlock-'));
+  const file = path.join(dir, `resume-${GIUN}.lock`);
+  for (const body of ['', 'garbage\n']) {
+    fs.writeFileSync(file, body);
+    let asked = 0;
+    assert.match(acquireResumeFileLock(GIUN, { dir, isAlive: () => { asked++; return false; } }).error, /in progress/, JSON.stringify(body));
+    assert.equal(fs.readFileSync(file, 'utf8'), body, 'left untouched');
+    assert.equal(asked, 0, 'no pid to ask about');
+  }
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('runSpawn (interactive): returns the launcher child so performResume can stop a stuck launch', () => {
+  const child = { unref() {} };
+  const r = runSpawn(buildSpawnPlan({ interactive: true, seed: genSessionSeed(() => FIXED_UUID) }), { spawnFn: () => child, escape: (c) => c });
+  assert.equal(r.child, child);
+});
+
+test('escapeServiceCgroup: the DEFAULT probe runs `systemd-run --user --scope … -- true` (not systemd-run twice)', () => {
+  const calls = [];
+  const out = escapeServiceCgroup(['x'], { E: 1 }, { cgroup: '0::/a/teleport-daemon.service', run: (bin, args, opts) => { calls.push([bin, ...args]); assert.deepEqual(opts.env, { E: 1 }); } });
+  assert.deepEqual(calls, [['systemd-run', '--user', '--scope', '--quiet', '--collect', '--', 'true']]);
+  assert.deepEqual(out, [...SYSTEMD_SCOPE_PREFIX, 'x']);
+  assert.deepEqual(escapeServiceCgroup(['x'], {}, { cgroup: '0::/a/teleport-daemon.service', run: () => { throw new Error('no bus'); } }), ['x']);
+});
+
+test('acquireResumeLock (linux, kernel-backed): exclusive, freed on release, unique per session', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'klock-'));
+  const name = `\0teleport-test-${process.pid}-${Math.random()}`;
+  const a = await acquireResumeLock(GIUN, { dir, platform: 'linux', name });
+  assert.ok(a.release);
+  assert.match((await acquireResumeLock(GIUN, { dir, platform: 'linux', name })).error, /in progress/);
+  a.release(); a.release();
+  await new Promise((r) => setTimeout(r, 20));
+  const b = await acquireResumeLock(GIUN, { dir, platform: 'linux', name });
+  assert.ok(b.release, 'free again after release');
+  b.release();
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('acquireResumeLock: failed-launch cooldown refuses until it expires, and frees the lock it took', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'klock-'));
+  const name = `\0teleport-test-${process.pid}-${Math.random()}`;
+  const a = await acquireResumeLock(GIUN, { dir, platform: 'linux', name });
+  a.beginLaunch(); a.markFailed(); a.release();
+  await new Promise((r) => setTimeout(r, 20));
+  assert.match((await acquireResumeLock(GIUN, { dir, platform: 'linux', name })).error, /failed .*ago/);
+  const later = await acquireResumeLock(GIUN, { dir, platform: 'linux', name, now: () => Date.now() + 200_000 });
+  assert.ok(later.release, 'cooldown over; and the refused attempt did not leave the lock held');
+  later.release();
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('acquireResumeLock: non-linux falls back to the file lock', async () => {
+  let used = 0;
+  const r = await acquireResumeLock(GIUN, { dir: os.tmpdir(), platform: 'darwin', fileLock: () => { used++; return { release() {} }; } });
+  assert.equal(used, 1);
+  assert.ok(r.release && r.markFailed);
+});
+
+test('acquireResumeFileLock: an OLD lock with no parseable holder is still not evicted', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rlock-'));
+  const file = path.join(dir, `resume-${GIUN}.lock`);
+  fs.writeFileSync(file, '');
+  assert.match(acquireResumeFileLock(GIUN, { dir, isAlive: () => false, now: () => Date.now() + RESUME_LOCK_STALE_MS + 1000 }).error, /in progress/);
+  assert.equal(fs.readFileSync(file, 'utf8'), '');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('acquireResumeLock: launch marker — written before launch (fail closed), removed on success, kept on failure', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'klock-'));
+  const name = () => `\0teleport-test-${process.pid}-${Math.random()}`;
+  const marker = path.join(dir, `resume-${GIUN}.failed`);
+  const a = await acquireResumeLock(GIUN, { dir, platform: 'linux', name: name() });
+  assert.deepEqual(a.beginLaunch(), { ok: true });
+  assert.ok(fs.existsSync(marker));
+  a.launchSucceeded(); a.release();
+  assert.equal(fs.existsSync(marker), false, 'success clears the guard');
+  const b = await acquireResumeLock(GIUN, { dir, platform: 'linux', name: name() });
+  assert.ok(b.release, 'no cooldown after a success');
+  b.beginLaunch(); b.markFailed(); b.release();
+  assert.match((await acquireResumeLock(GIUN, { dir, platform: 'linux', name: name() })).error, /failed .*ago/);
+  // unwritable dir → beginLaunch refuses
+  const ro = path.join(dir, 'ro'); fs.mkdirSync(ro); fs.chmodSync(ro, 0o500);
+  const c = await acquireResumeLock(GIUN, { dir: ro, platform: 'linux', name: name() });
+  if (process.getuid?.() !== 0) assert.match(c.beginLaunch().error, /refusing to launch/);
+  c.release(); fs.chmodSync(ro, 0o700);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('performResume: no launch when beginLaunch fails; launchSucceeded on a verified screen', async () => {
+  const events = [];
+  let { deps, log } = fakeDeps({ acquireLock: () => ({ release: () => events.push('release'), beginLaunch: () => ({ error: 'disk full' }) }) });
+  const r1 = await performResume({ sessionId: GIUN, cwd: '/w/umipay' }, deps);
+  assert.match(r1.error, /disk full/);
+  assert.equal(log.ran.length, 0);
+  ({ deps, log } = fakeDeps({ acquireLock: () => ({ release: () => events.push('release'), beginLaunch: () => { events.push('begin'); return { ok: true }; }, launchSucceeded: () => events.push('succeeded') }) }));
+  const r2 = await performResume({ sessionId: GIUN, cwd: '/w/umipay' }, deps);
+  assert.equal(r2.ok, true);
+  assert.deepEqual(events.slice(-3), ['begin', 'succeeded', 'release']);
+});
+
+test('resumeLockSecret: created once with mode 0600, stable; the lock name depends on it (unguessable by other users)', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ksec-'));
+  const a = resumeLockSecret(dir);
+  assert.equal(resumeLockSecret(dir), a);
+  assert.equal(fs.statSync(path.join(dir, '.resume-lock-secret')).mode & 0o777, 0o600);
+  assert.ok(a.length >= 32);
+  // default name derives from the secret: two dirs (secrets) never collide, same dir does
+  const d2 = fs.mkdtempSync(path.join(os.tmpdir(), 'ksec-'));
+  const l1 = await acquireResumeLock(GIUN, { dir, platform: 'linux' });
+  assert.ok(l1.release);
+  assert.match((await acquireResumeLock(GIUN, { dir, platform: 'linux' })).error, /in progress/);
+  const l2 = await acquireResumeLock(GIUN, { dir: d2, platform: 'linux' });
+  assert.ok(l2.release, 'different secret → different name');
+  l1.release(); l2.release();
+  fs.writeFileSync(path.join(d2, '.resume-lock-secret'), 'short', { mode: 0o600 });
+  fs.chmodSync(path.join(d2, '.resume-lock-secret'), 0o600);
+  assert.match((await acquireResumeLock(GIUN, { dir: d2, platform: 'linux' })).error, /malformed/);
+  fs.chmodSync(path.join(d2, '.resume-lock-secret'), 0o644);
+  assert.match((await acquireResumeLock(GIUN, { dir: d2, platform: 'linux' })).error, /readable by others/);
+  assert.equal(fs.readdirSync(dir).filter((f) => f.startsWith('.resume-lock-secret.')).length, 0, 'no temp files left');
+  fs.rmSync(dir, { recursive: true, force: true }); fs.rmSync(d2, { recursive: true, force: true });
+});
+
+test('resolveKillPid: name: — quoted (one token) or unquoted (words up to the next flag)', () => {
+  assert.deepEqual(resolveKillPid(['--kill', 'name:Rắn 3', '--restart']), { found: true, name: 'Rắn 3' });
+  assert.deepEqual(resolveKillPid(['--kill', 'name:Rắn', '3', '--restart']), { found: true, name: 'Rắn 3' });
+  assert.deepEqual(resolveKillPid(['--kill', 'name:', 'Giun']), { found: true, name: 'Giun' });
+  assert.match(resolveKillPid(['--kill', 'name:']).error, /needs a name/);
+});
+
+test('matchProcsByName: full name via session name or persona; emoji/case ignored; ambiguity refused', () => {
+  const rows = [
+    { pid: 1, name: '🐍 Rắn 3', hashtag: 'a', procStart: '111' }, { pid: 2, name: '🐍 Rắn', hashtag: 'b' },
+    { pid: 3, name: '🧚 UmiApp', hashtag: 'c' }, { pid: 4, name: 'digesty-a7', hashtag: 'd' }, { pid: 5, name: null, hashtag: 'e' },
+  ];
+  const persona = (r) => ({ c: '🧚 Tiên', d: '🦛 Hà Mã', e: '🦛 Hà Mã' })[r.hashtag] || null;
+  assert.deepEqual(matchProcsByName('Rắn 3', rows, persona), { pid: 1, start: '111' }, 'carries the start fingerprint');
+  assert.equal(matchProcsByName('rắn', rows, persona).pid, 2, 'full name, not substring of "Rắn 3"');
+  assert.equal(matchProcsByName('🧚 tiên', rows, persona).pid, 3, 'persona works too');
+  assert.equal(matchProcsByName('UmiApp', rows, persona).pid, 3);
+  assert.equal(matchProcsByName('UmiApp', rows, persona).start, null);
+  assert.match(matchProcsByName('Hà Mã', rows, persona).error, /matches 2 processes: PID 4 \(digesty-a7\), PID 5/);
+  assert.match(matchProcsByName('Cú', rows, persona).error, /no claude process named/);
+  assert.equal(normalizeAgentName(' 🐍  Rắn   3 '), 'rắn 3');
+});
+
+test('acquireResumeLock: one lock per session (different uuids don\'t block each other); cooldown counts from the failure', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kps-'));
+  const OTHER = '00000000-0000-4000-8000-0000000000bb';
+  const a = await acquireResumeLock(GIUN, { dir, platform: 'linux' });
+  const b = await acquireResumeLock(OTHER, { dir, platform: 'linux' });
+  assert.ok(a.release && b.release, 'per-session names');
+  b.release();
+  // begin at t0, fail at t0+100s → still refused at t0+150s (cooldown from failure)
+  const t0 = Date.now();
+  a.beginLaunch();
+  const marker = path.join(dir, `resume-${GIUN}.failed`);
+  fs.utimesSync(marker, new Date(t0), new Date(t0));
+  fs.utimesSync(marker, new Date(t0 + 100_000), new Date(t0 + 100_000)); // what markFailed does at t0+100s
+  a.release();
+  assert.match((await acquireResumeLock(GIUN, { dir, platform: 'linux', now: () => t0 + 150_000 })).error, /failed/);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('resumeLockSecret: rejects a symlink, a dangling symlink, and a group-readable secret', () => {
+  for (const setup of [
+    (d) => { fs.writeFileSync(path.join(d, 'real'), 'x'.repeat(64), { mode: 0o600 }); fs.symlinkSync(path.join(d, 'real'), path.join(d, '.resume-lock-secret')); },
+    (d) => fs.symlinkSync(path.join(d, 'nowhere'), path.join(d, '.resume-lock-secret')),
+    (d) => { fs.writeFileSync(path.join(d, '.resume-lock-secret'), 'x'.repeat(64)); fs.chmodSync(path.join(d, '.resume-lock-secret'), 0o640); },
+  ]) {
+    const d = fs.mkdtempSync(path.join(os.tmpdir(), 'ksec2-'));
+    setup(d);
+    assert.throws(() => resumeLockSecret(d), /not a regular file|readable by others/);
+    fs.rmSync(d, { recursive: true, force: true });
+  }
+});
+
+test('performResume: screen appearing while the stuck launcher is killed → ok, guard cleared', async () => {
+  let up = false; const ev = [];
+  const child = { exitCode: null, signalCode: null, kill: () => { up = true; ev.push('kill'); } };
+  const { deps } = fakeDeps({
+    run: () => ({ child }), screenExists: () => up,
+    acquireLock: () => ({ release: () => ev.push('release'), beginLaunch: () => ({ ok: true }), launchSucceeded: () => ev.push('succeeded'), markFailed: () => ev.push('failed') }),
+  });
+  const r = await performResume({ sessionId: GIUN, cwd: '/w/umipay' }, deps);
+  assert.equal(r.ok, true);
+  assert.deepEqual(ev, ['kill', 'succeeded', 'release']);
 });
