@@ -56,6 +56,14 @@ import {
 } from './tele-listen.mjs';
 export { prLinksOnly, PR_LINK_RE };
 import { loadCommands, resolveCommand, roleMeets, tokenizeArgs, COMMANDS_FILE } from './commands.mjs';
+import { canonicalPrUrl } from './merge.mjs';
+import {
+  readAutoMerge, writeAutoMerge, allowedRepos, decideRequest, validRequest, claimRequests,
+  deliverResult, auditAutoMerge,
+} from './merge-inbox.mjs';
+import { peekPersona } from './persona-store.mjs';
+import { formatPersona } from './persona.mjs';
+import { shortConvoHash } from './convo-hash.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ENV_FILE = path.join(__dirname, '..', '.env');
@@ -313,6 +321,7 @@ async function main() {
   };
 
   let lastHeartbeat = 0;
+  let mergeInboxBusy = false;
   // eslint-disable-next-line no-constant-condition
   while (true) {
     try {
@@ -352,6 +361,11 @@ async function main() {
       const presses = updates.filter((u) => u.callback_query && String(u.callback_query.from?.id) === daemonUserId);
       for (const u of presses) {
         handleMergeButton(u.callback_query, ctx).catch((e) => console.error(`[daemon] button: ${e?.message ?? e}`));
+      }
+      // Agent merge requests (file inbox) — one pass at a time.
+      if (!mergeInboxBusy) {
+        mergeInboxBusy = true;
+        processMergeRequests(ctx).catch((e) => console.error(`[daemon] merge inbox: ${e?.message ?? e}`)).finally(() => { mergeInboxBusy = false; });
       }
       if (updates.length) writeOffset(Math.max(...updates.map((u) => u.update_id)), daemonOffsetFile);
 
@@ -451,9 +465,13 @@ function childEnv(from, role, secretEnvKeys, extra = {}) {
 export async function handlePrLinks(links, msg, {
   daemonUserId, projectsConfig, registry, sendText, sendButtons, secretEnvKeys = [],
   runner = execFileP, scriptsDir = __dirname, parentDir = PARENT_DIR, store = pendingMergeButtons,
+  requester = null, header = '', deliver = deliverResult,
 }) {
   const spec = resolveCommand('merge', registry);
   if (!spec || !sendButtons) return;
+  // Canonical owner/name/pull/N only — what is previewed is exactly what a button runs.
+  links = [...new Set(links.map((l) => canonicalPrUrl(l)).filter(Boolean))];
+  if (!links.length) return;
   // The button chooses the operation: never let a deployment arg (`--close`)
   // turn the Merge preview into a close check.
   const baseArgs = spec.args.filter((a) => a !== '--close');
@@ -469,24 +487,31 @@ export async function handlePrLinks(links, msg, {
   };
   const { ok: canMerge, out } = await run(['--preview']);
   // Not mergeable → maybe still closable (all open): offer only [Close] [Cancel].
-  if (!canMerge && !(await run(['--close', '--preview'])).ok) { await sendText(msg.chat.id, out); return; }
+  if (!canMerge && !(await run(['--close', '--preview'])).ok) {
+    await sendText(msg.chat.id, header ? `${header}\n\n${out}` : out);
+    // An agent's request that can't even be offered → tell the agent why.
+    if (requester) await deliver({ convoId: requester.convoId, text: `Không merge/đóng được:\n${out}`, mode: 'ask' });
+    return { offered: false };
+  }
   const tok = crypto.randomBytes(8).toString('hex');
-  store.set(tok, { links, chatId: msg.chat.id, createdAt: Date.now(), canMerge });
+  store.set(tok, { links, chatId: msg.chat.id, createdAt: Date.now(), canMerge, ...(requester ? { requester } : {}) });
   // Keep the button message well under Telegram's 4096 chars (status edits are
   // appended later): a long batch preview goes out first as its own message.
   const what = links.length > 1 ? `these ${links.length} PRs (in order)` : 'this PR';
   const ask = canMerge ? `Merge or close ${what}?` : `Can't merge — close ${what} without merging?`;
-  let body = `${out}\n\n${ask}`;
-  if (body.length > PREVIEW_INLINE_MAX) { await sendText(msg.chat.id, out); body = `🔎 ${links.length} PR(s) ready — details above.\n\n${ask}`; }
+  const head = header ? `${header}\n\n` : '';
+  let body = `${head}${out}\n\n${ask}`;
+  if (body.length > PREVIEW_INLINE_MAX) { await sendText(msg.chat.id, out); body = `${head}🔎 ${links.length} PR(s) ready — details above.\n\n${ask}`; }
   await sendButtons(msg.chat.id, body,
     [
       ...(canMerge ? [{ text: '✅ Merge', callback_data: `mg:${tok}` }] : []),
       { text: '🚫 Close', callback_data: `cl:${tok}` },
       { text: '✖ Huỷ', callback_data: `mc:${tok}` },
     ]);
+  return { offered: true };
 }
 
-export async function handleMergeButton(cq, ctx, { take = takeMergeButton, dispatch = dispatchCommand } = {}) {
+export async function handleMergeButton(cq, ctx, { take = takeMergeButton, dispatch = dispatchCommand, deliver = deliverResult, audit = auditAutoMerge } = {}) {
   const m = String(cq.data || '').match(/^(mg|cl|mc):([0-9a-f]{16})$/);
   if (!m) { await ctx.answerButton(cq.id); return; }
   const entry = take(m[2]);
@@ -500,6 +525,7 @@ export async function handleMergeButton(cq, ctx, { take = takeMergeButton, dispa
   if (m[1] === 'mc') {
     await ctx.answerButton(cq.id, 'Đã huỷ');
     await ctx.editButtonsMessage(chatId, messageId, `${original}\n\n✖ Đã huỷ.`);
+    if (entry.requester) await deliver({ convoId: entry.requester.convoId, text: 'Owner đã huỷ — không merge, không đóng.', mode: 'ask' }).catch(() => {});
     return;
   }
   if (m[1] === 'mg' && entry.canMerge === false) { // never offered — refuse a forged press
@@ -516,7 +542,81 @@ export async function handleMergeButton(cq, ctx, { take = takeMergeButton, dispa
   const resolved = resolveCommand('merge', ctx.registry);
   if (!resolved) { await ctx.answerButton(cq.id, 'merge is not configured.'); return; }
   const registry = { ...ctx.registry, merge: { ...resolved, args: resolved.args.filter((a) => a !== '--close') } };
-  await dispatch({ cmd: 'merge', rest: entry.links.join(' ') + (closing ? ' --close' : '') }, cq.from || {}, { ...ctx, registry });
+  // For an agent's request, the result also goes back to that agent's queue.
+  const sendText = entry.requester
+    ? async (c, t) => {
+      await ctx.sendText(c, t);
+      // A batch can partly fail: only "no ❌ / ⏹ line anywhere" counts as ok.
+      audit({ requester: entry.requester.convoId, links: entry.links, ok: !/^\s*(❌|⏹)/mu.test(String(t)), mode: closing ? 'button-close' : 'button-merge' });
+      await deliver({ convoId: entry.requester.convoId, text: t, mode: 'ask' }).catch(() => {});
+    }
+    : ctx.sendText;
+  await dispatch({ cmd: 'merge', rest: entry.links.join(' ') + (closing ? ' --close' : '') }, cq.from || {}, { ...ctx, registry, sendText });
+}
+
+// ── Agent merge requests (file inbox; see merge-request.mjs / merge-inbox.mjs) ─
+
+export const AUTOMERGE_COMMAND = 'automerge';
+
+/** "🪱 Giun #a7611284" for a requester convo (best effort). */
+function requesterLabel(convoId) {
+  const p = peekPersona(convoId);
+  return `${p ? `${formatPersona(p)} ` : ''}#${shortConvoHash(convoId)}`;
+}
+
+/**
+ * Handle every pending agent request once. AUTO → merge.mjs as the owner, result
+ * to the agent + one-line FYI to the owner (+ audit); ASK → owner preview with
+ * buttons, result to the agent after the tap. Requests are claimed atomically and
+ * always removed afterwards (a malformed one is dropped with a log line).
+ */
+export async function processMergeRequests(ctx, {
+  claim = claimRequests, autoEnabled = readAutoMerge, allowed = (cfg) => allowedRepos(cfg, { parentDir: ctx.parentDir ?? PARENT_DIR }),
+  runner = execFileP, deliver = deliverResult, audit = auditAutoMerge, prLinks = handlePrLinks, remove = (f) => { try { fs.unlinkSync(f); } catch {} },
+  scriptsDir = __dirname, label = requesterLabel,
+} = {}) {
+  const { daemonUserId, projectsConfig, registry, sendText, secretEnvKeys = [] } = ctx;
+  let allowedSet = null; // computed once per pass, only if a request needs it
+  for (const { file, body } of claim()) {
+    try {
+      const req = validRequest(body);
+      if (!req) { console.error(`[daemon] dropped malformed/stale merge request ${path.basename(file)}`); continue; }
+      const who = label(req.convoId);
+      const spec = resolveCommand('merge', registry);
+      if (!spec) { await deliver({ convoId: req.convoId, text: '❌ /merge is not configured on the daemon.', mode: 'ask' }); continue; }
+      const on = autoEnabled();
+      if (on && !allowedSet) allowedSet = allowed(projectsConfig);
+      const decision = decideRequest(req.links, { autoEnabled: on, allowed: allowedSet || new Set() });
+      if (decision.mode === 'auto') {
+        const owner = { id: daemonUserId };
+        const role = resolveSenderRole(projectsConfig, daemonUserId);
+        let ok = true, text;
+        try {
+          // --skip-merged: a request retried after a crash continues past the PRs it already merged.
+          const r = await runner(process.execPath, [path.join(scriptsDir, spec.run), ...spec.args.filter((a) => a !== '--close'), ...req.links, '--skip-merged'], {
+            cwd: ctx.parentDir ?? PARENT_DIR, env: childEnv(owner, role, secretEnvKeys), timeout: COMMAND_TIMEOUT_MS, maxBuffer: COMMAND_MAX_BUFFER,
+          });
+          text = (r.stdout || '').trim();
+        } catch (e) { ok = false; text = ((e.stdout || '') + (e.stderr ? `\n${e.stderr}` : '')).trim() || `❌ ${e.message || e}`; }
+        audit({ requester: req.convoId, links: req.links, ok, mode: 'auto' });
+        await sendText(daemonUserId, `🤖 Tự merge theo yêu cầu của ${who}:\n\n${text}`);
+        try { await deliver({ convoId: req.convoId, text, mode: 'auto' }); }
+        catch (e) { await sendText(daemonUserId, `⚠️ Không gửi được kết quả về ${who}: ${e?.message ?? e}`); }
+      } else {
+        try {
+          await prLinks(req.links, { chat: { id: daemonUserId }, from: { id: daemonUserId } },
+            { ...ctx, requester: { convoId: req.convoId, label: who }, header: `📨 ${who} xin merge (${decision.reason}):`, deliver });
+        } catch (e) {
+          // Couldn't reach the owner (Telegram error) → the agent must not wait forever.
+          await deliver({ convoId: req.convoId, text: `⚠️ Không gửi được yêu cầu tới owner (${e?.message ?? e}) — thử merge-request lại sau.`, mode: 'ask' }).catch(() => {});
+        }
+      }
+    } catch (e) {
+      console.error(`[daemon] merge request ${path.basename(file)}: ${e?.message ?? e}`);
+    } finally {
+      remove(file);
+    }
+  }
 }
 
 // Generic registry dispatcher. Resolves `/cmd` to a command spec, gates by
@@ -535,6 +635,18 @@ export async function dispatchCommand(parsed, from, {
 }, replyText = null, messageId = null) {
   // Built-in: handled in-process, never via the registry (a `_commands` entry
   // named `reload` can't shadow it). Admin-only.
+  if (parsed.cmd === AUTOMERGE_COMMAND) {
+    const role = resolveSenderRole(projectsConfig, from && from.id);
+    if (!roleMeets(role, 'admin')) { await sendText(daemonUserId, `❌ /${AUTOMERGE_COMMAND} cần quyền admin (bạn: ${role}).`); return; }
+    const arg = parsed.rest.trim().toLowerCase();
+    if (arg === 'on' || arg === 'off') writeAutoMerge(arg === 'on');
+    else if (arg && arg !== 'status') { await sendText(daemonUserId, `usage: /${AUTOMERGE_COMMAND} on|off|status`); return; }
+    const on = readAutoMerge();
+    await sendText(daemonUserId, on
+      ? '🤖 Auto-merge: BẬT — merge-request của agent cho repo trong projects.json được merge ngay (vẫn qua mọi kiểm tra), anh nhận FYI. /automerge off để tắt.'
+      : '✋ Auto-merge: TẮT — merge-request của agent sẽ hỏi anh bằng nút. /automerge on để bật.');
+    return;
+  }
   if (parsed.cmd === RELOAD_COMMAND && reload) {
     const role = resolveSenderRole(projectsConfig, from && from.id);
     if (!roleMeets(role, 'admin')) { await sendText(daemonUserId, `❌ /${RELOAD_COMMAND} cần quyền admin (bạn: ${role}).`); return; }
