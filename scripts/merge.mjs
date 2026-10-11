@@ -25,9 +25,15 @@ export const DEFAULT_MERGE_METHOD = 'squash';
 
 const USAGE_LINE = 'usage: /merge <project> <pr#> [<pr#> …] | /merge <PR URL> [<PR URL> …]  [--squash|--merge|--rebase] [--keep-branch] [--force] | … --close';
 
+/** The canonical form `https://github.com/owner/name/pull/N` of a PR URL, or null. Pure. */
+export function canonicalPrUrl(s) {
+  const p = parsePrUrl(s);
+  return p ? `https://github.com/${p.repo}/pull/${p.number}` : null;
+}
+
 /** A GitHub PR URL → { repo: 'owner/name', number } | null. Pure. */
 export function parsePrUrl(s) {
-  const m = String(s).match(/^https?:\/\/github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/pull\/(\d+)(?:[/?#].*)?$/);
+  const m = String(s).match(/^https?:\/\/github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/pull\/(\d+)(?:[/?#]\S*)?$/); // no whitespace: a link can't smuggle extra args
   if (!m || m[1] === '.' || m[1] === '..' || m[2] === '.' || m[2] === '..') return null;
   const number = Number(m[3]);
   return Number.isSafeInteger(number) && number > 0 ? { repo: `${m[1]}/${m[2]}`, number } : null;

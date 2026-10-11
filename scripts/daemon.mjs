@@ -56,6 +56,7 @@ import {
 } from './tele-listen.mjs';
 export { prLinksOnly, PR_LINK_RE };
 import { loadCommands, resolveCommand, roleMeets, tokenizeArgs, COMMANDS_FILE } from './commands.mjs';
+import { canonicalPrUrl } from './merge.mjs';
 import {
   readAutoMerge, writeAutoMerge, allowedRepos, decideRequest, validRequest, claimRequests,
   deliverResult, auditAutoMerge,
@@ -468,6 +469,9 @@ export async function handlePrLinks(links, msg, {
 }) {
   const spec = resolveCommand('merge', registry);
   if (!spec || !sendButtons) return;
+  // Canonical owner/name/pull/N only — what is previewed is exactly what a button runs.
+  links = [...new Set(links.map((l) => canonicalPrUrl(l)).filter(Boolean))];
+  if (!links.length) return;
   // The button chooses the operation: never let a deployment arg (`--close`)
   // turn the Merge preview into a close check.
   const baseArgs = spec.args.filter((a) => a !== '--close');
@@ -507,7 +511,7 @@ export async function handlePrLinks(links, msg, {
   return { offered: true };
 }
 
-export async function handleMergeButton(cq, ctx, { take = takeMergeButton, dispatch = dispatchCommand, deliver = deliverResult } = {}) {
+export async function handleMergeButton(cq, ctx, { take = takeMergeButton, dispatch = dispatchCommand, deliver = deliverResult, audit = auditAutoMerge } = {}) {
   const m = String(cq.data || '').match(/^(mg|cl|mc):([0-9a-f]{16})$/);
   if (!m) { await ctx.answerButton(cq.id); return; }
   const entry = take(m[2]);
@@ -540,7 +544,11 @@ export async function handleMergeButton(cq, ctx, { take = takeMergeButton, dispa
   const registry = { ...ctx.registry, merge: { ...resolved, args: resolved.args.filter((a) => a !== '--close') } };
   // For an agent's request, the result also goes back to that agent's queue.
   const sendText = entry.requester
-    ? async (c, t) => { await ctx.sendText(c, t); await deliver({ convoId: entry.requester.convoId, text: t, mode: 'ask' }).catch(() => {}); }
+    ? async (c, t) => {
+      await ctx.sendText(c, t);
+      audit({ requester: entry.requester.convoId, links: entry.links, ok: /^[✅🚫]/u.test(String(t).trim()), mode: closing ? 'button-close' : 'button-merge' });
+      await deliver({ convoId: entry.requester.convoId, text: t, mode: 'ask' }).catch(() => {});
+    }
     : ctx.sendText;
   await dispatch({ cmd: 'merge', rest: entry.links.join(' ') + (closing ? ' --close' : '') }, cq.from || {}, { ...ctx, registry, sendText });
 }
@@ -567,6 +575,7 @@ export async function processMergeRequests(ctx, {
   scriptsDir = __dirname, label = requesterLabel,
 } = {}) {
   const { daemonUserId, projectsConfig, registry, sendText, secretEnvKeys = [] } = ctx;
+  let allowedSet = null; // computed once per pass, only if a request needs it
   for (const { file, body } of claim()) {
     try {
       const req = validRequest(body);
@@ -574,7 +583,9 @@ export async function processMergeRequests(ctx, {
       const who = label(req.convoId);
       const spec = resolveCommand('merge', registry);
       if (!spec) { await deliver({ convoId: req.convoId, text: '❌ /merge is not configured on the daemon.', mode: 'ask' }); continue; }
-      const decision = decideRequest(req.links, { autoEnabled: autoEnabled(), allowed: allowed(projectsConfig) });
+      const on = autoEnabled();
+      if (on && !allowedSet) allowedSet = allowed(projectsConfig);
+      const decision = decideRequest(req.links, { autoEnabled: on, allowed: allowedSet || new Set() });
       if (decision.mode === 'auto') {
         const owner = { id: daemonUserId };
         const role = resolveSenderRole(projectsConfig, daemonUserId);
@@ -585,9 +596,10 @@ export async function processMergeRequests(ctx, {
           });
           text = (r.stdout || '').trim();
         } catch (e) { ok = false; text = ((e.stdout || '') + (e.stderr ? `\n${e.stderr}` : '')).trim() || `❌ ${e.message || e}`; }
-        audit({ requester: req.convoId, links: req.links, ok });
-        await deliver({ convoId: req.convoId, text, mode: 'auto' });
+        audit({ requester: req.convoId, links: req.links, ok, mode: 'auto' });
         await sendText(daemonUserId, `🤖 Tự merge theo yêu cầu của ${who}:\n\n${text}`);
+        try { await deliver({ convoId: req.convoId, text, mode: 'auto' }); }
+        catch (e) { await sendText(daemonUserId, `⚠️ Không gửi được kết quả về ${who}: ${e?.message ?? e}`); }
       } else {
         await prLinks(req.links, { chat: { id: daemonUserId }, from: { id: daemonUserId } },
           { ...ctx, requester: { convoId: req.convoId, label: who }, header: `📨 ${who} xin merge (${decision.reason}):`, deliver });

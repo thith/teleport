@@ -598,7 +598,7 @@ test('processMergeRequests AUTO: merge.mjs as the owner, result to the agent, FY
   assert.equal(runs[0].opts.env.TELE_FROM_ID, '1', 'runs as the owner');
   assert.deepEqual(delivered, [{ convoId: '42', text: '✅ merged PR icetea-labs/umipay-hub#5', mode: 'auto' }]);
   assert.match(sent[0], /Tự merge theo yêu cầu của 🪱 Giun #a7611284/);
-  assert.deepEqual(audits, [{ requester: '42', links: [RQ], ok: true }]);
+  assert.deepEqual(audits, [{ requester: '42', links: [RQ], ok: true, mode: 'auto' }]);
   assert.deepEqual(removed, ['/inbox/1-aa.json.processing']);
 });
 
@@ -634,13 +634,14 @@ test('processMergeRequests: malformed request dropped (removed), nothing run or 
 test('button result for an agent request goes back to that agent too; Cancel tells the agent', async () => {
   const store = new Map([['dddddddddddddddd', { links: [RQ], createdAt: Date.now(), canMerge: true, requester: { convoId: '42', label: 'Giun' } }],
     ['eeeeeeeeeeeeeeee', { links: [RQ], createdAt: Date.now(), canMerge: true, requester: { convoId: '42', label: 'Giun' } }]]);
-  const delivered = [], owner = [];
+  const delivered = [], owner = [], audits = [];
   const ctx = { registry: MREG, sendText: async (c, t) => owner.push(t), answerButton: async () => {}, editButtonsMessage: async () => {} };
   const cq = (d) => ({ id: 'q', data: d, from: { id: 1 }, message: { chat: { id: 1 }, message_id: 1, text: 'p' } });
   await handleMergeButton(cq('mg:dddddddddddddddd'), ctx, {
-    take: (t) => takeMergeButton(t, { store }), deliver: async (r) => delivered.push(r),
+    take: (t) => takeMergeButton(t, { store }), deliver: async (r) => delivered.push(r), audit: (a) => audits.push(a),
     dispatch: async (p, f, c) => { await c.sendText('1', '✅ merged PR #5'); },
   });
+  assert.deepEqual(audits, [{ requester: '42', links: [RQ], ok: true, mode: 'button-merge' }], 'button merges of agent requests are audited too');
   assert.deepEqual(owner, ['✅ merged PR #5']);
   assert.deepEqual(delivered, [{ convoId: '42', text: '✅ merged PR #5', mode: 'ask' }]);
   await handleMergeButton(cq('mc:eeeeeeeeeeeeeeee'), ctx, { take: (t) => takeMergeButton(t, { store }), deliver: async (r) => delivered.push(r), dispatch: async () => {} });
