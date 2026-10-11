@@ -15,13 +15,15 @@
 // GBs (and, ~1 s later, the shared Kotlin daemon once its last client is gone).
 // --no-stop skips it. No `flock` on this machine → runs unlocked, loudly.
 // Nested heavy (a wrapped CI script that itself calls heavy) sees
-// TELEPORT_HEAVY_HELD=build from its ancestor and runs straight away instead of
-// waiting on its own parent's lock forever.
+// TELEPORT_HEAVY_HELD=<pid of the outer heavy> and runs straight away instead
+// of waiting on its own parent's lock forever — but only while that pid is the
+// live holder of record: something the build left behind (adb server, emulator…)
+// inherits the env too, and must not skip the lock after the build is over.
 
 import os from 'node:os';
 import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
-import { acquireLock, describeHolder } from './machine-lock.mjs';
+import { acquireLock, describeHolder, readHolder, lockPaths } from './machine-lock.mjs';
 import { isMainModule } from './is-direct-run.mjs';
 
 export const WAIT_TIMEOUT_EXIT = 75;
@@ -51,7 +53,7 @@ export const isGradlew = (cmd) => path.basename(cmd[0] || '') === 'gradlew';
 const hasSetpriv = () => spawnSync('setpriv', ['--version'], { stdio: 'ignore' }).status === 0;
 
 /** Spawn `cmd` in its own process group; forward signals; resolve its exit code. */
-export function runForwarded(cmd, { spawnFn = spawn, setpriv = hasSetpriv(), proc = process, env = { ...process.env, [HELD_ENV]: 'build' } } = {}) {
+export function runForwarded(cmd, { spawnFn = spawn, setpriv = hasSetpriv(), proc = process, env = { ...process.env, [HELD_ENV]: String(process.pid) } } = {}) {
   // setpriv --pdeathsig: if WE are SIGKILLed (uncatchable, lock released), the build dies too.
   const argv = setpriv ? ['setpriv', '--pdeathsig', 'TERM', '--', ...cmd] : cmd;
   return new Promise((resolve) => {
@@ -71,12 +73,20 @@ export function runForwarded(cmd, { spawnFn = spawn, setpriv = hasSetpriv(), pro
 
 // `--stop` goes through runForwarded too: signals stay handled (and forwarded)
 // until it is over, so it never outlives the lock.
-export async function main(argv, { acquire = acquireLock, run = runForwarded, stopGradle = (cmd) => runForwarded([cmd[0], '--stop']), log = (s) => console.error(s), env = process.env } = {}) {
+/** Is the build lock held by the heavy named in `env` (our live ancestor)? */
+export const heldByAncestor = (env, holder = () => readHolder(lockPaths('build').holder)) => {
+  const pid = Number(env[HELD_ENV]);
+  if (!(pid > 0)) return false;
+  const h = holder();
+  return !!h && h.alive && h.pid === pid;
+};
+
+export async function main(argv, { acquire = acquireLock, run = runForwarded, stopGradle = (cmd) => runForwarded([cmd[0], '--stop']), log = (s) => console.error(s), env = process.env, nested = heldByAncestor } = {}) {
   const a = parseHeavyArgs(argv);
   if (a.error) { log(a.error); return 2; }
   const cmdText = a.cmd.join(' ').slice(0, 200);
   let lock;
-  if (env[HELD_ENV] === 'build') {
+  if (nested(env)) {
     log('ℹ️ heavy: đã ở trong build lock của tiến trình cha — chạy luôn.');
     lock = { release() {}, waitedMs: 0 };
   } else try {

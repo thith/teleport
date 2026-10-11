@@ -6,7 +6,7 @@ import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { acquireLock, lockPaths, describeHolder, readHolder } from './machine-lock.mjs';
-import { parseHeavyArgs, isGradlew, main as heavyMain } from './heavy.mjs';
+import { parseHeavyArgs, isGradlew, heldByAncestor, main as heavyMain } from './heavy.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const HEAVY = path.join(HERE, 'heavy.mjs');
@@ -157,8 +157,16 @@ test('heavy args + gradlew --stop policy (after success AND failure, not with --
   assert.deepEqual(await run(['--', 'cargo', 'build'], 0), { rc: 0, ev: ['run', 'release'] });
   // nested heavy (ancestor already holds the build lock) → no acquire at all
   let acquired = false;
-  assert.equal(await heavyMain(['--', 'x'], { env: { TELEPORT_HEAVY_HELD: 'build' }, acquire: async () => { acquired = true; }, run: async () => 0, log: () => {} }), 0);
+  assert.equal(await heavyMain(['--', 'x'], { env: {}, nested: () => true, acquire: async () => { acquired = true; }, run: async () => 0, log: () => {} }), 0);
   assert.equal(acquired, false);
+  // the env token only counts while it names the live holder of record
+  const H = (h) => () => h;
+  assert.equal(heldByAncestor({ TELEPORT_HEAVY_HELD: '42' }, H({ pid: 42, alive: true })), true);
+  assert.equal(heldByAncestor({ TELEPORT_HEAVY_HELD: '42' }, H({ pid: 43, alive: true })), false, 'someone else holds it now');
+  assert.equal(heldByAncestor({ TELEPORT_HEAVY_HELD: '42' }, H({ pid: 42, alive: false })), false);
+  assert.equal(heldByAncestor({ TELEPORT_HEAVY_HELD: '42' }, H(null)), false);
+  assert.equal(heldByAncestor({ TELEPORT_HEAVY_HELD: 'build' }, H({ pid: 42, alive: true })), false);
+  assert.equal(heldByAncestor({}, H({ pid: 42, alive: true })), false);
   // flock unavailable → runs anyway (fail-open), loudly
   const logs = [];
   assert.equal(await heavyMain(['--', 'x'], { env: {}, acquire: async () => { throw new Error('spawn flock ENOENT'); }, run: async () => 0, log: (s) => logs.push(s) }), 0);
@@ -225,4 +233,16 @@ test('heavy: nested heavy inside a heavy command runs at once (no self-deadlock)
   const c = heavy(dir, ['--', process.execPath, HEAVY, '--wait', '0.05', '--', 'touch', marker]);
   assert.equal((await exitOf(c)).code, 0);
   assert.equal(fs.existsSync(marker), true);
+});
+
+test('heavy: a leftover of a finished build (inherited env) does NOT skip the lock while someone else holds it', async () => {
+  const dir = tmpDir();
+  const marker = path.join(dir, 'ran');
+  // the outer heavy is long gone (pid of this test's dead child), another holder took the lock
+  const dead = spawnSync('true').pid;
+  const other = await acquireLock('build', { dir, label: 'OTHER' });
+  const c = spawn(process.execPath, [HEAVY, '--wait', '0.03', '--', 'touch', marker], { env: { ...cleanEnv({ TELEPORT_LOCK_DIR: dir }), TELEPORT_HEAVY_HELD: String(dead) }, stdio: 'ignore' });
+  assert.equal((await exitOf(c)).code, 75, 'waited, then gave up');
+  other.release();
+  assert.equal(fs.existsSync(marker), false);
 });
