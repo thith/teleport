@@ -161,6 +161,7 @@ It's driven by **one owner user** (`_config.daemonUserId`) and is a thin, **regi
 | `/run <project> <script> [args]` | maintainer | run a `package.json` script — auto-detects npm/pnpm/yarn, validates the script, runs `<pm> run <script> -- <args>` (remote exec) |
 | `/whisper #<hash> <text>` | admin | discreet steer into a topic (also accepts a persona name or convoId as the target) — alias `/w` |
 | `/instruct #<hash> <text>` | admin | official *private* instruction to a topic — nothing hits the group; the agent replies to you via DM (reply to continue) — alias `/i` |
+| `/health` | member | machine status: CPU load, RAM / swap, disk, running claude agents (screen vs terminal, busy), top memory users, warnings (low RAM / disk, OOM kills in the last 24h) |
 | `/pending` | member | convos waiting on an admin reply |
 | `/start` | public | onboarding help |
 | `/merge <project> <pr#> [<pr#> …]` · `/merge <PR URL> […]` `[--squash\|--merge\|--rebase] [--keep-branch] [--force]` | admin | merge GitHub PRs in order (stops at the first failure) through the API — alias `/m`; `--close` closes them without merging (branch kept) (default squash, pinned to the checked head sha; refuses closed/draft/conflicting/failing — `--force` only skips pending checks / a BLOCKED state); deletes the head branch on GitHub; never touches the local checkout |
