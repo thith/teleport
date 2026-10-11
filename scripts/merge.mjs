@@ -18,6 +18,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
+import { PARENT_DIR, resolveSpawnCwd } from './workspace.mjs';
 import { isMainModule } from './is-direct-run.mjs';
 
 export const MERGE_METHODS = ['squash', 'merge', 'rebase'];
@@ -305,7 +306,7 @@ if (isMainModule(import.meta.url)) {
   // Bare numbers need a repo: the named project folder (resolved + contained like
   // /spawn), else — only with the older registry, where the daemon already cd'ed
   // into the project — the cwd. Never the workspace root itself.
-  const { resolveSpawnCwd, PARENT_DIR } = await import('./daemon.mjs');
+
   let cwd = process.cwd();
   if (args.project) {
     const r = resolveSpawnCwd(args.project);

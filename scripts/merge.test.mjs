@@ -294,3 +294,14 @@ test('--skip-merged: an already-merged PR is skipped, the batch continues (crash
   assert.match(r.text, /already merged — skipped[\s\S]*merged PR #2/);
   assert.equal(parseMergeArgs(['https://github.com/a/b/pull/1', '--skip-merged']).skipMerged, true);
 });
+
+test('merge.mjs runs as a CLI (no import deadlock): a usage error exits quickly with code 1', async () => {
+  const { spawnSync } = await import('node:child_process');
+  const { fileURLToPath } = await import('node:url');
+  const script = fileURLToPath(new URL('./merge.mjs', import.meta.url));
+  const r = spawnSync(process.execPath, [script, '--squash', '--rebase', '1'], { encoding: 'utf8', timeout: 15000 });
+  assert.equal(r.signal, null, 'did not hang');
+  assert.equal(r.status, 1, r.stderr);
+  assert.match(r.stdout, /pick one merge method/);
+  assert.doesNotMatch(r.stderr, /unsettled top-level await/);
+});

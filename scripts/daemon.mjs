@@ -57,6 +57,10 @@ import {
 export { prLinksOnly, PR_LINK_RE };
 import { loadCommands, resolveCommand, roleMeets, tokenizeArgs, COMMANDS_FILE } from './commands.mjs';
 import { canonicalPrUrl } from './merge.mjs';
+// Workspace paths live in workspace.mjs (merge.mjs needs them too — importing
+// daemon.mjs from there made a circular import that deadlocked merge.mjs).
+import { PARENT_DIR, resolveSpawnCwd } from './workspace.mjs';
+export { PARENT_DIR, resolveSpawnCwd };
 import {
   readAutoMerge, writeAutoMerge, allowedRepos, decideRequest, validRequest, claimRequests,
   deliverResult, auditAutoMerge,
@@ -68,10 +72,6 @@ import { shortConvoHash } from './convo-hash.mjs';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ENV_FILE = path.join(__dirname, '..', '.env');
 const PROJECTS_FILE = path.join(__dirname, '..', 'projects.json');
-// Common parent of teleport and its sibling projects (the workspace root). The
-// daemon orchestrates across siblings, so `/spawn <project>` resolves to
-// `<PARENT_DIR>/<project>`.
-export const PARENT_DIR = path.resolve(__dirname, '..', '..');
 
 export const DAEMON_POLL_MS = 3000;            // dedicated process → poll briskly
 export const HEARTBEAT_EVERY_MS = 60_000;      // reminder scan cadence
@@ -94,35 +94,6 @@ export function parseDaemonCommand(text) {
 export const COMMAND_TIMEOUT_MS = 5 * 60 * 1000;
 export const RELOAD_COMMAND = 'reload';
 export const COMMAND_MAX_BUFFER = 8 * 1024 * 1024;
-
-// Resolve `<folder>` (positional first token when needsProject) to a sibling
-// directory under PARENT_DIR. Returns
-// { cwd } or { error }. Validates the project token (no path traversal) and that
-// the directory exists with a package.json (teleport's project convention).
-export function resolveSpawnCwd(project, { parentDir = PARENT_DIR, statSync = fs.statSync, realpathSync = fs.realpathSync } = {}) {
-  if (!project) return { error: 'usage: /spawn <project>' };
-  if (!/^[A-Za-z0-9._-]+$/.test(project) || project === '.' || project === '..') {
-    return { error: `invalid project name: ${JSON.stringify(project)}` };
-  }
-  const cwd = path.join(parentDir, project);
-  try {
-    if (!statSync(cwd).isDirectory()) return { error: `not a directory: ${cwd}` };
-  } catch {
-    return { error: `project folder not found: ${cwd}` };
-  }
-  // Containment after following symlinks: a project dir that's a symlink to
-  // OUTSIDE the workspace parent must not let /spawn or /run execute elsewhere.
-  try {
-    const realParent = realpathSync(parentDir);
-    const realCwd = realpathSync(cwd);
-    if (realCwd !== realParent && !realCwd.startsWith(realParent + path.sep)) {
-      return { error: `project resolves outside the workspace: ${project}` };
-    }
-  } catch {
-    return { error: `cannot resolve project path: ${cwd}` };
-  }
-  return { cwd };
-}
 
 // The whisperer's advisory role, looked up across the catch-all roster
 // (`_default.roles`) AND every dedicated project's roles. The control-DM owner is
