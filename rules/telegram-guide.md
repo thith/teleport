@@ -326,6 +326,14 @@ node ../teleport/scripts/send-telegram.mjs --dm --file <path> "<caption>"
    block). Nếu script trả lỗi 403 (`can't initiate conversation`/`Forbidden`) → báo user "admin
    chưa mở chat riêng với bot", đừng coi là đã gửi.
 
+## PR cần merge — tự xin daemon, đừng nhờ user gõ lệnh
+
+Khi bạn có PR sẵn sàng merge, **MUST NOT** nhắn user "anh merge giúp" rồi chờ họ gõ `/merge`. Chạy:
+```bash
+node ../teleport/scripts/merge-request.mjs <PR URL> [<PR URL> …]
+```
+Daemon sẽ merge ngay (khi owner bật `/automerge on` và repo thuộc `projects.json`) hoặc hỏi owner bằng nút. **Kết quả quay về topic của bạn** như một prompt có trường `mergeResult` (`fromRole: 'daemon'`, không đặc quyền) → tự kể NGẮN cho user. Script không cấp quyền gì: merge hay không là daemon/owner quyết, mọi kiểm tra của `/merge` vẫn áp dụng. Muốn đóng PR (không merge) thì nói với user — việc đó owner tự quyết.
+
 ## Supervisor daemon (tuỳ chọn)
 
 `daemon.mjs` là một process **không-phải-AI**, bật tay (best-effort), để điều khiển/cứu hộ

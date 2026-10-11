@@ -8,6 +8,7 @@ import {
   validateDaemonConfig, resolveSenderRole, acquireSingleton, releaseSingleton, daemonStatus,
   reloadDaemonState, readJsonStrict,
   prLinksOnly, takeMergeButton, handlePrLinks, handleMergeButton, startupGreeting, gitShortHead,
+  processMergeRequests,
 } from './daemon.mjs';
 
 test('parseDaemonCommand: extracts command + rest, strips @botname, lowercases', () => {
@@ -578,4 +579,76 @@ test('the --close strip also holds when merge is an alias to a command with --cl
   assert.deepEqual(seen.args, ['--rebase']);
   assert.equal(seen.run, 'merge.mjs');
   assert.equal(seen.alias, undefined);
+});
+
+// ── Agent merge requests ──────────────────────────────────────────────────────
+const RQ = 'https://github.com/icetea-labs/umipay-hub/pull/5';
+const reqCtx = (sent) => ({ daemonUserId: '1', projectsConfig: OWNER_CFG, registry: MREG, sendText: async (c, t) => sent.push(t), parentDir: '/w' });
+
+test('processMergeRequests AUTO: merge.mjs as the owner, result to the agent, FYI to the owner, audited, file removed', async () => {
+  const sent = [], runs = [], delivered = [], audits = [], removed = [];
+  await processMergeRequests(reqCtx(sent), {
+    claim: () => [{ file: '/inbox/1-aa.json.processing', body: { links: [RQ], convoId: '42', createdAt: Date.now() } }],
+    autoEnabled: () => true, allowed: () => new Set(['icetea-labs/umipay-hub']),
+    runner: async (bin, argv, opts) => { runs.push({ argv, opts }); return { stdout: '✅ merged PR icetea-labs/umipay-hub#5' }; },
+    deliver: async (r) => delivered.push(r), audit: (a) => audits.push(a), remove: (f) => removed.push(f),
+    scriptsDir: '/s', label: () => '🪱 Giun #a7611284',
+  });
+  assert.deepEqual(runs[0].argv, ['/s/merge.mjs', RQ]);
+  assert.equal(runs[0].opts.env.TELE_FROM_ID, '1', 'runs as the owner');
+  assert.deepEqual(delivered, [{ convoId: '42', text: '✅ merged PR icetea-labs/umipay-hub#5', mode: 'auto' }]);
+  assert.match(sent[0], /Tự merge theo yêu cầu của 🪱 Giun #a7611284/);
+  assert.deepEqual(audits, [{ requester: '42', links: [RQ], ok: true }]);
+  assert.deepEqual(removed, ['/inbox/1-aa.json.processing']);
+});
+
+test('processMergeRequests ASK: switch off (or repo outside projects.json) → owner preview with buttons, nothing merged', async () => {
+  const sent = [], asked = [];
+  let ran = false;
+  for (const [autoEnabled, allowed] of [[() => false, () => new Set(['icetea-labs/umipay-hub'])], [() => true, () => new Set()]]) {
+    await processMergeRequests(reqCtx(sent), {
+      claim: () => [{ file: 'f', body: { links: [RQ], convoId: '42', createdAt: Date.now() } }],
+      autoEnabled, allowed, runner: async () => { ran = true; return {}; }, deliver: async () => {}, audit: () => {}, remove: () => {},
+      prLinks: async (links, msg, c) => asked.push({ links, chat: msg.chat.id, requester: c.requester, header: c.header }), label: () => 'Giun',
+    });
+  }
+  assert.equal(ran, false);
+  assert.equal(asked.length, 2);
+  assert.deepEqual(asked[0].requester, { convoId: '42', label: 'Giun' });
+  assert.equal(asked[0].chat, '1');
+  assert.match(asked[0].header, /Giun xin merge \(auto-merge is off\)/);
+  assert.match(asked[1].header, /not a projects\.json repo/);
+});
+
+test('processMergeRequests: malformed request dropped (removed), nothing run or delivered', async () => {
+  const removed = []; let touched = false;
+  await processMergeRequests(reqCtx([]), {
+    claim: () => [{ file: 'bad', body: { links: ['x'], convoId: '1' } }, { file: 'unreadable', body: null }],
+    autoEnabled: () => true, allowed: () => new Set(), runner: async () => { touched = true; }, deliver: async () => { touched = true; },
+    audit: () => {}, remove: (f) => removed.push(f), prLinks: async () => { touched = true; },
+  });
+  assert.equal(touched, false);
+  assert.deepEqual(removed, ['bad', 'unreadable']);
+});
+
+test('button result for an agent request goes back to that agent too; Cancel tells the agent', async () => {
+  const store = new Map([['dddddddddddddddd', { links: [RQ], createdAt: Date.now(), canMerge: true, requester: { convoId: '42', label: 'Giun' } }],
+    ['eeeeeeeeeeeeeeee', { links: [RQ], createdAt: Date.now(), canMerge: true, requester: { convoId: '42', label: 'Giun' } }]]);
+  const delivered = [], owner = [];
+  const ctx = { registry: MREG, sendText: async (c, t) => owner.push(t), answerButton: async () => {}, editButtonsMessage: async () => {} };
+  const cq = (d) => ({ id: 'q', data: d, from: { id: 1 }, message: { chat: { id: 1 }, message_id: 1, text: 'p' } });
+  await handleMergeButton(cq('mg:dddddddddddddddd'), ctx, {
+    take: (t) => takeMergeButton(t, { store }), deliver: async (r) => delivered.push(r),
+    dispatch: async (p, f, c) => { await c.sendText('1', '✅ merged PR #5'); },
+  });
+  assert.deepEqual(owner, ['✅ merged PR #5']);
+  assert.deepEqual(delivered, [{ convoId: '42', text: '✅ merged PR #5', mode: 'ask' }]);
+  await handleMergeButton(cq('mc:eeeeeeeeeeeeeeee'), ctx, { take: (t) => takeMergeButton(t, { store }), deliver: async (r) => delivered.push(r), dispatch: async () => {} });
+  assert.match(delivered[1].text, /huỷ/);
+});
+
+test('/automerge: admin only; on/off/status', async () => {
+  const sent = [];
+  await dispatchCommand({ cmd: 'automerge', rest: 'status' }, { id: '9' }, { daemonUserId: '1', projectsConfig: OWNER_CFG, registry: MREG, sendText: async (c, t) => sent.push(t) });
+  assert.match(sent[0], /cần quyền admin/);
 });

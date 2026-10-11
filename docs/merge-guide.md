@@ -26,6 +26,20 @@ Quyền: **admin**. Gửi trong DM với bot, hoặc trong topic nhóm thêm ti�
 
 Trong **DM riêng với bot**, dán tin nhắn **chỉ gồm** link PR (một hoặc nhiều, cách nhau bởi dấu cách/xuống dòng). Daemon kiểm tra như `/merge` nhưng chưa merge gì, rồi trả về tóm tắt kèm nút **[✅ Merge] [✖ Huỷ]**. Bấm Merge là merge (mỗi nút chỉ dùng được một lần, hết hạn sau 15 phút). Dán link trong topic nhóm, hoặc tin có kèm chữ khác, thì không có tác dụng.
 
+## Agent tự xin merge (merge-request)
+
+Agent có PR cần merge thì **tự chạy**, không nhờ user gõ lệnh:
+
+```
+node ../teleport/scripts/merge-request.mjs <URL PR> [<URL PR> …]
+```
+
+Daemon nhận yêu cầu:
+- `/automerge on` và repo của PR thuộc một project trong `projects.json` → **merge ngay** (vẫn qua đủ kiểm tra), kết quả gửi về topic của agent, owner nhận một dòng FYI.
+- Ngược lại (`/automerge off` là mặc định, hoặc repo ngoài danh sách) → owner nhận preview kèm nút **[✅ Merge] [🚫 Close] [✖ Huỷ]**; bấm xong thì kết quả cũng được gửi về agent.
+
+Agent nhận kết quả như một prompt (trường `mergeResult`), rồi tự kể ngắn cho user.
+
 ## Đóng PR (không merge)
 
 ```
