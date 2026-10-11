@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {
-  readAutoMerge, writeAutoMerge, repoFromRemote, allowedRepos, decideRequest, validRequest,
+  readAutoMerge, writeAutoMerge, repoFromRemote, decideRequest, validRequest,
   claimRequests, buildMergeResultPrompt, chatOfConvo, deliverResult,
 } from './merge-inbox.mjs';
 import { parseRequestArgs, writeRequest } from './merge-request.mjs';
@@ -27,20 +27,13 @@ test('repoFromRemote: https / ssh / .git / case', () => {
   assert.equal(repoFromRemote(''), null);
 });
 
-test('allowedRepos: repos of projects.json keys whose folders exist (never _ keys / bad names)', () => {
-  const cfg = { _default: { chatId: '-1' }, 'umipay-hub': {}, teleport: {}, ghost: {}, '../x': {} };
-  const remotes = { '/w/umipay-hub': 'https://github.com/icetea-labs/umipay-hub.git', '/w/teleport': 'git@github.com:thith/teleport.git' };
-  const set = allowedRepos(cfg, { parentDir: '/w', exists: (d) => d in remotes, remoteOf: (d) => remotes[d] });
-  assert.deepEqual([...set].sort(), ['icetea-labs/umipay-hub', 'thith/teleport']);
-});
-
 test('decideRequest: auto only when switch on AND every repo allowed', () => {
   const allowed = new Set(['icetea-labs/umipay-hub']);
   assert.deepEqual(decideRequest([L1], { autoEnabled: true, allowed }), { mode: 'auto' });
   assert.equal(decideRequest([L1], { autoEnabled: false, allowed }).mode, 'ask');
   const mixed = decideRequest([L1, L2], { autoEnabled: true, allowed });
   assert.equal(mixed.mode, 'ask');
-  assert.match(mixed.reason, /someone\/else/);
+  assert.match(mixed.reason, /not in the auto-merge list: someone\/else/);
   assert.equal(decideRequest(['https://github.com/ICETEA-LABS/Umipay-Hub/pull/5'], { autoEnabled: true, allowed }).mode, 'auto', 'case-insensitive');
 });
 
@@ -143,4 +136,38 @@ test('claimRequests: oldest first across a large inbox (no starvation), symlinks
   const tmpOld = path.join(dir, '.1-cd.tmp'); fs.writeFileSync(tmpOld, 'x'); fs.utimesSync(tmpOld, old, old);
   [...claimRequests(dir, { max: 0 })];
   assert.equal(fs.existsSync(tmpOld), false);
+});
+
+test('allowlist patterns: validation, matching (name-only *), add/remove persisted with the switch', async () => {
+  const { validRepoPattern, repoMatches, addAutoMergeRepo, removeAutoMergeRepo, readAutoMergeState, autoMergeAllowlist } = await import('./merge-inbox.mjs');
+  assert.equal(validRepoPattern('icetea-labs/*umipay*'), true);
+  assert.equal(validRepoPattern('icetea-labs/umipay-hub'), true);
+  assert.equal(validRepoPattern('*/umipay'), false, 'no wildcard owner');
+  assert.equal(validRepoPattern('*/*'), false);
+  assert.equal(validRepoPattern('a/b c'), false);
+  assert.equal(validRepoPattern('../x'), false);
+  assert.equal(repoMatches('icetea-labs/umipay-platform', 'icetea-labs/*umipay*'), true);
+  assert.equal(repoMatches('ICETEA-LABS/Umipay', 'icetea-labs/*umipay*'), true);
+  assert.equal(repoMatches('icetea-labs/dpay', 'icetea-labs/*umipay*'), false, 'dpay excluded');
+  assert.equal(repoMatches('icetea-labs/umi-landing', 'icetea-labs/*umipay*'), false);
+  assert.equal(repoMatches('evil/umipay', 'icetea-labs/*umipay*'), false, 'owner must match exactly');
+  assert.equal(repoMatches('icetea-labs/umipayXhub', 'icetea-labs/umipay.hub'), false, 'a dot is literal');
+  const f = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'aml-')), 's.json');
+  writeAutoMerge(true, f);
+  assert.deepEqual(addAutoMergeRepo('icetea-labs/*UMIPAY*', f).repos, ['icetea-labs/*umipay*']);
+  addAutoMergeRepo('icetea-labs/*umipay*', f);
+  assert.deepEqual(readAutoMergeState(f), { enabled: true, repos: ['icetea-labs/*umipay*'] }, 'deduped, switch kept');
+  writeAutoMerge(false, f);
+  assert.deepEqual(readAutoMergeState(f).repos, ['icetea-labs/*umipay*'], 'on/off keeps the list');
+  assert.match(addAutoMergeRepo('bad pattern', f).error, /not a repo pattern/);
+  assert.match(removeAutoMergeRepo('thith/ops', f).error, /not in the added list/);
+  assert.deepEqual(removeAutoMergeRepo('icetea-labs/*umipay*', f).repos, []);
+  const list = autoMergeAllowlist({ configPatterns: ['icetea-ai/*'], addedPatterns: ['icetea-labs/*umipay*', 'nope pattern'] });
+  assert.equal(list.has('thith/ops'), false, 'a projects.json routing key alone is NOT allowed');
+  assert.equal(list.has('icetea-ai/anything'), true);
+  assert.equal(list.has('icetea-labs/umipay-hub'), true);
+  assert.equal(list.has('icetea-labs/dpay'), false);
+  assert.deepEqual(list.patterns, ['icetea-ai/*', 'icetea-labs/*umipay*'], 'invalid patterns ignored');
+  assert.equal(decideRequest(['https://github.com/icetea-labs/umipay-platform/pull/34'], { autoEnabled: true, allowed: list }).mode, 'auto');
+  assert.equal(decideRequest(['https://github.com/icetea-labs/dpay/pull/1'], { autoEnabled: true, allowed: list }).mode, 'ask');
 });

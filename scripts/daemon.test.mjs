@@ -8,7 +8,7 @@ import {
   validateDaemonConfig, resolveSenderRole, acquireSingleton, releaseSingleton, daemonStatus,
   reloadDaemonState, readJsonStrict,
   prLinksOnly, takeMergeButton, handlePrLinks, handleMergeButton, startupGreeting, gitShortHead,
-  processMergeRequests,
+  processMergeRequests, formatAutoMergeStatus, buildAllowlist,
 } from './daemon.mjs';
 
 test('parseDaemonCommand: extracts command + rest, strips @botname, lowercases', () => {
@@ -602,7 +602,7 @@ test('processMergeRequests AUTO: merge.mjs as the owner, result to the agent, FY
   assert.deepEqual(removed, ['/inbox/1-aa.json.processing']);
 });
 
-test('processMergeRequests ASK: switch off (or repo outside projects.json) → owner preview with buttons, nothing merged', async () => {
+test('processMergeRequests ASK: switch off (or repo outside the auto-merge list) → owner preview with buttons, nothing merged', async () => {
   const sent = [], asked = [];
   let ran = false;
   for (const [autoEnabled, allowed] of [[() => false, () => new Set(['icetea-labs/umipay-hub'])], [() => true, () => new Set()]]) {
@@ -617,7 +617,7 @@ test('processMergeRequests ASK: switch off (or repo outside projects.json) → o
   assert.deepEqual(asked[0].requester, { convoId: '42', label: 'Giun' });
   assert.equal(asked[0].chat, '1');
   assert.match(asked[0].header, /Giun xin merge \(auto-merge is off\)/);
-  assert.match(asked[1].header, /not a projects\.json repo/);
+  assert.match(asked[1].header, /not in the auto-merge list/);
 });
 
 test('processMergeRequests: malformed request dropped (removed), nothing run or delivered', async () => {
@@ -669,4 +669,14 @@ test('button audit: a partly failed batch is not ok; owner-unreachable ASK tells
     prLinks: async () => { throw new Error('Telegram 502'); }, label: () => 'G',
   });
   assert.match(delivered[0].text, /Không gửi được yêu cầu tới owner \(Telegram 502\)/);
+});
+
+test('/automerge status lists the explicit patterns; buildAllowlist = config + added only', () => {
+  const list = buildAllowlist({ umipay: {}, _config: { autoMergeRepos: ['icetea-ai/*'] } }, { state: () => ({ enabled: true, repos: ['icetea-labs/*umipay*'] }) });
+  assert.equal(list.has('icetea-labs/umipay-hub'), true);
+  assert.equal(list.has('thith/ops'), false, 'explicit only');
+  const txt = formatAutoMergeStatus({ enabled: true, list });
+  assert.match(txt, /BẬT[\s\S]*• icetea-ai\/\* \(mẫu\)[\s\S]*• icetea-labs\/\*umipay\* \(mẫu\)/);
+  assert.doesNotMatch(txt, /projects\.json\)/);
+  assert.match(formatAutoMergeStatus({ enabled: false, list: { patterns: [] } }), /TẮT[\s\S]*\(trống/);
 });
