@@ -62,8 +62,8 @@ import { canonicalPrUrl } from './merge.mjs';
 import { PARENT_DIR, resolveSpawnCwd } from './workspace.mjs';
 export { PARENT_DIR, resolveSpawnCwd };
 import {
-  readAutoMerge, writeAutoMerge, allowedRepos, decideRequest, validRequest, claimRequests,
-  deliverResult, auditAutoMerge,
+  readAutoMerge, writeAutoMerge, decideRequest, validRequest, claimRequests,
+  deliverResult, auditAutoMerge, readAutoMergeState, addAutoMergeRepo, removeAutoMergeRepo, autoMergeAllowlist,
 } from './merge-inbox.mjs';
 import { peekPersona } from './persona-store.mjs';
 import { formatPersona } from './persona.mjs';
@@ -529,6 +529,28 @@ export async function handleMergeButton(cq, ctx, { take = takeMergeButton, dispa
 
 export const AUTOMERGE_COMMAND = 'automerge';
 
+/**
+ * Allowlist matcher — EXPLICIT only (owner's choice): patterns in projects.json
+ * `_config.autoMergeRepos` + patterns added with /automerge add. Being a
+ * routing key in projects.json does NOT make a repo auto-mergeable.
+ */
+export function buildAllowlist(projectsConfig, { state = readAutoMergeState } = {}) {
+  const cfgPatterns = Array.isArray(projectsConfig?._config?.autoMergeRepos) ? projectsConfig._config.autoMergeRepos : [];
+  return autoMergeAllowlist({ configPatterns: cfgPatterns, addedPatterns: state().repos });
+}
+
+/** /automerge status text. Pure. */
+export function formatAutoMergeStatus({ enabled, list }) {
+  const lines = [enabled
+    ? '🤖 Auto-merge: BẬT. merge-request của agent cho các repo dưới đây được merge ngay (vẫn qua mọi kiểm tra), anh nhận FYI.'
+    : '✋ Auto-merge: TẮT. Mọi merge-request của agent sẽ hỏi anh bằng nút.'];
+  lines.push('', 'Repo được tự merge:');
+  for (const p of list.patterns) lines.push(`• ${p}${p.includes('*') ? ' (mẫu)' : ''}`);
+  if (!list.patterns.length) lines.push('• (trống — mọi merge-request sẽ hỏi anh bằng nút)');
+  lines.push('', '/automerge on | off · /automerge add <owner/repo | owner/*mẫu*> · /automerge remove <…>');
+  return lines.join('\n');
+}
+
 /** "🪱 Giun #a7611284" for a requester convo (best effort). */
 function requesterLabel(convoId) {
   const p = peekPersona(convoId);
@@ -542,7 +564,7 @@ function requesterLabel(convoId) {
  * always removed afterwards (a malformed one is dropped with a log line).
  */
 export async function processMergeRequests(ctx, {
-  claim = claimRequests, autoEnabled = readAutoMerge, allowed = (cfg) => allowedRepos(cfg, { parentDir: ctx.parentDir ?? PARENT_DIR }),
+  claim = claimRequests, autoEnabled = readAutoMerge, allowed = (cfg) => buildAllowlist(cfg),
   runner = execFileP, deliver = deliverResult, audit = auditAutoMerge, prLinks = handlePrLinks, remove = (f) => { try { fs.unlinkSync(f); } catch {} },
   scriptsDir = __dirname, label = requesterLabel,
 } = {}) {
@@ -558,7 +580,7 @@ export async function processMergeRequests(ctx, {
       const on = autoEnabled();
       if (on && !allowedSet) allowedSet = allowed(projectsConfig);
       const decision = decideRequest(req.links, { autoEnabled: on, allowed: allowedSet || new Set() });
-      if (decision.mode === 'auto') {
+      if (decision.mode === 'auto') { // explicit allowlist + switch on
         const owner = { id: daemonUserId };
         const role = resolveSenderRole(projectsConfig, daemonUserId);
         let ok = true, text;
@@ -609,13 +631,14 @@ export async function dispatchCommand(parsed, from, {
   if (parsed.cmd === AUTOMERGE_COMMAND) {
     const role = resolveSenderRole(projectsConfig, from && from.id);
     if (!roleMeets(role, 'admin')) { await sendText(daemonUserId, `❌ /${AUTOMERGE_COMMAND} cần quyền admin (bạn: ${role}).`); return; }
-    const arg = parsed.rest.trim().toLowerCase();
-    if (arg === 'on' || arg === 'off') writeAutoMerge(arg === 'on');
-    else if (arg && arg !== 'status') { await sendText(daemonUserId, `usage: /${AUTOMERGE_COMMAND} on|off|status`); return; }
-    const on = readAutoMerge();
-    await sendText(daemonUserId, on
-      ? '🤖 Auto-merge: BẬT — merge-request của agent cho repo trong projects.json được merge ngay (vẫn qua mọi kiểm tra), anh nhận FYI. /automerge off để tắt.'
-      : '✋ Auto-merge: TẮT — merge-request của agent sẽ hỏi anh bằng nút. /automerge on để bật.');
+    const [sub = 'status', target] = tokenizeArgs(parsed.rest);
+    const op = sub.toLowerCase();
+    if (op === 'on' || op === 'off') writeAutoMerge(op === 'on');
+    else if (op === 'add' || op === 'remove') {
+      const r = op === 'add' ? addAutoMergeRepo(target || '') : removeAutoMergeRepo(target || '');
+      if (r.error) { await sendText(daemonUserId, `❌ ${r.error}`); return; }
+    } else if (op !== 'status') { await sendText(daemonUserId, `usage: /${AUTOMERGE_COMMAND} on|off|status|add <owner/repo>|remove <owner/repo>`); return; }
+    await sendText(daemonUserId, formatAutoMergeStatus({ enabled: readAutoMerge(), list: buildAllowlist(projectsConfig) }));
     return;
   }
   if (parsed.cmd === RELOAD_COMMAND && reload) {

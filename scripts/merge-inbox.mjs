@@ -2,7 +2,7 @@
 //
 // Each daemon loop claims request files from scripts/tmp/merge-requests/ and:
 //   • AUTO   — auto-merge is ON (owner's /automerge switch) and every PR's repo
-//              belongs to a project in projects.json → merge.mjs runs right away;
+//              is in the explicit allowlist (/automerge add, _config.autoMergeRepos) → merge.mjs runs right away;
 //   • ASK    — otherwise → the owner gets the usual preview + [Merge] [Close] [Huỷ];
 // then the result is injected into the requesting agent's prompt queue
 // (`mergeResult`) and the owner gets a one-line FYI for auto merges.
@@ -11,10 +11,8 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { parsePrUrl, canonicalPrUrl } from './merge.mjs';
-import { projectEntries } from './projects-config.mjs';
 import { readTopicsStore } from './topics-store.mjs';
 import { durableWrite } from './steer.mjs';
 import { DEFAULT_TMP_DIR } from './tele-listen.mjs';
@@ -30,15 +28,62 @@ export const STALE_CLAIM_MS = 10 * 60 * 1000;    // a .processing left by a cras
 
 // ── Auto-merge switch (default OFF; the owner turns it on with /automerge on) ──
 
-export function readAutoMerge(file = AUTOMERGE_STATE_FILE) {
-  try { return JSON.parse(fs.readFileSync(file, 'utf8')).enabled === true; } catch { return false; }
+/** { enabled, repos } — repos = extra allowlist patterns added with /automerge add. */
+export function readAutoMergeState(file = AUTOMERGE_STATE_FILE) {
+  try {
+    const j = JSON.parse(fs.readFileSync(file, 'utf8'));
+    return { enabled: j.enabled === true, repos: Array.isArray(j.repos) ? j.repos.filter(validRepoPattern).map((r) => r.toLowerCase()) : [] };
+  } catch { return { enabled: false, repos: [] }; }
 }
-export function writeAutoMerge(enabled, file = AUTOMERGE_STATE_FILE) {
+function writeState(state, file) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(file, JSON.stringify({ enabled: !!enabled, at: new Date().toISOString() }) + '\n');
+  const tmp = `${file}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify({ ...state, at: new Date().toISOString() }) + '\n');
+  fs.renameSync(tmp, file);
+}
+export function readAutoMerge(file = AUTOMERGE_STATE_FILE) { return readAutoMergeState(file).enabled; }
+export function writeAutoMerge(enabled, file = AUTOMERGE_STATE_FILE) {
+  writeState({ ...readAutoMergeState(file), enabled: !!enabled }, file);
 }
 
-// ── Allowlist: the GitHub repos of the projects in projects.json ──────────────
+/** `owner/name` with `*` allowed in the name part only (e.g. icetea-labs/*umipay*). Pure. */
+export function validRepoPattern(p) {
+  return typeof p === 'string' && /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.*-]+$/.test(p) && !p.startsWith('.') && p !== '*/*';
+}
+/** Does `repo` (owner/name) match a pattern? Case-insensitive; `*` = any run of name chars. Pure. */
+export function repoMatches(repo, pattern) {
+  const [po, pn] = String(pattern).toLowerCase().split('/');
+  const [ro, rn] = String(repo).toLowerCase().split('/');
+  if (po !== ro || rn == null) return false;
+  const re = new RegExp(`^${pn.split('*').map((x) => x.replace(/[.\-]/g, '\\$&')).join('[a-z0-9_.-]*')}$`);
+  return re.test(rn);
+}
+/** Add / remove an allowlist pattern (persisted). Returns { ok, repos } | { error }. */
+export function addAutoMergeRepo(pattern, file = AUTOMERGE_STATE_FILE) {
+  if (!validRepoPattern(pattern)) return { error: `not a repo pattern: ${JSON.stringify(pattern)} (owner/name, * allowed in the name)` };
+  const st = readAutoMergeState(file), p = pattern.toLowerCase();
+  if (!st.repos.includes(p)) st.repos.push(p);
+  writeState(st, file);
+  return { ok: true, repos: st.repos };
+}
+export function removeAutoMergeRepo(pattern, file = AUTOMERGE_STATE_FILE) {
+  const st = readAutoMergeState(file), p = String(pattern).toLowerCase();
+  if (!st.repos.includes(p)) return { error: `${pattern} is not in the added list ` };
+  st.repos = st.repos.filter((r) => r !== p);
+  writeState(st, file);
+  return { ok: true, repos: st.repos };
+}
+
+/**
+ * The allowlist as a matcher — explicit patterns only (projects.json
+ * `_config.autoMergeRepos` + /automerge add). `has(repo)` is what decideRequest uses.
+ */
+export function autoMergeAllowlist({ configPatterns = [], addedPatterns = [] } = {}) {
+  const patterns = [...new Set([...configPatterns, ...addedPatterns].filter(validRepoPattern).map((p) => p.toLowerCase()))];
+  return { patterns, has: (repo) => !!repo && patterns.some((p) => repoMatches(repo, p)) };
+}
+
+// ── Repo helpers ──────────────────────────────────────────────────────────────
 
 /** `owner/name` (lower-case) from a git remote URL (https or ssh), else null. Pure. */
 export function repoFromRemote(url) {
@@ -47,31 +92,11 @@ export function repoFromRemote(url) {
   return m ? `${m[1]}/${m[2]}`.toLowerCase() : null;
 }
 
-/**
- * Repos of every project key in projects.json whose folder exists under the
- * workspace root (its `origin` remote). `remoteOf(dir)` is injectable.
- */
-export function allowedRepos(projectsConfig, {
-  parentDir, exists = (d) => fs.existsSync(path.join(d, '.git')),
-  remoteOf = (d) => String(execFileSync('git', ['-C', d, 'remote', 'get-url', 'origin'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })),
-} = {}) {
-  const out = new Set();
-  for (const [key] of projectEntries(projectsConfig || {})) {
-    if (!/^[A-Za-z0-9._-]+$/.test(key) || key === '.' || key === '..') continue;
-    const dir = path.join(parentDir, key);
-    if (!exists(dir)) continue;
-    let repo = null;
-    try { repo = repoFromRemote(remoteOf(dir)); } catch { /* no remote */ }
-    if (repo) out.add(repo);
-  }
-  return out;
-}
-
 /** 'auto' when the switch is on and EVERY link's repo is allowed; else 'ask'. Pure. */
 export function decideRequest(links, { autoEnabled, allowed }) {
   if (!autoEnabled) return { mode: 'ask', reason: 'auto-merge is off' };
   const outside = links.map((l) => parsePrUrl(l)?.repo?.toLowerCase()).filter((r) => !r || !allowed.has(r));
-  if (outside.length) return { mode: 'ask', reason: `not a projects.json repo: ${[...new Set(outside.map((r) => r || '?'))].join(', ')}` };
+  if (outside.length) return { mode: 'ask', reason: `not in the auto-merge list: ${[...new Set(outside.map((r) => r || '?'))].join(', ')}` };
   return { mode: 'auto' };
 }
 

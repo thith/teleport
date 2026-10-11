@@ -4,7 +4,7 @@
 //
 // Writes a request into the daemon's file inbox (scripts/tmp/merge-requests/).
 // The daemon then either merges it right away (auto-merge ON and every PR's repo
-// belongs to a project in projects.json) or asks the owner with [Merge] [Close]
+// is in the owner's explicit auto-merge list) or asks the owner with [Merge] [Close]
 // [Huỷ] buttons. Either way the RESULT comes back to the requesting agent's own
 // topic as a prompt (field `mergeResult`) — the agent never posts the PR to the
 // user and waits for a typed command.
