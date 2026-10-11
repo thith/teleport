@@ -309,6 +309,7 @@ test('merge.mjs runs as a CLI (no import deadlock): a usage error exits quickly 
 test('billing: checks GitHub never STARTED are "not run" (allowed, noted); a real failure still refuses', async () => {
   assert.equal(checkRunIdFromUrl('https://github.com/o/r/actions/runs/38137305121/job/114471781656'), '114471781656');
   assert.equal(checkRunIdFromUrl('https://ci.example/x'), null);
+  assert.equal(checkRunIdFromUrl('https://evil.example/o/r/actions/runs/1/job/999'), null, 'github.com only');
   const BILL = 'The job was not started because recent account payments have failed or your spending limit needs to be increased. Please check the \'Billing & plans\' section in your settings';
   const rollup = [
     { name: 'gate', status: 'COMPLETED', conclusion: 'FAILURE', detailsUrl: 'https://github.com/o/r/actions/runs/1/job/11' },
@@ -316,12 +317,19 @@ test('billing: checks GitHub never STARTED are "not run" (allowed, noted); a rea
     { name: 'android', status: 'COMPLETED', conclusion: 'SKIPPED', detailsUrl: 'https://github.com/o/r/actions/runs/1/job/13' },
   ];
   const ann = { 11: [BILL], 12: ['Process completed with exit code 1.'] };
-  const marked = markBillingNotStarted(rollup, (id) => ann[id]);
+  const NEVER = { runner_id: 0, runner_name: '', steps: [] };
+  const marked = markBillingNotStarted(rollup, (id) => ann[id], () => NEVER);
   assert.deepEqual(summarizeChecks(marked), { failing: ['lint'], pending: [], notRun: ['gate'], total: 3 });
-  assert.equal(markBillingNotStarted(rollup, () => { throw new Error('api'); })[0].notStarted, undefined, 'unknown → still a failure');
+  assert.equal(markBillingNotStarted(rollup, () => { throw new Error('api'); }, () => NEVER)[0].notStarted, undefined, 'unknown → still a failure');
+  assert.equal(markBillingNotStarted(rollup, (id) => ann[id], () => { throw new Error('api'); })[0].notStarted, undefined, 'job unknown → still a failure');
+  // spoof: a job that RAN and printed the billing text via ::error:: stays a failure
+  const ran = { runner_id: 7, runner_name: 'GitHub Actions 7', steps: [{ name: 'x' }] };
+  assert.equal(markBillingNotStarted(rollup, (id) => ann[id], () => ran)[0].notStarted, undefined, 'spoofed annotation → still a failure');
+  assert.equal(markBillingNotStarted(rollup, (id) => ann[id], () => ({ ...NEVER, steps: [{ name: 'x' }] }))[0].notStarted, undefined, 'has steps → ran');
   // end to end through mergeOne with a fake gh
   const f = fakeGh({ 5: PR(5, { statusCheckRollup: [rollup[0]], mergeStateStatus: 'UNSTABLE' }) });
-  const gh = (a) => (a[0] === 'api' && /check-runs\/11\/annotations/.test(a[1] || '') ? JSON.stringify([{ message: BILL }]) : f.gh(a));
+  const gh = (a) => (a[0] === 'api' && /check-runs\/11\/annotations/.test(a[1] || '') ? JSON.stringify([{ message: BILL }])
+    : a[0] === 'api' && /actions\/jobs\/11$/.test(a[1] || '') ? JSON.stringify(NEVER) : f.gh(a));
   const r = await mergeOne(5, ARGS([5]), { gh });
   assert.equal(r.ok, true, r.text);
   assert.match(r.text, /✅ merged PR #5[\s\S]*⚠️ CI không chạy \(GitHub Actions billing\): gate/);

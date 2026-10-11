@@ -103,23 +103,30 @@ export const BILLING_NOT_STARTED_RE = /job was not started because .*(payments? 
 
 /** Check-run id from a GitHub Actions job details URL (…/actions/runs/<run>/job/<id>), else null. Pure. */
 export function checkRunIdFromUrl(url) {
-  const m = String(url || '').match(/\/actions\/runs\/\d+\/job\/(\d+)/);
+  const m = String(url || '').match(/^https:\/\/github\.com\/[^/]+\/[^/]+\/actions\/runs\/\d+\/job\/(\d+)/);
   return m ? m[1] : null;
 }
 
 /**
  * Mark failing checks that GitHub never STARTED for billing reasons (`notStarted`),
  * by reading their annotations. A real failure (the job ran and failed) is left
- * as is. `fetchAnnotations(id)` → array of messages (throws → treated as real failure).
+ * as is. The annotation text alone is spoofable (a job can print `::error::…`),
+ * so the job must also never have run: no runner, no steps.
+ * `fetchAnnotations(id)` → array of messages; `fetchJob(id)` → Actions job JSON
+ * (either throws → treated as real failure).
  */
-export function markBillingNotStarted(rollup = [], fetchAnnotations) {
+export function markBillingNotStarted(rollup = [], fetchAnnotations, fetchJob) {
   return (rollup || []).map((c) => {
     const verdict = String(c.conclusion || c.state || '').toUpperCase();
     const id = FAILING.has(verdict) ? checkRunIdFromUrl(c.detailsUrl) : null;
     if (!id) return c;
     let msgs = [];
     try { msgs = fetchAnnotations(id) || []; } catch { return c; }
-    return msgs.some((m) => BILLING_NOT_STARTED_RE.test(String(m))) ? { ...c, notStarted: true } : c;
+    if (!msgs.some((m) => BILLING_NOT_STARTED_RE.test(String(m)))) return c;
+    let job;
+    try { job = fetchJob(id); } catch { return c; }
+    const neverRan = job && !job.runner_id && !job.runner_name && !(job.steps || []).length;
+    return neverRan ? { ...c, notStarted: true } : c;
   });
 }
 
@@ -224,7 +231,8 @@ export async function mergeOne(target, { method, keepBranch, force, preview = fa
   // Checks GitHub refused to START (Actions billing) are "not run", like a repo
   // without CI (which the owner allows) — only real failures block.
   pr.statusCheckRollup = markBillingNotStarted(pr.statusCheckRollup, (id) =>
-    JSON.parse(gh(['api', `${c.api}/check-runs/${id}/annotations`])).map((a) => a.message));
+    JSON.parse(gh(['api', `${c.api}/check-runs/${id}/annotations`])).map((a) => a.message),
+  (id) => JSON.parse(gh(['api', `${c.api}/actions/jobs/${id}`])));
   const { notRun } = summarizeChecks(pr.statusCheckRollup);
   const ciNote = notRun.length ? `\n⚠️ CI không chạy (GitHub Actions billing): ${notRun.join(', ')} — xử lý như repo chưa có CI.` : '';
   const ok = assessPr(pr, { force });
