@@ -1072,3 +1072,11 @@ test('performResume: screen appearing while the stuck launcher is killed → ok,
   assert.equal(r.ok, true);
   assert.deepEqual(ev, ['kill', 'succeeded', 'release']);
 });
+
+test('matchProcsByName: a hashtag (with or without #) picks the process by session hashtag', () => {
+  const rows = [{ pid: 7, name: '🪱 Giun', hashtag: 'a7611284', procStart: '9' }, { pid: 8, name: 'x', hashtag: 'b1234567' }];
+  assert.deepEqual(matchProcsByName('#a7611284', rows), { pid: 7, start: '9' });
+  assert.deepEqual(matchProcsByName('a7611284', rows), { pid: 7, start: '9' });
+  assert.match(matchProcsByName('#c0000000', rows).error, /no claude process named/);
+  assert.match(matchProcsByName('#a7611284', [...rows, { pid: 9, hashtag: 'a7611284' }]).error, /matches 2 processes/);
+});
