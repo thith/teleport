@@ -243,6 +243,17 @@ test('screenSessionExists: matches a session in `screen -ls` output, else false'
   assert.equal(screenSessionExists('tele-abc123', throwWithStdout), true);
 });
 
+test('screenSessionExists: a "(Dead ???)" leftover socket counts as absent and is wiped', () => {
+  const lsOut = 'There are screens on:\n\t3591893.tele-a7611284\t(10/07/2026 08:28:11 PM)\t(Dead ???)\n\t12.tele-live\t(Detached)\nRemove dead screens with \'screen -wipe\'.\n';
+  const calls = [];
+  const exec = (cmd, args) => { calls.push(args.join(' ')); return args[0] === '-ls' ? lsOut : ''; };
+  assert.equal(screenSessionExists('tele-a7611284', exec), false);
+  assert.deepEqual(calls, ['-ls', '-wipe tele-a7611284']);
+  calls.length = 0;
+  assert.equal(screenSessionExists('tele-live', exec), true);
+  assert.deepEqual(calls, ['-ls'], 'a live session is never wiped');
+});
+
 test('screenSessionExists: no false-positive on a name that is a SUFFIX of another session (G-Major)', () => {
   const lsOut = 'There is a screen on:\n\t999.my.bot\t(Detached)\n';
   assert.equal(screenSessionExists('bot', () => lsOut), false); // "bot" must NOT match "my.bot"

@@ -246,7 +246,8 @@ export function hasBinary(bin, exec = execFileSync) {
  * Best-effort check that a `screen` session named `name` exists. `screen -ls`
  * may exit non-zero depending on state, so we read its output regardless. Used
  * to VERIFY an interactive spawn actually created the session before claiming
- * success (review C-Major). `exec` injectable for tests.
+ * success (review C-Major). A dead session's leftover socket counts as absent
+ * and is wiped. `exec` injectable for tests.
  */
 export function screenSessionExists(name, exec = execFileSync) {
   let out = '';
@@ -256,7 +257,12 @@ export function screenSessionExists(name, exec = execFileSync) {
   // PID boundary so a name that is merely a SUFFIX of another session's name
   // (e.g. "bot" vs "1234.my.bot") doesn't false-match (review G-Major).
   const esc = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  return new RegExp(`(?:^|\\s)\\d+\\.${esc}(\\s|$)`, 'm').test(out);
+  const line = out.split('\n').find((l) => new RegExp(`(?:^|\\s)\\d+\\.${esc}(\\s|$)`).test(l));
+  if (!line) return false;
+  // "(Dead ???)": the screen died (OOM, reboot) but its socket stayed behind. It
+  // is not a session — and it would block /resume forever — so wipe it.
+  if (/\(Dead\b/.test(line)) { try { exec('screen', ['-wipe', name], { encoding: 'utf8' }); } catch {} return false; }
+  return true;
 }
 
 /**
