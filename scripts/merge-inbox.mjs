@@ -124,7 +124,7 @@ export function* claimRequests(dir = MERGE_REQUEST_DIR, { max = REQUESTS_PER_PAS
       const st = fs.lstatSync(dst); // never follow a symlink
       if (st.isFile()) {
         const t = new Date(clock());
-        try { fs.utimesSync(dst, t, t); } catch { try { fs.renameSync(dst, src); } catch {} taken--; continue; }
+        try { fs.utimesSync(dst, t, t); } catch { try { fs.renameSync(dst, src); } catch {} continue; } // still counts toward max
         if (st.size <= REQUEST_MAX_BYTES) body = JSON.parse(fs.readFileSync(dst, 'utf8'));
       }
     } catch { /* unreadable → body null (dropped by the caller) */ }
