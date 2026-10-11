@@ -54,7 +54,7 @@ export function validRepoPattern(p) {
 export function repoMatches(repo, pattern) {
   const [po, pn] = String(pattern).toLowerCase().split('/');
   const [ro, rn] = String(repo).toLowerCase().split('/');
-  if (po !== ro || rn == null) return false;
+  if (pn == null || po !== ro || rn == null) return false;
   const re = new RegExp(`^${pn.split('*').map((x) => x.replace(/[.\-]/g, '\\$&')).join('[a-z0-9_.-]*')}$`);
   return re.test(rn);
 }
@@ -68,7 +68,7 @@ export function addAutoMergeRepo(pattern, file = AUTOMERGE_STATE_FILE) {
 }
 export function removeAutoMergeRepo(pattern, file = AUTOMERGE_STATE_FILE) {
   const st = readAutoMergeState(file), p = String(pattern).toLowerCase();
-  if (!st.repos.includes(p)) return { error: `${pattern} is not in the added list ` };
+  if (!st.repos.includes(p)) return { error: `${pattern} is not in the added list (patterns from projects.json _config.autoMergeRepos are edited there)` };
   st.repos = st.repos.filter((r) => r !== p);
   writeState(st, file);
   return { ok: true, repos: st.repos };
@@ -79,8 +79,11 @@ export function removeAutoMergeRepo(pattern, file = AUTOMERGE_STATE_FILE) {
  * `_config.autoMergeRepos` + /automerge add). `has(repo)` is what decideRequest uses.
  */
 export function autoMergeAllowlist({ configPatterns = [], addedPatterns = [] } = {}) {
-  const patterns = [...new Set([...configPatterns, ...addedPatterns].filter(validRepoPattern).map((p) => p.toLowerCase()))];
-  return { patterns, has: (repo) => !!repo && patterns.some((p) => repoMatches(repo, p)) };
+  const norm = (a) => [...new Set(a.filter(validRepoPattern).map((p) => p.toLowerCase()))];
+  const config = norm(configPatterns);
+  const added = norm(addedPatterns).filter((p) => !config.includes(p));
+  const patterns = [...config, ...added];
+  return { patterns, config, added, has: (repo) => !!repo && patterns.some((p) => repoMatches(repo, p)) };
 }
 
 // ── Repo helpers ──────────────────────────────────────────────────────────────

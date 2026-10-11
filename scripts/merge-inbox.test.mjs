@@ -171,3 +171,10 @@ test('allowlist patterns: validation, matching (name-only *), add/remove persist
   assert.equal(decideRequest(['https://github.com/icetea-labs/umipay-platform/pull/34'], { autoEnabled: true, allowed: list }).mode, 'auto');
   assert.equal(decideRequest(['https://github.com/icetea-labs/dpay/pull/1'], { autoEnabled: true, allowed: list }).mode, 'ask');
 });
+
+test('autoMergeAllowlist marks config vs added; repoMatches tolerates a slash-less pattern', async () => {
+  const { autoMergeAllowlist, repoMatches } = await import('./merge-inbox.mjs');
+  const l = autoMergeAllowlist({ configPatterns: ['a/x'], addedPatterns: ['a/x', 'b/*'] });
+  assert.deepEqual({ config: l.config, added: l.added, patterns: l.patterns }, { config: ['a/x'], added: ['b/*'], patterns: ['a/x', 'b/*'] });
+  assert.equal(repoMatches('a/b', 'noslash'), false);
+});

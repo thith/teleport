@@ -676,7 +676,45 @@ test('/automerge status lists the explicit patterns; buildAllowlist = config + a
   assert.equal(list.has('icetea-labs/umipay-hub'), true);
   assert.equal(list.has('thith/ops'), false, 'explicit only');
   const txt = formatAutoMergeStatus({ enabled: true, list });
-  assert.match(txt, /BẬT[\s\S]*• icetea-ai\/\* \(mẫu\)[\s\S]*• icetea-labs\/\*umipay\* \(mẫu\)/);
-  assert.doesNotMatch(txt, /projects\.json\)/);
+  assert.match(txt, /BẬT[\s\S]*• icetea-ai\/\*[\s\S]*• icetea-labs\/\*umipay\*/);
+  assert.match(txt, /• icetea-ai\/\* \(mẫu, projects\.json — sửa ở đó\)/, 'config entries are marked');
+  assert.match(txt, /• icetea-labs\/\*umipay\* \(mẫu\)\n/);
   assert.match(formatAutoMergeStatus({ enabled: false, list: { patterns: [] } }), /TẮT[\s\S]*\(trống/);
+});
+
+test('/automerge as admin: add / remove / on / off / status through dispatchCommand (isolated state file)', async () => {
+  const f = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'amd-')), 'state.json');
+  const sent = [];
+  const run = (rest) => dispatchCommand({ cmd: 'automerge', rest }, { id: '1' }, { daemonUserId: '1', projectsConfig: OWNER_CFG, registry: MREG, sendText: async (c, t) => sent.push(t), automergeStateFile: f });
+  await run('on');
+  assert.match(sent.at(-1), /BẬT[\s\S]*\(trống/);
+  await run('add icetea-labs/*umipay*');
+  assert.match(sent.at(-1), /• icetea-labs\/\*umipay\* \(mẫu\)/);
+  await run('add bad');
+  assert.match(sent.at(-1), /❌ not a repo pattern/);
+  await run('add a/b c/d');
+  assert.match(sent.at(-1), /^usage:/, 'extra tokens are rejected, not ignored');
+  await run('on extra');
+  assert.match(sent.at(-1), /^usage:/);
+  await run('off');
+  assert.match(sent.at(-1), /TẮT[\s\S]*icetea-labs\/\*umipay\*/, 'off keeps the list');
+  await run('remove nope/x');
+  assert.match(sent.at(-1), /❌ nope\/x is not in the added list/);
+  await run('remove icetea-labs/*umipay*');
+  assert.match(sent.at(-1), /\(trống/);
+  await run('add');
+  assert.match(sent.at(-1), /^usage:/);
+  await run('frobnicate');
+  assert.match(sent.at(-1), /^usage:/);
+});
+
+test('processMergeRequests: the allowlist is re-read per request (a mid-pass remove applies to the next request)', async () => {
+  const sent = []; let allowedNow = true; const modes = [];
+  await processMergeRequests(reqCtx(sent), {
+    claim: () => [{ file: 'a', body: { links: [RQ], convoId: '1', createdAt: Date.now() } }, { file: 'b', body: { links: [RQ], convoId: '2', createdAt: Date.now() } }],
+    autoEnabled: () => true, allowed: () => (allowedNow ? new Set(['icetea-labs/umipay-hub']) : new Set()),
+    runner: async () => { allowedNow = false; modes.push('auto'); return { stdout: '✅' }; },
+    deliver: async () => {}, audit: () => {}, remove: () => {}, prLinks: async () => { modes.push('ask'); }, label: () => 'x',
+  });
+  assert.deepEqual(modes, ['auto', 'ask']);
 });
