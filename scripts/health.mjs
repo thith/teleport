@@ -7,7 +7,9 @@
 
 import fs from 'node:fs';
 import os from 'node:os';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, execFile } from 'node:child_process';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { isMainModule } from './is-direct-run.mjs';
 import { listClaudeProcs } from './claude-procs.mjs';
 
@@ -23,7 +25,7 @@ export function parseMeminfo(text) {
 /** `df -B1 --output=size,avail,target <path>` body → { size, avail, target } | null. Pure. */
 export function parseDf(text) {
   const line = String(text).trim().split('\n')[1];
-  const m = line && line.trim().match(/^(\d+)\s+(\d+)\s+(\S+)/);
+  const m = line && line.trim().match(/^(\d+)\s+(\d+)\s+(.+)$/); // mount target may contain spaces
   return m ? { size: Number(m[1]), avail: Number(m[2]), target: m[3] } : null;
 }
 
@@ -31,7 +33,7 @@ export function parseDf(text) {
 export function topMemory(text, n = 5) {
   const agg = new Map();
   for (const line of String(text).split('\n')) {
-    const m = line.trim().match(/^(\S+)\s+(\d+)$/);
+    const m = line.trim().match(/^(.*?)\s+(\d+)$/); // comm may contain spaces
     if (!m) continue;
     const a = agg.get(m[1]) || { name: m[1], kb: 0, count: 0 };
     a.kb += Number(m[2]); a.count++;
@@ -88,10 +90,15 @@ export const MEM_ALERT_PCT = 15;
 export const MEM_ALERT_REPEAT_MS = 30 * 60 * 1000;
 
 /** Low-RAM early warning, rate-limited. Pure → { alert, text? }. */
+/** Is a low-RAM warning due now? Pure. */
+export function memoryAlertDue({ mem, now, lastAlertAt = 0, thresholdPct = MEM_ALERT_PCT, repeatMs = MEM_ALERT_REPEAT_MS }) {
+  if (!mem || !mem.total || mem.available == null) return false;
+  return (mem.available / mem.total) * 100 < thresholdPct && now - lastAlertAt >= repeatMs;
+}
+
 export function memoryAlert({ mem, top = [], now, lastAlertAt = 0, thresholdPct = MEM_ALERT_PCT, repeatMs = MEM_ALERT_REPEAT_MS }) {
-  if (!mem || !mem.total || mem.available == null) return { alert: false };
+  if (!memoryAlertDue({ mem, now, lastAlertAt, thresholdPct, repeatMs })) return { alert: false };
   const pct = (mem.available / mem.total) * 100;
-  if (pct >= thresholdPct || now - lastAlertAt < repeatMs) return { alert: false };
   const swap = mem.swapTotal ? ` · swap ${fmtGB(mem.swapTotal - (mem.swapFree ?? 0))} / ${fmtGB(mem.swapTotal)}` : '';
   const tops = top.slice(0, 4).map((t) => `${t.name}${t.count > 1 ? ` ×${t.count}` : ''} ${t.mb >= 1024 ? `${(t.mb / 1024).toFixed(1)} GB` : `${t.mb} MB`}`).join(', ');
   return {
@@ -107,13 +114,27 @@ export function agentDeaths(prev = [], now = []) {
   return prev.filter((r) => !alive.has(key(r)));
 }
 
-/** Death notice text. `oom` = an OOM kill was logged since the last check; `killedByOwner` = in the kill audit. Pure. */
-export function deathText(rows, { oom = false, killedByOwner = new Set() } = {}) {
+/**
+ * Was THIS agent an OOM victim? The journal names the exact pid ("Killed process
+ * <pid>") or the agent's own systemd unit ("<unit>: … killed …"). Pure.
+ */
+export function oomVictim(row, journalText, unit = null) {
+  const t = String(journalText || '');
+  if (new RegExp(`Killed process ${row.pid}\\b`).test(t)) return true;
+  if (unit && t.split('\n').some((l) => l.includes(`${unit}:`) && /killed/i.test(l))) return true;
+  return false;
+}
+
+/**
+ * Death notice text. `oomOf(row)` → OOM evidence for that agent; `killedByOwner`
+ * = { pids, hashtags } from the kill audit (the owner's own /kill is not news). Pure.
+ */
+export function deathText(rows, { oomOf = () => false, killedByOwner = { pids: new Set(), hashtags: new Set() } } = {}) {
   const lines = [];
   for (const r of rows) {
-    if (killedByOwner.has(r.pid)) continue; // the owner's own /kill — not news
+    if (killedByOwner.pids?.has(r.pid) || (r.hashtag && killedByOwner.hashtags?.has(r.hashtag))) continue;
     const who = `${r.name || 'agent'}${r.hashtag ? ` #${r.hashtag}` : ''}`;
-    const why = oom ? ' — có vẻ do HẾT RAM (systemd-oomd vừa giết tiến trình)' : '';
+    const why = oomOf(r) ? ' — do HẾT RAM (bị OOM-killer giết)' : ' (không rõ lý do — có thể đã thoát bình thường)';
     lines.push(`💀 ${who} (PID ${r.pid}) đã tắt${why}. Bật lại: /resume ${r.hashtag ? `#${r.hashtag}` : (r.name || '<tên>')}`);
   }
   return lines.join('\n');
@@ -138,46 +159,74 @@ if (isMainModule(import.meta.url)) {
   }) + '\n');
 }
 
+const execFileP = (bin, args, timeout = 10_000) => new Promise((resolve) => {
+  execFile(bin, args, { encoding: 'utf8', timeout, maxBuffer: 16 * 1024 * 1024 }, (err, stdout) => resolve(err ? null : String(stdout)));
+});
+const STATE_FILE = path.join(path.dirname(fileURLToPath(import.meta.url)), 'tmp', 'health-state.json');
+function readState(file = STATE_FILE) { try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return {}; } }
+function writeState(obj, file = STATE_FILE) { try { fs.mkdirSync(path.dirname(file), { recursive: true }); fs.writeFileSync(file, JSON.stringify(obj)); } catch {} }
+
+/** The leaf systemd unit of a pid (e.g. run-r….scope), or null. */
+export function unitOf(pid) {
+  try {
+    const t = fs.readFileSync(`/proc/${pid}/cgroup`, 'utf8');
+    return t.trim().split('\n').map((l) => l.split('/').pop()).find((x) => /\.(scope|service)$/.test(x)) || null;
+  } catch { return null; }
+}
+
 /**
- * One watch pass (daemon heartbeat). `state` persists across calls:
- * { prevAgents, lastMemAlertAt, lastCheckSec }. Sends at most one RAM warning per
- * repeat window and one death notice per vanished agent. Side effects injectable.
+ * One watch pass (daemon heartbeat). `state` persists across calls (in memory):
+ * { prevAgents, units, lastCheckSec }; the last RAM-alert time is persisted on
+ * disk so a daemon restart doesn't reset the 30-min throttle. Probes are async
+ * and bounded (ps / journalctl never block the daemon's event loop); the top
+ * memory users are only collected when a warning is actually due.
  */
 export async function machineWatch(state, send, {
   readMem = () => { try { return parseMeminfo(fs.readFileSync('/proc/meminfo', 'utf8')); } catch { return null; } },
-  listAgents = () => listClaudeProcs(),
-  top = () => { const o = tryRun('ps', ['-eo', 'comm=,rss=']); return o ? topMemory(o) : []; },
-  oomSince = (sec) => { const j = tryRun('journalctl', ['--user', '--since', `@${sec}`, '--no-pager', '-q']); return j ? countOomKills(j) : 0; },
+  listAgents = () => listClaudeProcs({ strict: true }),
+  top = async () => { const o = await execFileP('ps', ['-eo', 'comm=,rss=']); return o ? topMemory(o) : []; },
+  journalSince = async (sec) => (await execFileP('journalctl', ['--since', `@${sec}`, '--no-pager', '-q'])) ?? (await execFileP('journalctl', ['--user', '--since', `@${sec}`, '--no-pager', '-q'])) ?? '',
   recentKills = () => recentOwnerKills(),
+  unit = unitOf,
+  persisted = { read: readState, write: writeState },
   now = Date.now,
 } = {}) {
   const t = now();
+  const disk = persisted.read();
   const mem = readMem();
-  const m = memoryAlert({ mem, top: mem ? top() : [], now: t, lastAlertAt: state.lastMemAlertAt || 0 });
-  if (m.alert) { state.lastMemAlertAt = t; await send(m.text); }
-  let agents = null;
-  try { agents = listAgents(); } catch { agents = null; }
-  if (agents) {
-    if (state.prevAgents) {
-      const gone = agentDeaths(state.prevAgents, agents);
-      if (gone.length) {
-        const sinceSec = state.lastCheckSec || Math.floor(t / 1000) - 120;
-        const text = deathText(gone, { oom: oomSince(sinceSec) > 0, killedByOwner: recentKills() });
-        if (text) await send(text);
-      }
-    }
-    state.prevAgents = agents;
+  if (memoryAlertDue({ mem, now: t, lastAlertAt: disk.lastMemAlertAt || 0 })) {
+    const m = memoryAlert({ mem, top: await top(), now: t, lastAlertAt: disk.lastMemAlertAt || 0 });
+    if (m.alert) { persisted.write({ ...disk, lastMemAlertAt: t }); await send(m.text); }
   }
+  let agents;
+  try { agents = listAgents(); } catch { return; } // listing failed → keep the previous snapshot, report nothing
+  const key = (r) => `${r.pid}:${r.procStart ?? ''}`;
+  if (state.prevAgents) {
+    const gone = agentDeaths(state.prevAgents, agents);
+    if (gone.length) {
+      const sinceSec = (state.lastCheckSec || Math.floor(t / 1000) - 120) - 5;
+      const journal = await journalSince(sinceSec);
+      const text = deathText(gone, { oomOf: (r) => oomVictim(r, journal, state.units?.[key(r)]), killedByOwner: recentKills() });
+      if (text) await send(text);
+    }
+  }
+  state.prevAgents = agents;
+  state.units = Object.fromEntries(agents.map((r) => [key(r), unit(r.pid)]));
   state.lastCheckSec = Math.floor(t / 1000);
 }
 
-/** PIDs killed through /kill pid|name in the last 5 minutes (kill audit). */
+/** PIDs and screen hashtags stopped through /kill (pid|name|<hashtag>) in the last 5 minutes. */
 export function recentOwnerKills(file = new URL('./tmp/kill-pid-audit.jsonl', import.meta.url), { now = Date.now(), windowMs = 5 * 60 * 1000 } = {}) {
-  const out = new Set();
+  const pids = new Set(), hashtags = new Set();
   let text = '';
-  try { text = fs.readFileSync(file, 'utf8'); } catch { return out; }
+  try { text = fs.readFileSync(file, 'utf8'); } catch { return { pids, hashtags }; }
   for (const line of text.trim().split('\n').slice(-50)) {
-    try { const j = JSON.parse(line); if (now - Date.parse(j.ts) < windowMs && /exited|restarted/.test(j.result || '')) out.add(j.pid); } catch {}
+    try {
+      const j = JSON.parse(line);
+      if (now - Date.parse(j.ts) >= windowMs || !/exited|restarted|killed/.test(j.result || '')) continue;
+      if (j.pid) pids.add(j.pid);
+      if (j.hashtag) hashtags.add(j.hashtag);
+    } catch {}
   }
-  return out;
+  return { pids, hashtags };
 }
