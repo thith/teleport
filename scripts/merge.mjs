@@ -20,9 +20,11 @@ import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { PARENT_DIR, resolveSpawnCwd } from './workspace.mjs';
 import { isMainModule } from './is-direct-run.mjs';
+import { acquireLock, describeHolder } from './machine-lock.mjs';
 
 export const MERGE_METHODS = ['squash', 'merge', 'rebase'];
 export const DEFAULT_MERGE_METHOD = 'squash';
+export const MERGE_LOCK_WAIT_SEC = 180; // < the daemon's 5-minute COMMAND_TIMEOUT_MS, leaving time to merge
 
 const USAGE_LINE = 'usage: /merge <project> <pr#> [<pr#> …] | /merge <PR URL> [<PR URL> …]  [--squash|--merge|--rebase] [--keep-branch] [--force] | … --close';
 
@@ -362,7 +364,21 @@ if (isMainModule(import.meta.url)) {
   const gh = ghCli(cwd);
   const canon = canonicalizeTargets(args.targets, () => JSON.parse(gh(['repo', 'view', '--json', 'nameWithOwner'])).nameWithOwner);
   if (canon.error) { console.log(`❌ ${canon.error}`); process.exit(1); }
+  // One merge at a time machine-wide (RFC 17): /merge, the [Merge] button and the
+  // agent inbox otherwise race on retargets / branch deletes. Held by THIS process
+  // (no re-exec), so the daemon's timeout SIGTERM still stops the real merge. The
+  // wait stays well under the daemon's 5-minute COMMAND_TIMEOUT_MS. Previews only read.
+  let lock = null;
+  if (!args.preview) {
+    const waitSec = Number(process.env.TELEPORT_MERGE_LOCK_WAIT_SEC) || MERGE_LOCK_WAIT_SEC;
+    try {
+      lock = await acquireLock('merge', { waitSec, cmd: `merge ${canon.targets.map((t) => `${t.repo}#${t.number}`).join(' ')}`,
+        onWait: (h) => console.error(`⏳ đang có merge khác chạy: ${describeHolder(h)} — chờ…`) });
+    } catch (e) { console.log(`❌ cannot take the merge lock (${e.message}) — not merging.`); process.exit(1); }
+    if (lock.timeout) { console.log(`❌ đang có merge khác chạy quá ${waitSec}s: ${describeHolder(lock.holder)} — thử lại sau.`); process.exit(1); }
+  }
   const r = await mergeMany({ ...args, targets: canon.targets }, { gh });
+  lock?.release();
   console.log(r.text);
   process.exit(r.ok ? 0 : 1);
 }
