@@ -1,5 +1,6 @@
 {
   "spawn":    { "run": "spawn.mjs",   "args": ["--interactive"], "needsProject": true,  "minRole": "maintainer", "desc": "launch an interactive agent in <project>; /spawn <project> --resume-session <uuid> [--hashtag <h>] resumes a session (e.g. a hand-opened one) in a screen, listener re-armed" },
+  "resume":   { "run": "resume.mjs",  "args": [],                "needsProject": false, "minRole": "maintainer", "desc": "bring a dead agent back by name: /resume <persona name | #hashtag> (finds its session + folder, resumes it in a screen; refuses while it is alive)" },
   "headless": { "run": "spawn.mjs",   "args": [],                "needsProject": true,  "minRole": "maintainer", "desc": "launch a headless agent in <project>" },
   "kill":     { "run": "spawn.mjs",   "args": ["--kill"],        "needsProject": false, "minRole": "maintainer", "desc": "kill an agent: /kill <hashtag> (tele-* screen) or /kill pid:<PID> [--restart] (any claude process of yours, owner only, SIGTERM; --restart resumes its session in a screen)" },
   "ls":       { "run": "spawn.mjs",   "args": ["--list"],        "needsProject": false, "minRole": "member",     "desc": "list running agents in two sections — 📺 screens, then 🖥 terminal claude processes — with pid, cwd, full session id, #hashtag" },

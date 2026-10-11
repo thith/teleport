@@ -868,6 +868,14 @@ export function normalizeAgentName(s) {
  * shown in /ls. 0 or ≥2 matches → { error } listing candidates. Pure.
  */
 export function matchProcsByName(name, rows, personaOf = () => null) {
+  // A hashtag (`#a7611284` or `a7611284`, as copied from an agent's messages)
+  // picks the process whose session has that hashtag.
+  const tag = String(name ?? '').trim().replace(/^#/, '').toLowerCase();
+  if (/^[a-j]\d{7}$|^t\d+$/.test(tag)) {
+    const byTag = rows.filter((r) => r.hashtag === tag);
+    if (byTag.length === 1) return { pid: byTag[0].pid, start: byTag[0].procStart ?? null };
+    if (byTag.length > 1) return { error: `#${tag} matches ${byTag.length} processes: ${byTag.map((r) => `PID ${r.pid}`).join(', ')} — use /kill pid:<PID>.` };
+  }
   const q = normalizeAgentName(name);
   if (!q) return { error: 'empty name.' };
   const hits = rows.filter((r) => [r.name, personaOf(r)].some((n) => n && normalizeAgentName(n) === q));
