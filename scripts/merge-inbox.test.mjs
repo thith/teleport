@@ -124,3 +124,23 @@ test('claimRequests: a request that waited >10 min is NOT re-claimed right after
   const second = [...claimRequests(dir)];
   assert.equal(second.length, 0, 'still being processed — not stale');
 });
+
+test('claimRequests: oldest first across a large inbox (no starvation), symlinks never stamped, stale .tmp cleaned', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mr4-'));
+  for (let i = 0; i < 300; i++) fs.writeFileSync(path.join(dir, `.${i}-ab.tmp`), 'x');
+  for (let i = 0; i < 250; i++) writeRequest({ links: [L1], convoId: '1', dir, now: 5000 + i });
+  writeRequest({ links: [L1], convoId: '7', dir, now: 1 }); // the oldest
+  const first = [...claimRequests(dir, { max: 1 })];
+  assert.equal(first[0].body.convoId, '7', 'oldest request first even in a big directory');
+  // symlink target is never touched
+  const target = path.join(dir, 'target.txt'); fs.writeFileSync(target, '{}');
+  const old = new Date(Date.now() - 86_400_000); fs.utimesSync(target, old, old);
+  fs.symlinkSync(target, path.join(dir, '0-aa.json'));
+  const s = [...claimRequests(dir, { max: 1 })];
+  assert.equal(s[0].body, null);
+  assert.ok(Math.abs(fs.statSync(target).mtimeMs - old.getTime()) < 1000, 'symlink target mtime untouched');
+  // old leftover .tmp files are removed
+  const tmpOld = path.join(dir, '.1-cd.tmp'); fs.writeFileSync(tmpOld, 'x'); fs.utimesSync(tmpOld, old, old);
+  [...claimRequests(dir, { max: 0 })];
+  assert.equal(fs.existsSync(tmpOld), false);
+});

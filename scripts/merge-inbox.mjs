@@ -90,41 +90,44 @@ export function validRequest(req, { now = Date.now(), maxAgeMs = REQUEST_MAX_AGE
  * second daemon or a re-run can't take the same file). Returns [{ file, body }]
  * with body = parsed JSON or null if unreadable. Caller deletes when done.
  */
-export const SCAN_PER_PASS = 200;               // directory entries looked at per pass (bounded work)
-
-/** Up to `limit` entry names of `dir`, read incrementally (a flooded inbox can't stall a pass). */
-function scanNames(dir, limit) {
-  const out = [];
-  let d;
-  try { d = fs.opendirSync(dir); } catch { return out; }
-  try { for (let e; out.length < limit && (e = d.readSync()); ) out.push(e.name); } catch {} finally { try { d.closeSync(); } catch {} }
-  return out;
-}
-
-export function* claimRequests(dir = MERGE_REQUEST_DIR, { max = REQUESTS_PER_PASS, now = Date.now(), staleMs = STALE_CLAIM_MS, scan = SCAN_PER_PASS } = {}) {
-  let names = scanNames(dir, scan);
-  // A claim left by a crashed pass goes back in the queue. Re-running is safe:
-  // merge.mjs refuses a PR that is already merged/closed.
-  for (const n of names.filter((x) => /^\d+-[0-9a-f]+\.json\.processing$/.test(x))) {
+/**
+ * Claim pending requests, oldest first, at most `max` per pass (lazy generator:
+ * each file is claimed only when the caller is ready for it). One plain
+ * readdir per pass — even thousands of names list in milliseconds, and a full
+ * sorted listing can't starve old requests the way a partial scan would.
+ *  - A claim left by a crashed pass (`.processing` older than staleMs) goes back
+ *    in the queue; re-running is safe (the daemon passes --skip-merged).
+ *  - Leftover `.tmp` files from a crashed merge-request writer are cleaned up.
+ *  - Only regular, small files are read (no FIFO/symlink/huge file); the claim
+ *    time is stamped per claim (rename keeps the old mtime), and a claim whose
+ *    stamp fails is put back rather than processed.
+ */
+export function* claimRequests(dir = MERGE_REQUEST_DIR, { max = REQUESTS_PER_PASS, clock = Date.now, staleMs = STALE_CLAIM_MS } = {}) {
+  let names = [];
+  try { names = fs.readdirSync(dir); } catch { return; }
+  for (const n of names) {
     const f = path.join(dir, n);
-    try { if (now - fs.lstatSync(f).mtimeMs > staleMs) fs.renameSync(f, f.slice(0, -'.processing'.length)); } catch {}
+    let st; try { st = fs.lstatSync(f); } catch { continue; }
+    const old = clock() - st.mtimeMs > staleMs;
+    if (old && /^\d+-[0-9a-f]+\.json\.processing$/.test(n)) { try { fs.renameSync(f, f.slice(0, -'.processing'.length)); } catch {} }
+    else if (old && /^\.\d+-[0-9a-f]+\.tmp$/.test(n)) { try { fs.unlinkSync(f); } catch {} }
   }
-  names = scanNames(dir, scan).filter((n) => /^\d+-[0-9a-f]+\.json$/.test(n)).sort(); // re-scan: picks up recovered claims
+  try { names = fs.readdirSync(dir).filter((n) => /^\d+-[0-9a-f]+\.json$/.test(n)).sort(); } catch { return; }
   let taken = 0;
   for (const n of names) {
     if (taken >= max) return; // the rest waits for the next pass
     const src = path.join(dir, n), dst = `${src}.processing`;
-    try { fs.renameSync(src, dst); } catch { continue; } // claimed lazily, one at a time
-    // rename keeps the old mtime — stamp the claim time, or a request that waited
-    // >10 min in the queue would look "stale" right away and be re-claimed.
-    try { const t = new Date(now); fs.utimesSync(dst, t, t); } catch {}
+    try { fs.renameSync(src, dst); } catch { continue; }
     taken++;
     let body = null;
     try {
-      // Regular, small files only (no FIFO/symlink/huge file can block or bloat the daemon).
-      const st = fs.lstatSync(dst);
-      if (st.isFile() && st.size <= REQUEST_MAX_BYTES) body = JSON.parse(fs.readFileSync(dst, 'utf8'));
-    } catch { /* unreadable → body null */ }
+      const st = fs.lstatSync(dst); // never follow a symlink
+      if (st.isFile()) {
+        const t = new Date(clock());
+        try { fs.utimesSync(dst, t, t); } catch { try { fs.renameSync(dst, src); } catch {} taken--; continue; }
+        if (st.size <= REQUEST_MAX_BYTES) body = JSON.parse(fs.readFileSync(dst, 'utf8'));
+      }
+    } catch { /* unreadable → body null (dropped by the caller) */ }
     yield { file: dst, body };
   }
 }
