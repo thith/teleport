@@ -57,3 +57,11 @@ test('findResumeTarget: skips sessions still alive (newest dead match wins); all
   assert.equal(findResumeTarget('tiên', C, { aliveSessions: new Set(['s1']) }).target.sessionId, 's2');
   assert.match(findResumeTarget('ma', C, { aliveSessions: new Set(['s3']) }).error, /still running/);
 });
+
+test('findResumeTarget: reports skipped live namesakes; accepts the name: prefix', () => {
+  const r = findResumeTarget('tiên', C, { aliveSessions: new Set(['s1']) });
+  assert.equal(r.target.sessionId, 's2');
+  assert.deepEqual(r.skippedLive.map((x) => x.sessionId), ['s1']);
+  assert.equal(findResumeTarget('name:Ma', C).target.sessionId, 's3');
+  assert.equal(findResumeTarget('name: #c2383556', C).target.sessionId, 's3');
+});

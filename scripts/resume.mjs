@@ -35,7 +35,7 @@ export function normalizeName(s) {
  * Returns { target, others } | { error }. Pure.
  */
 export function findResumeTarget(query, candidates, { aliveSessions = new Set() } = {}) {
-  const q = String(query ?? '').trim();
+  const q = String(query ?? '').trim().replace(/^name:\s*/i, ''); // accept the /kill name: form too
   if (!q) return { error: 'usage: /resume <persona name | #hashtag>' };
   const tag = q.replace(/^#/, '').toLowerCase();
   let hits = /^[a-j]\d{7}$|^t\d+$/.test(tag) ? candidates.filter((c) => c.hashtag === tag) : [];
@@ -48,7 +48,7 @@ export function findResumeTarget(query, candidates, { aliveSessions = new Set() 
   // Only DEAD sessions can be resumed: skip ones a live claude still holds.
   const dead = hits.filter((h) => !aliveSessions.has(h.sessionId));
   if (!dead.length) return { error: `${hits[0].persona || q} #${hits[0].hashtag} is still running — nothing to resume (use /kill name:"…" --restart to restart it).` };
-  return { target: dead[0], others: dead.slice(1) };
+  return { target: dead[0], others: dead.slice(1), skippedLive: hits.filter((h) => aliveSessions.has(h.sessionId)) };
 }
 
 /** The `cwd` recorded in a transcript (first entries that carry one), or null. */
@@ -113,7 +113,8 @@ if (isMainModule(import.meta.url)) {
   if (c.error) { console.log(`❌ ${t.persona || ''} #${t.hashtag}: ${c.error}`); process.exit(1); }
   const { performResume } = await import('./spawn.mjs');
   const res = await performResume({ sessionId: t.sessionId, cwd: c.cwd });
-  const also = pick.others.length ? `\n(also matched, older: ${pick.others.slice(0, 5).map((o) => `#${o.hashtag}`).join(', ')} — use /resume #<hashtag> for one of those)` : '';
+  const also = (pick.others.length ? `\n(also matched, older: ${pick.others.slice(0, 5).map((o) => `#${o.hashtag}`).join(', ')} — use /resume #<hashtag> for one of those)` : '')
+    + (pick.skippedLive?.length ? `\n(skipped — still running: ${pick.skippedLive.map((o) => `#${o.hashtag}`).join(', ')})` : '');
   if (res.error) { console.log(`❌ ${t.persona || ''} #${t.hashtag}: ${res.error}${also}`); process.exit(1); }
   console.log(`🔁 resumed ${t.persona || ''} #${t.hashtag} (session ${t.sessionId}) in screen "${res.plan.sessionName}", folder ${path.basename(c.cwd)}. It will check its mailbox, re-arm its listener and greet in its topic.${also}`);
 }
