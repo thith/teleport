@@ -362,8 +362,8 @@ là một hằng số (`DM_CONTROL_PREFIX`) nên đổi tên cực dễ.
   `admin/maintainer` được authorize. Chạy detached giúp user nếu được yêu cầu:
   `screen -dmS teleport-daemon node ../teleport/scripts/daemon.mjs`.
   Sau khi bật, **chạy `--status` để xác nhận** (bản detached nuốt stderr). Trên **máy chỉ-gửi** (`_config.sendOnly`) daemon tự từ chối (exit `0`) — báo user "daemon không chạy ở máy chỉ-gửi", đừng báo đã bật.
-- **Agent sống độc lập với daemon:** khi daemon chạy dưới systemd, `spawn.mjs` bọc lệnh bằng
-  `systemd-run --user --scope` để mỗi agent có scope riêng — restart/crash daemon không kéo agent chết theo.
+- **Agent có scope riêng:** mọi lần spawn/resume (từ daemon hay từ terminal), nếu có systemd user, `spawn.mjs` bọc lệnh bằng
+  `systemd-run --user --scope` — restart/crash daemon hay đóng terminal không kéo agent chết theo (nhưng logout hẳn user mà không bật linger thì vẫn mất). `TELEPORT_NO_SCOPE=1` để tắt.
 - **Cấu hình:** đặt `_config.daemonChatId` (private chat id, dương) trong `../teleport/projects.json`
   (env chỉ giữ secrets). Mọi project/`_default.chatId` phải là **group (id âm)**; daemon
   chat phải là **private (id dương)** — daemon tự validate và báo lỗi nếu sai.
