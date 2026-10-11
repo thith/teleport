@@ -77,7 +77,7 @@ node ../teleport/scripts/merge-request.mjs <URL PR> [<URL PR> …]
 ## Daemon kiểm tra gì trước khi merge
 
 - PR phải **đang mở**, không phải draft, không có conflict. Nếu GitHub chưa tính xong trạng thái conflict (thường xảy ra ngay sau lần merge trước trong cùng lệnh), lệnh tự đợi vài giây.
-- Không có check CI nào **fail**. Còn check đang chạy thì phải đợi, hoặc dùng `--force`.
+- Không có check CI nào **fail**. Check mà GitHub **không chạy** vì billing (ví dụ hết phút Actions, annotation "The job was not started because…") được coi như repo chưa có CI: vẫn merge được, kết quả ghi "⚠️ CI không chạy (GitHub Actions billing)". Check đã chạy và đỏ thì vẫn bị từ chối. Còn check đang chạy thì phải đợi, hoặc dùng `--force`.
 - Merge ghim đúng commit vừa kiểm tra. Nếu có người push thêm giữa chừng, GitHub từ chối, chỉ cần gửi lại lệnh.
 - Merge qua GitHub API: **không đụng tới checkout local** của project.
 - Xoá branch sau merge chỉ khi an toàn: không phải branch mặc định, không có PR đang mở nào khác dùng nó (làm head hay base). Không kiểm tra được thì giữ lại.
