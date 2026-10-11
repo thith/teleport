@@ -34,7 +34,7 @@ export function normalizeName(s) {
  * Query `#a7611284` / `a7611284` → hashtag; otherwise a full persona name.
  * Returns { target, others } | { error }. Pure.
  */
-export function findResumeTarget(query, candidates) {
+export function findResumeTarget(query, candidates, { aliveSessions = new Set() } = {}) {
   const q = String(query ?? '').trim();
   if (!q) return { error: 'usage: /resume <persona name | #hashtag>' };
   const tag = q.replace(/^#/, '').toLowerCase();
@@ -45,7 +45,10 @@ export function findResumeTarget(query, candidates) {
   }
   if (!hits.length) return { error: `no agent "${q}" with a Telegram topic in the last ${RECENT_DAYS} days.` };
   hits.sort((a, b) => b.mtimeMs - a.mtimeMs);
-  return { target: hits[0], others: hits.slice(1) };
+  // Only DEAD sessions can be resumed: skip ones a live claude still holds.
+  const dead = hits.filter((h) => !aliveSessions.has(h.sessionId));
+  if (!dead.length) return { error: `${hits[0].persona || q} #${hits[0].hashtag} is still running — nothing to resume (use /kill name:"…" --restart to restart it).` };
+  return { target: dead[0], others: dead.slice(1) };
 }
 
 /** The `cwd` recorded in a transcript (first entries that carry one), or null. */
@@ -101,7 +104,9 @@ export function checkCwd(cwd, { parentDir = PARENT_DIR, realpath = fs.realpathSy
 
 if (isMainModule(import.meta.url)) {
   const query = process.argv.slice(2).join(' ');
-  const pick = findResumeTarget(query, listCandidates());
+  const { listClaudeProcs } = await import('./claude-procs.mjs');
+  const alive = new Set(listClaudeProcs().map((r) => r.sessionId).filter(Boolean));
+  const pick = findResumeTarget(query, listCandidates(), { aliveSessions: alive });
   if (pick.error) { console.log(`❌ ${pick.error}`); process.exit(1); }
   const t = pick.target;
   const c = checkCwd(transcriptCwd(t.file));

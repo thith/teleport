@@ -52,3 +52,8 @@ test('listCandidates: only recent transcripts whose convo has a Telegram topic',
   assert.deepEqual(c.map((x) => x.sessionId), [withTopic]);
   assert.equal(c[0].hashtag, shortConvoHash(uuidToConvoInt(withTopic)));
 });
+
+test('findResumeTarget: skips sessions still alive (newest dead match wins); all alive → clear error', () => {
+  assert.equal(findResumeTarget('tiên', C, { aliveSessions: new Set(['s1']) }).target.sessionId, 's2');
+  assert.match(findResumeTarget('ma', C, { aliveSessions: new Set(['s3']) }).error, /still running/);
+});
