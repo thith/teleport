@@ -768,6 +768,15 @@ export async function performResume({ sessionId, cwd, permissionMode = DEFAULT_P
       const holder = procs && findProcForSession(plan.sessionId, procs);
       const blockers = !pre.error || procsError || (holder && !holder.guessed) ? [] : findUnidentifiedProcs(cwd, procs);
       const allYoung = blockers.length > 0 && blockers.every((r) => { const s = etimeToSeconds(r.etime); return s != null && s < YOUNG_PROC_SECONDS; });
+      if (allYoung) {
+        // Would anything ELSE refuse (screen exists, transcript elsewhere)? Then say so now, don't wait.
+        const others = checkResumePreflight({
+          sessionId: plan.sessionId, sessionName: plan.sessionName, cwd,
+          procs: procs.filter((r) => !blockers.includes(r)), procsError: null,
+          screenExists: screenExists(plan.sessionName), transcriptDirs: transcriptDirs(plan.sessionId),
+        });
+        if (others.error) { pre = others; break; }
+      }
       if (!pre.error || !allYoung || waited >= youngWaitMs) {
         if (pre.error && waited > 0) pre = { error: `${pre.error} (waited ${Math.round(waited / 1000)}s for a session file)` };
         break;

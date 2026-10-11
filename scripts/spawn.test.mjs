@@ -1124,3 +1124,12 @@ test('performResume wait: a young proc that turns out to BE this session → ref
   assert.match(r2.error, /still held by live claude PID 9/);
   assert.equal(slept.length, 0, 'no wait when a definite holder is known');
 });
+
+test('performResume wait: another refusal (screen exists) is reported at once, not after the wait', async () => {
+  const slept = [];
+  const young = { pid: 5, sessionId: null, cwd: '/w/umipay', etime: '00:05' };
+  const { deps } = fakeDeps({ listProcs: () => [young], screenExists: () => true, sleep: async (ms) => slept.push(ms) });
+  const r = await performResume({ sessionId: GIUN, cwd: '/w/umipay' }, deps);
+  assert.match(r.error, /already exists/);
+  assert.equal(slept.length, 0);
+});
