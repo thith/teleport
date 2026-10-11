@@ -329,6 +329,17 @@ test('resolveAttachId: finds id (--attach/--resume), rejects missing / flag-look
   assert.deepEqual(resolveAttachId(['--kill', 'x']), { found: false, raw: null });       // no attach flag
 });
 
+test('listSpawnSessions: dead "(Dead ???)" sockets are wiped and not listed; live ones untouched', () => {
+  const lsOut = 'There are screens on:\n\t3591893.tele-a7611284\t(10/07/2026 08:28:11 PM)\t(Dead ???)\n\t12.tele-live\t(Detached)\n\t13.other\t(Dead ???)\n';
+  const calls = [];
+  const exec = (cmd, args) => { calls.push(args.join(' ')); return args[0] === '-ls' ? lsOut : ''; };
+  let wiped = null;
+  assert.deepEqual(listSpawnSessions(exec, { onWiped: (n) => { wiped = n; } }), [{ pid: '12', name: 'tele-live' }]);
+  assert.deepEqual(calls, ['-ls', '-wipe tele-a7611284'], 'only our dead tele-* socket; never a live one or a foreign screen');
+  assert.deepEqual(wiped, ['tele-a7611284']);
+  assert.deepEqual(parseScreenSessions(lsOut), [{ pid: '3591893', name: 'tele-a7611284', dead: true }, { pid: '12', name: 'tele-live' }]);
+});
+
 test('listSpawnSessions: tolerates screen -ls exiting non-zero (reads stdout off error)', () => {
   const lsOut = '\t111.tele-abc1234\t(Detached)\n';
   const throwWithStdout = () => { const e = new Error('exit 1'); e.stdout = lsOut; throw e; };
