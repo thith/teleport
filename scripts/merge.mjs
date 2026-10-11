@@ -86,15 +86,48 @@ const PENDING = new Set(['PENDING', 'QUEUED', 'IN_PROGRESS', 'EXPECTED', 'WAITIN
 
 /** Summarize statusCheckRollup (check runs + commit statuses). Pure. */
 export function summarizeChecks(rollup = []) {
-  const failing = [], pending = [];
+  const failing = [], pending = [], notRun = [];
   for (const c of rollup || []) {
     const name = c.name || c.context || '?';
     const verdict = String(c.conclusion || c.state || '').toUpperCase();
     const status = String(c.status || '').toUpperCase();
-    if (FAILING.has(verdict)) failing.push(name);
+    if (c.notStarted) notRun.push(name); // never ran (e.g. GitHub Actions billing) — not a failure
+    else if (FAILING.has(verdict)) failing.push(name);
     else if ((status && status !== 'COMPLETED') || PENDING.has(verdict)) pending.push(name);
   }
-  return { failing, pending, total: (rollup || []).length };
+  return { failing, pending, notRun, total: (rollup || []).length };
+}
+
+// The annotation GitHub puts on a job it refused to start for billing reasons.
+export const BILLING_NOT_STARTED_RE = /job was not started because .*(payments? have failed|spending limit|billing)/i;
+
+/** Check-run id from a GitHub Actions job details URL (…/actions/runs/<run>/job/<id>), else null. Pure. */
+export function checkRunIdFromUrl(url) {
+  const m = String(url || '').match(/^https:\/\/github\.com\/[^/]+\/[^/]+\/actions\/runs\/\d+\/job\/(\d+)/);
+  return m ? m[1] : null;
+}
+
+/**
+ * Mark failing checks that GitHub never STARTED for billing reasons (`notStarted`),
+ * by reading their annotations. A real failure (the job ran and failed) is left
+ * as is. The annotation text alone is spoofable (a job can print `::error::…`),
+ * so the job must also never have run: no runner, no steps.
+ * `fetchAnnotations(id)` → array of messages; `fetchJob(id)` → Actions job JSON
+ * (either throws → treated as real failure).
+ */
+export function markBillingNotStarted(rollup = [], fetchAnnotations, fetchJob) {
+  return (rollup || []).map((c) => {
+    const verdict = String(c.conclusion || c.state || '').toUpperCase();
+    const id = FAILING.has(verdict) ? checkRunIdFromUrl(c.detailsUrl) : null;
+    if (!id) return c;
+    let msgs = [];
+    try { msgs = fetchAnnotations(id) || []; } catch { return c; }
+    if (!msgs.some((m) => BILLING_NOT_STARTED_RE.test(String(m)))) return c;
+    let job;
+    try { job = fetchJob(id); } catch { return c; }
+    const neverRan = job && !job.runner_id && !job.runner_name && !(job.steps || []).length;
+    return neverRan ? { ...c, notStarted: true } : c;
+  });
 }
 
 /** Decide whether `pr` (gh pr view JSON) may be merged. Pure → { ok } | { error }. */
@@ -108,6 +141,7 @@ export function assessPr(pr, { force = false } = {}) {
   if (failing.length) return { error: `failing checks: ${failing.join(', ')}.` };
   if (pending.length && !force) return { error: `checks still running: ${pending.join(', ')} (wait, or --force).` };
   if (pr.mergeStateStatus === 'BLOCKED' && !force) return { error: 'GitHub says the PR is blocked (required reviews/checks) — --force to try anyway.' };
+  // (UNSTABLE = some checks not green — already judged above: real failures refused, not-run allowed.)
   return { ok: true };
 }
 
@@ -194,6 +228,13 @@ export async function mergeOne(target, { method, keepBranch, force, preview = fa
   // --skip-merged (daemon retries of an interrupted request): a PR that is
   // already merged counts as done instead of stopping the batch.
   if (skipMerged && pr.state === 'MERGED') return { ok: true, head: null, text: `ℹ️ PR ${c.label}${pr.number} "${pr.title}" was already merged — skipped.\n${pr.url}` };
+  // Checks GitHub refused to START (Actions billing) are "not run", like a repo
+  // without CI (which the owner allows) — only real failures block.
+  pr.statusCheckRollup = markBillingNotStarted(pr.statusCheckRollup, (id) =>
+    JSON.parse(gh(['api', `${c.api}/check-runs/${id}/annotations`])).map((a) => a.message),
+  (id) => JSON.parse(gh(['api', `${c.api}/actions/jobs/${id}`])));
+  const { notRun } = summarizeChecks(pr.statusCheckRollup);
+  const ciNote = notRun.length ? `\n⚠️ CI không chạy (GitHub Actions billing): ${notRun.join(', ')} — xử lý như repo chưa có CI.` : '';
   const ok = assessPr(pr, { force });
   if (ok.error) return { error: true, text: `❌ PR ${c.label}${pr.number} "${pr.title}": ${ok.error}\n${pr.url}` };
   // Stacked PR: its base is the head of a PR that is already merged. Merging now
@@ -211,7 +252,7 @@ export async function mergeOne(target, { method, keepBranch, force, preview = fa
   // Merge / Cancel buttons when a PR link is pasted).
   if (preview) {
     const { total } = summarizeChecks(pr.statusCheckRollup);
-    return { ok: true, head: pr.isCrossRepository ? null : `${repo || ''}:${pr.headRefName}`, text: `🔎 PR ${c.label}${pr.number} "${pr.title}"\n${pr.headRefName} → ${pr.baseRefName} · checks: ${total ? 'all passed' : 'none'} · ready to ${method}\n${pr.url}` };
+    return { ok: true, head: pr.isCrossRepository ? null : `${repo || ''}:${pr.headRefName}`, text: `🔎 PR ${c.label}${pr.number} "${pr.title}"\n${pr.headRefName} → ${pr.baseRefName} · checks: ${total ? (notRun.length ? 'not run' : 'all passed') : 'none'} · ready to ${method}${ciNote}\n${pr.url}` };
   }
   try {
     gh(['api', '-X', 'PUT', `${c.api}/pulls/${pr.number}/merge`,
@@ -232,7 +273,7 @@ export async function mergeOne(target, { method, keepBranch, force, preview = fa
     }
   }
   // Only same-repo heads can be the base of another PR here (a fork's `main` is not ours).
-  return { ok: true, head: pr.isCrossRepository ? null : `${repo || ''}:${pr.headRefName}`, text: `✅ merged PR ${c.label}${pr.number} "${pr.title}" into ${pr.baseRefName} (${method}).${branchNote}\n${pr.url}` };
+  return { ok: true, head: pr.isCrossRepository ? null : `${repo || ''}:${pr.headRefName}`, text: `✅ merged PR ${c.label}${pr.number} "${pr.title}" into ${pr.baseRefName} (${method}).${ciNote}${branchNote}\n${pr.url}` };
 }
 
 /**
