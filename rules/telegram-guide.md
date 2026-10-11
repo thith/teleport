@@ -94,6 +94,7 @@ another resume of the same session is in progress (per-session lock) — stop th
 - **`/kill pid:<PID> --restart`** = both in one: SIGTERM, wait for exit, then resume that session in screen
   `tele-<hashtag>` in its **old cwd**. Everything the restart needs (a session id from the session file — never a
   guess — and its transcript) is checked **before** killing, so a doomed restart kills nothing.
+- **Agent đã chết** (bị OOM, crash…): `/resume <tên persona | #hashtag>` — tìm session + folder theo tên, resume trong screen; khỏi gõ UUID. (`/kill … --restart` chỉ dùng cho agent còn sống.)
 - Typical flow: `/ls` → `/kill pid:<PID> --restart` (or `/kill pid:<PID>` then `/spawn <project> --resume-session <uuid>`).
 - If you are the agent that wakes up from such a restart: follow the seed prompt (mailbox → Monitor → greet).
 
