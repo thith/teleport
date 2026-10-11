@@ -77,16 +77,17 @@ node ../teleport/scripts/merge-request.mjs <URL PR> [<URL PR> …]
 ## Daemon kiểm tra gì trước khi merge
 
 - PR phải **đang mở**, không phải draft, không có conflict. Nếu GitHub chưa tính xong trạng thái conflict (thường xảy ra ngay sau lần merge trước trong cùng lệnh), lệnh tự đợi vài giây.
-- Không có check CI nào **fail**. Check mà GitHub **không chạy** vì billing (ví dụ hết phút Actions, annotation "The job was not started because…") được coi như repo chưa có CI: vẫn merge được, kết quả ghi "⚠️ CI không chạy (GitHub Actions billing)". Check đã chạy và đỏ thì vẫn bị từ chối. Còn check đang chạy thì phải đợi, hoặc dùng `--force`.
+- Không có check CI nào **fail**. Check mà GitHub **không chạy** vì billing (ví dụ hết phút Actions, annotation "The job was not started because…") được coi như repo chưa có CI: vẫn merge được, kết quả ghi "⚠️ CI không chạy (GitHub Actions billing)". Điều kiện là job **thật sự chưa chạy** (không runner, 0 step). Job đã chạy mà in ra dòng billing thì vẫn tính là fail, không lách được. Check đã chạy và đỏ thì vẫn bị từ chối. Còn check đang chạy thì phải đợi, hoặc dùng `--force`.
 - Merge ghim đúng commit vừa kiểm tra. Nếu có người push thêm giữa chừng, GitHub từ chối, chỉ cần gửi lại lệnh.
 - Merge qua GitHub API: **không đụng tới checkout local** của project.
+- **Mỗi lúc chỉ một merge** trên cả máy (lock `merge`, RFC 17). `/merge`, nút [Merge] và `merge-request` xếp hàng chứ không chạy song song. Chờ quá 3 phút thì báo `❌ đang có merge khác chạy…`, gửi lại sau. Xem trước (dán link) không phải chờ.
 - Xoá branch sau merge chỉ khi an toàn: không phải branch mặc định, không có PR đang mở nào khác dùng nó (làm head hay base). Không kiểm tra được thì giữ lại.
 
 ## Việc của agent khi soạn lệnh
 
 1. Xác định đúng **folder thật** của repo chứa PR (`readlink -f be` → `~/Projects/umipay-be` → project = `umipay-be`), rồi liệt kê PR đang mở: `gh -R <owner/repo> pr list --json number,title,isDraft,headRefName,baseRefName`.
 2. Với mỗi PR định merge, kiểm tra: không phải draft, CI xanh (`gh pr checks <n>`), không conflict.
-3. **PR xếp chồng** (base của PR B là branch của PR A): sau khi A merge, B sẽ bị **từ chối** (merge vào đó thì code không vào được main). Phải retarget B trước: `gh pr edit <B> --base main`, rồi mới merge B. (Nếu A và B nằm trong cùng một lệnh thì không thể ép bằng `--force`. Nếu A đã merge từ trước mà branch của nó vẫn được dùng tiếp, ví dụ `release`, thì `--force` cho qua.)
+3. **PR xếp chồng** (base của PR B là branch của PR A): sau khi A merge, B sẽ bị **từ chối** (merge vào đó thì code không vào được main). Phải retarget B trước: `gh pr edit <B> --base main`, rồi mới merge B. Nếu A merge kiểu squash, nên rebase B lên main (`git rebase --onto origin/main <tip cũ của A>`) để B không mang lại các commit của A. (Nếu A và B nằm trong cùng một lệnh thì không thể ép bằng `--force`. Nếu A đã merge từ trước mà branch của nó vẫn được dùng tiếp, ví dụ `release`, thì `--force` cho qua.)
 4. **Thứ tự**: nếu các PR đụng chung file hoặc phụ thuộc nhau thì xếp PR nền trước. Sau mỗi lần merge, PR sau có thể bị conflict, khi đó lệnh tự từ chối và báo lại.
 5. Trả về danh sách lệnh, mỗi lệnh một dòng (để copy), kèm một dòng ghi chú cho mỗi PR. Ví dụ:
 
@@ -101,3 +102,6 @@ node ../teleport/scripts/merge-request.mjs <URL PR> [<URL PR> …]
 
 - `✅ merged PR #N "…" into main (squash).` và `🧹 deleted branch … on GitHub`
 - `❌ PR #N "…": <lý do>` (đã đóng / draft / conflict / check fail / check đang chạy). Không có gì bị thay đổi.
+- `❌ đang có merge khác chạy quá 180s: <ai đang giữ>`: chưa đụng gì tới GitHub, gửi lại sau.
+
+Build nặng (Gradle, cargo, CI local) thì có lock riêng: xem [build-guide.md](build-guide.md).
