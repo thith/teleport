@@ -48,11 +48,12 @@ export function parsePrUrl(s) {
  */
 export function parseMergeArgs(argv) {
   const targets = [];
-  let project = null, method = null, keepBranch = false, force = false, preview = false, close = false, methodConflict = null;
+  let project = null, method = null, keepBranch = false, force = false, preview = false, close = false, methodConflict = null, skipMerged = false;
   argv.forEach((a, idx) => {
     if (targets.error) return;
     if (a === '--preview') { preview = true; return; }
     if (a === '--close') { close = true; return; }
+    if (a === '--skip-merged') { skipMerged = true; return; }
     if (/^--(squash|merge|rebase)$/.test(a)) {
       const m = a.slice(2);
       if (method && method !== m) { methodConflict = `pick one merge method (--${method} or --${m}).`; return; }
@@ -76,7 +77,7 @@ export function parseMergeArgs(argv) {
     if (seen.has(k)) return { error: `PR ${t.repo ? `${t.repo}` : ''}#${t.number} listed twice.` };
     seen.add(k);
   }
-  return { project, targets, method: method || DEFAULT_MERGE_METHOD, keepBranch, force, ...(preview ? { preview } : {}), ...(close ? { close } : {}) };
+  return { project, targets, method: method || DEFAULT_MERGE_METHOD, keepBranch, force, ...(preview ? { preview } : {}), ...(close ? { close } : {}), ...(skipMerged ? { skipMerged } : {}) };
 }
 
 const FAILING = new Set(['FAILURE', 'ERROR', 'CANCELLED', 'TIMED_OUT', 'ACTION_REQUIRED', 'STARTUP_FAILURE']);
@@ -174,7 +175,7 @@ const ghError = (e) => String(e?.stderr || e?.message || e).trim().split('\n').s
  * mergeable=UNKNOWN — normal right after a previous merge in the same batch.
  * Returns { ok, text } | { error, text }.
  */
-export async function mergeOne(target, { method, keepBranch, force, preview = false }, {
+export async function mergeOne(target, { method, keepBranch, force, preview = false, skipMerged = false }, {
   gh, sleep = (ms) => new Promise((r) => setTimeout(r, ms)), unknownTries = 5, unknownWaitMs = 2000,
   mergedHeads = [],
 }) {
@@ -189,6 +190,9 @@ export async function mergeOne(target, { method, keepBranch, force, preview = fa
   }
   // Never act on a different PR than the one asked for (e.g. a CLI fallback).
   if (pr.number !== number) return { error: true, text: `❌ asked for PR ${c.label}${number} but GitHub returned #${pr.number} — refusing.` };
+  // --skip-merged (daemon retries of an interrupted request): a PR that is
+  // already merged counts as done instead of stopping the batch.
+  if (skipMerged && pr.state === 'MERGED') return { ok: true, head: null, text: `ℹ️ PR ${c.label}${pr.number} "${pr.title}" was already merged — skipped.\n${pr.url}` };
   const ok = assessPr(pr, { force });
   if (ok.error) return { error: true, text: `❌ PR ${c.label}${pr.number} "${pr.title}": ${ok.error}\n${pr.url}` };
   // Stacked PR: its base is the head of a PR that is already merged. Merging now

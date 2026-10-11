@@ -286,3 +286,11 @@ test('--close: closes open PRs without merging (branch kept); refuses merged/clo
   assert.equal(parseMergeArgs(['https://github.com/a/b/pull/1', '--squash', '--rebase', '--close']).close, true, 'conflicting merge methods are irrelevant to --close');
   assert.match(parseMergeArgs(['https://github.com/a/b/pull/1', '--squash', '--rebase']).error, /pick one/);
 });
+
+test('--skip-merged: an already-merged PR is skipped, the batch continues (crash-retry of a request)', async () => {
+  const f = fakeGh({ 1: PR(1, { state: 'MERGED' }), 2: PR(2) });
+  const r = await mergeMany({ ...ARGS([1, 2]), skipMerged: true }, { gh: f.gh, sleep: async () => {} });
+  assert.equal(r.ok, true, r.text);
+  assert.match(r.text, /already merged — skipped[\s\S]*merged PR #2/);
+  assert.equal(parseMergeArgs(['https://github.com/a/b/pull/1', '--skip-merged']).skipMerged, true);
+});

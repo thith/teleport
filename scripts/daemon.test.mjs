@@ -594,7 +594,7 @@ test('processMergeRequests AUTO: merge.mjs as the owner, result to the agent, FY
     deliver: async (r) => delivered.push(r), audit: (a) => audits.push(a), remove: (f) => removed.push(f),
     scriptsDir: '/s', label: () => '🪱 Giun #a7611284',
   });
-  assert.deepEqual(runs[0].argv, ['/s/merge.mjs', RQ]);
+  assert.deepEqual(runs[0].argv, ['/s/merge.mjs', RQ, '--skip-merged']);
   assert.equal(runs[0].opts.env.TELE_FROM_ID, '1', 'runs as the owner');
   assert.deepEqual(delivered, [{ convoId: '42', text: '✅ merged PR icetea-labs/umipay-hub#5', mode: 'auto' }]);
   assert.match(sent[0], /Tự merge theo yêu cầu của 🪱 Giun #a7611284/);
@@ -652,4 +652,21 @@ test('/automerge: admin only; on/off/status', async () => {
   const sent = [];
   await dispatchCommand({ cmd: 'automerge', rest: 'status' }, { id: '9' }, { daemonUserId: '1', projectsConfig: OWNER_CFG, registry: MREG, sendText: async (c, t) => sent.push(t) });
   assert.match(sent[0], /cần quyền admin/);
+});
+
+test('button audit: a partly failed batch is not ok; owner-unreachable ASK tells the agent', async () => {
+  const store = new Map([['ffffffffffffffff', { links: [RQ], createdAt: Date.now(), canMerge: true, requester: { convoId: '42', label: 'G' } }]]);
+  const audits = [];
+  await handleMergeButton({ id: 'q', data: 'mg:ffffffffffffffff', from: { id: 1 }, message: { chat: { id: 1 }, message_id: 1, text: 'p' } },
+    { registry: MREG, sendText: async () => {}, answerButton: async () => {}, editButtonsMessage: async () => {} },
+    { take: (t) => takeMergeButton(t, { store }), deliver: async () => {}, audit: (a) => audits.push(a),
+      dispatch: async (p, f, c) => { await c.sendText('1', '✅ merged PR #1\n\n❌ PR #2: conflicts\n\n⏹ stopped. merged: #1'); } });
+  assert.equal(audits[0].ok, false);
+  const delivered = [];
+  await processMergeRequests(reqCtx([]), {
+    claim: () => [{ file: 'f', body: { links: [RQ], convoId: '42', createdAt: Date.now() } }],
+    autoEnabled: () => false, allowed: () => new Set(), deliver: async (r) => delivered.push(r), audit: () => {}, remove: () => {},
+    prLinks: async () => { throw new Error('Telegram 502'); }, label: () => 'G',
+  });
+  assert.match(delivered[0].text, /Không gửi được yêu cầu tới owner \(Telegram 502\)/);
 });

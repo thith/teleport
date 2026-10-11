@@ -546,7 +546,8 @@ export async function handleMergeButton(cq, ctx, { take = takeMergeButton, dispa
   const sendText = entry.requester
     ? async (c, t) => {
       await ctx.sendText(c, t);
-      audit({ requester: entry.requester.convoId, links: entry.links, ok: /^[✅🚫]/u.test(String(t).trim()), mode: closing ? 'button-close' : 'button-merge' });
+      // A batch can partly fail: only "no ❌ / ⏹ line anywhere" counts as ok.
+      audit({ requester: entry.requester.convoId, links: entry.links, ok: !/^\s*(❌|⏹)/mu.test(String(t)), mode: closing ? 'button-close' : 'button-merge' });
       await deliver({ convoId: entry.requester.convoId, text: t, mode: 'ask' }).catch(() => {});
     }
     : ctx.sendText;
@@ -591,7 +592,8 @@ export async function processMergeRequests(ctx, {
         const role = resolveSenderRole(projectsConfig, daemonUserId);
         let ok = true, text;
         try {
-          const r = await runner(process.execPath, [path.join(scriptsDir, spec.run), ...spec.args.filter((a) => a !== '--close'), ...req.links], {
+          // --skip-merged: a request retried after a crash continues past the PRs it already merged.
+          const r = await runner(process.execPath, [path.join(scriptsDir, spec.run), ...spec.args.filter((a) => a !== '--close'), ...req.links, '--skip-merged'], {
             cwd: ctx.parentDir ?? PARENT_DIR, env: childEnv(owner, role, secretEnvKeys), timeout: COMMAND_TIMEOUT_MS, maxBuffer: COMMAND_MAX_BUFFER,
           });
           text = (r.stdout || '').trim();
@@ -601,8 +603,13 @@ export async function processMergeRequests(ctx, {
         try { await deliver({ convoId: req.convoId, text, mode: 'auto' }); }
         catch (e) { await sendText(daemonUserId, `⚠️ Không gửi được kết quả về ${who}: ${e?.message ?? e}`); }
       } else {
-        await prLinks(req.links, { chat: { id: daemonUserId }, from: { id: daemonUserId } },
-          { ...ctx, requester: { convoId: req.convoId, label: who }, header: `📨 ${who} xin merge (${decision.reason}):`, deliver });
+        try {
+          await prLinks(req.links, { chat: { id: daemonUserId }, from: { id: daemonUserId } },
+            { ...ctx, requester: { convoId: req.convoId, label: who }, header: `📨 ${who} xin merge (${decision.reason}):`, deliver });
+        } catch (e) {
+          // Couldn't reach the owner (Telegram error) → the agent must not wait forever.
+          await deliver({ convoId: req.convoId, text: `⚠️ Không gửi được yêu cầu tới owner (${e?.message ?? e}) — thử merge-request lại sau.`, mode: 'ask' }).catch(() => {});
+        }
       }
     } catch (e) {
       console.error(`[daemon] merge request ${path.basename(file)}: ${e?.message ?? e}`);
