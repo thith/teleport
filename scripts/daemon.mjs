@@ -64,6 +64,7 @@ export { PARENT_DIR, resolveSpawnCwd };
 import {
   readAutoMerge, writeAutoMerge, decideRequest, validRequest, claimRequests,
   deliverResult, auditAutoMerge, readAutoMergeState, addAutoMergeRepo, removeAutoMergeRepo, autoMergeAllowlist,
+  AUTOMERGE_STATE_FILE,
 } from './merge-inbox.mjs';
 import { peekPersona } from './persona-store.mjs';
 import { formatPersona } from './persona.mjs';
@@ -545,7 +546,11 @@ export function formatAutoMergeStatus({ enabled, list }) {
     ? '🤖 Auto-merge: BẬT. merge-request của agent cho các repo dưới đây được merge ngay (vẫn qua mọi kiểm tra), anh nhận FYI.'
     : '✋ Auto-merge: TẮT. Mọi merge-request của agent sẽ hỏi anh bằng nút.'];
   lines.push('', 'Repo được tự merge:');
-  for (const p of list.patterns) lines.push(`• ${p}${p.includes('*') ? ' (mẫu)' : ''}`);
+  const config = list.config || [];
+  for (const p of list.patterns) {
+    const tags = [p.includes('*') ? 'mẫu' : null, config.includes(p) ? 'projects.json — sửa ở đó' : null].filter(Boolean);
+    lines.push(`• ${p}${tags.length ? ` (${tags.join(', ')})` : ''}`);
+  }
   if (!list.patterns.length) lines.push('• (trống — mọi merge-request sẽ hỏi anh bằng nút)');
   lines.push('', '/automerge on | off · /automerge add <owner/repo | owner/*mẫu*> · /automerge remove <…>');
   return lines.join('\n');
@@ -569,7 +574,6 @@ export async function processMergeRequests(ctx, {
   scriptsDir = __dirname, label = requesterLabel,
 } = {}) {
   const { daemonUserId, projectsConfig, registry, sendText, secretEnvKeys = [] } = ctx;
-  let allowedSet = null; // computed once per pass, only if a request needs it
   for (const { file, body } of claim()) {
     try {
       const req = validRequest(body);
@@ -578,8 +582,9 @@ export async function processMergeRequests(ctx, {
       const spec = resolveCommand('merge', registry);
       if (!spec) { await deliver({ convoId: req.convoId, text: '❌ /merge is not configured on the daemon.', mode: 'ask' }); continue; }
       const on = autoEnabled();
-      if (on && !allowedSet) allowedSet = allowed(projectsConfig);
-      const decision = decideRequest(req.links, { autoEnabled: on, allowed: allowedSet || new Set() });
+      // Re-read per request (tiny JSON read): an /automerge remove that lands
+      // mid-pass must apply to the very next request.
+      const decision = decideRequest(req.links, { autoEnabled: on, allowed: on ? allowed(projectsConfig) : new Set() });
       if (decision.mode === 'auto') { // explicit allowlist + switch on
         const owner = { id: daemonUserId };
         const role = resolveSenderRole(projectsConfig, daemonUserId);
@@ -625,20 +630,26 @@ export async function processMergeRequests(ctx, {
 export async function dispatchCommand(parsed, from, {
   daemonUserId, projectsConfig, registry, sendText, secretEnvKeys = [],
   runner = execFileP, scriptsDir = __dirname, parentDir = PARENT_DIR, reload = null,
+  automergeStateFile = AUTOMERGE_STATE_FILE,
 }, replyText = null, messageId = null) {
   // Built-in: handled in-process, never via the registry (a `_commands` entry
   // named `reload` can't shadow it). Admin-only.
   if (parsed.cmd === AUTOMERGE_COMMAND) {
     const role = resolveSenderRole(projectsConfig, from && from.id);
     if (!roleMeets(role, 'admin')) { await sendText(daemonUserId, `❌ /${AUTOMERGE_COMMAND} cần quyền admin (bạn: ${role}).`); return; }
-    const [sub = 'status', target] = tokenizeArgs(parsed.rest);
-    const op = sub.toLowerCase();
-    if (op === 'on' || op === 'off') writeAutoMerge(op === 'on');
-    else if (op === 'add' || op === 'remove') {
-      const r = op === 'add' ? addAutoMergeRepo(target || '') : removeAutoMergeRepo(target || '');
+    const usage = `usage: /${AUTOMERGE_COMMAND} on | off | status | add <owner/repo | owner/*pattern*> | remove <…>`;
+    const toks = tokenizeArgs(parsed.rest);
+    const op = (toks[0] || 'status').toLowerCase();
+    const f = automergeStateFile;
+    const wantsTarget = op === 'add' || op === 'remove';
+    // Exactly the expected arguments: a stray token is an error, never silently ignored.
+    if (toks.length > (wantsTarget ? 2 : 1) || (wantsTarget && toks.length < 2)) { await sendText(daemonUserId, usage); return; }
+    if (op === 'on' || op === 'off') writeAutoMerge(op === 'on', f);
+    else if (wantsTarget) {
+      const r = op === 'add' ? addAutoMergeRepo(toks[1], f) : removeAutoMergeRepo(toks[1], f);
       if (r.error) { await sendText(daemonUserId, `❌ ${r.error}`); return; }
-    } else if (op !== 'status') { await sendText(daemonUserId, `usage: /${AUTOMERGE_COMMAND} on|off|status|add <owner/repo>|remove <owner/repo>`); return; }
-    await sendText(daemonUserId, formatAutoMergeStatus({ enabled: readAutoMerge(), list: buildAllowlist(projectsConfig) }));
+    } else if (op !== 'status') { await sendText(daemonUserId, usage); return; }
+    await sendText(daemonUserId, formatAutoMergeStatus({ enabled: readAutoMerge(f), list: buildAllowlist(projectsConfig, { state: () => readAutoMergeState(f) }) }));
     return;
   }
   if (parsed.cmd === RELOAD_COMMAND && reload) {
