@@ -18,7 +18,9 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const until = async (f, ms = 5000) => { const t = Date.now(); while (!f()) { if (Date.now() - t > ms) throw new Error('timeout'); await sleep(50); } };
 // 'exit', not 'close': a leftover background process may hold our stdout pipe open.
 const exitOf = (child) => new Promise((r) => child.on('exit', (code, signal) => r({ code, signal })));
-const heavy = (dir, args, extra = {}) => spawn(process.execPath, [HEAVY, ...args], { env: { ...process.env, TELEPORT_LOCK_DIR: dir }, stdio: ['ignore', 'pipe', 'pipe'], ...extra });
+// Without TELEPORT_HEAVY_HELD, even if this suite itself runs under heavy.
+const cleanEnv = (extra) => { const e = { ...process.env, ...extra }; delete e.TELEPORT_HEAVY_HELD; return e; };
+const heavy = (dir, args, extra = {}) => spawn(process.execPath, [HEAVY, ...args], { env: cleanEnv({ TELEPORT_LOCK_DIR: dir }), stdio: ['ignore', 'pipe', 'pipe'], ...extra });
 
 test('lock names: only ^[a-z][a-z0-9-]{0,31}$ (no paths)', () => {
   assert.throws(() => lockPaths('../x'), /bad lock name/);
@@ -141,26 +143,33 @@ test('heavy args + gradlew --stop policy (after success AND failure, not with --
   assert.equal(isGradlew(['./gradlew', 'build']), true);
   assert.equal(isGradlew(['/x/android/gradlew']), true);
   assert.equal(isGradlew(['cargo', 'build']), false);
-  const lock = { release() {}, waitedMs: 0 };
   const run = async (argv, code) => {
-    const stops = [];
-    const rc = await heavyMain(argv, { acquire: async () => lock, run: async () => code, stopGradle: (c) => stops.push(c[0]), log: () => {} });
-    return { rc, stops };
+    const ev = [];
+    const lock = { release() { ev.push('release'); }, waitedMs: 0 };
+    const rc = await heavyMain(argv, { env: {}, acquire: async () => lock, run: async () => { ev.push('run'); return code; }, stopGradle: async (c) => { ev.push(`stop ${c[0]}`); }, log: () => {} });
+    return { rc, ev };
   };
-  assert.deepEqual(await run(['--', './gradlew', 'build'], 0), { rc: 0, stops: ['./gradlew'] });
-  assert.deepEqual(await run(['--', './gradlew', 'build'], 1), { rc: 1, stops: ['./gradlew'] });
-  assert.deepEqual(await run(['--no-stop', '--', './gradlew', 'build'], 0), { rc: 0, stops: [] });
-  assert.deepEqual(await run(['--', 'cargo', 'build'], 0), { rc: 0, stops: [] });
+  // --stop runs while the lock is still held (the reason it can't hit another build's daemon)
+  assert.deepEqual(await run(['--', './gradlew', 'build'], 0), { rc: 0, ev: ['run', 'stop ./gradlew', 'release'] });
+  assert.deepEqual(await run(['--', './gradlew', 'build'], 1), { rc: 1, ev: ['run', 'stop ./gradlew', 'release'] });
+  assert.deepEqual(await run(['--', './gradlew', 'build'], 127), { rc: 127, ev: ['run', 'release'] }, 'never started → no --stop');
+  assert.deepEqual(await run(['--no-stop', '--', './gradlew', 'build'], 0), { rc: 0, ev: ['run', 'release'] });
+  assert.deepEqual(await run(['--', 'cargo', 'build'], 0), { rc: 0, ev: ['run', 'release'] });
+  // nested heavy (ancestor already holds the build lock) → no acquire at all
+  let acquired = false;
+  assert.equal(await heavyMain(['--', 'x'], { env: { TELEPORT_HEAVY_HELD: 'build' }, acquire: async () => { acquired = true; }, run: async () => 0, log: () => {} }), 0);
+  assert.equal(acquired, false);
   // flock unavailable → runs anyway (fail-open), loudly
   const logs = [];
-  assert.equal(await heavyMain(['--', 'x'], { acquire: async () => { throw new Error('spawn flock ENOENT'); }, run: async () => 0, log: (s) => logs.push(s) }), 0);
+  assert.equal(await heavyMain(['--', 'x'], { env: {}, acquire: async () => { throw new Error('spawn flock ENOENT'); }, run: async () => 0, log: (s) => logs.push(s) }), 0);
   assert.match(logs.join('\n'), /KHÔNG khoá/);
 });
 
 test('merge.mjs: a real merge waits for the merge lock and gives up with the holder; --preview never takes it', async () => {
   const dir = tmpDir();
   const bin = path.join(dir, 'bin'); fs.mkdirSync(bin);
-  fs.writeFileSync(path.join(bin, 'gh'), '#!/bin/sh\necho "fake gh: offline" >&2\nexit 1\n', { mode: 0o755 });
+  const called = path.join(dir, 'gh-called');
+  fs.writeFileSync(path.join(bin, 'gh'), `#!/bin/sh\ntouch ${called}\necho "fake gh: offline" >&2\nexit 1\n`, { mode: 0o755 });
   const env = { ...process.env, TELEPORT_LOCK_DIR: dir, TELEPORT_MERGE_LOCK_WAIT_SEC: '1', PATH: `${bin}:${process.env.PATH}` };
   const l = await acquireLock('merge', { dir, label: 'Thi (daemon)', cmd: 'merge o/r#1' });
   try {
@@ -169,8 +178,51 @@ test('merge.mjs: a real merge waits for the merge lock and gives up with the hol
     assert.equal(m.status, 1);
     assert.match(m.stdout, /đang có merge khác chạy quá 1s: Thi \(daemon\) — merge o\/r#1/);
     assert.match(m.stderr, /⏳ đang có merge khác chạy/);
+    assert.equal(fs.existsSync(called), false, 'GitHub never touched before the lock is taken');
     const p = spawnSync(process.execPath, [MERGE, url, '--preview'], { env, encoding: 'utf8', timeout: 15000 });
     assert.doesNotMatch(p.stdout + p.stderr, /merge khác/, 'preview does not wait');
     assert.match(p.stdout, /cannot read PR/);
+    assert.equal(fs.existsSync(called), true);
   } finally { l.release(); }
+});
+
+test('acquire: re-notices every noticeMs and when the holder changes', async () => {
+  const dir = tmpDir();
+  const a = await acquireLock('build', { dir, label: 'A' });
+  const seen = [];
+  const t = await acquireLock('build', { dir, waitSec: 0.5, pollMs: 40, noticeMs: 150, onWait: (h) => seen.push(h?.label) });
+  assert.ok(t.timeout && seen.length >= 3 && seen.length <= 5, JSON.stringify(seen));
+  seen.length = 0;
+  const p = lockPaths('build', dir).holder;
+  setTimeout(() => fs.writeFileSync(p, JSON.stringify({ pid: process.pid, label: 'B', startedAt: Date.now() })), 150);
+  await acquireLock('build', { dir, waitSec: 0.4, pollMs: 40, noticeMs: 60000, onWait: (h) => seen.push(h?.label) });
+  assert.deepEqual(seen, ['A', 'B']);
+  a.release();
+});
+
+test('acquire: no flock binary → rejects (heavy runs unlocked, merge refuses) instead of waiting forever', () => {
+  const dir = tmpDir();
+  const code = `import('${path.join(HERE, 'machine-lock.mjs')}').then((m) => m.acquireLock('build', { dir: ${JSON.stringify(dir)}, waitSec: 2 })).then((r) => console.log('resolved', JSON.stringify(r)), (e) => console.log('rejected', e.code || e.message))`;
+  const r = spawnSync(process.execPath, ['-e', code], { env: { ...process.env, PATH: '/nonexistent' }, encoding: 'utf8', timeout: 10000 });
+  assert.match(r.stdout, /rejected ENOENT/);
+});
+
+test('heavy: wrapper SIGKILLed → the build dies too (setpriv --pdeathsig); lock free', { skip: spawnSync('setpriv', ['--version']).status !== 0 }, async () => {
+  const dir = tmpDir();
+  const c = heavy(dir, ['--', 'sleep', '30']);
+  await until(() => fs.existsSync(lockPaths('build', dir).holder));
+  await sleep(200);
+  const kids = spawnSync('pgrep', ['-P', String(c.pid)], { encoding: 'utf8' }).stdout.trim().split('\n').filter(Boolean).map(Number);
+  assert.equal(kids.length, 1);
+  c.kill('SIGKILL'); await exitOf(c);
+  await until(() => { try { process.kill(kids[0], 0); return false; } catch { return true; } }, 3000);
+  assert.equal(probe(dir), 'free');
+});
+
+test('heavy: nested heavy inside a heavy command runs at once (no self-deadlock)', async () => {
+  const dir = tmpDir();
+  const marker = path.join(dir, 'inner-ran');
+  const c = heavy(dir, ['--', process.execPath, HEAVY, '--wait', '0.05', '--', 'touch', marker]);
+  assert.equal((await exitOf(c)).code, 0);
+  assert.equal(fs.existsSync(marker), true);
 });
