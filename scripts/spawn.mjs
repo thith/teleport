@@ -764,9 +764,14 @@ export async function performResume({ sessionId, cwd, permissionMode = DEFAULT_P
         procs, procsError, screenExists: screenExists(plan.sessionName),
         transcriptDirs: transcriptDirs(plan.sessionId),
       });
-      const blockers = !pre.error || procsError ? [] : findUnidentifiedProcs(cwd, procs);
+      // A definite holder (session file, not a guess) is known now — never wait for it.
+      const holder = procs && findProcForSession(plan.sessionId, procs);
+      const blockers = !pre.error || procsError || (holder && !holder.guessed) ? [] : findUnidentifiedProcs(cwd, procs);
       const allYoung = blockers.length > 0 && blockers.every((r) => { const s = etimeToSeconds(r.etime); return s != null && s < YOUNG_PROC_SECONDS; });
-      if (!pre.error || !allYoung || waited >= youngWaitMs) break;
+      if (!pre.error || !allYoung || waited >= youngWaitMs) {
+        if (pre.error && waited > 0) pre = { error: `${pre.error} (waited ${Math.round(waited / 1000)}s for a session file)` };
+        break;
+      }
       await sleep(youngPollMs);
     }
     if (pre.error) return { error: pre.error, plan };
@@ -1030,7 +1035,6 @@ export function inSystemdService(cgroupText) {
  */
 export const SYSTEMD_SCOPE_PREFIX = ['systemd-run', '--user', '--scope', '--quiet', '--collect', '--'];
 export function escapeServiceCgroup(command, env, {
-  cgroup = (() => { try { return fs.readFileSync('/proc/self/cgroup', 'utf8'); } catch { return ''; } })(),
   run = execFileSync,
   probe = () => {
     const [bin, ...args] = SYSTEMD_SCOPE_PREFIX;

@@ -868,10 +868,10 @@ test('escapeServiceCgroup: wraps with systemd-run --scope whenever the probe wor
   const cmd = ['/bin/zsh', '-lic', 'exec "$@"', 'teleport-spawn', 'screen'];
   const svc = '0::/a/teleport-daemon.service';
   assert.deepEqual(SYSTEMD_SCOPE_PREFIX, ['systemd-run', '--user', '--scope', '--quiet', '--collect', '--'], 'literal argv: --scope keeps the pid, --user the user manager, -- ends options');
-  assert.deepEqual(escapeServiceCgroup(cmd, {}, { cgroup: svc, probe: () => true }), [...SYSTEMD_SCOPE_PREFIX, ...cmd]);
-  assert.deepEqual(escapeServiceCgroup(cmd, {}, { cgroup: svc, probe: () => false }), cmd);
+  assert.deepEqual(escapeServiceCgroup(cmd, {}, { probe: () => true }), [...SYSTEMD_SCOPE_PREFIX, ...cmd]);
+  assert.deepEqual(escapeServiceCgroup(cmd, {}, { probe: () => false }), cmd);
   // a terminal scope gets its own scope too (closing the terminal must not kill the agent)
-  assert.deepEqual(escapeServiceCgroup(cmd, {}, { cgroup: '0::/a/vte-spawn-x.scope', probe: () => true }), [...SYSTEMD_SCOPE_PREFIX, ...cmd]);
+  assert.deepEqual(escapeServiceCgroup(cmd, {}, { probe: () => true }), [...SYSTEMD_SCOPE_PREFIX, ...cmd]);
   } finally { process.env.TELEPORT_NO_SCOPE = '1'; }
   // the opt-out wins over a working probe
   assert.deepEqual(escapeServiceCgroup(['x'], {}, { probe: () => true }), ['x']);
@@ -910,10 +910,10 @@ test('escapeServiceCgroup: the DEFAULT probe runs `systemd-run --user --scope �
   delete process.env.TELEPORT_NO_SCOPE;
   try {
   const calls = [];
-  const out = escapeServiceCgroup(['x'], { E: 1 }, { cgroup: '0::/a/teleport-daemon.service', run: (bin, args, opts) => { calls.push([bin, ...args]); assert.deepEqual(opts.env, { E: 1 }); } });
+  const out = escapeServiceCgroup(['x'], { E: 1 }, { run: (bin, args, opts) => { calls.push([bin, ...args]); assert.deepEqual(opts.env, { E: 1 }); } });
   assert.deepEqual(calls, [['systemd-run', '--user', '--scope', '--quiet', '--collect', '--', 'true']]);
   assert.deepEqual(out, [...SYSTEMD_SCOPE_PREFIX, 'x']);
-  assert.deepEqual(escapeServiceCgroup(['x'], {}, { cgroup: '0::/a/teleport-daemon.service', run: () => { throw new Error('no bus'); } }), ['x']);
+  assert.deepEqual(escapeServiceCgroup(['x'], {}, { run: () => { throw new Error('no bus'); } }), ['x']);
   } finally { process.env.TELEPORT_NO_SCOPE = '1'; }
 });
 
@@ -1108,4 +1108,19 @@ test('performResume: waits for a just-started claude (young, no session file yet
   ({ deps, log } = fakeDeps({ listProcs: () => [young], sleep: async () => {} }));
   const r3 = await performResume({ sessionId: GIUN, cwd: '/w/umipay' }, { ...deps, youngPollMs: 1000, youngWaitMs: 3000 });
   assert.match(r3.error, /no session file/, 'gives up after the wait window');
+});
+
+test('performResume wait: a young proc that turns out to BE this session → refused, never launched; a definite holder → no wait', async () => {
+  let calls = 0; const slept = [];
+  const young = { pid: 5, sessionId: null, cwd: '/w/umipay', etime: '00:05' };
+  let { deps, log } = fakeDeps({ listProcs: () => (++calls < 3 ? [young] : [{ ...young, sessionId: GIUN }]), sleep: async (ms) => slept.push(ms) });
+  const r = await performResume({ sessionId: GIUN, cwd: '/w/umipay' }, { ...deps, youngPollMs: 3000, youngWaitMs: 60000 });
+  assert.match(r.error, /still held by live claude PID 5/);
+  assert.match(r.error, /waited \d+s/);
+  assert.equal(log.ran.length, 0);
+  slept.length = 0;
+  ({ deps, log } = fakeDeps({ listProcs: () => [{ pid: 9, sessionId: GIUN, cwd: '/w/umipay', etime: '2-00:00:00' }, young], sleep: async (ms) => slept.push(ms) }));
+  const r2 = await performResume({ sessionId: GIUN, cwd: '/w/umipay' }, deps);
+  assert.match(r2.error, /still held by live claude PID 9/);
+  assert.equal(slept.length, 0, 'no wait when a definite holder is known');
 });
