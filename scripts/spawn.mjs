@@ -40,7 +40,7 @@ import { formatPersona } from './persona.mjs';
 import { peekPersona } from './persona-store.mjs';
 import {
   listClaudeProcs, findProcForSession, findUnidentifiedProcs, cwdToProjectSlug, PROJECTS_DIR,
-  formatAgentList, parseKillPidArg, killClaudePid, KILL_PID_GRACE_MS, inspectPid,
+  formatAgentList, parseKillPidArg, killClaudePid, KILL_PID_GRACE_MS, inspectPid, etimeToSeconds,
 } from './claude-procs.mjs';
 import { readProjectsConfig, resolveDaemonUserId } from './projects-config.mjs';
 
@@ -725,6 +725,10 @@ function pidAliveLocal(p) {
   try { process.kill(p, 0); return true; } catch (e) { return e.code === 'EPERM'; }
 }
 
+/** A claude younger than this may simply not have written its session file yet. */
+export const YOUNG_PROC_SECONDS = 90;
+export const YOUNG_PROC_WAIT_MS = 60_000;
+
 /**
  * The whole resume: plan → lock → preflight → launch in `cwd` → verify the screen
  * came up. Shared by `--resume-session` and `--kill pid:<P> --restart`. Every
@@ -741,19 +745,30 @@ export async function performResume({ sessionId, cwd, permissionMode = DEFAULT_P
   transcriptDirs = (id) => findTranscriptDirs(id),
   run = (plan) => runSpawn(plan, { cwd, spawnFn }),
   sleep = sleepMs, timeoutMs = SPAWN_VERIFY_TIMEOUT_MS, pollMs = SPAWN_VERIFY_POLL_MS,
+  youngWaitMs = YOUNG_PROC_WAIT_MS, youngPollMs = 3000,
 } = {}) {
   const plan = buildSpawnPlan({ interactive: true, permissionMode, resumeSessionId: sessionId });
   // Held until the screen is verified — see acquireResumeLock.
   const lock = heldLock || await acquireLock(plan.sessionId);
   if (lock.error) return { error: lock.error, plan };
   try {
-    let procs = null, procsError = null;
-    try { procs = listProcs(); } catch (e) { procsError = e?.message ?? String(e); }
-    const pre = checkResumePreflight({
-      sessionId: plan.sessionId, sessionName: plan.sessionName, cwd,
-      procs, procsError, screenExists: screenExists(plan.sessionName),
-      transcriptDirs: transcriptDirs(plan.sessionId),
-    });
+    // A claude started seconds ago (e.g. the previous /resume in a batch) has no
+    // session file yet and looks "unidentified". If every blocker is that young,
+    // wait for it to write one instead of refusing; anything older still refuses.
+    let pre;
+    for (let waited = 0; ; waited += youngPollMs) {
+      let procs = null, procsError = null;
+      try { procs = listProcs(); } catch (e) { procsError = e?.message ?? String(e); }
+      pre = checkResumePreflight({
+        sessionId: plan.sessionId, sessionName: plan.sessionName, cwd,
+        procs, procsError, screenExists: screenExists(plan.sessionName),
+        transcriptDirs: transcriptDirs(plan.sessionId),
+      });
+      const blockers = !pre.error || procsError ? [] : findUnidentifiedProcs(cwd, procs);
+      const allYoung = blockers.length > 0 && blockers.every((r) => { const s = etimeToSeconds(r.etime); return s != null && s < YOUNG_PROC_SECONDS; });
+      if (!pre.error || !allYoung || waited >= youngWaitMs) break;
+      await sleep(youngPollMs);
+    }
     if (pre.error) return { error: pre.error, plan };
     const begun = lock.beginLaunch ? lock.beginLaunch() : { ok: true };
     if (begun.error) return { error: begun.error, plan };
@@ -1004,13 +1019,14 @@ export function inSystemdService(cgroupText) {
 }
 
 /**
- * Run agents OUTSIDE the daemon's service cgroup. Under systemd (KillMode=
- * control-group, the default) everything the daemon launches lives in its
- * cgroup, so restarting/stopping the daemon — or systemd restarting it after a
- * crash — would kill every agent it ever spawned or resumed. `systemd-run --user
- * --scope` gives the launch its own transient scope (it execs the command, so the
- * pid is unchanged). Only when inside a service AND a probe of systemd-run
- * succeeds; otherwise the command is returned as-is. Injectable for tests.
+ * Give every agent its OWN cgroup. Under systemd everything a process launches
+ * stays in that process's unit: the daemon's service (KillMode=control-group —
+ * a daemon restart or crash-restart kills them all) or the launching terminal's
+ * scope (closing that terminal can kill them). `systemd-run --user --scope` gives
+ * the launch a transient scope of its own (it execs the command, so the pid is
+ * unchanged). Applied whenever a probe of systemd-run succeeds (any systemd
+ * host); elsewhere (macOS, no user manager) the command is returned as-is.
+ * Injectable for tests.
  */
 export const SYSTEMD_SCOPE_PREFIX = ['systemd-run', '--user', '--scope', '--quiet', '--collect', '--'];
 export function escapeServiceCgroup(command, env, {
@@ -1021,7 +1037,8 @@ export function escapeServiceCgroup(command, env, {
     try { run(bin, [...args, 'true'], { env, stdio: 'ignore', timeout: 10_000 }); return true; } catch { return false; }
   },
 } = {}) {
-  if (!inSystemdService(cgroup) || !probe()) return command;
+  // TELEPORT_NO_SCOPE=1 opts out (tests; hosts where a scope is unwanted).
+  if (process.env.TELEPORT_NO_SCOPE === '1' || !probe()) return command;
   return [...SYSTEMD_SCOPE_PREFIX, ...command];
 }
 

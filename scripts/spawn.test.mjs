@@ -7,6 +7,8 @@ import { fileURLToPath } from 'node:url';
 // Isolate the persona pin store so `--list` persona mapping DERIVES instead of
 // reading machine-local pins (resolved at call-time from TELE_PERSONA_STORE).
 process.env.TELE_PERSONA_STORE = path.join(os.tmpdir(), `teleport-persona-store-spawn-${process.pid}.jsonl`);
+// No real systemd-run probe in unit tests (escapeServiceCgroup is tested with injected probes).
+process.env.TELEPORT_NO_SCOPE = '1';
 import { buildSpawnPlan, genSessionSeed, runSpawn, childLaunch, loginSeedEnv, wrapInLoginShell, scrubClaudeEnv, SEED_PATH, hasBinary, screenSessionExists, normalizeSessionName, parseScreenSessions, listSpawnSessions, resolveKillId, resolveAttachId, resolveAttachTarget, formatSessionList, resolveMode, SPAWN_PROMPT, PERMISSION_MODES, DEFAULT_PERMISSION_MODE, USAGE, personaByHashtag, gracefulKill, KILL_GRACE_MS, RESUME_PROMPT, resolveResumeSession, checkResumePreflight, findTranscriptDirs, checkPidKillAuth, resolveKillPid, normalizeAgentName, matchProcsByName, appendKillAudit, acquireResumeLock, acquireResumeFileLock, performResume, checkRestartTarget, checkRestartPreflight, RESUME_LOCK_STALE_MS, resumeLockSecret, inSystemdService, escapeServiceCgroup, SYSTEMD_SCOPE_PREFIX } from './spawn.mjs';
 import fs from 'node:fs';
 import { uuidToConvoInt } from './convo-registry.mjs';
@@ -860,15 +862,19 @@ test('inSystemdService: a service leaf (not user@N.service, not a scope)', () =>
   assert.equal(inSystemdService(''), false);
 });
 
-test('escapeServiceCgroup: wraps with systemd-run --scope only inside a service AND when the probe works', () => {
+test('escapeServiceCgroup: wraps with systemd-run --scope whenever the probe works (service or terminal)', () => {
+  delete process.env.TELEPORT_NO_SCOPE;
+  try {
   const cmd = ['/bin/zsh', '-lic', 'exec "$@"', 'teleport-spawn', 'screen'];
   const svc = '0::/a/teleport-daemon.service';
   assert.deepEqual(SYSTEMD_SCOPE_PREFIX, ['systemd-run', '--user', '--scope', '--quiet', '--collect', '--'], 'literal argv: --scope keeps the pid, --user the user manager, -- ends options');
   assert.deepEqual(escapeServiceCgroup(cmd, {}, { cgroup: svc, probe: () => true }), [...SYSTEMD_SCOPE_PREFIX, ...cmd]);
   assert.deepEqual(escapeServiceCgroup(cmd, {}, { cgroup: svc, probe: () => false }), cmd);
-  let probed = 0;
-  assert.deepEqual(escapeServiceCgroup(cmd, {}, { cgroup: '0::/a/x.scope', probe: () => { probed++; return true; } }), cmd);
-  assert.equal(probed, 0, 'no probe outside a service');
+  // a terminal scope gets its own scope too (closing the terminal must not kill the agent)
+  assert.deepEqual(escapeServiceCgroup(cmd, {}, { cgroup: '0::/a/vte-spawn-x.scope', probe: () => true }), [...SYSTEMD_SCOPE_PREFIX, ...cmd]);
+  } finally { process.env.TELEPORT_NO_SCOPE = '1'; }
+  // the opt-out wins over a working probe
+  assert.deepEqual(escapeServiceCgroup(['x'], {}, { probe: () => true }), ['x']);
 });
 
 test('runSpawn: the escape wrapper is applied to the (login-shell) launch command', () => {
@@ -901,11 +907,14 @@ test('runSpawn (interactive): returns the launcher child so performResume can st
 });
 
 test('escapeServiceCgroup: the DEFAULT probe runs `systemd-run --user --scope … -- true` (not systemd-run twice)', () => {
+  delete process.env.TELEPORT_NO_SCOPE;
+  try {
   const calls = [];
   const out = escapeServiceCgroup(['x'], { E: 1 }, { cgroup: '0::/a/teleport-daemon.service', run: (bin, args, opts) => { calls.push([bin, ...args]); assert.deepEqual(opts.env, { E: 1 }); } });
   assert.deepEqual(calls, [['systemd-run', '--user', '--scope', '--quiet', '--collect', '--', 'true']]);
   assert.deepEqual(out, [...SYSTEMD_SCOPE_PREFIX, 'x']);
   assert.deepEqual(escapeServiceCgroup(['x'], {}, { cgroup: '0::/a/teleport-daemon.service', run: () => { throw new Error('no bus'); } }), ['x']);
+  } finally { process.env.TELEPORT_NO_SCOPE = '1'; }
 });
 
 test('acquireResumeLock (linux, kernel-backed): exclusive, freed on release, unique per session', async () => {
@@ -1079,4 +1088,24 @@ test('matchProcsByName: a hashtag (with or without #) picks the process by sessi
   assert.deepEqual(matchProcsByName('a7611284', rows), { pid: 7, start: '9' });
   assert.match(matchProcsByName('#c0000000', rows).error, /no claude process named/);
   assert.match(matchProcsByName('#a7611284', [...rows, { pid: 9, hashtag: 'a7611284' }]).error, /matches 2 processes/);
+});
+
+test('performResume: waits for a just-started claude (young, no session file yet) instead of refusing; old blockers still refuse', async () => {
+  let calls = 0; const slept = [];
+  const young = { pid: 5, sessionId: null, cwd: '/w/umipay', etime: '00:05' };
+  let { deps, log } = fakeDeps({
+    listProcs: () => (++calls < 3 ? [young] : [{ ...young, sessionId: 'other' }]),
+    sleep: async (ms) => { slept.push(ms); },
+  });
+  const r = await performResume({ sessionId: GIUN, cwd: '/w/umipay' }, { ...deps, youngPollMs: 3000, youngWaitMs: 60000 });
+  assert.equal(r.ok, true, r.error);
+  assert.equal(calls, 3);
+  assert.ok(slept.filter((m) => m === 3000).length >= 2);
+  ({ deps, log } = fakeDeps({ listProcs: () => [{ ...young, etime: '05:00' }] }));
+  const r2 = await performResume({ sessionId: GIUN, cwd: '/w/umipay' }, deps);
+  assert.match(r2.error, /no session file/);
+  assert.equal(log.ran.length, 0);
+  ({ deps, log } = fakeDeps({ listProcs: () => [young], sleep: async () => {} }));
+  const r3 = await performResume({ sessionId: GIUN, cwd: '/w/umipay' }, { ...deps, youngPollMs: 1000, youngWaitMs: 3000 });
+  assert.match(r3.error, /no session file/, 'gives up after the wait window');
 });
