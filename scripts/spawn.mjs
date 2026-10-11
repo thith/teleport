@@ -293,17 +293,25 @@ export function parseScreenSessions(lsOut) {
   const sessions = [];
   for (const line of String(lsOut).split('\n')) {
     const m = line.match(/^\s*(\d+)\.(tele-[A-Za-z0-9_.-]+)\s+\(/);
-    if (m) sessions.push({ pid: m[1], name: m[2] });
+    if (m) sessions.push({ pid: m[1], name: m[2], ...(/\(Dead\b/.test(line) ? { dead: true } : {}) });
   }
   return sessions;
 }
 
-/** List our spawned screen sessions. `exec` injectable for tests. */
-export function listSpawnSessions(exec = execFileSync) {
+/**
+ * List our LIVE spawned screen sessions. A "(Dead ???)" row is the socket a dead
+ * screen left behind (OOM, reboot): it is wiped, not listed — otherwise /ls shows
+ * a dead agent as alive. `onWiped(names)` reports what was cleaned. `exec` injectable.
+ */
+export function listSpawnSessions(exec = execFileSync, { onWiped = () => {} } = {}) {
   let out = '';
   try { out = String(exec('screen', ['-ls'], { encoding: 'utf8' })); }
   catch (e) { out = String(e?.stdout ?? ''); } // screen -ls can exit non-zero
-  return parseScreenSessions(out);
+  const all = parseScreenSessions(out);
+  const dead = all.filter((s) => s.dead);
+  for (const s of dead) { try { exec('screen', ['-wipe', s.name], { encoding: 'utf8' }); } catch {} }
+  if (dead.length) onWiped(dead.map((s) => s.name));
+  return all.filter((s) => !s.dead);
 }
 
 /**
@@ -1116,12 +1124,14 @@ if (isDirectRun) {
   if (argv.includes('--list') || argv.includes('--ls')) {
     // Two sections (screens first, then hand-opened terminal sessions), each claude
     // line with its full session id — see formatAgentList.
-    const screens = hasBinary('screen') ? listSpawnSessions() : [];
+    let wiped = [];
+    const screens = hasBinary('screen') ? listSpawnSessions(undefined, { onWiped: (n) => { wiped = n; } }) : [];
     const pmap = personaByHashtag();
     console.log(formatAgentList({
       screens, procs: listClaudeProcs(),
       personaOf: (h) => (pmap[h] ? formatPersona(pmap[h]) : null),
     }));
+    if (wiped.length) console.log(`\n🧹 đã dọn ${wiped.length} screen chết: ${wiped.join(', ')}`);
     process.exit(0);
   }
 
