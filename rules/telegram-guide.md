@@ -342,7 +342,7 @@ từ xa **kể cả khi mọi agent đã chết** (quota/network). Nó nghe mộ
 (`DAEMON_CHAT_ID`) và xử lý lệnh: `/spawn <project>`, `/run <project> <script> [args]`,
 `/whisper #<hash> <text>` (alias `/w`), `/instruct #<hash> <text>` (alias `/i`, agent trả lời
 qua DM), `/pending`, `/start`, `/reload` (admin — đọc lại `commands.json` + `projects.json` không cần
-restart), `/merge <project> <pr#>` (admin — merge PR qua GitHub API; hướng dẫn soạn lệnh: `docs/merge-guide.md`), `/restartd` (admin — restart daemon khi chạy dưới systemd; **từ chối** nếu còn agent `claude` nằm chung
+restart), `/health` (member — tình trạng máy: CPU/RAM/swap/disk/agent; daemon cũng tự nhắn owner khi RAM sắp hết hoặc khi một agent bỗng tắt, kèm lệnh /resume), `/merge <project> <pr#>` (admin — merge PR qua GitHub API; hướng dẫn soạn lệnh: `docs/merge-guide.md`), `/restartd` (admin — restart daemon khi chạy dưới systemd; **từ chối** nếu còn agent `claude` nằm chung
 cgroup với daemon, vì `KillMode=control-group` sẽ giết luôn chúng — nên đặt `KillMode=process` trong unit), cùng **heartbeat auto-reminder** (đã
 chuyển từ tele-listen sang đây — nên **khi daemon KHÔNG chạy thì sẽ không có reminder/`/pending`**).
 `/run` tự detect npm/pnpm/yarn của project, validate script trong package.json, rồi chạy

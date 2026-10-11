@@ -1265,6 +1265,8 @@ if (isDirectRun) {
       console.error(`[spawn] FAILED to kill "${name}" (still listed). Try: screen -S ${name} -X quit`);
       process.exit(1);
     }
+    // Audit the owner's screen kill so the daemon's machine watch doesn't report it as a death.
+    appendKillAudit({ hashtag: name.replace(/^tele-/, ''), screen: name, result: 'killed', fromId: process.env.TELE_FROM_ID || '' });
     console.log(r.method === 'exit'
       ? `[spawn] "${name}" exited gracefully (/exit).`
       : `[spawn] "${name}" didn't exit in ${KILL_GRACE_MS / 1000}s — force-killed.`);

@@ -67,6 +67,7 @@ import {
   AUTOMERGE_STATE_FILE,
 } from './merge-inbox.mjs';
 import { peekPersona } from './persona-store.mjs';
+import { machineWatch } from './health.mjs';
 import { formatPersona } from './persona.mjs';
 import { shortConvoHash } from './convo-hash.mjs';
 
@@ -294,6 +295,7 @@ async function main() {
 
   let lastHeartbeat = 0;
   let mergeInboxBusy = false;
+  const watchState = {}; // machineWatch memory (previous agent list, last RAM alert)
   // eslint-disable-next-line no-constant-condition
   while (true) {
     try {
@@ -348,6 +350,9 @@ async function main() {
           const quietHours = resolveQuietHours(readProjectsConfig(PROJECTS_FILE), { env: process.env, envFile: env });
           await runHeartbeatReminders(token, groupAdminIds, { quietHours });
         } catch (e) { console.error(`[daemon] heartbeat: ${e?.message ?? e}`); }
+        // Machine watch: early low-RAM warning + agents that vanished (OOM-kills).
+        try { await machineWatch(watchState, (t) => sendText(daemonUserId, t)); }
+        catch (e) { console.error(`[daemon] machine watch: ${e?.message ?? e}`); }
       }
     } catch (e) {
       console.error(`[daemon] loop error: ${e instanceof Error ? e.message : e}`);
