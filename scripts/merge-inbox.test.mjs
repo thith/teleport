@@ -178,3 +178,10 @@ test('autoMergeAllowlist marks config vs added; repoMatches tolerates a slash-le
   assert.deepEqual({ config: l.config, added: l.added, patterns: l.patterns }, { config: ['a/x'], added: ['b/*'], patterns: ['a/x', 'b/*'] });
   assert.equal(repoMatches('a/b', 'noslash'), false);
 });
+
+test('buildMergeResultPrompt: a merge adds the short worktree-cleanup hint; a refusal does not', () => {
+  const merged = buildMergeResultPrompt({ convoId: 1, chatId: -1, mode: 'ask', text: '✅ merged PR o/r#3 "x" into main (squash).' }).text;
+  assert.match(merged, /PR đã merge: worktree .*`git worktree remove <path>`/);
+  const refused = buildMergeResultPrompt({ convoId: 1, chatId: -1, mode: 'auto', text: '❌ PR o/r#3 "x": failing checks: lint' }).text;
+  assert.doesNotMatch(refused, /worktree/);
+});
