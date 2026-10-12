@@ -68,6 +68,7 @@ import {
 } from './merge-inbox.mjs';
 import { peekPersona } from './persona-store.mjs';
 import { machineWatch } from './health.mjs';
+import { recordFetchOk, startListenWatchdog } from './listen-watch.mjs';
 import { formatPersona } from './persona.mjs';
 import { shortConvoHash } from './convo-hash.mjs';
 
@@ -293,6 +294,10 @@ async function main() {
     return r;
   };
 
+  // RFC 18 B: "is anyone hearing Telegram?" watchdog. Its own interval, so it
+  // still fires while the loop below is stuck in an await (e.g. a hung fetch).
+  startListenWatchdog({ send: (t) => sendText(daemonUserId, t) });
+
   let lastHeartbeat = 0;
   let mergeInboxBusy = false;
   const watchState = {}; // machineWatch memory (previous agent list, last RAM alert)
@@ -304,6 +309,7 @@ async function main() {
         try {
           const offset = readOffset(globalOffsetFile);
           const fetched = await fetchUpdates(token, offset);
+          recordFetchOk();
           if (fetched.length) {
             const { nonOrphan } = partitionOrphans(fetched, groupAdminIds);
             if (nonOrphan.length) appendToCache(nonOrphan, cacheFile);

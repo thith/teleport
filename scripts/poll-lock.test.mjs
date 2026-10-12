@@ -11,7 +11,7 @@ const age = (f, ms) => { const t = (Date.now() - ms) / 1000; fs.utimesSync(f, t,
 test('acquirePollLock: free → taken; held (fresh) → refused; release → free', () => {
   const f = lockIn();
   assert.equal(acquirePollLock(f), true);
-  assert.match(fs.readFileSync(f, 'utf8'), /^\d+$/);
+  assert.match(fs.readFileSync(f, 'utf8'), /^\d+:\d+:[0-9a-f]+$/); // <ms>:<pid>:<random> (RFC 18 B)
   assert.equal(acquirePollLock(f), false);
   releasePollLock(f);
   assert.equal(acquirePollLock(f), true);
