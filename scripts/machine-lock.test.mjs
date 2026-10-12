@@ -19,7 +19,8 @@ const until = async (f, ms = 5000) => { const t = Date.now(); while (!f()) { if 
 // 'exit', not 'close': a leftover background process may hold our stdout pipe open.
 const exitOf = (child) => new Promise((r) => child.on('exit', (code, signal) => r({ code, signal })));
 // Without TELEPORT_HEAVY_HELD, even if this suite itself runs under heavy.
-const cleanEnv = (extra) => { const e = { ...process.env, ...extra }; delete e.TELEPORT_HEAVY_HELD; return e; };
+// TELEPORT_HEAVY_MIN_FREE_MB=0: never wait for RAM (RFC 18 F) on a busy test box.
+const cleanEnv = (extra) => { const e = { ...process.env, TELEPORT_HEAVY_MIN_FREE_MB: '0', ...extra }; delete e.TELEPORT_HEAVY_HELD; return e; };
 const heavy = (dir, args, extra = {}) => spawn(process.execPath, [HEAVY, ...args], { env: cleanEnv({ TELEPORT_LOCK_DIR: dir }), stdio: ['ignore', 'pipe', 'pipe'], ...extra });
 
 test('lock names: only ^[a-z][a-z0-9-]{0,31}$ (no paths)', () => {
@@ -139,14 +140,14 @@ test('heavy args + gradlew --stop policy (after success AND failure, not with --
   assert.match(parseHeavyArgs(['--']).error, /usage/);
   assert.match(parseHeavyArgs(['--wait', 'x', '--', 'a']).error, /minutes/);
   assert.match(parseHeavyArgs(['--bogus', '--', 'a']).error, /unexpected/);
-  assert.deepEqual(parseHeavyArgs(['--no-stop', '--wait', '2', '--', 'a', '--b']), { cmd: ['a', '--b'], stop: false, waitSec: 120 });
+  assert.deepEqual(parseHeavyArgs(['--no-stop', '--wait', '2', '--', 'a', '--b']), { cmd: ['a', '--b'], stop: false, waitSec: 120, ownTarget: false, ramWait: true });
   assert.equal(isGradlew(['./gradlew', 'build']), true);
   assert.equal(isGradlew(['/x/android/gradlew']), true);
   assert.equal(isGradlew(['cargo', 'build']), false);
   const run = async (argv, code) => {
     const ev = [];
     const lock = { release() { ev.push('release'); }, waitedMs: 0 };
-    const rc = await heavyMain(argv, { env: {}, acquire: async () => lock, run: async () => { ev.push('run'); return code; }, stopGradle: async (c) => { ev.push(`stop ${c[0]}`); }, log: () => {} });
+    const rc = await heavyMain(argv, { env: {}, waitRam: async () => {}, cargoTarget: () => null, acquire: async () => lock, run: async () => { ev.push('run'); return code; }, stopGradle: async (c) => { ev.push(`stop ${c[0]}`); }, log: () => {} });
     return { rc, ev };
   };
   // --stop runs while the lock is still held (the reason it can't hit another build's daemon)
@@ -157,7 +158,7 @@ test('heavy args + gradlew --stop policy (after success AND failure, not with --
   assert.deepEqual(await run(['--', 'cargo', 'build'], 0), { rc: 0, ev: ['run', 'release'] });
   // nested heavy (ancestor already holds the build lock) → no acquire at all
   let acquired = false;
-  assert.equal(await heavyMain(['--', 'x'], { env: {}, nested: () => true, acquire: async () => { acquired = true; }, run: async () => 0, log: () => {} }), 0);
+  assert.equal(await heavyMain(['--', 'x'], { env: {}, waitRam: async () => {}, cargoTarget: () => null, nested: () => true, acquire: async () => { acquired = true; }, run: async () => 0, log: () => {} }), 0);
   assert.equal(acquired, false);
   // the env token only counts while it names the live holder of record
   const H = (h) => () => h;
@@ -169,7 +170,7 @@ test('heavy args + gradlew --stop policy (after success AND failure, not with --
   assert.equal(heldByAncestor({}, H({ pid: 42, alive: true })), false);
   // flock unavailable → runs anyway (fail-open), loudly
   const logs = [];
-  assert.equal(await heavyMain(['--', 'x'], { env: {}, acquire: async () => { throw new Error('spawn flock ENOENT'); }, run: async () => 0, log: (s) => logs.push(s) }), 0);
+  assert.equal(await heavyMain(['--', 'x'], { env: {}, waitRam: async () => {}, cargoTarget: () => null, acquire: async () => { throw new Error('spawn flock ENOENT'); }, run: async () => 0, log: (s) => logs.push(s) }), 0);
   assert.match(logs.join('\n'), /KHÔNG khoá/);
 });
 

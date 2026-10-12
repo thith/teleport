@@ -16,6 +16,12 @@ node ../teleport/scripts/heavy.mjs -- cargo nextest run --workspace
 - **Lệnh là `gradlew`:** sau khi xong, wrapper tự chạy `gradlew --stop` để trả vài GB RAM của Gradle daemon. Dùng `--no-stop` nếu sắp build tiếp ngay. Gọi `gradlew` **trực tiếp** (`./gradlew -p android …`), không gọi qua `sh -c "cd … && ./gradlew"`, nếu không sẽ không được nhận ra.
 - Build chết (Ctrl-C, timeout, bị kill) thì lock tự nhả, không bao giờ kẹt.
 
+## `target/` dùng chung và chờ RAM (RFC 18)
+
+- **`target/` dùng chung:** trong một git repo, nếu `CARGO_TARGET_DIR` chưa đặt, lệnh chạy với `CARGO_TARGET_DIR=~/.cache/teleport/cargo-target/<repo>-<hash6>`. Mọi worktree của cùng một repo dùng chung thư mục này, nên chỉ còn một bản 20–30G thay vì N bản. Wrapper in một dòng `ℹ️ CARGO_TARGET_DIR=…`. Đã tự đặt `CARGO_TARGET_DIR` thì wrapper giữ nguyên giá trị đó. Script cứng đường dẫn `./target/...` thì dùng `--own-target`.
+- **`cargo clean`** xoá cache dùng chung của **mọi** worktree. Wrapper cảnh báo nhưng vẫn chạy. Chỉ cần dọn một crate thì dùng `cargo clean -p <crate>`.
+- **Chờ RAM:** trước khi xếp hàng lấy lock, nếu `MemAvailable` dưới 3 GiB (đổi bằng `TELEPORT_HEAVY_MIN_FREE_MB`), wrapper chờ và in `⏳ chờ RAM: còn X GiB, cần Y GiB…` tối đa mỗi phút một lần. Nếu RAM không tăng trong 2 phút, hoặc đã chờ 15 phút, wrapper vẫn chạy kèm cảnh báo. `--no-ram-wait` để bỏ bước chờ. Heavy lồng nhau không chờ.
+
 ## Chờ lâu thì sao
 
 Có thể phải chờ một build khác 10–20 phút, nên đừng chạy foreground trong tool có timeout ngắn:
