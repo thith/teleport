@@ -173,7 +173,9 @@ export function buildMergeResultPrompt({ convoId, chatId, text, mode }) {
     + `<untrusted_github_data>\n${data}\n</untrusted_github_data>\n`
     + '→ Nếu bạn có gửi merge-request này: tự kể NGẮN cho user trong topic. Nếu không phải của bạn: bỏ qua.'
     // Something merged → the moment to free its worktree (preserve disk). Agent-only; the owner's DM stays short.
-    + (/✅ merged/.test(data) ? '\n→ PR đã merge: worktree của nhánh đó nếu do bạn tạo và không còn việc dở thì xoá ngay (`git worktree remove <path>`).' : '');
+    // Only merge.mjs's own line-leading "✅ merged PR" counts — a PR title (attacker-written,
+    // single-line, always after "PR o/r#N") saying "✅ merged" on a REFUSED merge must not trigger it.
+    + (/^✅ merged PR /m.test(data) ? '\n→ PR đã merge: worktree của nhánh đó nếu do bạn tạo và không còn việc dở thì xoá ngay (`git worktree remove <path>`).' : '');
   return {
     text: body, messageId: null, chatId: chatId == null ? null : String(chatId),
     fromUserId: null, fromName: 'teleport daemon', fromRole: 'daemon', fromMember: null,
