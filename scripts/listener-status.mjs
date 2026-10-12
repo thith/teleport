@@ -44,18 +44,15 @@ export function formatAge(ms) {
 }
 
 /**
- * Which cache file(s) to read: the bot-scoped one for the configured bot when
- * it exists (the live listener only reads that one), else every
- * updates-cache*.jsonl in tmpDir (merged, deduped by update_id).
+ * The ONE cache file to read. update_id sequences are per bot, so a convo
+ * offset may only be compared against its own bot's updates — never mix bots:
+ *   - botId known   → updates-cache.<botId>.jsonl only (what the live listener
+ *                     reads); missing → null (no unread shown).
+ *   - botId unknown → the legacy single updates-cache.jsonl; missing → null.
  */
-export function resolveCacheFiles({ tmpDir = DEFAULT_TMP_DIR, botId } = {}) {
-  if (botId !== undefined && botId !== null) {
-    const f = botScopedFiles(botId, tmpDir).cacheFile;
-    if (fs.existsSync(f)) return [f];
-  }
-  let names = [];
-  try { names = fs.readdirSync(tmpDir); } catch { return []; }
-  return names.filter((n) => /^updates-cache.*\.jsonl$/.test(n)).sort().map((n) => path.join(tmpDir, n));
+export function resolveCacheFile({ tmpDir = DEFAULT_TMP_DIR, botId = null } = {}) {
+  const f = botId != null ? botScopedFiles(botId, tmpDir).cacheFile : path.join(tmpDir, 'updates-cache.jsonl');
+  return fs.existsSync(f) ? f : null;
 }
 
 function configuredBotId(env = process.env) {
@@ -78,7 +75,7 @@ function mtimeMs(file) {
 export function createListenerStatus({
   tmpDir = DEFAULT_TMP_DIR,
   registryFile = tmpDir === DEFAULT_TMP_DIR ? REGISTRY_FILE : path.join(tmpDir, 'listener-registry.jsonl'),
-  cacheFiles,
+  cacheFile,
   topics,
   isLive = isLiveEntry,
   now = Date.now(),
@@ -89,16 +86,12 @@ export function createListenerStatus({
   let store = null;
   try { registry = readRegistry(registryFile); } catch { registry = null; }
   try {
-    const files = cacheFiles ?? resolveCacheFiles({ tmpDir, botId: botId === undefined ? configuredBotId() : botId });
-    const seen = new Set();
-    updates = [];
-    for (const f of files) {
-      for (const u of readCache(f)) {
-        if (u?.update_id == null || seen.has(u.update_id)) continue;
-        seen.add(u.update_id);
-        updates.push(u);
-      }
-    }
+    const file = cacheFile !== undefined
+      ? cacheFile
+      : resolveCacheFile({ tmpDir, botId: botId === undefined ? configuredBotId() : botId });
+    // One bot's file only; readCache dedupes by update_id within it.
+    // Missing file → null → no unread shown (not "0 unread").
+    updates = file && fs.existsSync(file) ? readCache(file) : null;
   } catch { updates = null; }
   try { store = topics ?? readTopicsStore(); } catch { store = null; }
 

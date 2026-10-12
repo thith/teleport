@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { createListenerStatus, formatAge, resolveCacheFiles } from './listener-status.mjs';
+import { createListenerStatus, formatAge, resolveCacheFile } from './listener-status.mjs';
 import { getProcessStartTime, isLiveEntry } from './tele-listen.mjs';
 import { formatAgentList } from './claude-procs.mjs';
 import { uuidToConvoInt } from './convo-registry.mjs';
@@ -34,7 +34,7 @@ function writeRegistry(dir, rows) {
   return f;
 }
 const status = (dir, opts = {}) => createListenerStatus({
-  tmpDir: dir, topics, cacheFiles: [], isLive: () => false, now: NOW, botId: null, ...opts,
+  tmpDir: dir, topics, cacheFile: null, isLive: () => false, now: NOW, botId: null, ...opts,
 });
 
 test('listener alive vs dead (injected liveness), only rows of THIS convo count', () => {
@@ -76,19 +76,26 @@ test('unread: offset boundary is >=, /dm, service, other topic and other chat ex
     msg(16, { date: sec(60) }),                            // duplicate append → counted once
   ]);
   fs.writeFileSync(path.join(dir, `convo-${CONVO}-offset.txt`), '11\n');
-  assert.equal(status(dir, { cacheFiles: [cache] })(CONVO), '🔇 listener tắt · 📨 2 tin chưa đọc (cũ nhất 7 phút)');
-  // The same update in two cache files (legacy + bot-scoped) is counted once.
-  const cache2 = writeCache(dir, [msg(16, { date: sec(60) })], 'updates-cache.jsonl');
-  assert.equal(status(dir, { cacheFiles: [cache, cache2] })(CONVO), '🔇 listener tắt · 📨 2 tin chưa đọc (cũ nhất 7 phút)');
+  assert.equal(status(dir, { cacheFile: cache })(CONVO), '🔇 listener tắt · 📨 2 tin chưa đọc (cũ nhất 7 phút)');
+  // Resolved from botId: ONLY that bot's file — another bot's cache and the
+  // legacy cache (update_id sequences are per bot) never leak into the count.
+  writeCache(dir, [msg(20, { date: sec(900) }), msg(21)], 'updates-cache.43.jsonl');
+  writeCache(dir, [msg(22, { date: sec(900) })], 'updates-cache.jsonl');
+  assert.equal(status(dir, { cacheFile: undefined, botId: 42 })(CONVO), '🔇 listener tắt · 📨 2 tin chưa đọc (cũ nhất 7 phút)');
+  assert.equal(status(dir, { cacheFile: undefined, botId: 43 })(CONVO), '🔇 listener tắt · 📨 2 tin chưa đọc (cũ nhất 15 phút)');
+  // Known bot whose file is missing → no unread shown (no fallback to others).
+  assert.equal(status(dir, { cacheFile: undefined, botId: 99 })(CONVO), '🔇 listener tắt');
+  // No bot id at all → legacy single cache only.
+  assert.equal(status(dir, { cacheFile: undefined, botId: null })(CONVO), '🔇 listener tắt · 📨 1 tin chưa đọc (cũ nhất 15 phút)');
   fs.writeFileSync(path.join(dir, `convo-${CONVO}-offset.txt`), '12\n');
-  assert.equal(status(dir, { cacheFiles: [cache] })(CONVO), '🔇 listener tắt · 📨 1 tin chưa đọc (cũ nhất 1 phút)');
+  assert.equal(status(dir, { cacheFile: cache })(CONVO), '🔇 listener tắt · 📨 1 tin chưa đọc (cũ nhất 1 phút)');
   fs.writeFileSync(path.join(dir, `convo-${CONVO}-offset.txt`), '17\n');
-  assert.equal(status(dir, { cacheFiles: [cache] })(CONVO), '🔇 listener tắt');
+  assert.equal(status(dir, { cacheFile: cache })(CONVO), '🔇 listener tắt');
   // No offset file (never listened) → no unread claim; no topic → none either.
   fs.rmSync(path.join(dir, `convo-${CONVO}-offset.txt`));
-  assert.equal(status(dir, { cacheFiles: [cache] })(CONVO), '🔇 listener tắt');
+  assert.equal(status(dir, { cacheFile: cache })(CONVO), '🔇 listener tắt');
   fs.writeFileSync(path.join(dir, `convo-${CONVO}-offset.txt`), '11\n');
-  assert.equal(status(dir, { cacheFiles: [cache], topics: {} })(CONVO), '🔇 listener tắt');
+  assert.equal(status(dir, { cacheFile: cache, topics: {} })(CONVO), '🔇 listener tắt');
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
@@ -113,8 +120,10 @@ test('errors never throw: missing dir, garbage files, throwing liveness, bad con
   const cache = writeCache(dir, ['nope'].map(() => ({})));
   fs.appendFileSync(cache, '{torn');
   fs.writeFileSync(path.join(dir, `convo-${CONVO}-offset.txt`), 'xx');
-  const st = status(dir, { cacheFiles: [cache, path.join(dir, 'missing.jsonl')], isLive: () => { throw new Error('boom'); } });
+  const st = status(dir, { cacheFile: cache, isLive: () => { throw new Error('boom'); } });
   assert.equal(st(CONVO), '🔇 listener tắt');
+  fs.writeFileSync(path.join(dir, `convo-${CONVO}-offset.txt`), '1');
+  assert.equal(status(dir, { cacheFile: path.join(dir, 'missing.jsonl') })(CONVO), '🔇 listener tắt');
   assert.equal(st(null), null);
   assert.equal(st('abc'), null);
   const gone = createListenerStatus({ tmpDir: path.join(dir, 'nope'), topics: null, now: NOW, botId: null });
@@ -122,14 +131,16 @@ test('errors never throw: missing dir, garbage files, throwing liveness, bad con
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
-test('resolveCacheFiles: bot-scoped file preferred, else every updates-cache*.jsonl', () => {
+test('resolveCacheFile: known bot → its own file only (missing → null); no bot → legacy file; never another bot', () => {
   const dir = tmp();
   fs.writeFileSync(path.join(dir, 'updates-cache.jsonl'), '');
   fs.writeFileSync(path.join(dir, 'updates-cache.7.jsonl'), '');
-  fs.writeFileSync(path.join(dir, 'other.jsonl'), '');
-  assert.deepEqual(resolveCacheFiles({ tmpDir: dir, botId: 7 }), [path.join(dir, 'updates-cache.7.jsonl')]);
-  assert.deepEqual(resolveCacheFiles({ tmpDir: dir, botId: 8 }).map((f) => path.basename(f)), ['updates-cache.7.jsonl', 'updates-cache.jsonl']);
-  assert.deepEqual(resolveCacheFiles({ tmpDir: path.join(dir, 'x'), botId: null }), []);
+  assert.equal(resolveCacheFile({ tmpDir: dir, botId: 7 }), path.join(dir, 'updates-cache.7.jsonl'));
+  assert.equal(resolveCacheFile({ tmpDir: dir, botId: 8 }), null); // not bot 7's, not legacy
+  assert.equal(resolveCacheFile({ tmpDir: dir, botId: null }), path.join(dir, 'updates-cache.jsonl'));
+  assert.equal(resolveCacheFile({ tmpDir: dir }), path.join(dir, 'updates-cache.jsonl'));
+  fs.rmSync(path.join(dir, 'updates-cache.jsonl'));
+  assert.equal(resolveCacheFile({ tmpDir: dir, botId: null }), null); // no fallback to bot 7
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
