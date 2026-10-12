@@ -505,6 +505,8 @@ Monitor({
 > - **Nếu Monitor không start được** (lệnh lỗi / không trả `task_id`) **2 lần liên tiếp** → dừng và **báo user qua send-telegram** (user thường ở xa, không thấy CLI stdout); đừng âm thầm điếc.
 > - **Wind-down:** trước khi đóng topic, `TaskStop` listener. Không còn heartbeat để tắt.
 >
+> - **Dòng `[tele-listen] ⚠️ Không ai nghe được Telegram đã N phút …`** là **cảnh báo hệ thống, KHÔNG phải prompt** (RFC 18 B): không ai (listener lẫn daemon) lấy được tin Telegram quá 5 phút. **Đừng đăng nó vào topic** và đừng tự sửa khoá; daemon đã DM owner. Listener vẫn chạy tiếp như cũ, dòng này nhắc lại tối đa mỗi 15 phút.
+>
 > *Recovery khi **cả tiến-trình-agent** chết hoặc bị chặn (hết token, đang hỏi câu hỏi) KHÔNG thuộc listener — đó là việc của daemon giám sát ([RFC 01](../docs/rfc/01-supervisor-daemon.md)). RFC 02 đã **bỏ hẳn** heartbeat `ScheduleWakeup` (tránh drain token cả đêm) và không thay bằng cơ chế nào trong listener.*
 
 **All other agents:** wait for one prompt at a time.

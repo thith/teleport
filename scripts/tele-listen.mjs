@@ -19,6 +19,7 @@ import { readTopicsStore, getThreadId, DEFAULT_TOPICS_FILE } from './topics-stor
 import { peekPersona } from './persona-store.mjs';
 import { readProjectsConfig, resolveProjectConfig, resolveProjectRouting, roleFor, memberFor, adminIdsFrom, resolveDefaultChatId, resolveSendOnly, SEND_ONLY_LISTEN_REFUSAL } from './projects-config.mjs';
 import { harvestMembers } from './roster-upsert.mjs';
+import { recordFetchOk, listenerStaleWarning } from './listen-watch.mjs';
 import {
   acquireLock as acquireConvoLock,
   appendRowLocked as appendConvoRow,
@@ -196,9 +197,13 @@ export function writeOffset(updateId, offsetFile = DEFAULT_OFFSET_FILE) {
 // daemon's inline-button presses (callback_query).
 export const ALLOWED_UPDATES = ['message', 'edited_message', 'callback_query'];
 
+export const FETCH_UPDATES_TIMEOUT_MS = 20_000;
+
 export async function fetchUpdates(token, offset) {
   const url = `${TELEGRAM_API}${token}/getUpdates?offset=${offset}&timeout=0&limit=100&allowed_updates=${encodeURIComponent(JSON.stringify(ALLOWED_UPDATES))}`;
-  const res = await fetch(url);
+  // RFC 18 B: bound the call. A hung connection otherwise holds poll.lock (and
+  // the caller's whole poll) until undici gives up, around 300 s.
+  const res = await fetch(url, { signal: AbortSignal.timeout(FETCH_UPDATES_TIMEOUT_MS) });
   const body = await res.json().catch(() => ({}));
   if (!res.ok || !body.ok) {
     throw new Error(body?.description ?? `HTTP ${res.status}`);
@@ -1374,8 +1379,11 @@ export function acquirePollLock(lockFile = POLL_LOCK_FILE) {
     } catch {}
     return false;
   }
+  // Body = "<ms>:<pid>:<random>": unique per acquisition (release checks it) and
+  // parseInt still reads the timestamp, so the stale check above is unchanged.
+  const token = `${Date.now()}:${process.pid}:${crypto.randomBytes(6).toString('hex')}`;
   try {
-    fs.writeSync(fd, String(Date.now()));
+    fs.writeSync(fd, token);
   } catch (e) {
     // e.g. ENOSPC: don't leave an empty lock behind.
     try { fs.closeSync(fd); } catch {}
@@ -1383,10 +1391,32 @@ export function acquirePollLock(lockFile = POLL_LOCK_FILE) {
     throw e;
   }
   fs.closeSync(fd);
+  heldLockTokens.set(path.resolve(lockFile), token);
   return true;
 }
 
+// lock path → the token THIS process wrote when it acquired it. A process holds
+// a given lock at most once at a time (acquire is O_EXCL), so a path key is enough.
+const heldLockTokens = new Map();
+
+/** The token this process holds for `lockFile`, or null. (Tests / diagnostics.) */
+export function heldPollLockToken(lockFile = POLL_LOCK_FILE) {
+  return heldLockTokens.get(path.resolve(lockFile)) ?? null;
+}
+
+// RFC 18 B: unlink only if the file still carries OUR token. If we overran
+// LOCK_STALE_MS (e.g. a hung fetch) a peer may have reclaimed the lock and
+// written its own token; deleting it would let a third poller in alongside it.
+// Not holding a token (never acquired / already released) → no-op.
 export function releasePollLock(lockFile = POLL_LOCK_FILE) {
+  const key = path.resolve(lockFile);
+  const mine = heldLockTokens.get(key);
+  if (mine == null) return;
+  heldLockTokens.delete(key);
+  let body;
+  try { body = fs.readFileSync(lockFile, 'utf8'); } catch { return; }
+  // Residual read→unlink window is microseconds, vs the 30 s LOCK_STALE_MS a peer must wait to reclaim.
+  if (body.trim() !== mine) return;
   try { fs.unlinkSync(lockFile); } catch {}
 }
 
@@ -2631,6 +2661,14 @@ async function main() {
     process.exit(loop ? 3 : 0);
   }
 
+  // RFC 18 B: nobody (no listener, no daemon) has completed a getUpdates for
+  // > 5 min → tell the agent through its Monitor (stdout). Throttled per convo;
+  // a system warning only — exit codes and the prompt protocol are unchanged.
+  if (convo != null) {
+    const warning = listenerStaleWarning({ convo });
+    if (warning) console.log(warning);
+  }
+
   // Prompt file path: stable per-convo for `--convo`, filter-keyed for legacy.
   const promptFile = convo != null
     ? path.join(DEFAULT_TMP_DIR, `prompt-convo-${convo}.json`)
@@ -2737,6 +2775,7 @@ async function main() {
     try {
       const globalOffset = preFetchGlobalOffset;
       const fetched = await fetchUpdates(token, globalOffset);
+      recordFetchOk();
       // NOTE: cross-cutting, non-AI control handling (/pending, /start, and the
       // heartbeat auto-reminder) was MOVED to the supervisor daemon (daemon.mjs).
       // Agent listeners no longer answer those — they only route replies to their
