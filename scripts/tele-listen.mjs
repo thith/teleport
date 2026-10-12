@@ -887,6 +887,9 @@ export function buildPromptSegment(msg, updateId = null, botId = null, roles = n
   const replyTo = realReplyTo(msg);
   return {
     messageId: msg.message_id,
+    // Message ids are per-chat; the chat makes a segment's identity unique
+    // (idempotent merge/spool — see promptSegmentKeys).
+    chatId: msg.chat?.id != null ? String(msg.chat.id) : null,
     edited: msg.edit_date != null,
     editedAt: msg.edit_date ?? null,
     fromUserId: String(msg.from?.id ?? msg.chat?.id),
@@ -2068,8 +2071,71 @@ export const PROCESSING_TTL_MS = 30 * 60 * 1000;
 // (incoming wins on conflict) so every kind present in the batch stays visible.
 const KIND_FLAGS = ['whisper', 'instruct', 'broadcast', 'ask', 'askReply', 'handover', 'handoverAck'];
 
+// ── Idempotent merge/spool (per Telegram message) ─────────────────────────────
+// Residual race: a --loop listener can pass its pre-write check, then a one-shot
+// drain (reading the same convo offset) writes the same updates first; the
+// listener then appends its already-prepared batch → the same message twice. So
+// merge/spool drops incoming segments already present in the target. Identity =
+// (chatId, messageId, editedAt): an EDIT of a pending message is a new version
+// and is kept. Segments with no messageId (ask/handover/steer synthetic prompts)
+// or no known chat are never deduped.
+function segmentKey(seg, fallbackChatId) {
+  if (!seg || seg.messageId == null) return null;
+  const chat = seg.chatId ?? fallbackChatId;
+  if (chat == null) return null;
+  return `${chat}:${seg.messageId}:${seg.editedAt ?? ''}`;
+}
+
+/** Set of message keys a prompt already carries (empty for null/synthetic). */
+export function promptSegmentKeys(data) {
+  const keys = new Set();
+  if (!data) return keys;
+  const segs = promptSegments(data);
+  // A segment without its own chatId: the top-level chatId is only trustworthy
+  // when the prompt is a single message.
+  const fallback = segs.length === 1 ? (data.chatId ?? null) : null;
+  for (const seg of segs) {
+    const k = segmentKey(seg, fallback);
+    if (k) keys.add(k);
+  }
+  return keys;
+}
+
+/**
+ * Drop `data`'s segments whose key is in `presentKeys`. Returns `data` unchanged
+ * (same object) when nothing is dropped, null when EVERYTHING is a duplicate,
+ * else a copy rebuilt from the remaining segments (text re-rendered, top-level
+ * metadata from the newest remaining segment). Pure.
+ */
+export function dropPresentSegments(data, presentKeys) {
+  if (!data || !presentKeys || presentKeys.size === 0) return data;
+  const segs = promptSegments(data);
+  const fallback = segs.length === 1 ? (data.chatId ?? null) : null;
+  const keep = segs.filter((seg) => { const k = segmentKey(seg, fallback); return !k || !presentKeys.has(k); });
+  if (keep.length === segs.length) return data;
+  if (keep.length === 0) return null;
+  const last = keep[keep.length - 1];
+  const out = {
+    ...data,
+    messages: keep,
+    text: keep.length === 1 ? (keep[0].text ?? '') : keep.map((seg) => `${attributionLabelFromData(seg)}: ${seg.text ?? ''}`).join('\n\n'),
+    textAttributed: keep.length > 1,
+    attachments: keep.flatMap((seg) => seg.attachments ?? []),
+    edited: keep.some((seg) => seg.edited),
+    editedAt: keep.reduce((acc, seg) => (seg.editedAt != null && (acc == null || seg.editedAt > acc) ? seg.editedAt : acc), null),
+  };
+  for (const k of ['messageId', 'fromUserId', 'fromName', 'fromRole', 'replyToMessageId', 'replyToText', 'quotedText', 'timestamp']) {
+    out[k] = last[k] ?? null;
+  }
+  if (last.chatId != null) out.chatId = last.chatId;
+  return out;
+}
+
 export function mergePromptData(existing, incoming) {
   if (!existing) return incoming;
+  if (!incoming) return existing;
+  // Idempotent: a message already in `existing` is not appended a second time.
+  incoming = dropPresentSegments(incoming, promptSegmentKeys(existing));
   if (!incoming) return existing;
   const seg = (d) => (d.textAttributed === false
     ? `${attributionLabelFromData(d)}: ${d.text ?? ''}`
@@ -2394,14 +2460,30 @@ export function claimPreexistingPrompt(promptFile, processingFile, writeLockFile
 // exhaustion we THROW (the durable write must complete before a sender reports
 // "queued"); the hold is microseconds (no network) so exhaustion is effectively
 // impossible. `writeLockFile` may be null for callers that don't need cross-process
-// serialization (e.g. unit tests). Returns 'merged' | 'spooled'.
-export async function mergeOrSpoolPrompt(promptFile, data, writeLockFile = null) {
+// serialization (e.g. unit tests). Returns 'merged' | 'spooled' | 'duplicate'.
+//
+// Idempotent per Telegram message (see promptSegmentKeys): segments already in the
+// claimed `.processing` batch (if readable) are dropped first, and mergePromptData
+// drops those already in the open prompt. Everything already present → nothing is
+// written ('duplicate'; the open prompt, if any, is left as it was).
+export async function mergeOrSpoolPrompt(promptFile, data, writeLockFile = null, processingFile = promptFile.replace(/\.json$/, '.processing.json')) {
   const acquired = writeLockFile ? await acquireLockWithRetry(writeLockFile) : true;
   if (!acquired) {
     throw new Error(`mergeOrSpoolPrompt: could not acquire ${path.basename(writeLockFile)} — prompt NOT written (do not report queued)`);
   }
   let takenFile = null;
   try {
+    let claimed = null;
+    if (processingFile && processingFile !== promptFile) {
+      try { claimed = JSON.parse(fs.readFileSync(processingFile, 'utf8')); } catch { /* none / unreadable → no dedupe against it */ }
+    }
+    data = dropPresentSegments(data, promptSegmentKeys(claimed));
+    if (!data) return 'duplicate';
+    if (fs.existsSync(promptFile)) {
+      let open = null;
+      try { open = JSON.parse(fs.readFileSync(promptFile, 'utf8')); } catch { /* torn → let the merge path handle it */ }
+      if (open && dropPresentSegments(data, promptSegmentKeys(open)) === null) return 'duplicate';
+    }
     const t = `${promptFile}.appending.${process.pid}`;
     let existing = null;
     try { fs.renameSync(promptFile, t); takenFile = t; } catch { /* no open prompt → spool fresh */ }

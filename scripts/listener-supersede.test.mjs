@@ -21,6 +21,9 @@ import {
   findPreWriteWinner,
   isLiveEntry,
   YIELD_TO_ONE_SHOT,
+  mergePromptData,
+  mergeOrSpoolPrompt,
+  buildCombinedPromptData,
 } from './tele-listen.mjs';
 
 // The --loop listener must YIELD (inconclusive → main exits 2, offset not
@@ -161,4 +164,62 @@ test('refreshRegistry read-only fallback (lock held) drops dead rows but keeps m
   }
   assert.deepEqual(registry.map((e) => e.pid), [LOOP_PID]);
   assert.equal(findSuperseder({ myPid: LOOP_PID, myFilter: null, myConvoId: '7', myLoop: true, registry }), null);
+});
+
+// ── Idempotent merge/spool (residual drain-vs-loop TOCTOU) ────────────────────
+// The --loop listener can pass its pre-write check, then the drain writes the
+// same updates first; the listener's already-prepared batch must not add a
+// second copy of a message that is still pending.
+
+function tgMsg(id, text, { chat = -100, edit = null } = {}) {
+  const m = { message_id: id, chat: { id: chat, type: 'supergroup' }, from: { id: 42, first_name: 'Thi' }, date: 1700000000 + id, text };
+  if (edit != null) m.edit_date = edit;
+  return { msg: m, update: { update_id: 9000 + id } };
+}
+const prompt = (...msgs) => buildCombinedPromptData(msgs);
+
+test('mergePromptData: merging the same message twice yields one copy', () => {
+  const a = prompt(tgMsg(1, 'hello'));
+  const merged = mergePromptData(a, prompt(tgMsg(1, 'hello')));
+  assert.equal(merged.messages.length, 1);
+  assert.equal(merged.text, 'hello');
+  // Partial overlap: only the new message is appended.
+  const m2 = mergePromptData(a, prompt(tgMsg(1, 'hello'), tgMsg(2, 'world')));
+  assert.deepEqual(m2.messages.map((s) => s.messageId), [1, 2]);
+  assert.equal((m2.text.match(/hello/g) || []).length, 1);
+  assert.match(m2.text, /world/);
+  assert.equal(m2.messageId, 2);
+});
+
+test('mergePromptData: an EDIT, another chat, or a synthetic (no messageId) prompt is NOT deduped', () => {
+  const a = prompt(tgMsg(1, 'hello'));
+  assert.equal(mergePromptData(a, prompt(tgMsg(1, 'hello v2', { edit: 1700000100 }))).messages.length, 2);
+  assert.equal(mergePromptData(a, prompt(tgMsg(1, 'other chat', { chat: -200 }))).messages.length, 2);
+  const synth = { text: 'ask', messageId: null, chatId: '-100', messages: [{ messageId: null, text: 'ask' }] };
+  assert.equal(mergePromptData(synth, { ...synth }).messages.length, 2);
+});
+
+test('mergeOrSpoolPrompt: merge path is idempotent (same batch twice → one copy)', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tele-idem-'));
+  const promptFile = path.join(dir, 'prompt-convo-7.json');
+  assert.equal(await mergeOrSpoolPrompt(promptFile, prompt(tgMsg(1, 'hello')), null), 'spooled');
+  assert.equal(await mergeOrSpoolPrompt(promptFile, prompt(tgMsg(1, 'hello')), null), 'duplicate');
+  assert.equal(JSON.parse(fs.readFileSync(promptFile, 'utf8')).messages.length, 1);
+  assert.equal(await mergeOrSpoolPrompt(promptFile, prompt(tgMsg(1, 'hello'), tgMsg(2, 'world')), null), 'merged');
+  assert.deepEqual(JSON.parse(fs.readFileSync(promptFile, 'utf8')).messages.map((s) => s.messageId), [1, 2]);
+});
+
+test('mergeOrSpoolPrompt: spool skips a message already in the claimed .processing batch', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tele-idem-'));
+  const promptFile = path.join(dir, 'prompt-convo-7.json');
+  const processingFile = path.join(dir, 'prompt-convo-7.processing.json');
+  fs.writeFileSync(processingFile, JSON.stringify(prompt(tgMsg(1, 'hello'))));
+  assert.equal(await mergeOrSpoolPrompt(promptFile, prompt(tgMsg(1, 'hello')), null), 'duplicate');
+  assert.equal(fs.existsSync(promptFile), false, 'nothing spooled');
+  // A batch mixing the claimed message with a new one spools only the new one.
+  assert.equal(await mergeOrSpoolPrompt(promptFile, prompt(tgMsg(1, 'hello'), tgMsg(2, 'world')), null), 'spooled');
+  const spooled = JSON.parse(fs.readFileSync(promptFile, 'utf8'));
+  assert.deepEqual(spooled.messages.map((s) => s.messageId), [2]);
+  assert.equal(spooled.text, 'world');
+  assert.equal(spooled.messageId, 2);
 });

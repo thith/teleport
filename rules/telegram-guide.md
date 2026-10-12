@@ -623,7 +623,7 @@ esac
 ```
 The bare `--convo` mode does one `fetchUpdates` (short-poll, sub-second) and exits — no need to wrap in `timeout`. If a new prompt landed, apply the misrouted-reply check above, then either act on it or confirm with admin BEFORE the critical action.
 
-If you are using the canonical Monitor pattern (Claude, `while … --loop …`), the drain is safe to run while that listener is live: a one-shot run (no `--loop`) never supersedes a `--loop` listener (the listener just skips its polls while the drain runs, so the two never write the same messages twice), so your listener keeps running — do **not** `TaskStop` it. (Only a legacy listener without `--loop` can still be superseded by the newer drain — undesirable but recoverable.)
+If you are using the canonical Monitor pattern (Claude, `while … --loop …`), the drain is safe to run while that listener is live: a one-shot run (no `--loop`) never supersedes a `--loop` listener (the listener skips its polls while a drain runs, so duplicates are rare; a duplicate is dropped if the earlier copy is still pending), so your listener keeps running — do **not** `TaskStop` it. (Only a legacy listener without `--loop` can still be superseded by the newer drain — undesirable but recoverable.)
 
 Also drain at natural idle moments — e.g. after a long task finishes and before you tell the admin "done", do one drain check. Catches the "I just sent a correction while you were working" case.
 
