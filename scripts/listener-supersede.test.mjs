@@ -20,7 +20,16 @@ import {
   findSuperseder,
   findPreWriteWinner,
   isLiveEntry,
+  YIELD_TO_ONE_SHOT,
 } from './tele-listen.mjs';
+
+// The --loop listener must YIELD (inconclusive → main exits 2, offset not
+// advanced) — never be "superseded" (a real row → exit 3, wrapper breaks).
+function assertYield(r) {
+  assert.ok(r, 'expected a yield, got null (would run alongside the drain → duplicate prompt)');
+  assert.equal(r.__inconclusive, true, 'expected a yield, got a real superseder (would stand down → deaf)');
+  assert.equal(r.reason, YIELD_TO_ONE_SHOT);
+}
 
 function tmpRegistry() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tele-supersede-'));
@@ -35,7 +44,7 @@ function deadPid() {
 const LOOP_PID = process.pid;   // live: plays the --loop listener's wrapper shell
 const DRAIN_PID = process.ppid; // live: plays the drain's short-lived bash
 
-test('a --loop listener is NOT superseded by a newer one-shot drain on the same convo', async () => {
+test('a --loop listener YIELDS (not superseded) to a newer live one-shot drain; the drain proceeds', async () => {
   const { file, lockFile } = tmpRegistry();
   await refreshRegistry({ pid: LOOP_PID, filter: null, offsetFile: 'o', convoId: '7', loop: true, file, lockFile, now: 1000 });
   // Drain registers LATER (newer startedAt) while the --loop listener is live.
@@ -45,11 +54,44 @@ test('a --loop listener is NOT superseded by a newer one-shot drain on the same 
   const registry = await refreshRegistry({ pid: LOOP_PID, filter: null, offsetFile: 'o', convoId: '7', loop: true, file, lockFile, now: 3000 });
   assert.equal(registry.find((e) => e.pid === LOOP_PID).loop, true);
   assert.ok(registry.some((e) => e.pid === DRAIN_PID), 'drain row is live and present');
-  assert.equal(findSuperseder({ myPid: LOOP_PID, myFilter: null, myConvoId: '7', myLoop: true, registry }), null);
+  assertYield(findSuperseder({ myPid: LOOP_PID, myFilter: null, myConvoId: '7', myLoop: true, registry }));
   // Pre-write guard agrees.
-  assert.equal(findPreWriteWinner({ myPid: LOOP_PID, myConvoId: '7', myLoop: true, registry: readRegistry(file) }), null);
+  assertYield(findPreWriteWinner({ myPid: LOOP_PID, myConvoId: '7', myLoop: true, registry: readRegistry(file) }));
   // And the drain itself is not stopped by the OLDER --loop listener (it still drains).
   assert.equal(findSuperseder({ myPid: DRAIN_PID, myFilter: null, myConvoId: '7', myLoop: false, registry }), null);
+  assert.equal(findPreWriteWinner({ myPid: DRAIN_PID, myConvoId: '7', myLoop: false, registry: readRegistry(file) }), null);
+});
+
+test('once the drain row is dead, the --loop listener proceeds normally', async () => {
+  const { file, lockFile } = tmpRegistry();
+  const dead = deadPid();
+  await refreshRegistry({ pid: LOOP_PID, filter: null, offsetFile: 'o', convoId: '7', loop: true, file, lockFile, now: 1000 });
+  // A drain that already exited left its (newer) row behind.
+  const rows = readRegistry(file);
+  rows.push({ pid: dead, convoId: '7', loop: false, startedAt: 2000 });
+  fs.writeFileSync(file, rows.map((e) => JSON.stringify(e)).join('\n') + '\n');
+  // Pre-write guard on the raw file: dead row ignored.
+  assert.equal(findPreWriteWinner({ myPid: LOOP_PID, myConvoId: '7', myLoop: true, registry: readRegistry(file) }), null);
+  // Next poll: refreshRegistry drops the dead row, supersede check is clean.
+  const registry = await refreshRegistry({ pid: LOOP_PID, filter: null, offsetFile: 'o', convoId: '7', loop: true, file, lockFile, now: 3000 });
+  assert.deepEqual(registry.map((e) => e.pid), [LOOP_PID]);
+  assert.equal(findSuperseder({ myPid: LOOP_PID, myFilter: null, myConvoId: '7', myLoop: true, registry }), null);
+});
+
+test('a real --loop superseder takes precedence over a one-shot yield; an OLDER one-shot causes no yield', () => {
+  const registry = [
+    { pid: 100, convoId: '7', loop: true, startedAt: 1000 },
+    { pid: 300, convoId: '7', loop: false, startedAt: 3000 },
+    { pid: 200, convoId: '7', loop: true, startedAt: 2000 },
+  ];
+  assert.equal(findSuperseder({ myPid: 100, myFilter: null, myConvoId: '7', myLoop: true, registry })?.pid, 200);
+  assert.equal(findPreWriteWinner({ myPid: 100, myConvoId: '7', myLoop: true, registry, isLive: () => true })?.pid, 200);
+  const olderOneShot = [
+    { pid: 100, convoId: '7', loop: true, startedAt: 2000 },
+    { pid: 300, convoId: '7', loop: false, startedAt: 1000 },
+  ];
+  assert.equal(findSuperseder({ myPid: 100, myFilter: null, myConvoId: '7', myLoop: true, registry: olderOneShot }), null);
+  assert.equal(findPreWriteWinner({ myPid: 100, myConvoId: '7', myLoop: true, registry: olderOneShot, isLive: () => true }), null);
 });
 
 test('two --loop listeners on the same convo: newer still wins (unchanged)', () => {

@@ -1961,6 +1961,15 @@ export function compareSameConvo(a, b) {
 // `while` wrapper would break — the agent goes deaf. Rows with no `loop` field
 // (written by older code) are treated as --loop rows, i.e. today's behaviour.
 // --loop vs --loop and one-shot vs anything are unchanged (newer wins).
+//
+// But the --loop listener must not simply run ALONGSIDE a live one-shot either:
+// both read the same convo-<N>-offset.txt, so both would write the same updates
+// → duplicate prompt content. So a NEWER live one-shot row on my convo makes a
+// --loop listener YIELD this poll — `{ __inconclusive, reason: 'yield-to-one-shot' }`
+// → main() exits 2 silently, offset NOT advanced; the next poll (after the
+// sub-second drain has exited and its row is dead) proceeds normally. Never
+// exit 3: yielding re-arms, standing down would leave the agent deaf.
+export const YIELD_TO_ONE_SHOT = 'yield-to-one-shot';
 export function ignoredAsSuperseder(peer, myLoop) {
   return myLoop === true && peer?.loop === false;
 }
@@ -1970,12 +1979,18 @@ export function findSuperseder({ myPid, myFilter, myConvoId = null, myLoop = nul
   // path or eviction), treat the supersede check as inconclusive — return a
   // sentinel that the caller interprets as "retry next poll".
   const mineEntry = registry.find((x) => x.pid === myPid);
+  let yieldTo = null;
   for (const e of registry) {
     if (e.pid === myPid) continue;
     // Cross-mode never supersedes (convo vs legacy).
     const eConvo = e.convoId ?? null;
     if ((myConvoId == null) !== (eConvo == null)) continue;
-    if (ignoredAsSuperseder(e, myLoop)) continue;
+    if (ignoredAsSuperseder(e, myLoop)) {
+      // Newer one-shot on my convo → yield this poll (see YIELD_TO_ONE_SHOT).
+      // `registry` comes from refreshRegistry, already liveness-filtered.
+      if (myConvoId != null && eConvo === myConvoId && mineEntry && compareSameConvo(e, mineEntry) > 0) yieldTo = e;
+      continue;
+    }
     if (myConvoId != null) {
       // Same-mode convo: peer with same convoId wins by (startedAt, pid).
       if (eConvo !== myConvoId) continue;
@@ -1985,6 +2000,8 @@ export function findSuperseder({ myPid, myFilter, myConvoId = null, myLoop = nul
     }
     if (isStrictSuperset(e.filter, myFilter)) return e;
   }
+  // A real superseder (returned above) takes precedence over a yield.
+  if (yieldTo) return { __inconclusive: true, reason: YIELD_TO_ONE_SHOT, pid: yieldTo.pid };
   return null;
 }
 
@@ -1992,19 +2009,21 @@ export function findSuperseder({ myPid, myFilter, myConvoId = null, myLoop = nul
 // the prompt and return the same-convo peer that beats us, or
 // `{ __inconclusive }` if my row is gone, or null. Dead rows are ignored (same
 // isLiveEntry filter refreshRegistry applies) — a finished drain's row must not
-// make a live --loop listener stand down — and one-shot rows never beat a
-// --loop listener (ignoredAsSuperseder).
+// make a live --loop listener stand down — and a newer LIVE one-shot row makes
+// a --loop listener yield this poll (inconclusive → exit 2), never stand down.
 export function findPreWriteWinner({ myPid, myConvoId, myLoop = null, registry, isLive = isLiveEntry }) {
   const mineEntry = registry.find((e) => e.pid === myPid);
   if (!mineEntry) return { __inconclusive: true, reason: 'my-entry-missing' };
+  let yieldTo = null;
   for (const e of registry) {
     if (e.pid === myPid) continue;
     if ((e.convoId ?? null) !== myConvoId) continue;
-    if (ignoredAsSuperseder(e, myLoop)) continue;
     if (compareSameConvo(e, mineEntry) <= 0) continue;
     if (!isLive(e)) continue;
+    if (ignoredAsSuperseder(e, myLoop)) { yieldTo = yieldTo ?? e; continue; } // newer live one-shot → yield, never stand down
     return e;
   }
+  if (yieldTo) return { __inconclusive: true, reason: YIELD_TO_ONE_SHOT, pid: yieldTo.pid };
   return null;
 }
 
@@ -2690,7 +2709,7 @@ async function main() {
   const registry = await refreshRegistry({ pid: myMonitorPid, filter: filterReplyTo, offsetFile, convoId: convo, loop });
   const superseder = findSuperseder({ myPid: myMonitorPid, myFilter: filterReplyTo, myConvoId: convo, myLoop: loop, registry });
   if (superseder && superseder.__inconclusive) {
-    process.exit(2); // supersede check inconclusive — retry next poll (silent; exit code is the signal)
+    process.exit(2); // inconclusive (my row missing) or yielding to a live one-shot drain — retry next poll, offset not advanced (silent)
   }
   if (superseder) {
     console.log(
@@ -3034,7 +3053,7 @@ async function main() {
   if (convo != null) {
     const winner = findPreWriteWinner({ myPid: myMonitorPid, myConvoId: convo, myLoop: loop, registry: readRegistry() });
     if (winner && winner.__inconclusive) {
-      process.exit(2); // registry row missing pre-write — defer to next poll (silent)
+      process.exit(2); // my row missing, or a live one-shot drain is newer (yield) — defer to next poll, offset not advanced (silent)
     }
     if (winner) {
       console.log(`[tele-listen] same-convo peer pid=${winner.pid} won pre-write race — exiting`);
