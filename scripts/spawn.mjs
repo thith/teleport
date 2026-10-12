@@ -35,6 +35,7 @@ import { fileURLToPath } from 'node:url';
 import { isMainModule } from './is-direct-run.mjs';
 import { uuidToConvoInt } from './convo-registry.mjs';
 import { shortConvoHash } from './convo-hash.mjs';
+import { createListenerStatus } from './listener-status.mjs';
 import { readTopicsStore } from './topics-store.mjs';
 import { formatPersona } from './persona.mjs';
 import { peekPersona } from './persona-store.mjs';
@@ -347,6 +348,23 @@ export function personaByHashtag(store = readTopicsStore()) {
     for (const key of Object.keys(entry)) {
       if (key.startsWith('_')) continue;
       map[shortConvoHash(key)] = peekPersona(key);
+    }
+  }
+  return map;
+}
+
+/**
+ * `{ <hashtag>: convoId }` from the topics store — lets `--ls` find a tele-*
+ * screen's convo (for its listener status) when the claude inside it has no
+ * readable session id. Same key walk as personaByHashtag. `store` injectable.
+ */
+export function convoByHashtag(store = readTopicsStore()) {
+  const map = {};
+  for (const entry of Object.values(store || {})) {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) continue;
+    for (const key of Object.keys(entry)) {
+      if (key.startsWith('_') || !/^\d+$/.test(key)) continue;
+      map[shortConvoHash(key)] = Number(key);
     }
   }
   return map;
@@ -1189,9 +1207,14 @@ if (isDirectRun) {
     let wiped = [];
     const screens = hasBinary('screen') ? listSpawnSessions(undefined, { onWiped: (n) => { wiped = n; } }) : [];
     const pmap = personaByHashtag();
+    // Listener alive / unread / busy per convo — best-effort, never blocks /ls.
+    let statusOf = () => null;
+    let cmap = {};
+    try { statusOf = createListenerStatus(); cmap = convoByHashtag(); } catch { /* omit statuses */ }
     console.log(formatAgentList({
       screens, procs: listClaudeProcs(),
       personaOf: (h) => (pmap[h] ? formatPersona(pmap[h]) : null),
+      statusOf, convoOfHashtag: (h) => cmap[h] ?? null,
     }));
     if (wiped.length) console.log(`\n🧹 đã dọn ${wiped.length} screen chết: ${wiped.join(', ')}`);
     process.exit(0);
