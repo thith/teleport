@@ -182,15 +182,22 @@ export function formatDuTop(rows, { partial = false, home = os.homedir(), n = DU
   return lines.join('\n');
 }
 
-/** Run du async, bounded. Resolves { stdout, timedOut, missing } — never rejects. */
-function runDuDefault(bin, args, timeout = DU_TIMEOUT_MS) {
+/**
+ * Run du async, bounded. Resolves { stdout, timedOut, code } — never rejects.
+ * `code`: 'ENOENT' when the binary is missing, the exit status otherwise (127 =
+ * `nice` ran but could not find `ionice`/`du`), null on success.
+ */
+export function runDuDefault(bin, args, timeout = DU_TIMEOUT_MS) {
   return new Promise((resolve) => {
     execFile(bin, args, { encoding: 'utf8', timeout, killSignal: 'SIGKILL', maxBuffer: 16 * 1024 * 1024 }, (err, stdout) => {
       // du exits 1 on an unreadable subdir but its totals are still valid → keep stdout on any error
-      resolve({ stdout: String(stdout || ''), timedOut: !!(err && (err.killed || err.signal)), missing: err?.code === 'ENOENT' });
+      resolve({ stdout: String(stdout || ''), timedOut: !!(err && (err.killed || err.signal)), code: err ? (err.code ?? null) : null });
     });
   });
 }
+
+/** ENOENT (no `nice`) or exit 127 (`nice` could not exec `ionice`). Pure. */
+export const wrapperUnavailable = (code) => code === 'ENOENT' || code === 127;
 
 /**
  * The du follow-up. One at a time: `state.duInFlight` guards it, so a slow du
@@ -206,8 +213,12 @@ export function diskFollowUp(state, send, { targets = () => duTargets(), runDu =
       if (!dirs.length) return;
       let [bin, args] = duCommand(dirs);
       let r = await runDu(bin, args);
-      if (r.missing) { [bin, args] = duCommand(dirs, { lowPriority: false }); r = await runDu(bin, args); }
-      const rows = parseDu(r.stdout);
+      let rows = parseDu(r.stdout);
+      if (!rows.length && wrapperUnavailable(r.code)) { // nice or ionice missing → plain du
+        [bin, args] = duCommand(dirs, { lowPriority: false });
+        r = await runDu(bin, args);
+        rows = parseDu(r.stdout);
+      }
       if (!rows.length) return; // nothing measured (timed out before the first total) → skip
       await send(formatDuTop(rows, { partial: r.timedOut, home }));
     } catch {} finally { state.duInFlight = false; }
@@ -236,9 +247,14 @@ export async function diskWatch(state, send, {
   let disk;
   try { disk = diskFromStatfs(statfs()); } catch { return; }
   const t = now();
-  const saved = diskPersisted.read() || {};
-  if (!diskAlertDue({ disk, now: t, lastAlertAt: saved.lastDiskAlertAt || 0 })) return;
-  diskPersisted.write({ ...saved, lastDiskAlertAt: t });
+  let saved = {};
+  try { saved = diskPersisted.read() || {}; } catch {}
+  // in-memory fallback: on a FULL disk the persisted write fails (ENOSPC), and
+  // without it every heartbeat would DM again
+  const last = Math.max(saved.lastDiskAlertAt || 0, state.lastDiskAlertAt || 0);
+  if (!diskAlertDue({ disk, now: t, lastAlertAt: last })) return;
+  state.lastDiskAlertAt = t;
+  try { diskPersisted.write({ ...saved, lastDiskAlertAt: t }); } catch {}
   await send(diskAlertText(disk));
   followUp(state, send); // not awaited: du can take up to a minute
 }

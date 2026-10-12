@@ -143,6 +143,17 @@ test('diskWatch: alerts once per window, throttle persisted in its own store acr
   assert.equal(followUps, 2);
   await diskWatch({}, send, { ...deps, statfs: () => { throw new Error('EACCES'); } });
   assert.equal(sent.length, 2, 'statfs failure → silent');
+
+  // full disk: the persisted write fails (ENOSPC) → the in-memory throttle still holds
+  const full = {}; const sentFull = [];
+  const fullDeps = { ...deps, statfs: () => ({ bsize: GB, blocks: 500, bavail: 0 }), diskPersisted: { read: () => ({}), write: () => { throw new Error('ENOSPC'); } } };
+  await diskWatch(full, async (t) => sentFull.push(t), fullDeps);
+  clock += 5 * 60_000;
+  await diskWatch(full, async (t) => sentFull.push(t), fullDeps);
+  assert.equal(sentFull.length, 1, 'no repeat DM within 30 min when the throttle cannot be persisted');
+  clock += 26 * 60_000;
+  await diskWatch(full, async (t) => sentFull.push(t), fullDeps);
+  assert.equal(sentFull.length, 2, 'repeats after the window');
 });
 
 test('duTargets / duCommand: readdir-expanded dirs, no glob strings, nice+ionice with plain-du fallback', async () => {
@@ -189,7 +200,7 @@ test('diskFollowUp: runs once while in flight, formats top 8, partial on timeout
   const sent2 = []; const calls2 = [];
   await diskFollowUp({}, async (t) => sent2.push(t), {
     targets: () => ['/a', '/b'], home: '/h',
-    runDu: async (bin, args) => { calls2.push(bin); return bin === 'nice' ? { stdout: '', missing: true } : { stdout: `${2 * GB}\t/a\n`, timedOut: true }; },
+    runDu: async (bin, args) => { calls2.push(bin); return bin === 'nice' ? { stdout: '', code: 'ENOENT' } : { stdout: `${2 * GB}\t/a\n`, timedOut: true }; },
   });
   assert.deepEqual(calls2, ['nice', 'du'], 'nice missing → plain du');
   assert.match(sent2[0], /\(một phần \/ quá giờ\):\n1\. \/a: 2\.0 GB/);
@@ -197,6 +208,29 @@ test('diskFollowUp: runs once while in flight, formats top 8, partial on timeout
   const sent3 = [];
   await diskFollowUp({}, async (t) => sent3.push(t), { targets: () => ['/a'], runDu: async () => ({ stdout: '', timedOut: true }) });
   assert.equal(sent3.length, 0, 'timed out with nothing parsed → skip');
+
+  const sent4 = []; const calls4 = [];
+  await diskFollowUp({}, async (t) => sent4.push(t), {
+    targets: () => ['/a'], home: '/h',
+    runDu: async (bin) => { calls4.push(bin); return bin === 'nice' ? { stdout: '', code: 127 } : { stdout: `${3 * GB}\t/a\n`, code: null }; },
+  });
+  assert.deepEqual(calls4, ['nice', 'du'], 'nice present but ionice missing (exit 127) → plain du');
+  assert.match(sent4[0], /1\. \/a: 3\.0 GB/);
+
+  const calls5 = [];
+  await diskFollowUp({}, async () => {}, { targets: () => ['/a'], runDu: async (bin) => { calls5.push(bin); return { stdout: '', code: 1 }; } });
+  assert.deepEqual(calls5, ['nice'], 'a plain du failure (exit 1) is not retried');
+  const calls6 = [];
+  await diskFollowUp({}, async () => {}, { targets: () => ['/a'], runDu: async (bin) => { calls6.push(bin); return { stdout: `${GB}\t/a\n`, code: 127 }; } });
+  assert.deepEqual(calls6, ['nice'], 'rows parsed → no rerun even with an odd exit code');
+});
+
+test('runDuDefault: reports ENOENT for a missing binary and the exit status otherwise (127 = wrapper could not exec)', async () => {
+  const { runDuDefault } = await import('./health.mjs');
+  assert.equal((await runDuDefault('/nonexistent/teleport-no-such-bin', [])).code, 'ENOENT');
+  assert.equal((await runDuDefault('sh', ['-c', 'exit 127'])).code, 127);
+  const ok = await runDuDefault('sh', ['-c', 'printf "5\\t/x\\n"']);
+  assert.equal(ok.code, null); assert.equal(ok.stdout, '5\t/x\n'); assert.equal(ok.timedOut, false);
 });
 
 test('machineWatch wires the disk alert (follow-up not awaited); real du on a tiny temp dir parses', async () => {
