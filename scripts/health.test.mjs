@@ -78,6 +78,7 @@ test('machineWatch: records first, reports deaths once, keeps the snapshot on a 
     readMem: () => mem, listAgents: () => agents, top: async () => { topCalls++; return []; },
     journalSince: async () => 'Killed process 2 (claude)', recentKills: () => ({ pids: new Set(), hashtags: new Set() }),
     unit: () => null, persisted: { read: () => disk, write: (o) => { disk = o; } }, now: () => 100_000_000,
+    statfs: () => ({ bsize: 4096, blocks: 1e8, bavail: 5e7 }), diskPersisted: { read: () => ({}), write: () => { throw new Error('no disk alert expected'); } },
   };
   const send = async (t) => sent.push(t);
   await machineWatch(state, send, deps);
@@ -96,4 +97,130 @@ test('machineWatch: records first, reports deaths once, keeps the snapshot on a 
   await machineWatch(state, send, deps);
   assert.equal(sent.filter((t) => /RAM sắp hết/.test(t)).length, 1, 'one warning per window, even across a restart');
   assert.equal(topCalls, 1);
+});
+
+const dirent = (name, dir = true) => ({ name, isDirectory: () => dir });
+
+test('diskLow / diskAlertDue: threshold by % and by GiB, throttled', async () => {
+  const { diskLow, diskAlertDue, diskFromStatfs, diskAlertText } = await import('./health.mjs');
+  assert.deepEqual(diskFromStatfs({ bsize: 4096, blocks: 1000, bavail: 250 }), { size: 4096000, avail: 1024000 });
+  assert.equal(diskLow({ size: 500 * GB, avail: 120 * GB }), false, '24% and 120 GB → healthy');
+  assert.equal(diskLow({ size: 1000 * GB, avail: 140 * GB }), true, '14% → low even with 140 GB');
+  assert.equal(diskLow({ size: 1000 * GB, avail: 150 * GB }), false, 'exactly 15% / 150 GB → fine');
+  assert.equal(diskLow({ size: 200 * GB, avail: 39 * GB }), true, '19.5% but 39 GB → low by GiB');
+  assert.equal(diskLow({ size: 200 * GB, avail: 40 * GB }), false, '20% and 40 GB → fine');
+  const low = { size: 500 * GB, avail: 30 * GB };
+  assert.equal(diskAlertDue({ disk: low, now: 10_000_000, lastAlertAt: 0 }), true);
+  assert.equal(diskAlertDue({ disk: low, now: 10_000_000, lastAlertAt: 10_000_000 - 29 * 60_000 }), false, 'within 30 min');
+  assert.equal(diskAlertDue({ disk: low, now: 10_000_000, lastAlertAt: 10_000_000 - 30 * 60_000 }), true);
+  assert.equal(diskAlertDue({ disk: null, now: 1 }), false);
+  assert.match(diskAlertText(low), /^💾 Disk sắp đầy: còn 30\.0 GB \/ 500\.0 GB \(6%\)/);
+  assert.match(formatHealth({ disk: { size: 200 * GB, avail: 39 * GB, target: '/' } }), /⚠️ Disk sắp đầy \(còn 20%\)/, '/health warns on the same thresholds');
+});
+
+test('diskWatch: alerts once per window, throttle persisted in its own store across restarts, follow-up kicked once', async () => {
+  const { diskWatch } = await import('./health.mjs');
+  let store = {}; let clock = 50_000_000; let avail = 30; const sent = []; let followUps = 0;
+  const deps = {
+    statfs: () => ({ bsize: GB, blocks: 500, bavail: avail }),
+    diskPersisted: { read: () => store, write: (o) => { store = o; } },
+    followUp: () => { followUps++; }, now: () => clock,
+  };
+  const send = async (t) => sent.push(t);
+  await diskWatch({}, send, deps);
+  assert.equal(sent.length, 1); assert.match(sent[0], /Disk sắp đầy: còn 30\.0 GB/);
+  assert.equal(store.lastDiskAlertAt, 50_000_000, 'throttle persisted');
+  assert.equal(followUps, 1);
+  clock += 10 * 60_000;
+  await diskWatch({}, send, deps); // fresh in-memory state = daemon restart
+  assert.equal(sent.length, 1, 'still throttled after a restart');
+  clock += 21 * 60_000;
+  await diskWatch({}, send, deps);
+  assert.equal(sent.length, 2, 'repeats after 30 min');
+  avail = 200; clock += 60 * 60_000;
+  await diskWatch({}, send, deps);
+  assert.equal(sent.length, 2, 'healthy → no alert');
+  assert.equal(followUps, 2);
+  await diskWatch({}, send, { ...deps, statfs: () => { throw new Error('EACCES'); } });
+  assert.equal(sent.length, 2, 'statfs failure → silent');
+});
+
+test('duTargets / duCommand: readdir-expanded dirs, no glob strings, nice+ionice with plain-du fallback', async () => {
+  const { duTargets, duCommand } = await import('./health.mjs');
+  const tree = {
+    '/h/Projects': [dirent('teleport'), dirent('umipay'), dirent('notes.txt', false)],
+    '/h/.cache/teleport': [dirent('cargo-target')],
+    '/t': [dirent('claude-1000'), dirent('other'), dirent('claude-x', false)],
+  };
+  const dirs = duTargets({ home: '/h', tmp: '/t', readdir: (d) => { if (!tree[d]) throw new Error('ENOENT'); return tree[d]; } });
+  assert.deepEqual(dirs, ['/h/Projects/teleport', '/h/Projects/umipay', '/h/.cache/teleport/cargo-target', '/t/claude-1000']);
+  assert.deepEqual(duTargets({ home: '/none', tmp: '/none', readdir: () => { throw new Error('ENOENT'); } }), []);
+  const [bin, args] = duCommand(dirs);
+  assert.equal(bin, 'nice');
+  assert.deepEqual(args, ['-n19', 'ionice', '-c3', 'du', '-x', '-B1', '-s', '--', ...dirs]);
+  assert.ok(!args.some((a) => a.includes('*')), 'no glob reaches du');
+  assert.ok(!(args.includes('-s') && args.some((a) => a.startsWith('--max-depth'))), '-s with --max-depth is invalid');
+  assert.deepEqual(duCommand(['/a'], { lowPriority: false }), ['du', ['-x', '-B1', '-s', '--', '/a']]);
+});
+
+test('diskFollowUp: runs once while in flight, formats top 8, partial on timeout, falls back without nice', async () => {
+  const { diskFollowUp, parseDu, formatDuTop } = await import('./health.mjs');
+  assert.deepEqual(parseDu('100\t/a b\n200\t/c\n30'), [{ bytes: 100, path: '/a b' }, { bytes: 200, path: '/c' }], 'cut-off line dropped, spaces kept');
+  const rows = Array.from({ length: 10 }, (_, i) => ({ bytes: (i + 1) * GB, path: `/h/Projects/p${i}` }));
+  rows.push({ bytes: 500 * 1024 ** 2, path: '/t/claude-1000' });
+  const top = formatDuTop(rows, { home: '/h' });
+  assert.match(top, /^📂 Thư mục lớn nhất:\n1\. ~\/Projects\/p9: 10\.0 GB\n2\. ~\/Projects\/p8: 9\.0 GB/);
+  assert.equal(top.split('\n').length, 9, 'header + top 8');
+  assert.match(formatDuTop([{ bytes: 500 * 1024 ** 2, path: '/t/claude-1000' }], { home: '/h' }), /1\. \/t\/claude-1000: 500 MB/);
+
+  const state = {}; const sent = []; const calls = []; let release;
+  const gate = new Promise((r) => { release = r; });
+  const runDu = async (bin, args) => { calls.push([bin, args]); await gate; return { stdout: `${5 * GB}\t/h/Projects/big\n${GB}\t/h/.cache/teleport/x\n`, timedOut: false }; };
+  const send = async (t) => sent.push(t);
+  const p1 = diskFollowUp(state, send, { targets: () => ['/h/Projects/big', '/h/.cache/teleport/x'], runDu, home: '/h' });
+  const p2 = diskFollowUp(state, send, { targets: () => ['/h/Projects/big'], runDu, home: '/h' });
+  assert.equal(state.duInFlight, true);
+  release(); await p1; await p2;
+  assert.equal(calls.length, 1, 'second call while in flight does not start another du');
+  assert.equal(sent.length, 1);
+  assert.match(sent[0], /1\. ~\/Projects\/big: 5\.0 GB\n2\. ~\/\.cache\/teleport\/x: 1\.0 GB/);
+  assert.equal(state.duInFlight, false, 'flag released');
+
+  const sent2 = []; const calls2 = [];
+  await diskFollowUp({}, async (t) => sent2.push(t), {
+    targets: () => ['/a', '/b'], home: '/h',
+    runDu: async (bin, args) => { calls2.push(bin); return bin === 'nice' ? { stdout: '', missing: true } : { stdout: `${2 * GB}\t/a\n`, timedOut: true }; },
+  });
+  assert.deepEqual(calls2, ['nice', 'du'], 'nice missing → plain du');
+  assert.match(sent2[0], /\(một phần \/ quá giờ\):\n1\. \/a: 2\.0 GB/);
+
+  const sent3 = [];
+  await diskFollowUp({}, async (t) => sent3.push(t), { targets: () => ['/a'], runDu: async () => ({ stdout: '', timedOut: true }) });
+  assert.equal(sent3.length, 0, 'timed out with nothing parsed → skip');
+});
+
+test('machineWatch wires the disk alert (follow-up not awaited); real du on a tiny temp dir parses', async () => {
+  const { machineWatch, diskFollowUp } = await import('./health.mjs');
+  const fs = await import('node:fs'); const os = await import('node:os'); const path = await import('node:path');
+  const sent = []; let kicked = 0; let store = {};
+  let timer;
+  const finished = await Promise.race([
+    machineWatch({}, async (t) => sent.push(t), {
+      readMem: () => null, listAgents: () => [], persisted: { read: () => ({}), write: () => {} }, now: () => 1e9,
+      statfs: () => ({ bsize: GB, blocks: 500, bavail: 10 }), diskPersisted: { read: () => store, write: (o) => { store = o; } },
+      followUp: () => { kicked++; return new Promise(() => {}); }, // never settles: machineWatch must not wait on it
+    }).then(() => true),
+    new Promise((r) => { timer = setTimeout(() => r(false), 1000); }),
+  ]);
+  clearTimeout(timer);
+  assert.equal(finished, true, 'machineWatch returns without waiting for the du follow-up');
+  assert.match(sent[0], /💾 Disk sắp đầy: còn 10\.0 GB \/ 500\.0 GB \(2%\)/);
+  assert.equal(kicked, 1);
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'health-du-'));
+  try {
+    fs.mkdirSync(path.join(dir, 'a b')); fs.writeFileSync(path.join(dir, 'a b', 'f'), Buffer.alloc(3 * 1024 * 1024, 1));
+    const out = [];
+    await diskFollowUp({}, async (t) => out.push(t), { targets: () => [path.join(dir, 'a b')], home: '/nonexistent' });
+    assert.ok(out[0].includes(`1. ${dir}/a b: 3 MB`), out[0]);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
