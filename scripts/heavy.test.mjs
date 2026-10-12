@@ -58,6 +58,10 @@ test('C: inherited CARGO_TARGET_DIR respected; --own-target; outside git → uns
   const { repo } = repoWithWorktree();
   assert.equal(resolveCargoTarget({ env: { CARGO_TARGET_DIR: '/mine' }, cwd: repo }), null);
   assert.equal(resolveCargoTarget({ env: {}, ownTarget: true, cwd: repo }), null);
+  // HOME="" / relative → would be a relative (per-worktree) dir → don't set
+  assert.equal(resolveCargoTarget({ env: {}, cwd: repo, home: '' }), null);
+  assert.equal(resolveCargoTarget({ env: {}, cwd: repo, home: 'rel/home' }), null);
+  assert.ok(path.isAbsolute(resolveCargoTarget({ env: {}, cwd: repo, home: '/h' })));
   const out = tmp('tp-heavy-nogit-');
   assert.equal(gitCommonDir(out), null, 'tmpdir is not inside a git repo');
   assert.equal(resolveCargoTarget({ env: {}, cwd: out }), null);
@@ -93,13 +97,23 @@ test('C: main passes CARGO_TARGET_DIR to the command (and gradlew --stop), says 
   assert.doesNotMatch(r.logs, /cargo clean/);
 });
 
-test('C: hasCargoClean — token `clean` right after a token named cargo (also inside sh -c)', () => {
+test('C: hasCargoClean — `cargo [+tc] [-flags] clean` (also inside sh -c), but not `clean -p <crate>`', () => {
   assert.equal(hasCargoClean(['cargo', 'clean']), true);
-  assert.equal(hasCargoClean(['/home/u/.cargo/bin/cargo', 'clean', '-p', 'x']), true);
+  assert.equal(hasCargoClean(['/home/u/.cargo/bin/cargo', 'clean', '--release']), true);
   assert.equal(hasCargoClean(['sh', '-c', 'cd a && cargo clean && cargo build']), true);
   assert.equal(hasCargoClean(['cargo', 'build', 'clean']), false);
   assert.equal(hasCargoClean(['make', 'clean']), false);
   assert.equal(hasCargoClean(['cargo-clean']), false);
+  assert.equal(hasCargoClean(['cargo', '+nightly', 'clean']), true);
+  assert.equal(hasCargoClean(['cargo', '-q', 'clean']), true);
+  assert.equal(hasCargoClean(['sh', '-c', 'cargo clean&&x']), true);
+  assert.equal(hasCargoClean(['sh', '-c', '(cargo clean)']), true);
+  // only one crate → not a wipe of the shared cache
+  assert.equal(hasCargoClean(['cargo', 'clean', '-p', 'foo']), false);
+  assert.equal(hasCargoClean(['cargo', 'clean', '--package', 'foo']), false);
+  assert.equal(hasCargoClean(['cargo', 'clean', '--package=foo']), false);
+  assert.equal(hasCargoClean(['cargo', 'clean', '-pfoo']), false);
+  assert.equal(hasCargoClean(['sh', '-c', 'cargo clean -p foo; cargo clean']), true, '-p of another command does not count');
 });
 
 test('C: real process — inside a repo the command sees the shared dir; outside git it does not', { skip: spawnSync('git', ['--version']).status !== 0 }, async () => {
@@ -158,7 +172,8 @@ test('F: waits (polling every 10 s) and proceeds as soon as RAM rises above the 
 });
 
 test('F: stops after 2 min without any rise (plateau), with a warning', async () => {
-  const f = fake([1, 1.2, 1.2, 1.1]); // best 1.2 at t=10 s, never beaten
+  // best 1.5 at t=10 s, never beaten; 1.2 → 1.4 is a rise vs the previous reading but not vs the best
+  const f = fake([1, 1.5, 1.2, 1.4, 1.4]);
   const r = await waitForRam({ minBytes: 3 * GiB, ...f });
   assert.equal(r.reason, 'plateau');
   assert.equal(r.waitedMs, RAM_POLL_MS + RAM_PLATEAU_MS);

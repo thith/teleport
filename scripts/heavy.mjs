@@ -79,15 +79,29 @@ export function sharedTargetDir(commonDir, home = os.homedir()) {
 
 /** CARGO_TARGET_DIR to set for the child, or null (inherited / --own-target / not in git). */
 export function resolveCargoTarget({ env = process.env, ownTarget = false, cwd = process.cwd(), home = os.homedir(), commonDir = gitCommonDir } = {}) {
-  if (env.CARGO_TARGET_DIR || ownTarget) return null;
+  // HOME="" → os.homedir() is "" → a RELATIVE dir, i.e. one per worktree again: don't.
+  if (env.CARGO_TARGET_DIR || ownTarget || !home || !path.isAbsolute(home)) return null;
   const cd = commonDir(cwd);
   return cd ? sharedTargetDir(cd, home) : null;
 }
 
-/** Does the command line run `cargo clean` (also inside `sh -c "…"`)? Pure. */
+/**
+ * Does the command line run a whole-target `cargo clean` (also inside `sh -c "…"`,
+ * `cargo +nightly clean`, `cargo -q clean`)? `cargo clean -p <crate>` only drops
+ * that crate → false. Pure, heuristic (a warning, not a gate).
+ */
 export function hasCargoClean(cmd) {
-  const toks = cmd.join(' ').split(/\s+/);
-  return toks.some((t, i) => path.basename(t) === 'cargo' && toks[i + 1] === 'clean');
+  for (const seg of cmd.join(' ').split(/[;&|()]+/)) {
+    const toks = seg.split(/\s+/).filter(Boolean);
+    for (let i = 0; i < toks.length; i++) {
+      if (path.basename(toks[i]) !== 'cargo') continue;
+      let j = i + 1;
+      while (j < toks.length && /^[+-]/.test(toks[j])) j++;
+      if (toks[j] !== 'clean') continue;
+      if (!toks.slice(j + 1).some((t) => /^(-p|--package)(=|$)|^-p./.test(t))) return true;
+    }
+  }
+  return false;
 }
 
 // ── RFC 18 F: wait for free RAM ──

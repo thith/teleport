@@ -21,7 +21,8 @@ const exitOf = (child) => new Promise((r) => child.on('exit', (code, signal) => 
 // Without TELEPORT_HEAVY_HELD, even if this suite itself runs under heavy.
 // TELEPORT_HEAVY_MIN_FREE_MB=0: never wait for RAM (RFC 18 F) on a busy test box.
 const cleanEnv = (extra) => { const e = { ...process.env, TELEPORT_HEAVY_MIN_FREE_MB: '0', ...extra }; delete e.TELEPORT_HEAVY_HELD; return e; };
-const heavy = (dir, args, extra = {}) => spawn(process.execPath, [HEAVY, ...args], { env: cleanEnv({ TELEPORT_LOCK_DIR: dir }), stdio: ['ignore', 'pipe', 'pipe'], ...extra });
+// --own-target: lock tests don't care about target dirs (and the ℹ️ line would be the first stderr chunk).
+const heavy = (dir, args, extra = {}) => spawn(process.execPath, [HEAVY, '--own-target', ...args], { env: cleanEnv({ TELEPORT_LOCK_DIR: dir }), stdio: ['ignore', 'pipe', 'pipe'], ...extra });
 
 test('lock names: only ^[a-z][a-z0-9-]{0,31}$ (no paths)', () => {
   assert.throws(() => lockPaths('../x'), /bad lock name/);
@@ -127,8 +128,9 @@ test('heavy: waiter killed while waiting leaves nothing behind (command never ru
   const l = await acquireLock('build', { dir });
   const marker = path.join(dir, 'ran');
   const c = heavy(dir, ['--', 'touch', marker]);
-  await new Promise((r) => c.stderr.once('data', r)); // the ⏳ notice
-  c.kill('SIGKILL'); await exitOf(c);
+  // really waiting (⏳), not just started; exiting first means it never waited → the marker check fails
+  await new Promise((r) => { let s = ''; c.stderr.on('data', (d) => { s += d; if (/⏳/.test(s)) r(); }); c.on('exit', r); });
+  if (c.exitCode === null && c.signalCode === null) { c.kill('SIGKILL'); await exitOf(c); }
   l.release();
   await sleep(1500);
   assert.equal(fs.existsSync(marker), false);
