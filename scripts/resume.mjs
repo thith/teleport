@@ -105,11 +105,13 @@ export function checkCwd(cwd, { parentDir = PARENT_DIR, realpath = fs.realpathSy
 if (isMainModule(import.meta.url)) {
   // Forwarded claude flags (RFC 18): split BEFORE joining the name query.
   const { splitForwarded, parseExtraArgs } = await import('./spawn-extra-args.mjs');
+  // (resume.mjs splits BEFORE joining the name query — a flag must never become part of the name.)
   const { readProjectsConfig, resolveDaemonUserId } = await import('./projects-config.mjs');
   const { own, fwd } = splitForwarded(process.argv.slice(2));
   const query = own.join(' ');
   const ownerId = resolveDaemonUserId(readProjectsConfig(new URL('../projects.json', import.meta.url).pathname), { env: {} });
-  const callerIsOwner = Boolean(process.stdin.isTTY) || Boolean(ownerId && process.env.TELE_FROM_ID && String(process.env.TELE_FROM_ID) === String(ownerId));
+  const { isOwnerCaller } = await import('./spawn-extra-args.mjs');
+  const callerIsOwner = isOwnerCaller({ isTTY: process.stdin.isTTY, env: process.env, ownerId });
   let extraArgs;
   if (fwd !== null) {
     const px = parseExtraArgs(fwd, { owner: callerIsOwner });

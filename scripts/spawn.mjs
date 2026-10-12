@@ -43,7 +43,7 @@ import {
   formatAgentList, parseKillPidArg, killClaudePid, KILL_PID_GRACE_MS, inspectPid, etimeToSeconds,
 } from './claude-procs.mjs';
 import { readProjectsConfig, resolveDaemonUserId } from './projects-config.mjs';
-import { splitForwarded, misplacedFlag, parseExtraArgs, saveExtraArgs, clearExtraArgs, loadExtraArgs } from './spawn-extra-args.mjs';
+import { splitForwarded, misplacedFlag, parseExtraArgs, saveExtraArgs, clearExtraArgs, loadExtraArgs, isOwnerCaller } from './spawn-extra-args.mjs';
 
 export const SPAWN_PROMPT = 'Find and read process.md and review-guide.md if present in this project, then Telegram me and wait for instructions';
 
@@ -160,8 +160,10 @@ export function buildSpawnPlan({ interactive = false, sessionName, sessionId, se
   }
   // Forwarded claude flags (RFC 18): the ONE place every launch path goes through,
   // so the allowlist is enforced here (owner gating is the caller's — see
-  // spawn-extra-args.mjs). They go right after --permission-mode, BEFORE
-  // --session-id/--resume: `--remote-control [name]` would swallow the next token.
+  // spawn-extra-args.mjs). They go right after `claude`, so the next token is
+  // always `--permission-mode`: `--remote-control [name]` takes an OPTIONAL value
+  // and would swallow a following non-flag token (e.g. the prompt when no
+  // --session-id is forced).
   const fx = parseExtraArgs(extraArgs, { owner: true });
   if (fx.error) throw new Error(`spawn: ${fx.error}`);
   const extra = fx.args;
@@ -181,7 +183,7 @@ export function buildSpawnPlan({ interactive = false, sessionName, sessionId, se
       sessionId: resumeSessionId,
       resumed: true,
       extraArgs: extra,
-      command: ['screen', '-U', '-dmS', name, 'claude', '--permission-mode', permissionMode, ...extra, '--resume', resumeSessionId, prompt ?? RESUME_PROMPT],
+      command: ['screen', '-U', '-dmS', name, 'claude', ...extra, '--permission-mode', permissionMode, '--resume', resumeSessionId, prompt ?? RESUME_PROMPT],
       teardown: `screen -S ${name} -X quit`,
     };
   }
@@ -214,8 +216,8 @@ export function buildSpawnPlan({ interactive = false, sessionName, sessionId, se
     // are predictable from the parent (and the screen name matches the hashtag).
     // `--permission-mode` is always present (works alongside the positional prompt).
     const claudeArgs = sid != null
-      ? ['claude', '--permission-mode', permissionMode, ...extra, '--session-id', sid, prompt]
-      : ['claude', '--permission-mode', permissionMode, ...extra, prompt];
+      ? ['claude', ...extra, '--permission-mode', permissionMode, '--session-id', sid, prompt]
+      : ['claude', ...extra, '--permission-mode', permissionMode, prompt];
     return {
       mode: 'interactive',
       sessionName: name,
@@ -784,7 +786,6 @@ export async function performResume({ sessionId, cwd, permissionMode = DEFAULT_P
   let note = null;
   const given = extraArgs; // what the CALLER passed — only that is (re)saved
   if (extraArgs === undefined) { const l = extras.load(sessionId); extraArgs = l.args; note = l.dropped; }
-  else if (extraArgs.length === 0) extras.clear(sessionId);
   const plan = buildSpawnPlan({ interactive: true, permissionMode, resumeSessionId: sessionId, extraArgs });
   if (note) plan.extraNote = note;
   // Held until the screen is verified — see acquireResumeLock.
@@ -836,8 +837,10 @@ export async function performResume({ sessionId, cwd, permissionMode = DEFAULT_P
           lock.markFailed?.();
           return { error: `screen "${plan.sessionName}" exited right after launch — claude probably rejected a forwarded flag (${plan.extraArgs.join(' ')}). Retry with different flags, or with "--" alone to drop the stored ones.`, plan, launchFailed: true };
         }
-        if (given !== undefined && given.length) { try { extras.save(sessionId, plan.extraArgs, { setBy }); } catch {} }
       }
+      // Only a VERIFIED launch changes what is remembered (a refused resume — e.g.
+      // the agent is still alive — must not forget a rescue session's flags).
+      if (given !== undefined) { try { if (given.length) extras.save(sessionId, plan.extraArgs, { setBy }); else extras.clear(sessionId); } catch {} }
       lock.launchSucceeded?.();
       return { ok: true, plan };
     };
@@ -1070,7 +1073,8 @@ export function wrapInLoginShell(command, base = process.env) {
  */
 export function scrubClaudeEnv(base = process.env) {
   const env = { ...base };
-  for (const k of Object.keys(env)) if (/^CLAUDE(CODE)?(_|$)/.test(k)) delete env[k];
+  // TELE_FROM_* too: the daemon's owner identity must never leak into an agent (it would make the agent "owner").
+  for (const k of Object.keys(env)) if (/^CLAUDE(CODE)?(_|$)/.test(k) || /^TELE_FROM_/.test(k)) delete env[k];
   return env;
 }
 
@@ -1161,7 +1165,7 @@ if (isDirectRun) {
   // projects.json, no env fallback), or a human at a real terminal. An agent
   // running spawn for someone has neither → owner-only flags are refused.
   const ownerId = resolveDaemonUserId(readProjectsConfig(path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'projects.json')), { env: {} });
-  const callerIsOwner = Boolean(process.stdin.isTTY) || Boolean(ownerId && process.env.TELE_FROM_ID && String(process.env.TELE_FROM_ID) === String(ownerId));
+  const callerIsOwner = isOwnerCaller({ isTTY: process.stdin.isTTY, env: process.env, ownerId });
   let extraArgs;
   if (fwd !== null) {
     const px = parseExtraArgs(fwd, { owner: callerIsOwner });
@@ -1403,6 +1407,8 @@ if (isDirectRun) {
   let plan;
   try { plan = buildSpawnPlan({ interactive, permissionMode, extraArgs: extraArgs ?? [] }); }
   catch (e) { console.error(`[spawn] ❌ ${e.message.replace(/^spawn: /, '')}`); process.exit(1); }
+  // Test seam: print the plan instead of launching (no claude/screen needed).
+  if (process.env.TELEPORT_SPAWN_DRY_RUN === '1') { console.log(JSON.stringify({ command: plan.command, extraArgs: plan.extraArgs, setBy })); process.exit(0); }
   const result = runSpawn(plan);
   if (plan.mode === 'interactive') {
     // Verify the screen session actually came up — `screen -dmS` returns 0 even if

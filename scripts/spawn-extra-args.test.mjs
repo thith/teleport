@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { splitForwarded, misplacedFlag, parseExtraArgs, stripOwnerOnly, saveExtraArgs, loadExtraArgs, clearExtraArgs } from './spawn-extra-args.mjs';
+import { splitForwarded, misplacedFlag, parseExtraArgs, stripOwnerOnly, saveExtraArgs, loadExtraArgs, clearExtraArgs, isOwnerCaller } from './spawn-extra-args.mjs';
 import { buildSpawnPlan, performResume } from './spawn.mjs';
 
 const SID = 'ac22f365-d351-4e54-82a5-303156081507';
@@ -56,23 +56,25 @@ test('stored flags: one file per session; owner-set remote control survives, any
   fs.writeFileSync(path.join(dir, `${SID}.json`), JSON.stringify({ args: ['--dangerously-skip-permissions'], setBy: 'owner' }));
   assert.equal(loadExtraArgs(SID, { dir }).args.length, 0);
   assert.match(loadExtraArgs(SID, { dir }).dropped, /ignored/);
+  fs.writeFileSync(path.join(dir, `${SID}.json`), JSON.stringify({ args: ['--remote-control', 'x'] }));
+  assert.deepEqual(loadExtraArgs(SID, { dir }).args, [], 'no setBy = not the owner');
   clearExtraArgs(SID, { dir });
   assert.deepEqual(loadExtraArgs(SID, { dir }), { args: [], dropped: null });
   assert.throws(() => saveExtraArgs('../x', [], { dir }), /bad session id/);
 });
 
-test('buildSpawnPlan: forwarded flags sit right after --permission-mode, before --session-id/--resume; prompt stays last', () => {
-  const p = buildSpawnPlan({ interactive: true, extraArgs: ['--remote-control'] });
-  const c = p.command;
-  assert.equal(c[c.indexOf('--permission-mode') + 2], '--remote-control');
-  assert.ok(c.indexOf('--session-id') > c.indexOf('--remote-control'), 'bare --remote-control must not swallow the session id');
-  assert.ok(c.at(-1).startsWith('Find and read'), 'prompt is the final element');
+test('buildSpawnPlan: forwarded flags come right after `claude` (next token is always a flag); prompt stays last', () => {
+  for (const p of [buildSpawnPlan({ interactive: true, extraArgs: ['--remote-control'] }), buildSpawnPlan({ interactive: true, sessionName: 'tele-x', extraArgs: ['--remote-control'] })]) {
+    const c = p.command, at = c.indexOf('--remote-control');
+    assert.equal(c[at - 1], 'claude');
+    assert.ok(c[at + 1].startsWith('--'), 'a bare optional-value flag is never followed by a value-looking token');
+    assert.ok(c.at(-1).startsWith('Find and read'), 'prompt is the final element');
+  }
   const r = buildSpawnPlan({ interactive: true, resumeSessionId: SID, extraArgs: ['--remote-control', 'cuuho'] });
-  assert.deepEqual(r.command.slice(4, 11), ['claude', '--permission-mode', 'auto', '--remote-control', 'cuuho', '--resume', SID]);
+  assert.deepEqual(r.command.slice(4, 11), ['claude', '--remote-control', 'cuuho', '--permission-mode', 'auto', '--resume', SID]);
   assert.deepEqual(r.extraArgs, ['--remote-control', 'cuuho']);
   assert.throws(() => buildSpawnPlan({ extraArgs: ['--model', 'opus'] }), /interactive/);
   assert.throws(() => buildSpawnPlan({ interactive: true, extraArgs: ['--dangerously-skip-permissions'] }), /not allowed/);
-  assert.equal(buildSpawnPlan({ interactive: true }).command.includes('--remote-control'), false);
 });
 
 const deps = (over = {}) => {
@@ -129,4 +131,44 @@ test('CLI: refusals happen before anything launches (misplaced flag, forbidden f
   assert.equal(r.status, 1); assert.match(r.stderr, /owner-only/, 'no TTY + no owner TELE_FROM_ID = refused');
   r = run('--interactive', '—', '--remote-control', 'cuuho');
   assert.match(r.stderr, /owner-only/, 'em dash works as the separator too');
+});
+
+test('isOwnerCaller: daemon relaying the owner, or a real terminal — never from inside a Claude Code session', () => {
+  assert.equal(isOwnerCaller({ env: { TELE_FROM_ID: '144' }, ownerId: '144' }), true);
+  assert.equal(isOwnerCaller({ env: { TELE_FROM_ID: '999' }, ownerId: '144' }), false);
+  assert.equal(isOwnerCaller({ env: { TELE_FROM_ID: '144' }, ownerId: null }), false, 'no owner configured → no owner');
+  assert.equal(isOwnerCaller({ env: {}, ownerId: '144' }), false);
+  assert.equal(isOwnerCaller({ isTTY: true, env: {}, ownerId: '144' }), true);
+  assert.equal(isOwnerCaller({ isTTY: true, env: { CLAUDECODE: '1' }, ownerId: '144' }), false, 'an agent faking a TTY with script(1)');
+  assert.equal(isOwnerCaller({ env: { CLAUDECODE: '1', TELE_FROM_ID: '144' }, ownerId: '144' }), false);
+});
+
+test('performResume: "--" alone forgets stored flags only after a VERIFIED launch (a refused resume keeps them)', async () => {
+  let { d, log } = deps({ acquireLock: () => ({ error: 'another resume in progress' }) });
+  await performResume({ sessionId: SID, cwd: '/w/x', extraArgs: [] }, d);
+  assert.equal(log.cleared, 0);
+  ({ d, log } = deps());
+  await performResume({ sessionId: SID, cwd: '/w/x', extraArgs: [] }, d);
+  assert.equal(log.cleared, 1);
+  ({ d, log } = deps({ extras: { load: () => ({ args: [], dropped: 'stored --remote-control ignored (not set by the owner)' }), save() {}, clear() {} } }));
+  const r = await performResume({ sessionId: SID, cwd: '/w/x' }, d);
+  assert.match(r.plan.extraNote, /not set by the owner/, 'the success line can say what was dropped');
+});
+
+test('CLI: a fresh spawn really forwards the flags (dry-run seam); resume.mjs splits before joining', async () => {
+  const { spawnSync } = await import('node:child_process');
+  const { fileURLToPath } = await import('node:url');
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  const bin = tmp();
+  for (const b of ['claude', 'screen']) fs.writeFileSync(path.join(bin, b), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+  const env = { ...process.env, PATH: `${bin}:/usr/bin:/bin`, TELEPORT_SPAWN_DRY_RUN: '1', TELE_FROM_ID: '' };
+  delete env.CLAUDECODE;
+  // --model is not owner-only, so this needs no owner config (projects.json is not in git).
+  const r = spawnSync(process.execPath, [path.join(here, 'spawn.mjs'), '--interactive', '—', '--model', 'opus'], { env, encoding: 'utf8', input: '', timeout: 15000 });
+  assert.equal(r.status, 0, r.stderr);
+  const out = JSON.parse(r.stdout.trim().split('\n').pop());
+  assert.deepEqual(out.command.slice(4, 7), ['claude', '--model', 'opus']);
+  assert.equal(out.setBy, 'agent', 'no TTY, no owner TELE_FROM_ID');
+  const r2 = spawnSync(process.execPath, [path.join(here, 'resume.mjs'), 'nobody', '--', '--dangerously-skip-permissions'], { env, encoding: 'utf8', input: '', timeout: 15000 });
+  assert.match(r2.stdout, /not allowed/, 'resume.mjs validates the part after "--" instead of joining it into the name');
 });

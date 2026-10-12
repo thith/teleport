@@ -79,6 +79,18 @@ export function parseExtraArgs(tokens, { owner = false } = {}) {
   return { args: out };
 }
 
+/**
+ * May this caller set owner-only flags? The daemon relaying the OWNER's command
+ * (TELE_FROM_ID = projects.json owner), or a human at a real terminal — but never
+ * from inside a Claude Code session (CLAUDECODE=1 on every Bash-tool child):
+ * an agent can fake a TTY with script(1). Pure.
+ */
+export function isOwnerCaller({ isTTY = false, env = {}, ownerId = null } = {}) {
+  if (env.CLAUDECODE) return false;
+  if (ownerId && env.TELE_FROM_ID && String(env.TELE_FROM_ID) === String(ownerId)) return true;
+  return Boolean(isTTY);
+}
+
 export const hasRemoteControl = (args) => (args || []).some((a) => a === '--remote-control' || a === '--remote-control-session-name-prefix');
 
 /** Drop owner-only flags (and their values) from normalised args. Pure. */
