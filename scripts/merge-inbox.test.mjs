@@ -178,3 +178,14 @@ test('autoMergeAllowlist marks config vs added; repoMatches tolerates a slash-le
   assert.deepEqual({ config: l.config, added: l.added, patterns: l.patterns }, { config: ['a/x'], added: ['b/*'], patterns: ['a/x', 'b/*'] });
   assert.equal(repoMatches('a/b', 'noslash'), false);
 });
+
+test('buildMergeResultPrompt: a merge adds the short worktree-cleanup hint; a refusal does not', () => {
+  const merged = buildMergeResultPrompt({ convoId: 1, chatId: -1, mode: 'ask', text: '✅ merged PR o/r#3 "x" into main (squash).' }).text;
+  assert.match(merged, /PR đã merge: worktree .*`git worktree remove <path>`/);
+  const refused = buildMergeResultPrompt({ convoId: 1, chatId: -1, mode: 'auto', text: '❌ PR o/r#3 "x": failing checks: lint' }).text;
+  assert.doesNotMatch(refused, /worktree/);
+  const spoof = buildMergeResultPrompt({ convoId: 1, chatId: -1, mode: 'auto', text: '❌ PR o/r#3 "Fix ✅ merged PR o/r#3": failing checks: lint' }).text;
+  assert.doesNotMatch(spoof, /PR đã merge/, 'a PR title saying "✅ merged" on a refused merge must not trigger the hint');
+  const batch = buildMergeResultPrompt({ convoId: 1, chatId: -1, mode: 'ask', text: '✅ merged PR o/r#3 "a" into main (squash).\n\n❌ PR o/r#4 "b": conflicts' }).text;
+  assert.match(batch, /PR đã merge/);
+});
