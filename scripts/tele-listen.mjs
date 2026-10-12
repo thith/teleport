@@ -1869,6 +1869,10 @@ export async function refreshRegistry({
   filter,
   offsetFile,
   convoId = null,
+  // true = a persistent --loop listener; false = a one-shot run (the bare
+  // pre-critical-action drain, a --wait-once child, the legacy `until` loop).
+  // null = unknown (legacy caller) — treated like a --loop row by peers.
+  loop = null,
   file = REGISTRY_FILE,
   lockFile = REGISTRY_LOCK_FILE,
   now = Date.now(),
@@ -1882,7 +1886,10 @@ export async function refreshRegistry({
     // this cycle, which means *being detected as a superseder* by older
     // peers is delayed by one poll. Acceptable: the next 12s poll retries.
     console.error('[tele-listen] could not acquire registry lock; will retry next poll');
-    return readRegistry(file);
+    // Same liveness filter as the locked path: a dead peer's row (e.g. a
+    // finished drain) must never make us stand down. My own row is kept so
+    // findSuperseder can locate it.
+    return readRegistry(file).filter((e) => e.pid === pid || isLiveEntry(e));
   }
   try {
     const all = readRegistry(file);
@@ -1893,6 +1900,7 @@ export async function refreshRegistry({
       filter: filter instanceof Set ? Array.from(filter) : filter,
       offsetFile,
       convoId,
+      loop: loop == null ? null : Boolean(loop),
       startedAt: existing && Number.isFinite(existing.startedAt) ? existing.startedAt : now,
       // If a transient `ps` failure returned null, keep the prior valid startTime
       // rather than downgrade liveness checks to fallback mode next round.
@@ -1945,7 +1953,19 @@ export function compareSameConvo(a, b) {
   return b.pid - a.pid; // lower pid wins on tie
 }
 
-export function findSuperseder({ myPid, myFilter, myConvoId = null, registry }) {
+// A one-shot run (row `loop === false`: the bare pre-critical-action drain, a
+// --wait-once child, the legacy `until` loop) must NEVER make a persistent
+// --loop listener stand down. The drain's parent bash is brand-new, so its row
+// always carries the NEWEST startedAt; without this rule a drain racing a
+// --loop poll would win newer-wins, the --loop listener would exit 3 and its
+// `while` wrapper would break — the agent goes deaf. Rows with no `loop` field
+// (written by older code) are treated as --loop rows, i.e. today's behaviour.
+// --loop vs --loop and one-shot vs anything are unchanged (newer wins).
+export function ignoredAsSuperseder(peer, myLoop) {
+  return myLoop === true && peer?.loop === false;
+}
+
+export function findSuperseder({ myPid, myFilter, myConvoId = null, myLoop = null, registry }) {
   // Locate my own registry row up front. If it's missing (read-only-fallback
   // path or eviction), treat the supersede check as inconclusive — return a
   // sentinel that the caller interprets as "retry next poll".
@@ -1955,6 +1975,7 @@ export function findSuperseder({ myPid, myFilter, myConvoId = null, registry }) 
     // Cross-mode never supersedes (convo vs legacy).
     const eConvo = e.convoId ?? null;
     if ((myConvoId == null) !== (eConvo == null)) continue;
+    if (ignoredAsSuperseder(e, myLoop)) continue;
     if (myConvoId != null) {
       // Same-mode convo: peer with same convoId wins by (startedAt, pid).
       if (eConvo !== myConvoId) continue;
@@ -1963,6 +1984,26 @@ export function findSuperseder({ myPid, myFilter, myConvoId = null, registry }) 
       continue;
     }
     if (isStrictSuperset(e.filter, myFilter)) return e;
+  }
+  return null;
+}
+
+// Pre-write race guard (see main): re-read the registry right before writing
+// the prompt and return the same-convo peer that beats us, or
+// `{ __inconclusive }` if my row is gone, or null. Dead rows are ignored (same
+// isLiveEntry filter refreshRegistry applies) — a finished drain's row must not
+// make a live --loop listener stand down — and one-shot rows never beat a
+// --loop listener (ignoredAsSuperseder).
+export function findPreWriteWinner({ myPid, myConvoId, myLoop = null, registry, isLive = isLiveEntry }) {
+  const mineEntry = registry.find((e) => e.pid === myPid);
+  if (!mineEntry) return { __inconclusive: true, reason: 'my-entry-missing' };
+  for (const e of registry) {
+    if (e.pid === myPid) continue;
+    if ((e.convoId ?? null) !== myConvoId) continue;
+    if (ignoredAsSuperseder(e, myLoop)) continue;
+    if (compareSameConvo(e, mineEntry) <= 0) continue;
+    if (!isLive(e)) continue;
+    return e;
   }
   return null;
 }
@@ -2646,8 +2687,8 @@ async function main() {
     console.error('[tele-listen] refusing to run with reparented PPID ≤ 1 (init/launchd) — Monitor wrapper appears dead');
     process.exit(1);
   }
-  const registry = await refreshRegistry({ pid: myMonitorPid, filter: filterReplyTo, offsetFile, convoId: convo });
-  const superseder = findSuperseder({ myPid: myMonitorPid, myFilter: filterReplyTo, myConvoId: convo, registry });
+  const registry = await refreshRegistry({ pid: myMonitorPid, filter: filterReplyTo, offsetFile, convoId: convo, loop });
+  const superseder = findSuperseder({ myPid: myMonitorPid, myFilter: filterReplyTo, myConvoId: convo, myLoop: loop, registry });
   if (superseder && superseder.__inconclusive) {
     process.exit(2); // supersede check inconclusive — retry next poll (silent; exit code is the signal)
   }
@@ -2991,18 +3032,13 @@ async function main() {
   // prompt-convo-<N>.json path, and the second writer's rename clobbers the
   // first — one prompt silently lost).
   if (convo != null) {
-    const fresh = readRegistry();
-    const mineEntry = fresh.find((e) => e.pid === myMonitorPid);
-    if (!mineEntry) {
+    const winner = findPreWriteWinner({ myPid: myMonitorPid, myConvoId: convo, myLoop: loop, registry: readRegistry() });
+    if (winner && winner.__inconclusive) {
       process.exit(2); // registry row missing pre-write — defer to next poll (silent)
     }
-    for (const e of fresh) {
-      if (e.pid === myMonitorPid) continue;
-      if ((e.convoId ?? null) !== convo) continue;
-      if (compareSameConvo(e, mineEntry) > 0) {
-        console.log(`[tele-listen] same-convo peer pid=${e.pid} won pre-write race — exiting`);
-        process.exit(loop ? 3 : 0); // --loop: stand down (3); legacy: end until-loop (0)
-      }
+    if (winner) {
+      console.log(`[tele-listen] same-convo peer pid=${winner.pid} won pre-write race — exiting`);
+      process.exit(loop ? 3 : 0); // --loop: stand down (3); legacy: end until-loop (0)
     }
   }
   // P3 (--append): coalesce into the OPEN (unclaimed) prompt rather than clobber
