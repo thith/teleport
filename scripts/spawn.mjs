@@ -43,6 +43,7 @@ import {
   formatAgentList, parseKillPidArg, killClaudePid, KILL_PID_GRACE_MS, inspectPid, etimeToSeconds,
 } from './claude-procs.mjs';
 import { readProjectsConfig, resolveDaemonUserId } from './projects-config.mjs';
+import { splitForwarded, misplacedFlag, parseExtraArgs, saveExtraArgs, clearExtraArgs, loadExtraArgs, isOwnerCaller } from './spawn-extra-args.mjs';
 
 export const SPAWN_PROMPT = 'Find and read process.md and review-guide.md if present in this project, then Telegram me and wait for instructions';
 
@@ -78,6 +79,10 @@ Usage:
                                                       SIGTERM one claude process (daemon owner only);
                                                       --restart then resumes its session in a screen
   node spawn.mjs --help | -h                          show this help
+  … -- <claude flags>                                 forward claude flags to an interactive spawn / resume /
+                                                      restart (remembered per session): --remote-control [name],
+                                                      --remote-control-session-name-prefix <p> (owner only),
+                                                      --model <m>, -n|--name <n>. "--" alone forgets them.
 
 Spawn modes:
   (default)          headless: detached \`claude -p\` — fire-and-forget, auto-exits.
@@ -147,12 +152,21 @@ export function genSessionSeed(genUuid = () => crypto.randomUUID()) {
  * Pure: compute the launch plan. No side effects, so it's unit-testable.
  * Returns `{ mode, sessionName, command: [...], teardown }`.
  */
-export function buildSpawnPlan({ interactive = false, sessionName, sessionId, seed, prompt, permissionMode = DEFAULT_PERMISSION_MODE, resumeSessionId } = {}) {
+export function buildSpawnPlan({ interactive = false, sessionName, sessionId, seed, prompt, permissionMode = DEFAULT_PERMISSION_MODE, resumeSessionId, extraArgs = [] } = {}) {
   // Every spawn is launched with an EXPLICIT `--permission-mode` (never left to
   // the CLI default) so the agent's autonomy is deliberate, not incidental.
   if (!PERMISSION_MODES.includes(permissionMode)) {
     throw new Error(`spawn: invalid permission mode ${JSON.stringify(permissionMode)} (allowed: ${PERMISSION_MODES.join(', ')})`);
   }
+  // Forwarded claude flags (RFC 18): the ONE place every launch path goes through,
+  // so the allowlist is enforced here (owner gating is the caller's — see
+  // spawn-extra-args.mjs). They go right after `claude`, so the next token is
+  // always `--permission-mode`: `--remote-control [name]` takes an OPTIONAL value
+  // and would swallow a following non-flag token (e.g. the prompt when no
+  // --session-id is forced).
+  const fx = parseExtraArgs(extraArgs, { owner: true });
+  if (fx.error) throw new Error(`spawn: ${fx.error}`);
+  const extra = fx.args;
   if (resumeSessionId != null) {
     // Resume is always interactive (screen): the session's convoId — hence its
     // hashtag, persona and topic — is derived from the UUID, and `claude --resume`
@@ -168,7 +182,8 @@ export function buildSpawnPlan({ interactive = false, sessionName, sessionId, se
       sessionName: name,
       sessionId: resumeSessionId,
       resumed: true,
-      command: ['screen', '-U', '-dmS', name, 'claude', '--permission-mode', permissionMode, '--resume', resumeSessionId, prompt ?? RESUME_PROMPT],
+      extraArgs: extra,
+      command: ['screen', '-U', '-dmS', name, 'claude', ...extra, '--permission-mode', permissionMode, '--resume', resumeSessionId, prompt ?? RESUME_PROMPT],
       teardown: `screen -S ${name} -X quit`,
     };
   }
@@ -201,12 +216,13 @@ export function buildSpawnPlan({ interactive = false, sessionName, sessionId, se
     // are predictable from the parent (and the screen name matches the hashtag).
     // `--permission-mode` is always present (works alongside the positional prompt).
     const claudeArgs = sid != null
-      ? ['claude', '--permission-mode', permissionMode, '--session-id', sid, prompt]
-      : ['claude', '--permission-mode', permissionMode, prompt];
+      ? ['claude', ...extra, '--permission-mode', permissionMode, '--session-id', sid, prompt]
+      : ['claude', ...extra, '--permission-mode', permissionMode, prompt];
     return {
       mode: 'interactive',
       sessionName: name,
       sessionId: sid,
+      extraArgs: extra,
       // `-U` forces screen into UTF-8 mode so the child TUI's multibyte output
       // (e.g. Vietnamese) renders correctly; without it screen inherits whatever
       // the spawn-time locale was and garbles non-ASCII on attach.
@@ -214,6 +230,7 @@ export function buildSpawnPlan({ interactive = false, sessionName, sessionId, se
       teardown: `screen -S ${name} -X quit`,
     };
   }
+  if (extra.length) throw new Error('spawn: forwarded claude flags (after "--") need an interactive spawn (-i) or a resume.');
   return {
     mode: 'headless',
     sessionName: null,
@@ -748,7 +765,7 @@ export const YOUNG_PROC_WAIT_MS = 60_000;
  * came up. Shared by `--resume-session` and `--kill pid:<P> --restart`. Every
  * side effect is injectable for tests. Returns { ok, plan } | { error, plan }.
  */
-export async function performResume({ sessionId, cwd, permissionMode = DEFAULT_PERMISSION_MODE }, {
+export async function performResume({ sessionId, cwd, permissionMode = DEFAULT_PERMISSION_MODE, extraArgs, setBy = 'agent' }, {
   // A lock the CALLER already holds (`--restart` takes it before killing and
   // keeps it to the end) — then we neither acquire nor release it here.
   heldLock = null,
@@ -760,8 +777,17 @@ export async function performResume({ sessionId, cwd, permissionMode = DEFAULT_P
   run = (plan) => runSpawn(plan, { cwd, spawnFn }),
   sleep = sleepMs, timeoutMs = SPAWN_VERIFY_TIMEOUT_MS, pollMs = SPAWN_VERIFY_POLL_MS,
   youngWaitMs = YOUNG_PROC_WAIT_MS, youngPollMs = 3000,
+  extras = { load: loadExtraArgs, save: saveExtraArgs, clear: clearExtraArgs }, settleMs = EXTRA_SETTLE_MS,
 } = {}) {
-  const plan = buildSpawnPlan({ interactive: true, permissionMode, resumeSessionId: sessionId });
+  // Forwarded flags: given → use (and remember once it is up); `--` alone ([]) →
+  // forget the stored ones; not given → re-apply what this session was last
+  // launched with (so a rescue session keeps --remote-control across /resume and
+  // /kill --restart — owner-set only, see loadExtraArgs).
+  let note = null;
+  const given = extraArgs; // what the CALLER passed — only that is (re)saved
+  if (extraArgs === undefined) { const l = extras.load(sessionId); extraArgs = l.args; note = l.dropped; }
+  const plan = buildSpawnPlan({ interactive: true, permissionMode, resumeSessionId: sessionId, extraArgs });
+  if (note) plan.extraNote = note;
   // Held until the screen is verified — see acquireResumeLock.
   const lock = heldLock || await acquireLock(plan.sessionId);
   if (lock.error) return { error: lock.error, plan };
@@ -802,7 +828,22 @@ export async function performResume({ sessionId, cwd, permissionMode = DEFAULT_P
     if (begun.error) return { error: begun.error, plan };
     const launched = run(plan);
     // Poll (the login shell takes seconds to exec screen) — same as a fresh spawn.
-    const up = () => { lock.launchSucceeded?.(); return { ok: true, plan }; };
+    const up = async () => {
+      // A claude flag it rejects makes claude (hence the screen) exit within a
+      // second or two — look again before calling it a success.
+      if (plan.extraArgs.length) {
+        await sleep(settleMs);
+        if (!screenExists(plan.sessionName)) {
+          lock.markFailed?.();
+          return { error: `screen "${plan.sessionName}" exited right after launch — claude probably rejected a forwarded flag (${plan.extraArgs.join(' ')}). Retry with different flags, or with "--" alone to drop the stored ones.`, plan, launchFailed: true };
+        }
+      }
+      // Only a VERIFIED launch changes what is remembered (a refused resume — e.g.
+      // the agent is still alive — must not forget a rescue session's flags).
+      if (given !== undefined) { try { if (given.length) extras.save(sessionId, plan.extraArgs, { setBy }); else extras.clear(sessionId); } catch {} }
+      lock.launchSucceeded?.();
+      return { ok: true, plan };
+    };
     for (let waited = 0; waited < timeoutMs; waited += pollMs) {
       if (screenExists(plan.sessionName)) return up();
       await sleep(Math.min(pollMs, timeoutMs - waited));
@@ -941,6 +982,8 @@ export function appendKillAudit(entry, file = KILL_PID_AUDIT_FILE) {
 /** How long to wait for the screen session to appear, and how often to look. */
 export const SPAWN_VERIFY_TIMEOUT_MS = 15_000;
 export const SPAWN_VERIFY_POLL_MS = 250;
+// With forwarded flags: look again this long after the screen first appears (claude exits fast on a flag it rejects).
+export const EXTRA_SETTLE_MS = 5_000;
 
 /** Non-blocking delay (avoids spawning the `sleep` binary + its fractional-second assumption). */
 const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -1030,7 +1073,8 @@ export function wrapInLoginShell(command, base = process.env) {
  */
 export function scrubClaudeEnv(base = process.env) {
   const env = { ...base };
-  for (const k of Object.keys(env)) if (/^CLAUDE(CODE)?(_|$)/.test(k)) delete env[k];
+  // TELE_FROM_* too: the daemon's owner identity must never leak into an agent (it would make the agent "owner").
+  for (const k of Object.keys(env)) if (/^CLAUDE(CODE)?(_|$)/.test(k) || /^TELE_FROM_/.test(k)) delete env[k];
   return env;
 }
 
@@ -1111,7 +1155,25 @@ export function runSpawn(plan, { runner, cwd, spawnFn = cpSpawn, escape = escape
 
 const isDirectRun = isMainModule(import.meta.url);
 if (isDirectRun) {
-  const argv = process.argv.slice(2);
+  // Split off forwarded claude flags FIRST (RFC 18): every spawn flag below is
+  // read from `argv` = the part before the separator only, so tokens after it can
+  // never steer spawn (`-- --restart`, `-- --mode auto`).
+  const { own: argv, fwd } = splitForwarded(process.argv.slice(2));
+  const misplaced = misplacedFlag(argv);
+  if (misplaced) { console.error(`[spawn] ❌ ${misplaced}`); process.exit(1); }
+  // Owner = the daemon relaying the owner's own command (TELE_FROM_ID matches
+  // projects.json, no env fallback), or a human at a real terminal. An agent
+  // running spawn for someone has neither → owner-only flags are refused.
+  const ownerId = resolveDaemonUserId(readProjectsConfig(path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'projects.json')), { env: {} });
+  const callerIsOwner = isOwnerCaller({ isTTY: process.stdin.isTTY, env: process.env, ownerId });
+  let extraArgs;
+  if (fwd !== null) {
+    const px = parseExtraArgs(fwd, { owner: callerIsOwner });
+    if (px.error) { console.error(`[spawn] ❌ ${px.error}`); process.exit(1); }
+    extraArgs = px.args;
+  }
+  const setBy = callerIsOwner ? 'owner' : 'agent';
+  const flagsNote = (plan) => [plan.extraArgs?.length ? `claude flags: ${plan.extraArgs.join(' ')}` : null, plan.extraNote].filter(Boolean).join(' · ');
 
   // --help / -h: FIRST check — a requested help prints to stdout and exits 0
   // (before any subcommand dispatch, so `--help` never falls through to a spawn).
@@ -1244,7 +1306,7 @@ if (isDirectRun) {
           // "screen already exists" check doesn't trip on the dying session.
           for (let w = 0; w < 5000 && screenSessionExists(buildSpawnPlan({ interactive: true, resumeSessionId: t.sessionId }).sessionName); w += 250) await sleepMs(250);
         }
-        const res = rc2.error ? rc2 : await performResume({ sessionId: t.sessionId, cwd: t.cwd, permissionMode: restartMode }, { heldLock: restartLock });
+        const res = rc2.error ? rc2 : await performResume({ sessionId: t.sessionId, cwd: t.cwd, permissionMode: restartMode, extraArgs, setBy }, { heldLock: restartLock });
         appendKillAudit({ pid: killPid.pid, fromId, result: res.error ? 'restart-failed' : 'restarted', reason: res.error, sessionId: t?.sessionId ?? null, screen: res.plan?.sessionName ?? null });
         if (res.error) {
           console.error(`[spawn] ❌ killed, but restart failed: ${res.error}`);
@@ -1252,6 +1314,7 @@ if (isDirectRun) {
           process.exit(1);
         }
         console.log(`[spawn] 🔁 restarted session ${t.sessionId} in screen "${res.plan.sessionName}" (cwd ${t.cwd}) → topic #${res.plan.sessionName.replace(/^tele-/, '')}. It will check its mailbox, re-arm its listener and greet in its topic.`);
+        if (flagsNote(res.plan)) console.log(`[spawn] ${flagsNote(res.plan)}`);
         process.exit(0);
       }
       // Only suggest a resume for a session we KNOW (session file), never a guess.
@@ -1332,15 +1395,20 @@ if (isDirectRun) {
     process.exit(1);
   }
   if (resume.found) {
-    const res = await performResume({ sessionId: resume.sessionId, cwd: process.cwd(), permissionMode });
+    const res = await performResume({ sessionId: resume.sessionId, cwd: process.cwd(), permissionMode, extraArgs, setBy });
     if (res.error) { console.error(`[spawn] refusing to resume / FAILED: ${res.error}`); process.exit(1); }
     const { plan } = res;
     console.log(`[spawn] resumed session ${plan.sessionId} in screen "${plan.sessionName}" → topic #${plan.sessionName.replace(/^tele-/, '')} (subscription billing).`);
+    if (flagsNote(plan)) console.log(`[spawn] ${flagsNote(plan)}`);
     console.log('[spawn] it will check its mailbox, re-arm its Telegram listener and greet in its existing topic.');
     console.log(`[spawn] teardown: ${plan.teardown}`);
     process.exit(0);
   }
-  const plan = buildSpawnPlan({ interactive, permissionMode });
+  let plan;
+  try { plan = buildSpawnPlan({ interactive, permissionMode, extraArgs: extraArgs ?? [] }); }
+  catch (e) { console.error(`[spawn] ❌ ${e.message.replace(/^spawn: /, '')}`); process.exit(1); }
+  // Test seam: print the plan instead of launching (no claude/screen needed).
+  if (process.env.TELEPORT_SPAWN_DRY_RUN === '1') { console.log(JSON.stringify({ command: plan.command, extraArgs: plan.extraArgs, setBy })); process.exit(0); }
   const result = runSpawn(plan);
   if (plan.mode === 'interactive') {
     // Verify the screen session actually came up — `screen -dmS` returns 0 even if
@@ -1361,6 +1429,16 @@ if (isDirectRun) {
     if (!up && !screenSessionExists(plan.sessionName)) {
       console.error(`[spawn] FAILED: screen session "${plan.sessionName}" not found after ${SPAWN_VERIFY_TIMEOUT_MS / 1000}s (claude or screen may have errored). Check: screen -ls`);
       process.exit(1);
+    }
+    if (plan.extraArgs.length) {
+      // claude exits within seconds on a flag it rejects → look again before claiming success.
+      await sleepMs(EXTRA_SETTLE_MS);
+      if (!screenSessionExists(plan.sessionName)) {
+        console.error(`[spawn] FAILED: screen "${plan.sessionName}" exited right after launch — claude probably rejected a forwarded flag (${plan.extraArgs.join(' ')}).`);
+        process.exit(1);
+      }
+      if (plan.sessionId) { try { saveExtraArgs(plan.sessionId, plan.extraArgs, { setBy }); } catch {} }
+      console.log(`[spawn] claude flags: ${plan.extraArgs.join(' ')} (remembered for /resume and /kill --restart)`);
     }
     console.log(`[spawn] interactive agent launched in screen session "${plan.sessionName}" (subscription billing).`);
     if (plan.sessionId) {
