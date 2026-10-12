@@ -69,6 +69,7 @@ import {
 import { peekPersona } from './persona-store.mjs';
 import { machineWatch } from './health.mjs';
 import { recordFetchOk, startListenWatchdog } from './listen-watch.mjs';
+import { launchCleanup, startCleanupScheduler } from './cleanup-launch.mjs';
 import { formatPersona } from './persona.mjs';
 import { shortConvoHash } from './convo-hash.mjs';
 
@@ -299,6 +300,17 @@ async function main() {
   // Its send must THROW on failure (unlike sendText, which swallows) so a DM lost
   // during the outage is retried instead of counted as delivered.
   startListenWatchdog({ send: (t) => sendTextToAdmin(token, daemonUserId, t, { raw: false, plain: true }) });
+
+  // RFC 18 E: daily worktree/target cleanup — launched DETACHED by its own
+  // timers (never awaited here); cleanup.mjs DMs the owner its report. The very
+  // first run (no state file) is a dry run.
+  startCleanupScheduler({
+    launch: ({ dryRun }) => {
+      const childEnv = { ...process.env };
+      for (const k of secretEnvKeys) delete childEnv[k];
+      launchCleanup({ dryRun, env: childEnv });
+    },
+  });
 
   let lastHeartbeat = 0;
   let mergeInboxBusy = false;
