@@ -7,8 +7,9 @@
 //     "đang dọn"; cleanup.mjs DMs the owner its report when done.
 //   • the daemon's daily scheduler (startCleanupScheduler): first tick 10 min
 //     after start, then whenever 24 h have passed since `lastCleanupAt`
-//     (persisted in its own atomic state file). The FIRST EVER run — no state
-//     file, or an unreadable one — is a dry run.
+//     (persisted in its own atomic state file). Runs stay DRY until
+//     cleanup.mjs records `dryRunReportedAt` after a dry-run report reached
+//     the owner — a missing/unreadable state file means dry run.
 //
 // Light imports only: daemon.mjs imports this file.
 
@@ -46,12 +47,22 @@ export function launchCleanup({ dryRun = false, env = process.env, spawnFn = spa
   } finally { if (typeof fd === 'number') try { fs.closeSync(fd); } catch {} }
 }
 
-/** State file → { lastCleanupAt } or null when missing/garbled (= treat as first ever run). */
-export function readCleanupState(file = CLEANUP_STATE_FILE) {
+/** Raw state object, or null when missing/garbled/not an object. */
+function readRawState(file) {
   try {
     const s = JSON.parse(fs.readFileSync(file, 'utf8'));
-    return s && typeof s === 'object' && Number.isFinite(s.lastCleanupAt) ? s : null;
+    return s && typeof s === 'object' && !Array.isArray(s) ? s : null;
   } catch { return null; }
+}
+const num = (v) => (Number.isFinite(v) ? v : null);
+
+/**
+ * State file → { lastCleanupAt, dryRunReportedAt } (each a number or null), or
+ * null when missing/garbled (= treat as first ever run).
+ */
+export function readCleanupState(file = CLEANUP_STATE_FILE) {
+  const s = readRawState(file);
+  return s ? { lastCleanupAt: num(s.lastCleanupAt), dryRunReportedAt: num(s.dryRunReportedAt) } : null;
 }
 
 export function writeCleanupState(state, file = CLEANUP_STATE_FILE) {
@@ -61,12 +72,27 @@ export function writeCleanupState(state, file = CLEANUP_STATE_FILE) {
   catch (e) { try { fs.unlinkSync(tmp); } catch {} throw e; }
 }
 
-/** Is a scheduled run due? Pure. No/garbled state → dry run (first ever run). */
+/** Merge `patch` into the state file (atomic). */
+export function updateCleanupState(patch, file = CLEANUP_STATE_FILE) {
+  writeCleanupState({ ...(readRawState(file) || {}), ...patch }, file);
+}
+
+/** cleanup.mjs calls this only AFTER a dry-run report reached the owner: from then on, scheduled runs are real. */
+export function recordDryRunReported(file = CLEANUP_STATE_FILE, now = Date.now()) {
+  updateCleanupState({ dryRunReportedAt: now }, file);
+}
+
+/**
+ * Is a scheduled run due, and must it be a dry run? Pure. It stays a dry run
+ * until a dry-run report was DELIVERED (`dryRunReportedAt`), so a crashed or
+ * undelivered first run never leads to a real one.
+ */
 export function decideScheduledRun(state, now, everyMs = CLEANUP_EVERY_MS) {
-  if (!state) return { run: true, dryRun: true };
+  const dryRun = !Number.isFinite(state?.dryRunReportedAt);
+  if (!state || !Number.isFinite(state.lastCleanupAt)) return { run: true, dryRun };
   const age = now - state.lastCleanupAt;
   // A timestamp far in the future (clock jump) must not block cleanup forever.
-  if (age >= everyMs || age < -3600_000) return { run: true, dryRun: false };
+  if (age >= everyMs || age < -3600_000) return { run: true, dryRun };
   return { run: false };
 }
 
@@ -74,7 +100,7 @@ export function decideScheduledRun(state, now, everyMs = CLEANUP_EVERY_MS) {
 export function cleanupTick({ stateFile = CLEANUP_STATE_FILE, launch, now = Date.now(), log = console.error } = {}) {
   const d = decideScheduledRun(readCleanupState(stateFile), now);
   if (!d.run) return d;
-  try { writeCleanupState({ lastCleanupAt: now, lastDryRun: d.dryRun }, stateFile); }
+  try { updateCleanupState({ lastCleanupAt: now, lastDryRun: d.dryRun }, stateFile); }
   catch (e) { log(`[cleanup] cannot write state, not launching: ${e?.message ?? e}`); return { run: false, error: true }; }
   try { launch({ dryRun: d.dryRun }); } catch (e) { log(`[cleanup] launch failed: ${e?.message ?? e}`); }
   return d;
@@ -88,12 +114,17 @@ export function startCleanupScheduler({ launch, stateFile = CLEANUP_STATE_FILE, 
   return () => { clearTimeout(t); if (iv) clearInterval(iv); };
 }
 
+/** `/cleanup` arguments: none, or exactly `--dry-run`. Anything else (incl. a phone's `—dry-run`) throws. */
+export function parseLaunchArgs(argv) {
+  const bad = argv.filter((a) => a !== '--dry-run');
+  if (bad.length) throw new Error(`❌ /cleanup: không hiểu ${bad.join(' ')} — dùng /cleanup hoặc /cleanup --dry-run`);
+  return { dryRun: argv.includes('--dry-run') };
+}
+
 // CLI (the /cleanup command): launch and reply at once.
 if (isMainModule(import.meta.url)) {
-  const argv = process.argv.slice(2);
-  const bad = argv.filter((a) => a !== '--dry-run');
-  if (bad.length) { console.log(`❌ /cleanup: không hiểu ${bad.join(' ')} — dùng /cleanup hoặc /cleanup --dry-run`); process.exit(2); }
-  const dryRun = argv.includes('--dry-run');
-  launchCleanup({ dryRun });
-  console.log(`🧹 Đang dọn${dryRun ? ' (dry-run: chỉ liệt kê, không xoá)' : ''}, sẽ báo khi xong.`);
+  let opts;
+  try { opts = parseLaunchArgs(process.argv.slice(2)); } catch (e) { console.log(e.message); process.exit(2); }
+  launchCleanup({ dryRun: opts.dryRun });
+  console.log(`🧹 Đang dọn${opts.dryRun ? ' (dry-run: chỉ liệt kê, không xoá)' : ''}, sẽ báo khi xong.`);
 }

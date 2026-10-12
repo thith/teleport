@@ -7,9 +7,9 @@ import { execFile, execFileSync } from 'node:child_process';
 import { promisify } from 'node:util';
 import {
   runCleanup, parseWorktreePorcelain, githubSlug, isBuildPath, parseStatusZ, judgePrs, formatReport,
-  findRecentFile, readTranscriptCwds, parseCleanupArgs, MAX_REMOVALS,
+  findRecentFile, readTranscriptCwds, parseCleanupArgs, MAX_REMOVALS, strayEntries, hiddenEdits, scanFileCwds, cli,
 } from './cleanup.mjs';
-import { decideScheduledRun, cleanupTick, readCleanupState, launchCleanup } from './cleanup-launch.mjs';
+import { decideScheduledRun, cleanupTick, readCleanupState, launchCleanup, parseLaunchArgs, recordDryRunReported } from './cleanup-launch.mjs';
 import { acquireLock } from './machine-lock.mjs';
 
 const execFileP = promisify(execFile);
@@ -92,7 +92,25 @@ test('isBuildPath: build dir as a directory segment only', () => {
 test('parseStatusZ: tracked vs untracked/ignored; rename consumes the source token', () => {
   const s = parseStatusZ(' M a.txt\0R  new\0old\0?? tmp/\0!! server/target/\0');
   assert.deepEqual(s.tracked, ['a.txt', 'new']);
-  assert.deepEqual(s.extra, ['tmp/', 'server/target/']);
+  assert.deepEqual(s.untracked, ['tmp/']);
+  assert.deepEqual(s.ignored, ['server/target/']);
+});
+
+test('strayEntries: untracked is always stray (even under build/); ignored only outside build dirs', () => {
+  assert.deepEqual(strayEntries({ untracked: ['build/new.sh', 'dist/notes.md'], ignored: ['server/target/', '.env'] }), ['build/new.sh', 'dist/notes.md', '.env']);
+  assert.deepEqual(strayEntries({ untracked: [], ignored: ['target/', 'app/build/', 'node_modules/'] }), []);
+});
+
+test('hiddenEdits: skip-worktree (S/s) and assume-unchanged (lowercase) flagged', () => {
+  assert.deepEqual(hiddenEdits('H a\0S b\0h c\0s d\0H e\0'), ['b', 'c', 'd']);
+  assert.deepEqual(hiddenEdits('H a\0H b\0'), []);
+});
+
+test('scanFileCwds: whole file, cwd lines spanning chunk boundaries, past the first 512 KB', () => {
+  const f = path.join(tmp(), 't.jsonl');
+  const filler = `{"type":"assistant","text":"${'é'.repeat(300_000)}"}\n`; // ~600 KB of multibyte text
+  fs.writeFileSync(f, `{"cwd":"/w/first"}\n${filler}{"type":"user","cwd":"/w/late \\"q\\""}\n${filler}{"cwd":"/w/last"}`);
+  assert.deepEqual([...scanFileCwds(f, new Set(), 4096)].sort(), ['/w/first', '/w/last', '/w/late "q"']);
 });
 
 test('judgePrs: merged at HEAD ok; moved HEAD / open / none / other branch name → keep', () => {
@@ -352,12 +370,82 @@ test('E1+E2: --dry-run decides but deletes nothing', async () => {
   const b = w.add('feat-b');
   write(path.join(b.path, 'crate', 'Cargo.toml'), '[package]');
   write(path.join(b.path, 'crate', 'target', 'debug', 'big'), 'x'.repeat(1000));
-  const r = await run(w, deps({ prs: { 'feat-a': merged(a) } }), { dryRun: true });
+  const cache = path.join(w.parent, 'cache');
+  write(path.join(cache, 'old-abc123', 'debug', 'x'));
+  const r = await run(w, deps({ prs: { 'feat-a': merged(a) } }), { dryRun: true, cargoCacheDir: cache });
   assert.equal(r.removed.length, 1);
   assert.equal(r.targets.length, 1);
+  assert.equal(r.cache.length, 1);
   assert.ok(exists(a.path));
   assert.ok(exists(path.join(b.path, 'crate', 'target', 'debug', 'big')));
+  assert.ok(exists(path.join(cache, 'old-abc123', 'debug', 'x')));
   assert.match(formatReport(r), /DRY-RUN/);
+});
+
+test('E1: skip-worktree / assume-unchanged local edits (invisible to git status) → kept', async () => {
+  const w = world();
+  const a = w.add('feat-a');
+  g(a.path, 'update-index', '--skip-worktree', 'README.md');
+  write(path.join(a.path, 'README.md'), 'local secret edit');
+  touchAt(path.join(a.path, 'README.md'), Date.now() - 40 * DAY);
+  const b = w.add('feat-b');
+  g(b.path, 'update-index', '--assume-unchanged', '.gitignore');
+  write(path.join(b.path, '.gitignore'), 'changed\n');
+  touchAt(path.join(b.path, '.gitignore'), Date.now() - 40 * DAY);
+  assert.equal(g(a.path, 'status', '--porcelain'), ''); // what makes this dangerous
+  const r = await run(w, deps({ prs: { 'feat-a': merged(a), 'feat-b': merged(b, 2) } }));
+  assert.ok(exists(a.path) && exists(b.path));
+  assert.match(keptReason(r, a), /skip-worktree.*README\.md/);
+  assert.match(keptReason(r, b), /\.gitignore/);
+});
+
+test('E1: untracked file under a TRACKED build-named dir → kept', async () => {
+  const w = world();
+  const a = w.add('feat-a');
+  write(path.join(a.path, 'build', 'ci.sh'), 'echo ci');
+  g(a.path, 'add', 'build/ci.sh');
+  g(a.path, 'commit', '-q', '-m', 'ci');
+  a.head = g(a.path, 'rev-parse', 'HEAD');
+  write(path.join(a.path, 'build', 'new.sh'), 'echo new');
+  const r = await run(w, deps({ prs: { 'feat-a': merged(a) } }));
+  assert.ok(exists(path.join(a.path, 'build', 'new.sh')));
+  assert.match(keptReason(r, a), /build\/new\.sh/);
+});
+
+test('E1: a linked worktree that is a top-level folder of the workspace → kept (notable), no E2 either', async () => {
+  const w = world();
+  const side = path.join(w.parent, 'repo-side');
+  g(w.main, 'worktree', 'add', '-q', '-b', 'side', side);
+  write(path.join(side, 'Cargo.toml'), '[package]');
+  write(path.join(side, 'target', 'x'));
+  const head = g(side, 'rev-parse', 'HEAD');
+  const r = await run(w, deps({ prs: { side: [{ number: 1, state: 'MERGED', headRefOid: head, headRefName: 'side' }] } }));
+  assert.ok(exists(path.join(side, 'target', 'x')));
+  const k = r.kept.find((x) => x.path === side);
+  assert.match(k.reason, /cấp cao nhất/);
+  assert.equal(k.notable, true);
+});
+
+test('E1: HEAD re-read differs from `worktree list` → kept', async () => {
+  const w = world();
+  const a = w.add('feat-a');
+  const d = deps({ prs: { 'feat-a': merged(a) } });
+  const exec0 = d.exec;
+  d.exec = async (cmd, args, o) => (cmd === 'git' && args.includes('rev-parse') ? 'f'.repeat(40) + '\n' : exec0(cmd, args, o));
+  const r = await run(w, d);
+  assert.ok(exists(a.path));
+  assert.match(keptReason(r, a), /HEAD vừa đổi/);
+});
+
+test('E1: a process enters between the checks and the removal → kept', async () => {
+  const w = world();
+  const a = w.add('feat-a');
+  const d = deps({ prs: { 'feat-a': merged(a) } });
+  let n = 0;
+  d.procCwds = () => (++n >= 2 ? [{ pid: 99, cwd: fs.realpathSync(a.path) }] : []);
+  const r = await run(w, d);
+  assert.ok(exists(a.path));
+  assert.match(keptReason(r, a), /vừa vào/);
 });
 
 // ── E2 ───────────────────────────────────────────────────────────────────────
@@ -406,6 +494,30 @@ test('E2: the main checkout\'s target/ is not touched', async () => {
   assert.equal(r.targets.length, 0);
 });
 
+test('E2: a target/ with TRACKED content is not a build dir → kept', async () => {
+  const w = world();
+  const b = w.add('feat-b');
+  write(path.join(b.path, 'crate', 'Cargo.toml'), '[package]');
+  write(path.join(b.path, 'crate', 'target', 'README.md'), 'docs');
+  g(b.path, 'add', '-f', 'crate');
+  g(b.path, 'commit', '-q', '-m', 'tracked target');
+  write(path.join(b.path, 'crate', 'target', 'debug', 'x'));
+  const r = await run(w, deps());
+  assert.ok(exists(path.join(b.path, 'crate', 'target', 'README.md')));
+  assert.equal(r.targets.length, 0);
+});
+
+test('E2: a worktree outside the workspace → its target/ is not touched', async () => {
+  const w = world();
+  const outside = path.join(tmp('tp-out-'), 'wt');
+  g(w.main, 'worktree', 'add', '-q', '-b', 'far', outside);
+  write(path.join(outside, 'Cargo.toml'), '[package]');
+  write(path.join(outside, 'target', 'x'));
+  const r = await run(w, deps());
+  assert.ok(exists(path.join(outside, 'target', 'x')));
+  assert.equal(r.targets.length, 0);
+});
+
 test('C cache: idle subdir pruned, recent kept; skipped while the build lock is held', async () => {
   const w = world();
   const cache = path.join(w.parent, 'cache');
@@ -426,15 +538,29 @@ test('C cache: idle subdir pruned, recent kept; skipped while the build lock is 
 
 // ── scheduler / launcher ─────────────────────────────────────────────────────
 
-test('decideScheduledRun: no state → dry run; <24h → no; ≥24h → real', () => {
+test('decideScheduledRun: dry until a dry-run report was delivered; <24h → no; ≥24h → run', () => {
   const now = 1e12;
+  const rep = { dryRunReportedAt: now - 2 * DAY };
   assert.deepEqual(decideScheduledRun(null, now), { run: true, dryRun: true });
-  assert.deepEqual(decideScheduledRun({ lastCleanupAt: now - 3600_000 }, now), { run: false });
-  assert.deepEqual(decideScheduledRun({ lastCleanupAt: now - DAY }, now), { run: true, dryRun: false });
-  assert.deepEqual(decideScheduledRun({ lastCleanupAt: now + 5 * DAY }, now), { run: true, dryRun: false });
+  assert.deepEqual(decideScheduledRun({ lastCleanupAt: now - 3600_000, ...rep }, now), { run: false });
+  assert.deepEqual(decideScheduledRun({ lastCleanupAt: now - DAY }, now), { run: true, dryRun: true });
+  assert.deepEqual(decideScheduledRun({ lastCleanupAt: now - DAY, ...rep }, now), { run: true, dryRun: false });
+  assert.deepEqual(decideScheduledRun({ lastCleanupAt: now + 5 * DAY, ...rep }, now), { run: true, dryRun: false });
+  assert.deepEqual(decideScheduledRun({ lastCleanupAt: null, ...rep }, now), { run: true, dryRun: false });
 });
 
-test('cleanupTick: first ever → dry run + state written atomically; then waits 24h; garbled state → dry run', () => {
+test('readCleanupState: valid JSON with non-numeric fields → nulls (→ dry run); array/garbled → null', () => {
+  const f = path.join(tmp(), 's.json');
+  fs.writeFileSync(f, JSON.stringify({ lastCleanupAt: 'yesterday', dryRunReportedAt: '1' }));
+  assert.deepEqual(readCleanupState(f), { lastCleanupAt: null, dryRunReportedAt: null });
+  assert.deepEqual(decideScheduledRun(readCleanupState(f), 1e12), { run: true, dryRun: true });
+  fs.writeFileSync(f, '[1]');
+  assert.equal(readCleanupState(f), null);
+  fs.writeFileSync(f, '{nope');
+  assert.equal(readCleanupState(f), null);
+});
+
+test('cleanupTick: stays dry until dryRunReportedAt is recorded; waits 24h; keeps the record; garbled → dry', () => {
   const d = tmp();
   const stateFile = path.join(d, 'cleanup-state.json');
   const launches = [];
@@ -444,12 +570,57 @@ test('cleanupTick: first ever → dry run + state written atomically; then waits
   assert.equal(readCleanupState(stateFile).lastCleanupAt, 1000);
   cleanupTick({ stateFile, launch, now: 1000 + DAY - 1 });
   assert.equal(launches.length, 1);
+  // the first dry run crashed / was never delivered → the next one is dry again
   cleanupTick({ stateFile, launch, now: 1000 + DAY });
-  assert.deepEqual(launches[1], { dryRun: false });
+  assert.deepEqual(launches[1], { dryRun: true });
+  recordDryRunReported(stateFile, 2000 + DAY);
+  assert.equal(readCleanupState(stateFile).lastCleanupAt, 1000 + DAY); // merge, not overwrite
+  cleanupTick({ stateFile, launch, now: 1000 + 2 * DAY });
+  assert.deepEqual(launches[2], { dryRun: false });
+  assert.equal(readCleanupState(stateFile).dryRunReportedAt, 2000 + DAY); // tick keeps the record
   fs.writeFileSync(stateFile, '{garbled');
-  cleanupTick({ stateFile, launch, now: 5 * DAY });
-  assert.deepEqual(launches[2], { dryRun: true });
+  cleanupTick({ stateFile, launch, now: 9 * DAY });
+  assert.deepEqual(launches[3], { dryRun: true });
   assert.deepEqual(fs.readdirSync(d), ['cleanup-state.json']);
+});
+
+test('cli: dry-run report delivered → dryRunReportedAt recorded; undelivered / failed run / no --report-to-owner / real run → not', async () => {
+  const d = tmp();
+  const lockDir = path.join(d, 'locks');
+  const stateFile = path.join(d, 'state.json');
+  const ok = async () => ({ dryRun: true, removed: [], kept: [], targets: [], cache: [], cacheSkipped: null, errors: [] });
+  const sent = [];
+  const send = (t, toOwner) => sent.push([t, toOwner]);
+  const quiet = console.log; console.log = () => {};
+  const err = console.error; console.error = () => {};
+  try {
+    assert.equal(await cli(['--dry-run', '--report-to-owner'], { run: ok, send: () => { throw new Error('403'); }, stateFile, lockDir }), 1);
+    assert.equal(readCleanupState(stateFile), null);
+    assert.equal(await cli(['--dry-run', '--report-to-owner'], { run: async () => { throw new Error('boom'); }, send, stateFile, lockDir }), 0);
+    assert.equal(readCleanupState(stateFile), null);
+    assert.match(sent.at(-1)[0], /lỗi/);
+    assert.equal(await cli(['--dry-run'], { run: ok, send, stateFile, lockDir }), 0);
+    assert.equal(readCleanupState(stateFile), null);
+    assert.equal(await cli(['--report-to-owner'], { run: ok, send, stateFile, lockDir }), 0);
+    assert.equal(readCleanupState(stateFile), null);
+    assert.equal(await cli(['--dry-run', '--report-to-owner'], { run: ok, send, stateFile, lockDir, now: () => 777 }), 0);
+    assert.equal(readCleanupState(stateFile).dryRunReportedAt, 777);
+    // a busy cleanup lock: no run, nothing recorded
+    const held = await acquireLock('cleanup', { dir: lockDir, waitSec: 0 });
+    let ran = false;
+    assert.equal(await cli(['--report-to-owner'], { run: async () => { ran = true; return ok(); }, send, stateFile, lockDir }), 0);
+    held.release();
+    assert.equal(ran, false);
+    assert.match(sent.at(-1)[0], /đang có một lượt khác/);
+  } finally { console.log = quiet; console.error = err; }
+});
+
+test('parseLaunchArgs: [] / --dry-run only; anything else (incl. em-dash) → error', () => {
+  assert.deepEqual(parseLaunchArgs([]), { dryRun: false });
+  assert.deepEqual(parseLaunchArgs(['--dry-run']), { dryRun: true });
+  assert.throws(() => parseLaunchArgs(['—dry-run']), /không hiểu/);
+  assert.throws(() => parseLaunchArgs(['--force']), /không hiểu/);
+  assert.throws(() => parseLaunchArgs(['--dry-run', 'x']), /không hiểu/);
 });
 
 test('cleanupTick: unwritable state → no launch', () => {

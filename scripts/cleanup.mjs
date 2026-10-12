@@ -27,6 +27,8 @@ import path from 'node:path';
 import { execFile, execFileSync } from 'node:child_process';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
+import { StringDecoder } from 'node:string_decoder';
+import { recordDryRunReported, CLEANUP_STATE_FILE } from './cleanup-launch.mjs';
 import { isMainModule } from './is-direct-run.mjs';
 import { acquireLock, LOCK_DIR } from './machine-lock.mjs';
 import { PARENT_DIR } from './workspace.mjs';
@@ -76,18 +78,35 @@ export function isBuildPath(p) {
   return segs.slice(0, -1).some((s) => BUILD_DIRS.has(s));
 }
 
-/** `git status --porcelain=v1 -z --ignored` → { tracked: [...], extra: [...untracked/ignored paths] }. */
+/** `git status --porcelain=v1 -z …` → { tracked, untracked, ignored } path lists. */
 export function parseStatusZ(out) {
   const toks = String(out).split('\0');
-  const tracked = [], extra = [];
+  const tracked = [], untracked = [], ignored = [];
   for (let i = 0; i < toks.length; i++) {
     const t = toks[i];
     if (!t) continue;
     const xy = t.slice(0, 2), p = t.slice(3);
-    if (xy === '??' || xy === '!!') extra.push(p);
+    if (xy === '??') untracked.push(p);
+    else if (xy === '!!') ignored.push(p);
     else { tracked.push(p); if (xy[0] === 'R' || xy[0] === 'C') i++; } // rename/copy: next token = source path
   }
-  return { tracked, extra };
+  return { tracked, untracked, ignored };
+}
+
+/**
+ * Entries that are NOT disposable build output. An untracked-but-not-ignored
+ * file is always stray, even under a build-named dir (tracked `build/ci.sh` +
+ * new `build/new.sh`); only IGNORED entries may match the build allowlist.
+ */
+export function strayEntries({ untracked, ignored }) {
+  return [...untracked, ...ignored.filter((p) => !isBuildPath(p))];
+}
+
+/** `git ls-files -v -z` → paths flagged skip-worktree (S/s) or assume-unchanged (lowercase tag): edits git status cannot see. */
+export function hiddenEdits(out) {
+  return String(out).split('\0').filter(Boolean)
+    .filter((t) => { const tag = t[0]; return tag === 'S' || (tag >= 'a' && tag <= 'z'); })
+    .map((t) => t.slice(2));
 }
 
 /** PR verdict for a branch at `head` → { ok } | { ok:false, reason, notable }. */
@@ -166,8 +185,33 @@ export function readProcCwds(procDir = '/proc') {
   return out;
 }
 
-/** cwds named in Claude transcripts (~/.claude/projects/*\/*.jsonl) modified since `since`. */
-export function readTranscriptCwds({ root = TRANSCRIPTS_DIR, since, headBytes = 512 * 1024 } = {}) {
+/** Every `"cwd":"…"` in a file, read WHOLE in chunks (a line may span chunks). */
+export function scanFileCwds(file, into = new Set(), chunkBytes = 1024 * 1024) {
+  const fd = fs.openSync(file, 'r');
+  const dec = new StringDecoder('utf8');
+  const buf = Buffer.alloc(chunkBytes);
+  let carry = '';
+  const scan = (text) => {
+    if (!text.includes('"cwd":"')) return;
+    for (const m of text.matchAll(/"cwd":"((?:[^"\\]|\\.)*)"/g)) { try { into.add(JSON.parse(`"${m[1]}"`)); } catch {} }
+  };
+  try {
+    for (;;) {
+      const n = fs.readSync(fd, buf, 0, chunkBytes, null);
+      if (n <= 0) break;
+      const text = carry + dec.write(buf.subarray(0, n));
+      const nl = text.lastIndexOf('\n');
+      if (nl < 0) { carry = text; continue; }
+      scan(text.slice(0, nl));
+      carry = text.slice(nl + 1);
+    }
+    scan(carry + dec.end());
+  } finally { fs.closeSync(fd); }
+  return into;
+}
+
+/** cwds named ANYWHERE in Claude transcripts (~/.claude/projects/*\/*.jsonl) modified since `since`. */
+export function readTranscriptCwds({ root = TRANSCRIPTS_DIR, since } = {}) {
   const cwds = new Set();
   let projects;
   try { projects = fs.readdirSync(root, { withFileTypes: true }); } catch (e) { if (e.code === 'ENOENT') return cwds; throw e; }
@@ -180,12 +224,7 @@ export function readTranscriptCwds({ root = TRANSCRIPTS_DIR, since, headBytes = 
       let st;
       try { st = fs.statSync(file); } catch { continue; }
       if (!st.isFile() || st.mtimeMs < since) continue;
-      const buf = Buffer.alloc(Math.min(headBytes, st.size));
-      const fd = fs.openSync(file, 'r');
-      try { fs.readSync(fd, buf, 0, buf.length, 0); } finally { fs.closeSync(fd); }
-      for (const m of buf.toString('utf8').matchAll(/"cwd":"((?:[^"\\]|\\.)*)"/g)) {
-        try { cwds.add(JSON.parse(`"${m[1]}"`)); } catch {}
-      }
+      try { scanFileCwds(file, cwds); } catch (e) { if (e.code !== 'ENOENT') throw e; } // vanished mid-scan: fine; else keep everything
     }
   }
   return cwds;
@@ -259,6 +298,8 @@ export async function runCleanup({
     if (!real || wt.prunable) return { ok: false, reason: 'thư mục không còn', notable: false };
     if (!fs.lstatSync(wt.path).isDirectory()) return { ok: false, reason: 'không phải thư mục', notable: false };
     if (!isInside(real, realParent) || real === realParent) return { ok: false, reason: 'nằm ngoài workspace', notable: false };
+    // A sibling project folder (~/Projects/repo-side) is visible work, not a scratch tree.
+    if (path.dirname(real) === realParent) return { ok: false, reason: 'là thư mục dự án cấp cao nhất trong workspace — không tự xoá', notable: true };
     if (wt.locked) return { ok: false, reason: 'bị khoá (git worktree lock)', notable: false };
     if (wt.detached || !wt.branch || !wt.branch.startsWith('refs/heads/')) return { ok: false, reason: 'detached HEAD', notable: false };
     if (!/^[0-9a-f]{40,64}$/.test(wt.head || '')) return { ok: false, reason: 'không đọc được HEAD', notable: false };
@@ -273,8 +314,10 @@ export async function runCleanup({
     if (headNow !== wt.head) return { ok: false, reason: 'HEAD vừa đổi', notable: true };
     const st = parseStatusZ(await git(['-C', wt.path, 'status', '--porcelain=v1', '-z', '--untracked-files=all', '--ignored=matching']));
     if (st.tracked.length) return { ok: false, reason: `có thay đổi chưa commit (${st.tracked.slice(0, 3).join(', ')}${st.tracked.length > 3 ? ', …' : ''})`, notable: true };
-    const stray = st.extra.filter((p) => !isBuildPath(p));
+    const stray = strayEntries(st);
     if (stray.length) return { ok: false, reason: `có file ngoài git: ${stray.slice(0, 5).join(', ')}${stray.length > 5 ? ', …' : ''}`, notable: true };
+    const hidden = hiddenEdits(await git(['-C', wt.path, 'ls-files', '-v', '-z']));
+    if (hidden.length) return { ok: false, reason: `có file skip-worktree/assume-unchanged (${hidden.slice(0, 3).join(', ')}${hidden.length > 3 ? ', …' : ''})`, notable: true };
     const procs = busyIn(real);
     if (procs.length) return { ok: false, reason: `có tiến trình đang ở trong (pid ${procs.slice(0, 3).map((p) => p.pid).join(', ')})`, notable: true };
     if (!transcriptCwds) return { ok: false, reason: 'không đọc được transcript', notable: false };
@@ -312,7 +355,7 @@ export async function runCleanup({
   for (const L of stay) {
     if (!L.real) continue;
     try {
-      if (!isInside(L.real, realParent) || !fs.lstatSync(L.real).isDirectory()) continue;
+      if (!isInside(L.real, realParent) || path.dirname(L.real) === realParent || !fs.lstatSync(L.real).isDirectory()) continue;
       const { targets } = findCargoTargets(L.real);
       for (const t of targets) {
         if (!fs.lstatSync(t).isDirectory()) continue;
@@ -405,19 +448,30 @@ function deliver(text, toOwner) {
   });
 }
 
-async function cli(argv) {
+/**
+ * The CLI body (effects injectable for tests). A dry run whose report reached
+ * the owner is recorded (`dryRunReportedAt`); until then the daily scheduler
+ * keeps choosing dry runs, so a crashed/undelivered first run never leads to a
+ * real one.
+ */
+export async function cli(argv, {
+  run = runCleanup, send = deliver, stateFile = CLEANUP_STATE_FILE, lockDir = LOCK_DIR, now = Date.now,
+} = {}) {
   let opts;
   try { opts = parseCleanupArgs(argv); } catch (e) { console.error(e.message); return 2; }
-  const lock = await acquireLock('cleanup', { waitSec: 0, cmd: `cleanup.mjs ${argv.join(' ')}`.trim() });
+  const lock = await acquireLock('cleanup', { waitSec: 0, dir: lockDir, cmd: `cleanup.mjs ${argv.join(' ')}`.trim() });
   if (lock.timeout) {
-    deliver('🧹 Dọn dẹp: đang có một lượt khác chạy (lock cleanup bận) — bỏ qua lượt này.', opts.reportToOwner);
+    try { send('🧹 Dọn dẹp: đang có một lượt khác chạy (lock cleanup bận) — bỏ qua lượt này.', opts.reportToOwner); } catch {}
     return 0;
   }
-  let text;
-  try { text = formatReport(await runCleanup({ dryRun: opts.dryRun })); }
+  let text, ok = false;
+  try { text = formatReport(await run({ dryRun: opts.dryRun })); ok = true; }
   catch (e) { text = `❌ Dọn dẹp lỗi, không xoá thêm gì: ${e instanceof Error ? e.message : e}`; }
   finally { lock.release(); }
-  try { deliver(text, opts.reportToOwner); } catch (e) { console.error(`[cleanup] report failed: ${e.message}`); return 1; }
+  try { send(text, opts.reportToOwner); } catch (e) { console.error(`[cleanup] report failed: ${e.message}`); return 1; }
+  if (ok && opts.dryRun && opts.reportToOwner) {
+    try { recordDryRunReported(stateFile, now()); } catch (e) { console.error(`[cleanup] cannot record dry-run: ${e.message}`); return 1; }
+  }
   return 0;
 }
 
