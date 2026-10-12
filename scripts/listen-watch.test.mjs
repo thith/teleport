@@ -97,14 +97,67 @@ test('watchdog: fetching resumes after an alert → one recovery line with the o
   assert.equal(await tick(T0 + 53 * MIN), 'alert');
 });
 
-test('watchdog: a throwing send does not cause a DM every tick', async () => {
+// A DM that fails (likely: the network outage being reported) must not mute the
+// alert for 30 min, nor be retried every tick.
+function flakySend() {
+  const log = { calls: 0, sent: [], fail: true };
+  log.send = async (t) => { log.calls++; if (log.fail) throw new Error('net down'); log.sent.push(t); };
+  return log;
+}
+
+test('watchdog: failed alert → no retry within 5 min → retry after 5 min → success → 30-min throttle', async () => {
   const { files } = sandbox();
   recordFetchOk({ file: files.lastFetchOkFile, now: T0 });
-  let calls = 0;
-  const send = async () => { calls++; throw new Error('net down'); };
-  await assert.rejects(listenWatchdogTick({ ...files, now: T0 + 6 * MIN, send }));
-  await listenWatchdogTick({ ...files, now: T0 + 7 * MIN, send });
-  assert.equal(calls, 1);
+  const s = flakySend();
+  const tick = (now) => listenWatchdogTick({ ...files, now, send: s.send });
+  await assert.rejects(tick(T0 + 6 * MIN), /net down/);
+  assert.equal(await tick(T0 + 7 * MIN), null);
+  assert.equal(await tick(T0 + 10 * MIN), null, '4 min after the failed attempt');
+  assert.equal(s.calls, 1);
+  s.fail = false;
+  assert.equal(await tick(T0 + 11 * MIN), 'alert', '5 min after the failed attempt: retried');
+  assert.equal(s.calls, 2);
+  assert.match(s.sent[0], /đã 11 phút/);
+  assert.equal(await tick(T0 + 16 * MIN), null, 'delivered → 30-min throttle (not the 5-min retry)');
+  assert.equal(await tick(T0 + 40 * MIN), null);
+  assert.equal(await tick(T0 + 41 * MIN), 'alert');
+  assert.equal(s.calls, 3);
+});
+
+test('watchdog: failed recovery DM keeps the outage state and is retried (attempt-throttled)', async () => {
+  const { files } = sandbox();
+  recordFetchOk({ file: files.lastFetchOkFile, now: T0 });
+  const s = flakySend();
+  s.fail = false;
+  const tick = (now) => listenWatchdogTick({ ...files, now, send: s.send });
+  await tick(T0 + 6 * MIN);                 // alert delivered
+  recordFetchOk({ file: files.lastFetchOkFile, now: T0 + 20 * MIN });
+  s.fail = true;
+  await assert.rejects(tick(T0 + 20 * MIN + 10_000));
+  assert.equal(await tick(T0 + 22 * MIN), null, 'no retry within 5 min');
+  s.fail = false;
+  recordFetchOk({ file: files.lastFetchOkFile, now: T0 + 25 * MIN }); // still fetching fine
+  assert.equal(await tick(T0 + 26 * MIN), 'recovered');
+  assert.equal(s.sent.at(-1), '✅ Đã nghe Telegram lại (gián đoạn 20 phút).');
+  assert.equal(await tick(T0 + 27 * MIN), null, 'said once');
+  assert.equal(s.calls, 3);
+});
+
+test('watchdog: an outage that ends before any alert got through sends nothing', async () => {
+  const { files } = sandbox();
+  recordFetchOk({ file: files.lastFetchOkFile, now: T0 });
+  const s = flakySend();
+  const tick = (now) => listenWatchdogTick({ ...files, now, send: s.send });
+  await assert.rejects(tick(T0 + 6 * MIN));
+  recordFetchOk({ file: files.lastFetchOkFile, now: T0 + 8 * MIN });
+  s.fail = false;
+  assert.equal(await tick(T0 + 12 * MIN), null);
+  assert.deepEqual(s.sent, []);
+  // State was cleared: a later outage alerts immediately and is measured from ITS start.
+  assert.equal(await tick(T0 + 14 * MIN), 'alert');
+  recordFetchOk({ file: files.lastFetchOkFile, now: T0 + 20 * MIN });
+  assert.equal(await tick(T0 + 20 * MIN), 'recovered');
+  assert.equal(s.sent.at(-1), '✅ Đã nghe Telegram lại (gián đoạn 12 phút).');
 });
 
 test('startListenWatchdog: interval is unref\'d and calls the tick with send', async () => {

@@ -27,6 +27,7 @@ export const LISTEN_STALE_MS = 5 * 60 * 1000;          // no fetch for this long
 export const DAEMON_ALERT_THROTTLE_MS = 30 * 60 * 1000;
 export const LISTENER_WARN_THROTTLE_MS = 15 * 60 * 1000;
 export const WATCHDOG_EVERY_MS = 60 * 1000;
+export const SEND_RETRY_MS = 5 * 60 * 1000;           // failed alert/recovery DM: retry cadence
 
 let counter = 0;
 function atomicWrite(file, content) {
@@ -85,10 +86,16 @@ function readState(file) {
 
 /**
  * One watchdog tick (daemon). Pure-ish: clock, files and send are injectable.
- * Returns 'alert' | 'recovered' | null (what it sent).
+ * Returns 'alert' | 'recovered' | null (what it sent); rethrows a failed send
+ * after recording the attempt.
  *   - last-fetch-ok missing → nothing (we cannot tell how long; no false alarm);
  *   - gap > 5 min → DM once, again at most every 30 min (state persisted);
- *   - fresh again after an alert → one recovery DM, state cleared.
+ *   - fresh again after an alert → one recovery DM, then state cleared.
+ * `alertedAt` is recorded only after a send SUCCEEDS: the send is likely to fail
+ * during the very outage it reports, and a failed alert must not mute the next
+ * 30 min. A failure records `lastAttemptAt` and is retried at most every 5 min
+ * (never a DM attempt per tick). Same for the recovery line: the outage state is
+ * kept until that DM is actually delivered.
  */
 export async function listenWatchdogTick({
   now = Date.now(),
@@ -101,19 +108,40 @@ export async function listenWatchdogTick({
   if (last == null) return null;
   const state = readState(stateFile);
   const gap = now - last;
+  const attemptThrottled = state.lastAttemptAt != null && now - state.lastAttemptAt < SEND_RETRY_MS;
+  const attempt = async (text, onSuccess, failState) => {
+    try {
+      await send(text);
+    } catch (e) {
+      atomicWrite(stateFile, JSON.stringify({ ...failState, lastAttemptAt: now }));
+      throw e;
+    }
+    atomicWrite(stateFile, JSON.stringify(onSuccess));
+  };
   if (gap > LISTEN_STALE_MS) {
+    // Deaf again while a recovery DM was still pending: that "back" moment is void.
+    if (state.backAt != null) { delete state.backAt; atomicWrite(stateFile, JSON.stringify(state)); }
     if (state.alertedAt != null && now - state.alertedAt < DAEMON_ALERT_THROTTLE_MS) return null;
-    // Persist BEFORE sending: a send that throws must not turn into a DM per tick.
-    atomicWrite(stateFile, JSON.stringify({ alertedAt: now, outageSince: state.outageSince ?? last }));
-    await send(`📡 Không ai nghe được Telegram đã ${minutes(gap)} phút (poll.lock: ${describePollLock(lockFile, now)}). Gửi tin vẫn chạy.`);
+    if (attemptThrottled) return null;
+    const outageSince = state.outageSince ?? last;
+    await attempt(
+      `📡 Không ai nghe được Telegram đã ${minutes(gap)} phút (poll.lock: ${describePollLock(lockFile, now)}). Gửi tin vẫn chạy.`,
+      { alertedAt: now, outageSince },
+      { ...state, outageSince },
+    );
     return 'alert';
   }
   if (state.alertedAt != null) {
+    if (attemptThrottled) return null;
     const since = state.outageSince ?? state.alertedAt;
-    atomicWrite(stateFile, JSON.stringify({}));
-    await send(`✅ Đã nghe Telegram lại (gián đoạn ${minutes(last - since)} phút).`);
+    // First fetch seen after the outage: kept across a retried recovery DM so
+    // the reported length does not grow with each retry.
+    const backAt = state.backAt ?? last;
+    await attempt(`✅ Đã nghe Telegram lại (gián đoạn ${minutes(backAt - since)} phút).`, {}, { ...state, backAt });
     return 'recovered';
   }
+  // Outage that ended before any alert got through: nothing to report.
+  if (Object.keys(state).length) atomicWrite(stateFile, JSON.stringify({}));
   return null;
 }
 

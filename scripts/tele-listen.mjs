@@ -1415,6 +1415,7 @@ export function releasePollLock(lockFile = POLL_LOCK_FILE) {
   heldLockTokens.delete(key);
   let body;
   try { body = fs.readFileSync(lockFile, 'utf8'); } catch { return; }
+  // Residual read→unlink window is microseconds, vs the 30 s LOCK_STALE_MS a peer must wait to reclaim.
   if (body.trim() !== mine) return;
   try { fs.unlinkSync(lockFile); } catch {}
 }

@@ -296,7 +296,9 @@ async function main() {
 
   // RFC 18 B: "is anyone hearing Telegram?" watchdog. Its own interval, so it
   // still fires while the loop below is stuck in an await (e.g. a hung fetch).
-  startListenWatchdog({ send: (t) => sendText(daemonUserId, t) });
+  // Its send must THROW on failure (unlike sendText, which swallows) so a DM lost
+  // during the outage is retried instead of counted as delivered.
+  startListenWatchdog({ send: (t) => sendTextToAdmin(token, daemonUserId, t, { raw: false, plain: true }) });
 
   let lastHeartbeat = 0;
   let mergeInboxBusy = false;
