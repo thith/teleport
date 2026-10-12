@@ -189,13 +189,34 @@ export function buildProcRows({ psRows, uid, sessions = new Map(), procExtras = 
  *   screens  — parseScreenSessions() rows `{ pid, name }` (tele-* only)
  *   procs    — buildProcRows() rows
  *   personaOf(hashtag) → label | null — topic persona for a tele-* screen
+ *   statusOf(convoId) → string | null — listener / unread status line (see
+ *                 listener-status.mjs); printed under each agent that has a convo.
+ *   convoOfHashtag(hashtag) → convoId | null — recovers a tele-* screen's convo
+ *                 when no claude inside carries a session id with that hashtag.
  */
-export function formatAgentList({ screens = [], procs = [], personaOf = () => null, home = os.homedir() } = {}) {
+export function formatAgentList({ screens = [], procs = [], personaOf = () => null, home = os.homedir(), statusOf = () => null, convoOfHashtag = () => null } = {}) {
   // Folder name only (Thi: "chỉ hiện tên folder") — the full path is noise on a phone.
   const short = (p) => (p ? (p === home ? '~' : path.basename(p)) : null);
   const sess = (r) => (r.sessionId
     ? `  session ${r.sessionId}${r.guessed ? ' (đoán)' : ''}${r.hashtag ? ` · #${r.hashtag}` : ''}`
     : '  session ?');
+  // Status line for a convo — never throws, nothing for agents without a convo.
+  const status = (convo) => {
+    if (convo == null) return;
+    let st = null;
+    try { st = statusOf(convo); } catch { st = null; }
+    if (st) lines.push(`  ${st}`);
+  };
+  const sessConvo = (rows) => rows.map((r) => uuidToConvoInt(r.sessionId)).filter((c) => c != null);
+  // A tele-<hash> screen's convo: the claude inside whose session hashes to the
+  // screen name, else the topics-store lookup. Other screens: their claude's convo.
+  const convoOfScreen = (name, rows) => {
+    if (!name.startsWith('tele-')) return sessConvo(rows)[0] ?? null;
+    const h = name.slice(5);
+    const own = sessConvo(rows).find((c) => shortConvoHash(c) === h);
+    if (own != null) return own;
+    try { return convoOfHashtag(h) ?? null; } catch { return null; }
+  };
   // No tty column (Thi: only useful at the keyboard). r.tty stays in the row/audit.
   const procLine = (r) => [
     `PID ${r.pid}`, r.name ? `${r.name}${r.status ? ` (${r.status})` : ''}` : (r.status ? `(${r.status})` : null),
@@ -217,10 +238,11 @@ export function formatAgentList({ screens = [], procs = [], personaOf = () => nu
     const rows = inScreen.get(name) || [];
     lines.push(`• ${[name, persona].filter(Boolean).join(' · ')}${rows.length ? '' : ' · (không thấy claude bên trong)'}`);
     for (const r of rows) { lines.push(`  ${procLine(r)}`); lines.push(sess(r)); }
+    status(convoOfScreen(name, rows));
   }
   lines.push('', `🖥 Terminal (${terminal.length})`);
   if (!terminal.length) lines.push('  (không có)');
-  for (const r of terminal) { lines.push(`• ${procLine(r)}`); lines.push(sess(r)); }
+  for (const r of terminal) { lines.push(`• ${procLine(r)}`); lines.push(sess(r)); status(uuidToConvoInt(r.sessionId)); }
   lines.push('', 'Dừng (chỉ owner): /kill pid:<PID> · screen: /kill <hashtag>');
   lines.push('Chạy lại trong screen: /spawn <project> --resume-session <session>');
   return lines.join('\n');
