@@ -24,6 +24,8 @@ import {
   mergePromptData,
   mergeOrSpoolPrompt,
   buildCombinedPromptData,
+  dropPresentSegments,
+  promptSegmentKeys,
 } from './tele-listen.mjs';
 
 // The --loop listener must YIELD (inconclusive → main exits 2, offset not
@@ -171,8 +173,8 @@ test('refreshRegistry read-only fallback (lock held) drops dead rows but keeps m
 // same updates first; the listener's already-prepared batch must not add a
 // second copy of a message that is still pending.
 
-function tgMsg(id, text, { chat = -100, edit = null } = {}) {
-  const m = { message_id: id, chat: { id: chat, type: 'supergroup' }, from: { id: 42, first_name: 'Thi' }, date: 1700000000 + id, text };
+function tgMsg(id, text, { chat = -100, edit = null, from = { id: 42, first_name: 'Thi' } } = {}) {
+  const m = { message_id: id, chat: { id: chat, type: 'supergroup' }, from, date: 1700000000 + id, text };
   if (edit != null) m.edit_date = edit;
   return { msg: m, update: { update_id: 9000 + id } };
 }
@@ -222,4 +224,35 @@ test('mergeOrSpoolPrompt: spool skips a message already in the claimed .processi
   assert.deepEqual(spooled.messages.map((s) => s.messageId), [2]);
   assert.equal(spooled.text, 'world');
   assert.equal(spooled.messageId, 2);
+});
+
+test('partial dedupe: a dropped segment\'s fromMember / chatId never leak onto the rebuilt batch', () => {
+  const roles = { '43': { role: 'member', note: 'designer' } };
+  const user = tgMsg(1, 'from user');                                           // sender 42, not a member
+  const member = tgMsg(2, 'from member', { chat: -200, from: { id: 43, first_name: 'Mem' } });
+  const batch = buildCombinedPromptData([user, member], null, null, roles);
+  assert.ok(batch.fromMember, 'precondition: newest sender is a member');
+  assert.equal(batch.chatId, '-200');
+  // The member's message is already pending → only the user's survives.
+  const existing = buildCombinedPromptData([member], null, null, roles);
+  const merged = mergePromptData(existing, batch);
+  assert.deepEqual(merged.messages.map((s) => s.messageId), [2, 1]);
+  assert.equal(merged.fromUserId, '42');
+  assert.equal(merged.fromMember, null);
+  assert.equal(merged.chatId, '-100');
+  // Same sender kept → its member record is kept.
+  const m1 = tgMsg(3, 'a', { from: { id: 43, first_name: 'Mem' } });
+  const m2 = tgMsg(4, 'b', { from: { id: 43, first_name: 'Mem' } });
+  const both = buildCombinedPromptData([m1, m2], null, null, roles);
+  const kept = mergePromptData(buildCombinedPromptData([m2], null, null, roles), both);
+  assert.deepEqual(kept.messages.map((s) => s.messageId), [4, 3]);
+  assert.deepEqual(kept.fromMember, both.fromMember);
+  // Kept segment with no chatId (older prompt) → chatId null, not the dropped one's.
+  const legacy = { chatId: '-200', fromUserId: '43', messages: [
+    { messageId: 5, fromUserId: '42', text: 'old' },
+    { messageId: 6, chatId: '-200', fromUserId: '43', text: 'dup' },
+  ] };
+  const rebuilt = dropPresentSegments(legacy, promptSegmentKeys({ chatId: '-200', messages: [{ messageId: 6, chatId: '-200' }] }));
+  assert.deepEqual(rebuilt.messages.map((s) => s.messageId), [5]);
+  assert.equal(rebuilt.chatId, null);
 });

@@ -2127,7 +2127,14 @@ export function dropPresentSegments(data, presentKeys) {
   for (const k of ['messageId', 'fromUserId', 'fromName', 'fromRole', 'replyToMessageId', 'replyToText', 'quotedText', 'timestamp']) {
     out[k] = last[k] ?? null;
   }
-  if (last.chatId != null) out.chatId = last.chatId;
+  out.chatId = last.chatId ?? null;
+  // `fromMember` is batch-level (the newest sender's member record, a pure
+  // function of that user id) and segments don't carry it. Keep it only if the
+  // newest KEPT segment has the same sender; otherwise null — never let a
+  // dropped segment's member record leak onto a different sender.
+  out.fromMember = (last.fromUserId != null && String(last.fromUserId) === String(data.fromUserId ?? ''))
+    ? (data.fromMember ?? null)
+    : null;
   return out;
 }
 
