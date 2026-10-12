@@ -1356,23 +1356,34 @@ export function resolveStartOffset(
 
 export function acquirePollLock(lockFile = POLL_LOCK_FILE) {
   fs.mkdirSync(path.dirname(lockFile), { recursive: true });
+  let fd;
   try {
-    const fd = fs.openSync(lockFile, 'wx');
-    fs.writeSync(fd, String(Date.now()));
-    fs.closeSync(fd);
-    return true;
+    fd = fs.openSync(lockFile, 'wx');
   } catch (e) {
     if (e.code !== 'EEXIST') throw e;
     try {
-      const content = fs.readFileSync(lockFile, 'utf8').trim();
-      const lockTime = parseInt(content, 10);
-      if (!isNaN(lockTime) && Date.now() - lockTime > LOCK_STALE_MS) {
+      // An EMPTY/garbled lock (we died, or the disk was full, between create and
+      // write) used to read as NaN = "never stale" and wedged every listener for
+      // good. Fall back to the file's mtime for its age.
+      const lockTime = parseInt(fs.readFileSync(lockFile, 'utf8').trim(), 10);
+      const age = Date.now() - (isNaN(lockTime) ? fs.statSync(lockFile).mtimeMs : lockTime);
+      if (age > LOCK_STALE_MS) {
         fs.unlinkSync(lockFile);
         return acquirePollLock(lockFile);
       }
     } catch {}
     return false;
   }
+  try {
+    fs.writeSync(fd, String(Date.now()));
+  } catch (e) {
+    // e.g. ENOSPC: don't leave an empty lock behind.
+    try { fs.closeSync(fd); } catch {}
+    try { fs.unlinkSync(lockFile); } catch {}
+    throw e;
+  }
+  fs.closeSync(fd);
+  return true;
 }
 
 export function releasePollLock(lockFile = POLL_LOCK_FILE) {
