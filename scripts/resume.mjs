@@ -103,7 +103,19 @@ export function checkCwd(cwd, { parentDir = PARENT_DIR, realpath = fs.realpathSy
 }
 
 if (isMainModule(import.meta.url)) {
-  const query = process.argv.slice(2).join(' ');
+  // Forwarded claude flags (RFC 18): split BEFORE joining the name query.
+  const { splitForwarded, parseExtraArgs } = await import('./spawn-extra-args.mjs');
+  const { readProjectsConfig, resolveDaemonUserId } = await import('./projects-config.mjs');
+  const { own, fwd } = splitForwarded(process.argv.slice(2));
+  const query = own.join(' ');
+  const ownerId = resolveDaemonUserId(readProjectsConfig(new URL('../projects.json', import.meta.url).pathname), { env: {} });
+  const callerIsOwner = Boolean(process.stdin.isTTY) || Boolean(ownerId && process.env.TELE_FROM_ID && String(process.env.TELE_FROM_ID) === String(ownerId));
+  let extraArgs;
+  if (fwd !== null) {
+    const px = parseExtraArgs(fwd, { owner: callerIsOwner });
+    if (px.error) { console.log(`❌ ${px.error}`); process.exit(1); }
+    extraArgs = px.args;
+  }
   const { listClaudeProcs } = await import('./claude-procs.mjs');
   const alive = new Set(listClaudeProcs().map((r) => r.sessionId).filter(Boolean));
   const pick = findResumeTarget(query, listCandidates(), { aliveSessions: alive });
@@ -112,9 +124,9 @@ if (isMainModule(import.meta.url)) {
   const c = checkCwd(transcriptCwd(t.file));
   if (c.error) { console.log(`❌ ${t.persona || ''} #${t.hashtag}: ${c.error}`); process.exit(1); }
   const { performResume } = await import('./spawn.mjs');
-  const res = await performResume({ sessionId: t.sessionId, cwd: c.cwd });
+  const res = await performResume({ sessionId: t.sessionId, cwd: c.cwd, extraArgs, setBy: callerIsOwner ? 'owner' : 'agent' });
   const also = (pick.others.length ? `\n(also matched, older: ${pick.others.slice(0, 5).map((o) => `#${o.hashtag}`).join(', ')} — use /resume #<hashtag> for one of those)` : '')
     + (pick.skippedLive?.length ? `\n(skipped — still running: ${pick.skippedLive.map((o) => `#${o.hashtag}`).join(', ')})` : '');
   if (res.error) { console.log(`❌ ${t.persona || ''} #${t.hashtag}: ${res.error}${also}`); process.exit(1); }
-  console.log(`🔁 resumed ${t.persona || ''} #${t.hashtag} (session ${t.sessionId}) in screen "${res.plan.sessionName}", folder ${path.basename(c.cwd)}. It will check its mailbox, re-arm its listener and greet in its topic.${also}`);
+  console.log(`🔁 resumed ${t.persona || ''} #${t.hashtag} (session ${t.sessionId}) in screen "${res.plan.sessionName}", folder ${path.basename(c.cwd)}. It will check its mailbox, re-arm its listener and greet in its topic.${res.plan.extraArgs?.length ? `\nclaude flags: ${res.plan.extraArgs.join(' ')}` : ''}${res.plan.extraNote ? `\n${res.plan.extraNote}` : ''}${also}`);
 }
