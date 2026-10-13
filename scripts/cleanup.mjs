@@ -298,8 +298,8 @@ export async function runCleanup({
     if (!real || wt.prunable) return { ok: false, reason: 'thư mục không còn', notable: false };
     if (!fs.lstatSync(wt.path).isDirectory()) return { ok: false, reason: 'không phải thư mục', notable: false };
     if (!isInside(real, realParent) || real === realParent) return { ok: false, reason: 'nằm ngoài workspace', notable: false };
-    // A sibling project folder (~/Projects/repo-side) is visible work, not a scratch tree.
-    if (path.dirname(real) === realParent) return { ok: false, reason: 'là thư mục dự án cấp cao nhất trong workspace — không tự xoá', notable: true };
+    // (No "top-level folder" exemption: on this workspace agents always create
+    // worktrees as siblings — ~/Projects/<repo>-<topic> — so it exempted everything.)
     if (wt.locked) return { ok: false, reason: 'bị khoá (git worktree lock)', notable: false };
     if (wt.detached || !wt.branch || !wt.branch.startsWith('refs/heads/')) return { ok: false, reason: 'detached HEAD', notable: false };
     if (!/^[0-9a-f]{40,64}$/.test(wt.head || '')) return { ok: false, reason: 'không đọc được HEAD', notable: false };
@@ -355,7 +355,7 @@ export async function runCleanup({
   for (const L of stay) {
     if (!L.real) continue;
     try {
-      if (!isInside(L.real, realParent) || path.dirname(L.real) === realParent || !fs.lstatSync(L.real).isDirectory()) continue;
+      if (!isInside(L.real, realParent) || !fs.lstatSync(L.real).isDirectory()) continue;
       const { targets } = findCargoTargets(L.real);
       for (const t of targets) {
         if (!fs.lstatSync(t).isDirectory()) continue;

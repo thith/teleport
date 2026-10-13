@@ -412,18 +412,15 @@ test('E1: untracked file under a TRACKED build-named dir → kept', async () => 
   assert.match(keptReason(r, a), /build\/new\.sh/);
 });
 
-test('E1: a linked worktree that is a top-level folder of the workspace → kept (notable), no E2 either', async () => {
+test('E1: a sibling worktree (~/Projects/<repo>-<topic>, the workspace convention) is judged like any other — merged + clean + idle → removed', async () => {
   const w = world();
   const side = path.join(w.parent, 'repo-side');
   g(w.main, 'worktree', 'add', '-q', '-b', 'side', side);
-  write(path.join(side, 'Cargo.toml'), '[package]');
-  write(path.join(side, 'target', 'x'));
   const head = g(side, 'rev-parse', 'HEAD');
   const r = await run(w, deps({ prs: { side: [{ number: 1, state: 'MERGED', headRefOid: head, headRefName: 'side' }] } }));
-  assert.ok(exists(path.join(side, 'target', 'x')));
   const k = r.kept.find((x) => x.path === side);
-  assert.match(k.reason, /cấp cao nhất/);
-  assert.equal(k.notable, true);
+  assert.ok(!k || !/cấp cao nhất/.test(k.reason), 'no top-level exemption any more');
+  assert.equal(exists(side), false, k ? `kept: ${k.reason}` : 'removed');
 });
 
 test('E1: HEAD re-read differs from `worktree list` → kept', async () => {
