@@ -2,7 +2,7 @@
 // heavy.mjs — run a heavy build under the machine-wide `build` lock (RFC 17),
 // so two agents never build at once and OOM the box.
 //
-//   node ../teleport/scripts/heavy.mjs [--no-stop] [--wait <minutes>] [--shared-target] [--no-ram-wait] -- <command> [args…]
+//   node ../teleport/scripts/heavy.mjs [--no-stop] [--wait <minutes>] [--no-ram-wait] -- <command> [args…]
 //
 // Busy → prints who holds it ("⏳ build đang bận: 🧛 Ma #c2383556 — ./gradlew …")
 // and waits (forever by default; --wait N gives up after N minutes, exit 75,
@@ -20,14 +20,11 @@
 // live holder of record: something the build left behind (adb server, emulator…)
 // inherits the env too, and must not skip the lock after the build is over.
 //
-// RFC 18 C — shared cargo target, OPT-IN only (--shared-target): the command gets
-// CARGO_TARGET_DIR=~/.cache/teleport/cargo-target/<repo>-<hash6>, one dir for every
-// worktree of that repo. NOT the default: worktrees of one repo build path crates
-// with the same name+version → same artifact files, and cargo's mtime fingerprint
-// then links another branch's (older) build — wrong code, even green tests on it
-// (found by 🪱 Giun, 2026-10-13). Serializing builds does not help. Default = each
-// worktree's own target/ (disk is reclaimed by the daily cleanup). --own-target is
-// still accepted (it is the default now).
+// No shared cargo target (RFC 18 C was removed): worktrees of one repo build path
+// crates with the same name+version → same artifact files, and cargo's mtime
+// fingerprint then links another branch's build — wrong code, even green tests on
+// it (found by 🪱 Giun, 2026-10-13). Each worktree keeps its own target/; disk is
+// reclaimed by the daily cleanup. `--own-target` is still accepted (a no-op).
 // RFC 18 F — RAM wait: before queueing for the lock (not while holding it), wait
 // while MemAvailable < TELEPORT_HEAVY_MIN_FREE_MB (default 3 GiB); give up — and
 // build anyway, with a warning — once it has not risen for 2 min, or after 15 min.
@@ -36,25 +33,23 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import crypto from 'node:crypto';
 import { spawn, spawnSync } from 'node:child_process';
 import { acquireLock, describeHolder, readHolder, lockPaths } from './machine-lock.mjs';
 import { isMainModule } from './is-direct-run.mjs';
 
 export const WAIT_TIMEOUT_EXIT = 75;
 export const HELD_ENV = 'TELEPORT_HEAVY_HELD';
-const USAGE = 'usage: heavy.mjs [--no-stop] [--wait <minutes>] [--shared-target] [--no-ram-wait] -- <command> [args…]';
+const USAGE = 'usage: heavy.mjs [--no-stop] [--wait <minutes>] [--no-ram-wait] -- <command> [args…]';
 
-/** argv → { cmd, stop, waitSec, sharedTarget, ramWait } | { error }. Pure. */
+/** argv → { cmd, stop, waitSec, ramWait } | { error }. Pure. */
 export function parseHeavyArgs(argv) {
   const sep = argv.indexOf('--');
   if (sep < 0 || sep === argv.length - 1) return { error: USAGE };
-  let stop = true, waitSec = Infinity, sharedTarget = false, ramWait = true;
+  let stop = true, waitSec = Infinity, ramWait = true;
   const opts = argv.slice(0, sep);
   for (let i = 0; i < opts.length; i++) {
     if (opts[i] === '--no-stop') stop = false;
-    else if (opts[i] === '--own-target') sharedTarget = false; // the default now; kept for old command lines
-    else if (opts[i] === '--shared-target') sharedTarget = true;
+    else if (opts[i] === '--own-target') { /* no-op: each worktree always has its own target/ */ }
     else if (opts[i] === '--no-ram-wait') ramWait = false;
     else if (opts[i] === '--wait') {
       const n = Number(opts[++i]);
@@ -62,50 +57,7 @@ export function parseHeavyArgs(argv) {
       waitSec = n * 60;
     } else return { error: `unexpected: ${opts[i]}\n${USAGE}` };
   }
-  return { cmd: argv.slice(sep + 1), stop, waitSec, sharedTarget, ramWait };
-}
-
-// ── RFC 18 C: shared cargo target dir ──
-
-/** Absolute git common dir of `cwd`, or null (not in a repo / no git). */
-export function gitCommonDir(cwd) {
-  const r = spawnSync('git', ['rev-parse', '--path-format=absolute', '--git-common-dir'], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
-  const out = r.status === 0 ? r.stdout.trim() : '';
-  return out && path.isAbsolute(out) ? out : null;
-}
-
-/** Shared target dir for a git common dir: <home>/.cache/teleport/cargo-target/<repo>-<hash6>. Pure. */
-export function sharedTargetDir(commonDir, home = os.homedir()) {
-  const repo = path.basename(path.dirname(commonDir)) || 'repo';
-  const hash6 = crypto.createHash('sha256').update(commonDir).digest('hex').slice(0, 6);
-  return path.join(home, '.cache', 'teleport', 'cargo-target', `${repo}-${hash6}`);
-}
-
-/** CARGO_TARGET_DIR to set for the child, or null (not --shared-target / inherited / not in git). */
-export function resolveCargoTarget({ env = process.env, sharedTarget = false, cwd = process.cwd(), home = os.homedir(), commonDir = gitCommonDir } = {}) {
-  // HOME="" → os.homedir() is "" → a RELATIVE dir, i.e. one per worktree again: don't.
-  if (!sharedTarget || env.CARGO_TARGET_DIR || !home || !path.isAbsolute(home)) return null;
-  const cd = commonDir(cwd);
-  return cd ? sharedTargetDir(cd, home) : null;
-}
-
-/**
- * Does the command line run a whole-target `cargo clean` (also inside `sh -c "…"`,
- * `cargo +nightly clean`, `cargo -q clean`)? `cargo clean -p <crate>` only drops
- * that crate → false. Pure, heuristic (a warning, not a gate).
- */
-export function hasCargoClean(cmd) {
-  for (const seg of cmd.join(' ').split(/[;&|()]+/)) {
-    const toks = seg.split(/\s+/).filter(Boolean);
-    for (let i = 0; i < toks.length; i++) {
-      if (path.basename(toks[i]) !== 'cargo') continue;
-      let j = i + 1;
-      while (j < toks.length && /^[+-]/.test(toks[j])) j++;
-      if (toks[j] !== 'clean') continue;
-      if (!toks.slice(j + 1).some((t) => /^(-p|--package)(=|$)|^-p./.test(t))) return true;
-    }
-  }
-  return false;
+  return { cmd: argv.slice(sep + 1), stop, waitSec, ramWait };
 }
 
 // ── RFC 18 F: wait for free RAM ──
@@ -195,18 +147,12 @@ export const heldByAncestor = (env, holder = () => readHolder(lockPaths('build')
 export async function main(argv, {
   acquire = acquireLock, run = (cmd, o) => runForwarded(cmd, o), stopGradle = (cmd, o) => runForwarded([cmd[0], '--stop'], o),
   log = (s) => console.error(s), env = process.env, nested = heldByAncestor,
-  cargoTarget = resolveCargoTarget, waitRam = waitForRam,
+  waitRam = waitForRam,
 } = {}) {
   const a = parseHeavyArgs(argv);
   if (a.error) { log(a.error); return 2; }
   const cmdText = a.cmd.join(' ').slice(0, 200);
   const childEnv = { ...env, [HELD_ENV]: String(process.pid) };
-  const target = cargoTarget({ env, sharedTarget: a.sharedTarget });
-  if (target) {
-    childEnv.CARGO_TARGET_DIR = target;
-    log(`ℹ️ CARGO_TARGET_DIR=${target} (dùng chung giữa các worktree — opt-in, có thể link nhầm mã nhánh khác)`);
-  }
-  if (childEnv.CARGO_TARGET_DIR && hasCargoClean(a.cmd)) log(`⚠️ heavy: \`cargo clean\` xoá ${childEnv.CARGO_TARGET_DIR} — cache build DÙNG CHUNG của mọi worktree (vẫn chạy).`);
   const isNested = nested(env);
   if (!isNested && a.ramWait) await waitRam({ minBytes: minFreeBytes(env), log });
   let lock;

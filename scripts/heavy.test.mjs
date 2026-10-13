@@ -1,4 +1,4 @@
-// RFC 18 C (shared cargo target dir) + F (RAM wait) in heavy.mjs.
+// heavy.mjs: arg parsing, never a shared cargo target (RFC 18 C removed), F (RAM wait).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -7,7 +7,7 @@ import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import {
-  parseHeavyArgs, resolveCargoTarget, sharedTargetDir, gitCommonDir, hasCargoClean,
+  parseHeavyArgs,
   waitForRam, minFreeBytes, readMemAvailable, main as heavyMain,
   RAM_POLL_MS, RAM_PLATEAU_MS, RAM_CAP_MS,
 } from './heavy.mjs';
@@ -34,115 +34,28 @@ function repoWithWorktree() {
   return { root, repo, wt };
 }
 
-test('parse: --shared-target is opt-in (default off); --own-target still accepted; --no-ram-wait', () => {
-  assert.deepEqual(parseHeavyArgs(['--', 'a']), { cmd: ['a'], stop: true, waitSec: Infinity, sharedTarget: false, ramWait: true });
-  assert.deepEqual(parseHeavyArgs(['--shared-target', '--no-stop', '--no-ram-wait', '--wait', '1', '--', 'cargo', '--own-target']),
-    { cmd: ['cargo', '--own-target'], stop: false, waitSec: 60, sharedTarget: true, ramWait: false });
-  assert.equal(parseHeavyArgs(['--own-target', '--', 'a']).sharedTarget, false);
+test('parse: --own-target accepted as a no-op; --shared-target no longer exists; --no-ram-wait', () => {
+  assert.deepEqual(parseHeavyArgs(['--', 'a']), { cmd: ['a'], stop: true, waitSec: Infinity, ramWait: true });
+  assert.deepEqual(parseHeavyArgs(['--own-target', '--no-stop', '--no-ram-wait', '--wait', '1', '--', 'cargo', '--shared-target']),
+    { cmd: ['cargo', '--shared-target'], stop: false, waitSec: 60, ramWait: false });
+  assert.match(parseHeavyArgs(['--shared-target', '--', 'a']).error, /unexpected/);
 });
 
-test('C: every worktree (and subdir) of one repo → the same <repo>-<hash6> dir under ~/.cache/teleport/cargo-target', () => {
-  const { repo, wt } = repoWithWorktree();
-  const home = '/h';
-  const a = resolveCargoTarget({ env: {}, sharedTarget: true, cwd: repo, home });
-  const b = resolveCargoTarget({ env: {}, sharedTarget: true, cwd: wt, home });
-  const c = resolveCargoTarget({ env: {}, sharedTarget: true, cwd: path.join(wt, 'sub'), home });
-  assert.match(a, /^\/h\/\.cache\/teleport\/cargo-target\/myrepo-[0-9a-f]{6}$/);
-  assert.equal(b, a);
-  assert.equal(c, a);
-  assert.equal(gitCommonDir(wt), path.join(repo, '.git'));
-  // same basename, different repo → different hash
-  assert.notEqual(sharedTargetDir('/x/myrepo/.git', home), sharedTargetDir('/y/myrepo/.git', home));
-});
-
-test('C: shared target is opt-in; inherited CARGO_TARGET_DIR respected; outside git → unset', () => {
-  const { repo } = repoWithWorktree();
-  assert.equal(resolveCargoTarget({ env: { CARGO_TARGET_DIR: '/mine' }, sharedTarget: true, cwd: repo }), null);
-  assert.equal(resolveCargoTarget({ env: {}, cwd: repo }), null, 'default: no shared target (each worktree builds into its own target/)');
-  // HOME="" / relative → would be a relative (per-worktree) dir → don't set
-  assert.equal(resolveCargoTarget({ env: {}, sharedTarget: true, cwd: repo, home: '' }), null);
-  assert.equal(resolveCargoTarget({ env: {}, sharedTarget: true, cwd: repo, home: 'rel/home' }), null);
-  assert.ok(path.isAbsolute(resolveCargoTarget({ env: {}, sharedTarget: true, cwd: repo, home: '/h' })));
-  const out = tmp('tp-heavy-nogit-');
-  assert.equal(gitCommonDir(out), null, 'tmpdir is not inside a git repo');
-  assert.equal(resolveCargoTarget({ env: {}, sharedTarget: true, cwd: out }), null);
-  assert.equal(resolveCargoTarget({ env: {}, sharedTarget: true, cwd: out, commonDir: () => null }), null);
-});
-
-test('C: main passes CARGO_TARGET_DIR to the command (and gradlew --stop), says so; cargo clean warns but still runs', async () => {
-  const go = async (argv, env = {}, target = '/t/repo-abc123') => {
-    const logs = [], envs = [];
-    const rc = await heavyMain(argv, {
-      env, log: (s) => logs.push(s), nested: () => false, waitRam: async () => {},
-      cargoTarget: ({ env: e, sharedTarget }) => (!sharedTarget || e.CARGO_TARGET_DIR ? null : target),
-      acquire: async () => ({ release() {}, waitedMs: 0 }),
-      run: async (cmd, o) => { envs.push(o.env.CARGO_TARGET_DIR); return 0; },
-      stopGradle: async (cmd, o) => { envs.push(`stop ${o.env.CARGO_TARGET_DIR}`); },
-    });
-    return { rc, logs: logs.join('\n'), envs };
-  };
-  let r = await go(['--shared-target', '--', './gradlew', 'build']);
-  assert.deepEqual(r.envs, ['/t/repo-abc123', 'stop /t/repo-abc123']);
-  assert.match(r.logs, /ℹ️ CARGO_TARGET_DIR=\/t\/repo-abc123 \(dùng chung giữa các worktree — opt-in/);
-  r = await go(['--', 'cargo', 'build']);
-  assert.deepEqual(r.envs, [undefined]);
-  assert.doesNotMatch(r.logs, /CARGO_TARGET_DIR/);
-  r = await go(['--', 'cargo', 'build'], { CARGO_TARGET_DIR: '/mine' });
-  assert.deepEqual(r.envs, ['/mine']);
-  assert.doesNotMatch(r.logs, /ℹ️/);
-  r = await go(['--shared-target', '--', 'cargo', 'clean']);
-  assert.equal(r.rc, 0);
-  assert.deepEqual(r.envs, ['/t/repo-abc123'], 'still runs');
-  assert.match(r.logs, /cargo clean.*DÙNG CHUNG/);
-  r = await go(['--', 'cargo', 'build']);
-  assert.doesNotMatch(r.logs, /cargo clean/);
-});
-
-test('C: hasCargoClean — `cargo [+tc] [-flags] clean` (also inside sh -c), but not `clean -p <crate>`', () => {
-  assert.equal(hasCargoClean(['cargo', 'clean']), true);
-  assert.equal(hasCargoClean(['/home/u/.cargo/bin/cargo', 'clean', '--release']), true);
-  assert.equal(hasCargoClean(['sh', '-c', 'cd a && cargo clean && cargo build']), true);
-  assert.equal(hasCargoClean(['cargo', 'build', 'clean']), false);
-  assert.equal(hasCargoClean(['make', 'clean']), false);
-  assert.equal(hasCargoClean(['cargo-clean']), false);
-  assert.equal(hasCargoClean(['cargo', '+nightly', 'clean']), true);
-  assert.equal(hasCargoClean(['cargo', '-q', 'clean']), true);
-  assert.equal(hasCargoClean(['sh', '-c', 'cargo clean&&x']), true);
-  assert.equal(hasCargoClean(['sh', '-c', '(cargo clean)']), true);
-  // only one crate → not a wipe of the shared cache
-  assert.equal(hasCargoClean(['cargo', 'clean', '-p', 'foo']), false);
-  assert.equal(hasCargoClean(['cargo', 'clean', '--package', 'foo']), false);
-  assert.equal(hasCargoClean(['cargo', 'clean', '--package=foo']), false);
-  assert.equal(hasCargoClean(['cargo', 'clean', '-pfoo']), false);
-  assert.equal(hasCargoClean(['sh', '-c', 'cargo clean -p foo; cargo clean']), true, '-p of another command does not count');
-});
-
-test('C: real process — by default no shared dir; with --shared-target inside a repo the command sees it; outside git never', { skip: spawnSync('git', ['--version']).status !== 0 }, async () => {
+test('real process: heavy never sets CARGO_TARGET_DIR (each worktree builds into its own target/)', async () => {
   const { wt } = repoWithWorktree();
-  const lockDir = tmp('tp-heavy-lock-');
-  const home = tmp('tp-heavy-home-');
-  const runIn = (cwd, flags = ['--shared-target']) => new Promise((resolve) => {
-    const env = { ...process.env, TELEPORT_LOCK_DIR: lockDir, TELEPORT_HEAVY_MIN_FREE_MB: '0', HOME: home, GIT_CEILING_DIRECTORIES: path.dirname(cwd) };
-    delete env.TELEPORT_HEAVY_HELD; delete env.CARGO_TARGET_DIR;
-    const c = spawn(process.execPath, [HEAVY, ...flags, '--', 'sh', '-c', 'echo "T=${CARGO_TARGET_DIR:-none}"'], { cwd, env, stdio: ['ignore', 'pipe', 'pipe'] });
+  const env = { ...process.env, TELEPORT_LOCK_DIR: tmp('tp-heavy-lock-'), TELEPORT_HEAVY_MIN_FREE_MB: '0' };
+  delete env.TELEPORT_HEAVY_HELD; delete env.CARGO_TARGET_DIR;
+  const r = await new Promise((resolve) => {
+    const c = spawn(process.execPath, [HEAVY, '--', 'sh', '-c', 'echo "T=${CARGO_TARGET_DIR:-none}"'], { cwd: wt, env, stdio: ['ignore', 'pipe', 'pipe'] });
     let out = '', err = '';
     c.stdout.on('data', (d) => { out += d; });
     c.stderr.on('data', (d) => { err += d; });
     c.on('close', (code) => resolve({ code, out, err }));
   });
-  const r = await runIn(wt);
   assert.equal(r.code, 0, r.err);
-  assert.match(r.out, new RegExp(`T=${home}/\\.cache/teleport/cargo-target/myrepo-[0-9a-f]{6}`));
-  assert.match(r.err, /ℹ️ CARGO_TARGET_DIR=/);
-  const r0 = await runIn(wt, []);
-  assert.match(r0.out, /T=none/, 'default: own target');
-  assert.doesNotMatch(r0.err, /ℹ️ CARGO_TARGET_DIR/);
-  const r2 = await runIn(fs.realpathSync(tmp('tp-heavy-nogit-')));
-  assert.equal(r2.code, 0, r2.err);
-  assert.match(r2.out, /T=none/);
+  assert.match(r.out, /T=none/);
+  assert.doesNotMatch(r.err, /CARGO_TARGET_DIR/);
 });
-
-// ── F ──
 
 /** Fake clock: sleep advances `now`; readMem plays `seq` (GiB) one value per read, last repeats. */
 function fake(seq) {
@@ -199,7 +112,7 @@ test('F: main waits BEFORE acquiring the lock; skipped when nested or --no-ram-w
   const go = async (argv, { nested = false, env = {} } = {}) => {
     const ev = [];
     await heavyMain(argv, {
-      env, nested: () => nested, log: () => {}, cargoTarget: () => null,
+      env, nested: () => nested, log: () => {},
       waitRam: async ({ minBytes }) => { ev.push(`ram ${minBytes / 1024 / 1024}`); },
       acquire: async () => { ev.push('acquire'); return { release() { ev.push('release'); }, waitedMs: 0 }; },
       run: async () => { ev.push('run'); return 0; },

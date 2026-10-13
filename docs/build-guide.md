@@ -16,11 +16,9 @@ node ../teleport/scripts/heavy.mjs -- cargo nextest run --workspace
 - **Lệnh là `gradlew`:** sau khi xong, wrapper tự chạy `gradlew --stop` để trả vài GB RAM của Gradle daemon. Dùng `--no-stop` nếu sắp build tiếp ngay. Gọi `gradlew` **trực tiếp** (`./gradlew -p android …`), không gọi qua `sh -c "cd … && ./gradlew"`, nếu không sẽ không được nhận ra.
 - Build chết (Ctrl-C, timeout, bị kill) thì lock tự nhả, không bao giờ kẹt.
 
-## `target/` dùng chung và chờ RAM (RFC 18)
+## `target/` và chờ RAM (RFC 18)
 
-- **`target/` riêng mỗi worktree (mặc định):** wrapper không đặt `CARGO_TARGET_DIR`, mỗi worktree build vào `target/` của nó như bình thường. Dùng chung một `target/` giữa các worktree cùng repo là **nguy hiểm**: các worktree có crate cùng tên/phiên bản nên ra cùng file, cargo so theo mtime và có thể link nhầm mã đã build từ nhánh khác, kể cả cho test chạy xanh trên mã sai (🪱 Giun phát hiện, 2026-10-13). Disk được lấy lại nhờ dọn hằng ngày (xoá `target/` bỏ hoang) và `cargo clean` khi xong việc.
-- **`--shared-target` (opt-in):** chỉ dùng khi bạn chắc mọi worktree cùng một mã, ví dụ build lại cùng một nhánh. Wrapper đặt `CARGO_TARGET_DIR=~/.cache/teleport/cargo-target/<repo>-<hash6>` và in một dòng `ℹ️`. Đã tự đặt `CARGO_TARGET_DIR` thì giữ nguyên. `--own-target` vẫn được nhận (giờ là mặc định).
-- **`cargo clean`** khi dùng `--shared-target` sẽ xoá cache dùng chung của **mọi** worktree. Wrapper cảnh báo nhưng vẫn chạy. Chỉ cần dọn một crate thì dùng `cargo clean -p <crate>` (lệnh này không bị cảnh báo).
+- **`target/` riêng mỗi worktree:** wrapper không bao giờ đặt `CARGO_TARGET_DIR`, mỗi worktree build vào `target/` của nó. Dùng chung `target/` giữa các worktree đã bị bỏ: các worktree có crate cùng tên/phiên bản nên cargo có thể link nhầm mã của nhánh khác, kể cả cho test chạy xanh trên mã sai (🪱 Giun phát hiện, 2026-10-13). Disk được lấy lại nhờ dọn hằng ngày (xoá `target/` bỏ hoang) và `cargo clean` khi xong việc. `--own-target` vẫn được nhận (không làm gì).
 - **Chờ RAM:** trước khi xếp hàng lấy lock, nếu `MemAvailable` dưới 3 GiB (đổi bằng `TELEPORT_HEAVY_MIN_FREE_MB`), wrapper chờ và in `⏳ chờ RAM: còn X GiB, cần Y GiB…` tối đa mỗi phút một lần. Nếu RAM không tăng trong 2 phút, hoặc đã chờ 15 phút, wrapper vẫn chạy kèm cảnh báo. `--no-ram-wait` để bỏ bước chờ. Heavy lồng nhau không chờ. `--wait N` chỉ tính thời gian chờ lock, không tính thời gian chờ RAM, nên trường hợp xấu nhất là 15 + N phút.
 
 ## Chờ lâu thì sao
