@@ -24,7 +24,7 @@ Quyền: **admin**. Gửi trong DM với bot, hoặc trong topic nhóm thêm ti�
 
 ## Cách nhanh nhất: dán link
 
-Trong **DM riêng với bot**, dán tin nhắn **chỉ gồm** link PR (một hoặc nhiều, cách nhau bởi dấu cách/xuống dòng). Daemon kiểm tra như `/merge` nhưng chưa merge gì, rồi trả về tóm tắt kèm nút **[✅ Merge] [✖ Huỷ]**. Bấm Merge là merge (mỗi nút chỉ dùng được một lần, hết hạn sau 24 giờ, restart daemon không mất). Merge chỉ merge đúng commit lúc gửi preview: nếu PR có commit mới sau đó thì bị từ chối, gửi lại link / merge-request để xem preview mới. Dán link trong topic nhóm, hoặc tin có kèm chữ khác, thì không có tác dụng.
+Trong **DM riêng với bot**, dán tin nhắn **chỉ gồm** link PR (một hoặc nhiều, cách nhau bởi dấu cách/xuống dòng). Daemon kiểm tra như `/merge` nhưng chưa merge gì, rồi trả về tóm tắt kèm nút **[✅ Merge] [✖ Huỷ]**. Bấm Merge là merge (mỗi nút chỉ dùng được một lần, hết hạn sau 24 giờ, restart daemon không mất). Merge chỉ merge đúng commit và đúng nhánh đích lúc gửi preview (ghi trong dòng 📌): nếu PR có commit mới hoặc bị đổi nhánh đích sau đó thì bị từ chối, gửi lại link / merge-request để xem preview mới. Dán link trong topic nhóm, hoặc tin có kèm chữ khác, thì không có tác dụng.
 
 ## Danh sách tự merge (owner)
 

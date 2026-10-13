@@ -374,3 +374,18 @@ test('mergeOne: --expect-head given but none for THIS PR → refused (every targ
   assert.equal(r.error, true);
   assert.equal(f.calls.some((c) => c[2] === 'PUT'), false);
 });
+
+test('--expect-base: a PR retargeted since the preview is refused; missing base pin for a target → refused', async () => {
+  const sha = 'a'.repeat(40), t = { repo: 'acme/repo', number: 3 };
+  const a = parseMergeArgs(['https://github.com/acme/repo/pull/3', `--expect-head=acme/repo#3=${sha}`, '--expect-base=acme/repo#3=main']);
+  assert.deepEqual(a.expectBases, { 'acme/repo#3': 'main' });
+  const moved = fakeGh({ 3: PR(3, { headRefOid: sha, baseRefName: 'release' }) });
+  const r = await mergeOne(t, ARGS([3], { expectHeads: a.expectHeads, expectBases: a.expectBases }), { gh: moved.gh });
+  assert.match(r.text, /đổi nhánh đích sau khi preview \(main → release\)/);
+  assert.equal(moved.calls.some((c) => c[2] === 'PUT'), false);
+  const other = fakeGh({ 3: PR(3, { headRefOid: sha }) });
+  const r2 = await mergeOne(t, ARGS([3], { expectHeads: a.expectHeads, expectBases: { 'acme/other#3': 'main' } }), { gh: other.gh });
+  assert.equal(r2.error, true);
+  const ok = fakeGh({ 3: PR(3, { headRefOid: sha }) });
+  assert.equal((await mergeOne(t, ARGS([3], { expectHeads: a.expectHeads, expectBases: a.expectBases }), { gh: ok.gh })).ok, true);
+});

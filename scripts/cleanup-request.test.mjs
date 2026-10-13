@@ -738,3 +738,15 @@ test('escapeControls: bidi overrides / zero-width chars are shown escaped', asyn
   assert.equal(escapeControls('notes‮hs.txt'), 'notes\\u202ehs.txt');
   assert.equal(escapeControls('a​b﻿'), 'a\\u200bb\\ufeff');
 });
+
+test('a bare repo whose objects/ is a symlink still counts as a repo (tmp/ kept)', async () => {
+  const w = world();
+  const a = w.add('feat-a');
+  const ext = tmp('tp-objs-');
+  fs.mkdirSync(path.join(a.path, 'tmp', 'private.git'), { recursive: true });
+  write(path.join(a.path, 'tmp', 'private.git', 'HEAD'), 'ref: refs/heads/main\n');
+  fs.symlinkSync(ext, path.join(a.path, 'tmp', 'private.git', 'objects'));
+  const r = await req(w, a.path, deps({ prs: { 'feat-a': merged(a) } }));
+  assert.equal(r.ok, false);
+  assert.match(r.reason, /repo git trong tmp/);
+});

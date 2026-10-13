@@ -743,19 +743,20 @@ test('handlePrLinks: heads read BEFORE the preview are pinned IN the message; Me
     daemonUserId: '1', projectsConfig: OWNER_CFG, registry: MREG, store, scriptsDir: '/s', parentDir: '/w',
     sendText: async () => {}, sendButtons: async (c, t, b) => buttons.push({ t, b }),
     runner: async () => { order.push('preview'); return { stdout: '🔎 ok' }; },
-    fetchHead: async (l) => { order.push(`head:${l}`); return sha; },
+    fetchHead: async (l) => { order.push(`head:${l}`); return { sha, base: 'main' }; },
   });
   assert.deepEqual(order, [`head:${L1}`, 'preview']);
-  assert.ok(buttons[0].t.includes(`📌 ${L1} @ ${sha.slice(0, 12)}`));
+  assert.ok(buttons[0].t.includes(`📌 ${L1} @ ${sha.slice(0, 12)} → main`));
   const [tok, entry] = [...store.entries()][0];
   assert.deepEqual(entry.heads, { [L1]: sha });
   const dispatched = [];
   const ctx = { registry: MREG, fetchHead: () => sha, answerButton: async () => {}, editButtonsMessage: async () => {} };
   const pressed = (data, text) => ({ id: 'q', data, from: { id: 1 }, message: { chat: { id: 1 }, message_id: 5, text } });
   await handleMergeButton(pressed(`mg:${tok}`, buttons[0].t), ctx, { take: (t) => takeMergeButton(t, { store }), dispatch: async (p) => dispatched.push(p) });
-  assert.deepEqual(dispatched, [{ cmd: 'merge', rest: `${L1} --expect-head=thith/teleport#3=${sha}` }]);
-  // a tampered persisted entry (other head / other PR than the message shows) → refused
-  for (const bad of [{ links: [L1], heads: { [L1]: 'c'.repeat(40) } }, { links: ['https://github.com/evil/x/pull/1'], heads: { 'https://github.com/evil/x/pull/1': sha } }, { links: [L1] }]) {
+  assert.deepEqual(dispatched, [{ cmd: 'merge', rest: `${L1} --expect-head=thith/teleport#3=${sha} --expect-base=thith/teleport#3=main` }]);
+  // a tampered persisted entry (other head / base / PR than the message shows, or unpinned) → refused
+  for (const bad of [{ links: [L1], heads: { [L1]: 'c'.repeat(40) }, bases: { [L1]: 'main' } }, { links: [L1], heads: { [L1]: sha }, bases: { [L1]: 'release' } },
+    { links: [L1], heads: { [L1]: sha } }, { links: ['https://github.com/evil/x/pull/1'], heads: { 'https://github.com/evil/x/pull/1': sha } }, { links: [L1] }]) {
     store.set('dddddddddddddddd', { ...bad, createdAt: Date.now(), canMerge: true });
     await handleMergeButton(pressed('mg:dddddddddddddddd', buttons[0].t), ctx, { take: (t) => takeMergeButton(t, { store }), dispatch: async (p) => dispatched.push(p) });
   }

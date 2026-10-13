@@ -52,13 +52,17 @@ export function parsePrUrl(s) {
 export function parseMergeArgs(argv) {
   const targets = [];
   let project = null, method = null, keepBranch = false, force = false, preview = false, close = false, methodConflict = null, skipMerged = false;
-  const expectHeads = {};
+  const expectHeads = {}, expectBases = {};
   argv.forEach((a, idx) => {
     if (targets.error) return;
     // --expect-head=owner/name#N=<sha> (the daemon's Merge button): merge only if
     // the PR's head is still the commit the owner was shown in the preview.
     const eh = a.match(/^--expect-head=([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)#(\d+)=([0-9a-f]{40,64})$/);
     if (eh) { expectHeads[`${eh[1].toLowerCase()}#${Number(eh[2])}`] = eh[3]; return; }
+    // --expect-base=owner/name#N=<branch>: …and still targeting the branch shown.
+    const eb = a.match(/^--expect-base=([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)#(\d+)=([A-Za-z0-9._/-]{1,200})$/);
+    if (eb) { expectBases[`${eb[1].toLowerCase()}#${Number(eb[2])}`] = eb[3]; return; }
+    if (a.startsWith('--expect-base')) { targets.error = `bad ${JSON.stringify(a)} (want --expect-base=owner/name#N=<branch>).`; return; }
     if (a.startsWith('--expect-head')) { targets.error = `bad ${JSON.stringify(a)} (want --expect-head=owner/name#N=<sha>).`; return; }
     if (a === '--preview') { preview = true; return; }
     if (a === '--close') { close = true; return; }
@@ -86,7 +90,7 @@ export function parseMergeArgs(argv) {
     if (seen.has(k)) return { error: `PR ${t.repo ? `${t.repo}` : ''}#${t.number} listed twice.` };
     seen.add(k);
   }
-  return { project, targets, method: method || DEFAULT_MERGE_METHOD, keepBranch, force, ...(preview ? { preview } : {}), ...(close ? { close } : {}), ...(skipMerged ? { skipMerged } : {}), ...(Object.keys(expectHeads).length ? { expectHeads } : {}) };
+  return { project, targets, method: method || DEFAULT_MERGE_METHOD, keepBranch, force, ...(preview ? { preview } : {}), ...(close ? { close } : {}), ...(skipMerged ? { skipMerged } : {}), ...(Object.keys(expectHeads).length ? { expectHeads } : {}), ...(Object.keys(expectBases).length ? { expectBases } : {}) };
 }
 
 const FAILING = new Set(['FAILURE', 'ERROR', 'CANCELLED', 'TIMED_OUT', 'ACTION_REQUIRED', 'STARTUP_FAILURE']);
@@ -218,7 +222,7 @@ const ghError = (e) => String(e?.stderr || e?.message || e).trim().split('\n').s
  * mergeable=UNKNOWN — normal right after a previous merge in the same batch.
  * Returns { ok, text } | { error, text }.
  */
-export async function mergeOne(target, { method, keepBranch, force, preview = false, skipMerged = false, expectHeads = null }, {
+export async function mergeOne(target, { method, keepBranch, force, preview = false, skipMerged = false, expectHeads = null, expectBases = null }, {
   gh, sleep = (ms) => new Promise((r) => setTimeout(r, ms)), unknownTries = 5, unknownWaitMs = 2000,
   mergedHeads = [],
 }) {
@@ -241,6 +245,9 @@ export async function mergeOne(target, { method, keepBranch, force, preview = fa
   const expected = expectHeads?.[`${String(repo || '').toLowerCase()}#${number}`];
   if (expectHeads && !expected) return { error: true, text: `❌ PR ${c.label}${pr.number}: không có commit đã ghim cho PR này — không merge.\n${pr.url}` };
   if (expected && pr.headRefOid !== expected) return { error: true, text: `❌ PR ${c.label}${pr.number} "${pr.title}": có commit mới sau khi preview (${expected.slice(0, 7)} → ${String(pr.headRefOid).slice(0, 7)}) — không merge. Gửi lại link / merge-request để xem preview mới.\n${pr.url}` };
+  const expectedBase = expectBases?.[`${String(repo || '').toLowerCase()}#${number}`];
+  if (expectBases && !expectedBase) return { error: true, text: `❌ PR ${c.label}${pr.number}: không có nhánh đích đã ghim cho PR này — không merge.\n${pr.url}` };
+  if (expectedBase && pr.baseRefName !== expectedBase) return { error: true, text: `❌ PR ${c.label}${pr.number} "${pr.title}": đã đổi nhánh đích sau khi preview (${expectedBase} → ${pr.baseRefName}) — không merge. Gửi lại link / merge-request để xem preview mới.\n${pr.url}` };
   if (skipMerged && pr.state === 'MERGED') return { ok: true, head: null, text: `ℹ️ PR ${c.label}${pr.number} "${pr.title}" was already merged — skipped.\n${pr.url}` };
   // Checks GitHub refused to START (Actions billing) are "not run", like a repo
   // without CI (which the owner allows) — only real failures block.

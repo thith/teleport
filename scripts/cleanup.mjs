@@ -139,10 +139,14 @@ export function scratchHasRepo(root, { maxEntries = WALK_MAX_ENTRIES } = {}) {
   return false;
 }
 
-/** Dirents of one directory → is it (or does it hold) a git repo? `.git`, or a bare repo (HEAD + objects/). Pure. */
+/**
+ * Dirents of one directory → is it (or does it hold) a git repo? `.git`, or a
+ * bare repo: HEAD next to objects or refs — of ANY type (git accepts a symlinked
+ * objects/; erring on "repo" only means keeping / asking). Pure.
+ */
 export function looksLikeRepo(ents) {
-  const names = new Map(ents.map((e) => [e.name, e]));
-  return names.has('.git') || (names.get('HEAD')?.isFile?.() && names.get('objects')?.isDirectory?.()) || false;
+  const names = new Set(ents.map((e) => e.name));
+  return names.has('.git') || (names.has('HEAD') && (names.has('objects') || names.has('refs')));
 }
 
 /**

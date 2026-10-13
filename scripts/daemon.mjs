@@ -469,20 +469,23 @@ export function takeMergeButton(tok, { now = Date.now(), store = pendingMergeBut
   return e;
 }
 
-/** `gh pr view` → the PR's head commit sha (or throws). */
+/** `gh pr view` → { sha, base }: the PR's head commit and target branch (or throws). */
 export async function defaultFetchHead(link, { runner = execFileP, env = process.env } = {}) {
   const m = String(link).match(/^https:\/\/github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)$/);
   if (!m) throw new Error('not a canonical PR link');
-  const { stdout } = await runner('gh', ['pr', 'view', m[2], '-R', m[1], '--json', 'headRefOid', '-q', '.headRefOid'], { env, timeout: 60_000 });
-  const sha = String(stdout).trim();
+  const { stdout } = await runner('gh', ['pr', 'view', m[2], '-R', m[1], '--json', 'headRefOid,baseRefName'], { env, timeout: 60_000 });
+  const j = JSON.parse(String(stdout));
+  const sha = String(j.headRefOid || ''), base = String(j.baseRefName || '');
   if (!/^[0-9a-f]{40,64}$/.test(sha)) throw new Error('bad sha');
-  return sha;
+  if (!BASE_REF_RE.test(base)) throw new Error('unsupported base branch name');
+  return { sha, base };
 }
 
 /** heads { link: sha } → '\n📌 <link> @ <sha12>' lines (shown in the button message). Pure. */
-export function pinLines(heads) {
-  return Object.entries(heads || {}).map(([l, sha]) => `\n📌 ${l} @ ${String(sha).slice(0, 12)}`).join('');
+export function pinLines(heads, bases = {}) {
+  return Object.entries(heads || {}).map(([l, sha]) => `\n${pinLine(l, sha, bases?.[l])}`).join('');
 }
+const pinLine = (l, sha, base) => `📌 ${l} @ ${String(sha).slice(0, 12)}${base ? ` → ${base}` : ''}`;
 
 /**
  * Does the pressed message show exactly what this entry would act on? Every link
@@ -491,20 +494,23 @@ export function pinLines(heads) {
  */
 export function entryMatchesMessage(entry, text) {
   const t = String(text || '');
-  const heads = entry.heads || {};
+  const heads = entry.heads || {}, bases = entry.bases || {};
   const lines = t.split('\n');
   // Whole lines / whole links: `…/pull/3` must not match a message showing `…/pull/36`.
   return (entry.links || []).length > 0 && entry.links.every((l) => (heads[l]
-    ? lines.includes(`📌 ${l} @ ${String(heads[l]).slice(0, 12)}`)
+    ? lines.includes(pinLine(l, heads[l], bases[l]))
     : new RegExp(`(^|\\s)${l.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(\\s|$)`, 'm').test(t)));
 }
 
 /** heads { link: sha } → ' --expect-head=owner/name#N=sha …' (canonical links only). Pure. */
-export function expectHeadArgs(heads) {
+export const BASE_REF_RE = /^[A-Za-z0-9._/-]{1,200}$/;
+export function expectHeadArgs(heads, bases = {}) {
   let out = '';
   for (const [link, sha] of Object.entries(heads || {})) {
     const m = String(link).match(/^https:\/\/github\.com\/([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\/pull\/(\d+)$/);
-    if (m && /^[0-9a-f]{40,64}$/.test(String(sha))) out += ` --expect-head=${m[1]}#${m[2]}=${sha}`;
+    if (!m || !/^[0-9a-f]{40,64}$/.test(String(sha))) continue;
+    out += ` --expect-head=${m[1]}#${m[2]}=${sha}`;
+    if (BASE_REF_RE.test(String(bases?.[link] || ''))) out += ` --expect-base=${m[1]}#${m[2]}=${bases[link]}`;
   }
   return out;
 }
@@ -549,14 +555,17 @@ export async function handlePrLinks(links, msg, {
   // exactly these (merge.mjs --expect-head), so a push after the preview — even
   // hours later — is refused instead of merged unseen.
   // (main() passes fetchHead; without it — tests, older callers — nothing is pinned.)
-  const heads = {};
+  const heads = {}, bases = {};
   if (fetchHead) {
     for (const l of links) {
       const h = await Promise.resolve().then(() => fetchHead(l)).catch(() => null);
-      if (h) heads[l] = h;
+      // { sha, base } (a bare sha string from older callers / tests = no base pin)
+      const sha = typeof h === 'string' ? h : h?.sha;
+      if (sha) heads[l] = sha;
+      if (h?.base) bases[l] = h.base;
     }
     // No pin → no button: an unpinned Merge could merge a later push unseen.
-    const missing = links.filter((l) => !heads[l]);
+    const missing = links.filter((l) => !heads[l] || !bases[l]);
     if (missing.length) {
       const why = `⚠️ Không đọc được commit của ${missing.join(', ')} (gh lỗi) — không gửi nút. Thử lại sau.`;
       await sendText(msg.chat.id, header ? `${header}\n\n${why}` : why);
@@ -573,7 +582,7 @@ export async function handlePrLinks(links, msg, {
     return { offered: false };
   }
   const tok = crypto.randomBytes(8).toString('hex');
-  store.set(tok, { links, chatId: msg.chat.id, createdAt: Date.now(), canMerge, heads, ...(requester ? { requester } : {}) });
+  store.set(tok, { links, chatId: msg.chat.id, createdAt: Date.now(), canMerge, heads, bases, ...(requester ? { requester } : {}) });
   // Keep the button message well under Telegram's 4096 chars (status edits are
   // appended later): a long batch preview goes out first as its own message.
   const what = links.length > 1 ? `these ${links.length} PRs (in order)` : 'this PR';
@@ -581,7 +590,7 @@ export async function handlePrLinks(links, msg, {
   const head = header ? `${header}\n\n` : '';
   // The pinned commits are part of the button message itself: a press is only
   // honoured if what it would act on is written in the message the owner saw.
-  const pins = pinLines(heads);
+  const pins = pinLines(heads, bases);
   let body = `${head}${out}${pins}\n\n${ask}`;
   if (body.length > PREVIEW_INLINE_MAX) { await sendText(msg.chat.id, out); body = `${head}🔎 ${links.length} PR(s) ready — details above.${pins}\n\n${ask}`; }
   await sendButtons(msg.chat.id, body,
@@ -618,9 +627,11 @@ export async function handleMergeButton(cq, ctx, { take = takeMergeButton, dispa
   // that doesn't match the message the owner saw, is refused.
   // Every pin must be a FULL sha (a shortened one would be dropped from
   // --expect-head and the merge would go unpinned).
+  const pinArgs = expectHeadArgs(entry.heads, entry.bases);
   const unpinned = m[1] === 'mg' && (ctx.fetchHead || Object.keys(entry.heads || {}).length)
     && (entry.links.some((l) => !/^[0-9a-f]{40,64}$/.test(String(entry.heads?.[l] || '')))
-      || (expectHeadArgs(entry.heads).match(/--expect-head=/g) || []).length !== entry.links.length); // every link must yield a pin
+      || (pinArgs.match(/--expect-head=/g) || []).length !== entry.links.length // every link must yield a pin
+      || (ctx.fetchHead && (pinArgs.match(/--expect-base=/g) || []).length !== entry.links.length)); // …and its target branch
   if (unpinned || !entryMatchesMessage(entry, original)) {
     await ctx.answerButton(cq.id, 'Nút không khớp nội dung — dán lại link.');
     await ctx.editButtonsMessage(chatId, messageId, `${original}\n\n⚠️ Nút không khớp nội dung tin nhắn — không làm gì. Dán lại link / gửi lại merge-request.`);
@@ -645,7 +656,7 @@ export async function handleMergeButton(cq, ctx, { take = takeMergeButton, dispa
       await deliver({ convoId: entry.requester.convoId, text: t, mode: 'ask' }).catch(() => {});
     }
     : ctx.sendText;
-  await dispatch({ cmd: 'merge', rest: entry.links.join(' ') + (closing ? ' --close' : expectHeadArgs(entry.heads)) }, cq.from || {}, { ...ctx, registry, sendText });
+  await dispatch({ cmd: 'merge', rest: entry.links.join(' ') + (closing ? ' --close' : pinArgs) }, cq.from || {}, { ...ctx, registry, sendText });
 }
 
 // ── Agent merge requests (file inbox; see merge-request.mjs / merge-inbox.mjs) ─
