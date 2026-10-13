@@ -887,6 +887,9 @@ export function buildPromptSegment(msg, updateId = null, botId = null, roles = n
   const replyTo = realReplyTo(msg);
   return {
     messageId: msg.message_id,
+    // Message ids are per-chat; the chat makes a segment's identity unique
+    // (idempotent merge/spool — see promptSegmentKeys).
+    chatId: msg.chat?.id != null ? String(msg.chat.id) : null,
     edited: msg.edit_date != null,
     editedAt: msg.edit_date ?? null,
     fromUserId: String(msg.from?.id ?? msg.chat?.id),
@@ -1869,6 +1872,10 @@ export async function refreshRegistry({
   filter,
   offsetFile,
   convoId = null,
+  // true = a persistent --loop listener; false = a one-shot run (the bare
+  // pre-critical-action drain, a --wait-once child, the legacy `until` loop).
+  // null = unknown (legacy caller) — treated like a --loop row by peers.
+  loop = null,
   file = REGISTRY_FILE,
   lockFile = REGISTRY_LOCK_FILE,
   now = Date.now(),
@@ -1882,7 +1889,10 @@ export async function refreshRegistry({
     // this cycle, which means *being detected as a superseder* by older
     // peers is delayed by one poll. Acceptable: the next 12s poll retries.
     console.error('[tele-listen] could not acquire registry lock; will retry next poll');
-    return readRegistry(file);
+    // Same liveness filter as the locked path: a dead peer's row (e.g. a
+    // finished drain) must never make us stand down. My own row is kept so
+    // findSuperseder can locate it.
+    return readRegistry(file).filter((e) => e.pid === pid || isLiveEntry(e));
   }
   try {
     const all = readRegistry(file);
@@ -1893,6 +1903,7 @@ export async function refreshRegistry({
       filter: filter instanceof Set ? Array.from(filter) : filter,
       offsetFile,
       convoId,
+      loop: loop == null ? null : Boolean(loop),
       startedAt: existing && Number.isFinite(existing.startedAt) ? existing.startedAt : now,
       // If a transient `ps` failure returned null, keep the prior valid startTime
       // rather than downgrade liveness checks to fallback mode next round.
@@ -1945,16 +1956,44 @@ export function compareSameConvo(a, b) {
   return b.pid - a.pid; // lower pid wins on tie
 }
 
-export function findSuperseder({ myPid, myFilter, myConvoId = null, registry }) {
+// A one-shot run (row `loop === false`: the bare pre-critical-action drain, a
+// --wait-once child, the legacy `until` loop) must NEVER make a persistent
+// --loop listener stand down. The drain's parent bash is brand-new, so its row
+// always carries the NEWEST startedAt; without this rule a drain racing a
+// --loop poll would win newer-wins, the --loop listener would exit 3 and its
+// `while` wrapper would break — the agent goes deaf. Rows with no `loop` field
+// (written by older code) are treated as --loop rows, i.e. today's behaviour.
+// --loop vs --loop and one-shot vs anything are unchanged (newer wins).
+//
+// But the --loop listener must not simply run ALONGSIDE a live one-shot either:
+// both read the same convo-<N>-offset.txt, so both would write the same updates
+// → duplicate prompt content. So a NEWER live one-shot row on my convo makes a
+// --loop listener YIELD this poll — `{ __inconclusive, reason: 'yield-to-one-shot' }`
+// → main() exits 2 silently, offset NOT advanced; the next poll (after the
+// sub-second drain has exited and its row is dead) proceeds normally. Never
+// exit 3: yielding re-arms, standing down would leave the agent deaf.
+export const YIELD_TO_ONE_SHOT = 'yield-to-one-shot';
+export function ignoredAsSuperseder(peer, myLoop) {
+  return myLoop === true && peer?.loop === false;
+}
+
+export function findSuperseder({ myPid, myFilter, myConvoId = null, myLoop = null, registry }) {
   // Locate my own registry row up front. If it's missing (read-only-fallback
   // path or eviction), treat the supersede check as inconclusive — return a
   // sentinel that the caller interprets as "retry next poll".
   const mineEntry = registry.find((x) => x.pid === myPid);
+  let yieldTo = null;
   for (const e of registry) {
     if (e.pid === myPid) continue;
     // Cross-mode never supersedes (convo vs legacy).
     const eConvo = e.convoId ?? null;
     if ((myConvoId == null) !== (eConvo == null)) continue;
+    if (ignoredAsSuperseder(e, myLoop)) {
+      // Newer one-shot on my convo → yield this poll (see YIELD_TO_ONE_SHOT).
+      // `registry` comes from refreshRegistry, already liveness-filtered.
+      if (myConvoId != null && eConvo === myConvoId && mineEntry && compareSameConvo(e, mineEntry) > 0) yieldTo = e;
+      continue;
+    }
     if (myConvoId != null) {
       // Same-mode convo: peer with same convoId wins by (startedAt, pid).
       if (eConvo !== myConvoId) continue;
@@ -1964,6 +2003,30 @@ export function findSuperseder({ myPid, myFilter, myConvoId = null, registry }) 
     }
     if (isStrictSuperset(e.filter, myFilter)) return e;
   }
+  // A real superseder (returned above) takes precedence over a yield.
+  if (yieldTo) return { __inconclusive: true, reason: YIELD_TO_ONE_SHOT, pid: yieldTo.pid };
+  return null;
+}
+
+// Pre-write race guard (see main): re-read the registry right before writing
+// the prompt and return the same-convo peer that beats us, or
+// `{ __inconclusive }` if my row is gone, or null. Dead rows are ignored (same
+// isLiveEntry filter refreshRegistry applies) — a finished drain's row must not
+// make a live --loop listener stand down — and a newer LIVE one-shot row makes
+// a --loop listener yield this poll (inconclusive → exit 2), never stand down.
+export function findPreWriteWinner({ myPid, myConvoId, myLoop = null, registry, isLive = isLiveEntry }) {
+  const mineEntry = registry.find((e) => e.pid === myPid);
+  if (!mineEntry) return { __inconclusive: true, reason: 'my-entry-missing' };
+  let yieldTo = null;
+  for (const e of registry) {
+    if (e.pid === myPid) continue;
+    if ((e.convoId ?? null) !== myConvoId) continue;
+    if (compareSameConvo(e, mineEntry) <= 0) continue;
+    if (!isLive(e)) continue;
+    if (ignoredAsSuperseder(e, myLoop)) { yieldTo = yieldTo ?? e; continue; } // newer live one-shot → yield, never stand down
+    return e;
+  }
+  if (yieldTo) return { __inconclusive: true, reason: YIELD_TO_ONE_SHOT, pid: yieldTo.pid };
   return null;
 }
 
@@ -2008,8 +2071,78 @@ export const PROCESSING_TTL_MS = 30 * 60 * 1000;
 // (incoming wins on conflict) so every kind present in the batch stays visible.
 const KIND_FLAGS = ['whisper', 'instruct', 'broadcast', 'ask', 'askReply', 'handover', 'handoverAck'];
 
+// ── Idempotent merge/spool (per Telegram message) ─────────────────────────────
+// Residual race: a --loop listener can pass its pre-write check, then a one-shot
+// drain (reading the same convo offset) writes the same updates first; the
+// listener then appends its already-prepared batch → the same message twice. So
+// merge/spool drops incoming segments already present in the target. Identity =
+// (chatId, messageId, editedAt): an EDIT of a pending message is a new version
+// and is kept. Segments with no messageId (ask/handover/steer synthetic prompts)
+// or no known chat are never deduped.
+function segmentKey(seg, fallbackChatId) {
+  if (!seg || seg.messageId == null) return null;
+  const chat = seg.chatId ?? fallbackChatId;
+  if (chat == null) return null;
+  return `${chat}:${seg.messageId}:${seg.editedAt ?? ''}`;
+}
+
+/** Set of message keys a prompt already carries (empty for null/synthetic). */
+export function promptSegmentKeys(data) {
+  const keys = new Set();
+  if (!data) return keys;
+  const segs = promptSegments(data);
+  // A segment without its own chatId: the top-level chatId is only trustworthy
+  // when the prompt is a single message.
+  const fallback = segs.length === 1 ? (data.chatId ?? null) : null;
+  for (const seg of segs) {
+    const k = segmentKey(seg, fallback);
+    if (k) keys.add(k);
+  }
+  return keys;
+}
+
+/**
+ * Drop `data`'s segments whose key is in `presentKeys`. Returns `data` unchanged
+ * (same object) when nothing is dropped, null when EVERYTHING is a duplicate,
+ * else a copy rebuilt from the remaining segments (text re-rendered, top-level
+ * metadata from the newest remaining segment). Pure.
+ */
+export function dropPresentSegments(data, presentKeys) {
+  if (!data || !presentKeys || presentKeys.size === 0) return data;
+  const segs = promptSegments(data);
+  const fallback = segs.length === 1 ? (data.chatId ?? null) : null;
+  const keep = segs.filter((seg) => { const k = segmentKey(seg, fallback); return !k || !presentKeys.has(k); });
+  if (keep.length === segs.length) return data;
+  if (keep.length === 0) return null;
+  const last = keep[keep.length - 1];
+  const out = {
+    ...data,
+    messages: keep,
+    text: keep.length === 1 ? (keep[0].text ?? '') : keep.map((seg) => `${attributionLabelFromData(seg)}: ${seg.text ?? ''}`).join('\n\n'),
+    textAttributed: keep.length > 1,
+    attachments: keep.flatMap((seg) => seg.attachments ?? []),
+    edited: keep.some((seg) => seg.edited),
+    editedAt: keep.reduce((acc, seg) => (seg.editedAt != null && (acc == null || seg.editedAt > acc) ? seg.editedAt : acc), null),
+  };
+  for (const k of ['messageId', 'fromUserId', 'fromName', 'fromRole', 'replyToMessageId', 'replyToText', 'quotedText', 'timestamp']) {
+    out[k] = last[k] ?? null;
+  }
+  out.chatId = last.chatId ?? null;
+  // `fromMember` is batch-level (the newest sender's member record, a pure
+  // function of that user id) and segments don't carry it. Keep it only if the
+  // newest KEPT segment has the same sender; otherwise null — never let a
+  // dropped segment's member record leak onto a different sender.
+  out.fromMember = (last.fromUserId != null && String(last.fromUserId) === String(data.fromUserId ?? ''))
+    ? (data.fromMember ?? null)
+    : null;
+  return out;
+}
+
 export function mergePromptData(existing, incoming) {
   if (!existing) return incoming;
+  if (!incoming) return existing;
+  // Idempotent: a message already in `existing` is not appended a second time.
+  incoming = dropPresentSegments(incoming, promptSegmentKeys(existing));
   if (!incoming) return existing;
   const seg = (d) => (d.textAttributed === false
     ? `${attributionLabelFromData(d)}: ${d.text ?? ''}`
@@ -2334,14 +2467,30 @@ export function claimPreexistingPrompt(promptFile, processingFile, writeLockFile
 // exhaustion we THROW (the durable write must complete before a sender reports
 // "queued"); the hold is microseconds (no network) so exhaustion is effectively
 // impossible. `writeLockFile` may be null for callers that don't need cross-process
-// serialization (e.g. unit tests). Returns 'merged' | 'spooled'.
-export async function mergeOrSpoolPrompt(promptFile, data, writeLockFile = null) {
+// serialization (e.g. unit tests). Returns 'merged' | 'spooled' | 'duplicate'.
+//
+// Idempotent per Telegram message (see promptSegmentKeys): segments already in the
+// claimed `.processing` batch (if readable) are dropped first, and mergePromptData
+// drops those already in the open prompt. Everything already present → nothing is
+// written ('duplicate'; the open prompt, if any, is left as it was).
+export async function mergeOrSpoolPrompt(promptFile, data, writeLockFile = null, processingFile = promptFile.replace(/\.json$/, '.processing.json')) {
   const acquired = writeLockFile ? await acquireLockWithRetry(writeLockFile) : true;
   if (!acquired) {
     throw new Error(`mergeOrSpoolPrompt: could not acquire ${path.basename(writeLockFile)} — prompt NOT written (do not report queued)`);
   }
   let takenFile = null;
   try {
+    let claimed = null;
+    if (processingFile && processingFile !== promptFile) {
+      try { claimed = JSON.parse(fs.readFileSync(processingFile, 'utf8')); } catch { /* none / unreadable → no dedupe against it */ }
+    }
+    data = dropPresentSegments(data, promptSegmentKeys(claimed));
+    if (!data) return 'duplicate';
+    if (fs.existsSync(promptFile)) {
+      let open = null;
+      try { open = JSON.parse(fs.readFileSync(promptFile, 'utf8')); } catch { /* torn → let the merge path handle it */ }
+      if (open && dropPresentSegments(data, promptSegmentKeys(open)) === null) return 'duplicate';
+    }
     const t = `${promptFile}.appending.${process.pid}`;
     let existing = null;
     try { fs.renameSync(promptFile, t); takenFile = t; } catch { /* no open prompt → spool fresh */ }
@@ -2646,10 +2795,10 @@ async function main() {
     console.error('[tele-listen] refusing to run with reparented PPID ≤ 1 (init/launchd) — Monitor wrapper appears dead');
     process.exit(1);
   }
-  const registry = await refreshRegistry({ pid: myMonitorPid, filter: filterReplyTo, offsetFile, convoId: convo });
-  const superseder = findSuperseder({ myPid: myMonitorPid, myFilter: filterReplyTo, myConvoId: convo, registry });
+  const registry = await refreshRegistry({ pid: myMonitorPid, filter: filterReplyTo, offsetFile, convoId: convo, loop });
+  const superseder = findSuperseder({ myPid: myMonitorPid, myFilter: filterReplyTo, myConvoId: convo, myLoop: loop, registry });
   if (superseder && superseder.__inconclusive) {
-    process.exit(2); // supersede check inconclusive — retry next poll (silent; exit code is the signal)
+    process.exit(2); // inconclusive (my row missing) or yielding to a live one-shot drain — retry next poll, offset not advanced (silent)
   }
   if (superseder) {
     console.log(
@@ -2991,18 +3140,13 @@ async function main() {
   // prompt-convo-<N>.json path, and the second writer's rename clobbers the
   // first — one prompt silently lost).
   if (convo != null) {
-    const fresh = readRegistry();
-    const mineEntry = fresh.find((e) => e.pid === myMonitorPid);
-    if (!mineEntry) {
-      process.exit(2); // registry row missing pre-write — defer to next poll (silent)
+    const winner = findPreWriteWinner({ myPid: myMonitorPid, myConvoId: convo, myLoop: loop, registry: readRegistry() });
+    if (winner && winner.__inconclusive) {
+      process.exit(2); // my row missing, or a live one-shot drain is newer (yield) — defer to next poll, offset not advanced (silent)
     }
-    for (const e of fresh) {
-      if (e.pid === myMonitorPid) continue;
-      if ((e.convoId ?? null) !== convo) continue;
-      if (compareSameConvo(e, mineEntry) > 0) {
-        console.log(`[tele-listen] same-convo peer pid=${e.pid} won pre-write race — exiting`);
-        process.exit(loop ? 3 : 0); // --loop: stand down (3); legacy: end until-loop (0)
-      }
+    if (winner) {
+      console.log(`[tele-listen] same-convo peer pid=${winner.pid} won pre-write race — exiting`);
+      process.exit(loop ? 3 : 0); // --loop: stand down (3); legacy: end until-loop (0)
     }
   }
   // P3 (--append): coalesce into the OPEN (unclaimed) prompt rather than clobber
