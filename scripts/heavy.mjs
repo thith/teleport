@@ -184,7 +184,11 @@ export function stopScope(unit, { run = spawnSync, populated = cgroupPopulated, 
     run('systemctl', ['--user', 'kill', '-s', 'KILL', unit], { encoding: 'utf8', timeout: 10_000 });
     sleep(500);
   }
-  return false;
+  // One last look: the final KILL may have emptied it.
+  const sh = run('systemctl', ['--user', 'show', '-p', 'ControlGroup', '--value', unit], { encoding: 'utf8', timeout: 10_000 });
+  if (sh.error || sh.status !== 0) return false;
+  const cg = String(sh.stdout || '').trim();
+  return !cg || !populated(cg);
 }
 
 /**
@@ -211,17 +215,35 @@ export function appSliceOomKills({ uid = process.getuid?.() ?? 0, read = (f) => 
   try { const m = /^oom_kill (\d+)/m.exec(read(`/sys/fs/cgroup/user.slice/user-${uid}.slice/user@${uid}.service/app.slice/memory.events`)); return m ? Number(m[1]) : null; } catch { return null; }
 }
 
-/** Does this Cargo TOML set build.jobs? `jobs` under [build], `build.jobs = …`, `build = { jobs = … }`; comments ignored. Pure. */
+/** A TOML line without its comment (a `#` inside a "…" / '…' string is kept). Pure. */
+function stripTomlComment(line) {
+  let q = null;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (q) { if (c === '\\' && q === '"') i++; else if (c === q) q = null; }
+    else if (c === '"' || c === "'") q = c;
+    else if (c === '#') return line.slice(0, i);
+  }
+  return line;
+}
+/** `"build" . 'jobs'` → `build.jobs` (quotes and spaces around a key path removed). Pure. */
+const normKey = (k) => k.replace(/["'\s]/g, '');
+
+/** Does this Cargo TOML set build.jobs? `jobs` under [build], `build.jobs = …`, `build = { jobs = … }`; comments / quoted keys handled. Pure. */
 export function tomlHasBuildJobs(text) {
   let table = '';
   for (const raw of String(text).split('\n')) {
-    const line = raw.replace(/\r$/, '').replace(/#.*$/, '').trim(); // (no `#` inside our keys/values of interest)
+    const line = stripTomlComment(raw.replace(/\r$/, '')).trim();
     if (!line) continue;
-    const h = /^\[\s*([^\]]+?)\s*\]$/.exec(line);
-    if (h) { table = h[1]; continue; }
-    if (table === 'build' && /^jobs\s*=/.test(line)) return true;
-    if (table === '' && /^build\.jobs\s*=/.test(line)) return true;
-    if (table === '' && /^build\s*=\s*\{[^}]*\bjobs\s*=/.test(line)) return true;
+    const h = /^\[([^\[\]]+)\]$/.exec(line);
+    if (h) { table = normKey(h[1]); continue; }
+    const eq = line.indexOf('=');
+    if (eq < 0) continue;
+    const key = normKey(line.slice(0, eq));
+    const val = line.slice(eq + 1).trim();
+    if (table === 'build' && key === 'jobs') return true;
+    if (table === '' && key === 'build.jobs') return true;
+    if (table === '' && key === 'build' && val.startsWith('{') && /[{,]\s*["']?jobs["']?\s*=/.test(val)) return true;
   }
   return false;
 }

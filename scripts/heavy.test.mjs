@@ -398,3 +398,16 @@ test('PR39 review: tomlHasBuildJobs — CRLF and a header with a trailing commen
   const { tomlHasBuildJobs } = await import('./heavy.mjs');
   assert.equal(tomlHasBuildJobs('[build] # cargo\r\njobs = 2\r\n'), true);
 });
+
+test('PR39 codex: build.jobs with quoted keys, spaced dotted keys, # inside strings', async () => {
+  const { tomlHasBuildJobs } = await import('./heavy.mjs');
+  for (const t of ['[build]\n"jobs" = 1', 'build . jobs = 1', 'build = { target-dir = "a#b", jobs = 1 }', '["build"]\njobs = 1', "build.'jobs' = 2"]) assert.equal(tomlHasBuildJobs(t), true, t);
+  for (const t of ['[build]\ntarget-dir = "x" # jobs = 2', 'build = { target-dir = "jobs = 3" }', '[build.env]\njobs = 1']) assert.equal(tomlHasBuildJobs(t), false, t);
+});
+
+test('PR39 codex: stopScope re-checks after the LAST kill', () => {
+  let k = 0;
+  const pops = [true, true, true, true, false];
+  const run = (b, a) => (a[1] === 'show' ? { status: 0, stdout: '/u/x.scope\n' } : { status: 0 });
+  assert.equal(stopScope('heavy-1-a.scope', { run, populated: () => pops[Math.min(k++, pops.length - 1)], sleep: () => {} }), true);
+});
