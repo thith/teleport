@@ -330,7 +330,7 @@ node ../teleport/scripts/send-telegram.mjs --dm --file <path> "<caption>"
 ## Merge PR và dọn worktree — tự làm, bị chặn thì xin daemon
 
 **Merge PR**
-1. Chỉ tự merge (git/gh) khi người dùng yêu cầu rõ (ở terminal hoặc qua Telegram).
+1. Chỉ tự merge (git/gh) khi người dùng yêu cầu rõ (ở terminal hoặc qua Telegram). **Tự merge xong thì dọn worktree của PR đó ngay** theo mục "Dọn worktree" bên dưới: không ai nhắc bạn (lời nhắc tự động chỉ có khi merge qua merge-request).
 2. PR đã xong mà không được bảo tự merge, hoặc tự merge bị chặn (hook, thiếu quyền): dùng `merge-request.mjs <PR URL>`.
 
 ```bash

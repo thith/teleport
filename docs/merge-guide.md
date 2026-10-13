@@ -44,7 +44,7 @@ Cũng có thể khai báo cố định trong `projects.json` → `_config.autoMe
 > Phần này viết cho **agent** (Claude/Codex/Gemini đang làm trong một project). Owner không phải đọc.
 
 **Khi nào gọi:**
-1. Chỉ tự merge (git/gh) khi người dùng yêu cầu rõ (ở terminal hoặc qua Telegram).
+1. Chỉ tự merge (git/gh) khi người dùng yêu cầu rõ (ở terminal hoặc qua Telegram). Tự merge xong thì dọn worktree của PR đó ngay (xem phần cleanup-request bên dưới): không có lời nhắc tự động như khi merge qua merge-request.
 2. PR đã xong mà không được bảo tự merge, hoặc tự merge bị chặn (hook, thiếu quyền): dùng `merge-request.mjs <PR URL>`.
 
 "Đã xong" nghĩa là đã tự review/test theo process của repo và bạn muốn nó vào nhánh chính.
