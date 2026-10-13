@@ -142,7 +142,7 @@ test('heavy args + gradlew --stop policy (after success AND failure, not with --
   assert.match(parseHeavyArgs(['--']).error, /usage/);
   assert.match(parseHeavyArgs(['--wait', 'x', '--', 'a']).error, /minutes/);
   assert.match(parseHeavyArgs(['--bogus', '--', 'a']).error, /unexpected/);
-  assert.deepEqual(parseHeavyArgs(['--no-stop', '--wait', '2', '--', 'a', '--b']), { cmd: ['a', '--b'], stop: false, waitSec: 120, ownTarget: false, ramWait: true });
+  assert.deepEqual(parseHeavyArgs(['--no-stop', '--wait', '2', '--', 'a', '--b']), { cmd: ['a', '--b'], stop: false, waitSec: 120, sharedTarget: false, ramWait: true });
   assert.equal(isGradlew(['./gradlew', 'build']), true);
   assert.equal(isGradlew(['/x/android/gradlew']), true);
   assert.equal(isGradlew(['cargo', 'build']), false);
