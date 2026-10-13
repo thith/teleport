@@ -688,3 +688,26 @@ test('cleanupEntryMatchesMessage: whole fields only (no prefix / substring match
     assert.equal(cleanupEntryMatchesMessage({ ...e, ...bad }, t), false, JSON.stringify(bad));
   }
 });
+
+test('non-UTF-8 names: a repo under tmp/<bad-name>/ keeps tmp/; a bad-name stray entry gets no button', async () => {
+  const { scratchHasRepo, strayFingerprint: fpr } = await import('./cleanup.mjs');
+  const root = tmp();
+  const bad = Buffer.concat([Buffer.from(path.join(root, 'tmp') + '/x'), Buffer.from([0xe9])]);
+  fs.mkdirSync(Buffer.concat([bad, Buffer.from('/clone/.git')]), { recursive: true });
+  assert.equal(scratchHasRepo(root), true);
+  assert.equal(fpr(root, ['caf�/']), null);
+  fs.mkdirSync(path.join(root, 'ok'), { recursive: true });
+  fs.writeFileSync(Buffer.concat([Buffer.from(path.join(root, 'ok') + '/f'), Buffer.from([0xe9])]), 'x');
+  assert.equal(fpr(root, ['ok/']), null, 'a bad name inside a shown dir → no fingerprint');
+  assert.equal(fpr(root, ['missing.txt']), null, 'reported by git but not visible → no fingerprint');
+});
+
+test('allowStray must equal the stray set: a bogus extra entry → refused', async () => {
+  const w = world();
+  const a = w.add('feat-a');
+  write(path.join(a.path, 'notes.txt'));
+  const d = deps({ prs: { 'feat-a': merged(a) } });
+  const r = await cleanupRequested(a.path, { parentDir: w.parent, deps: d, allowStray: ['notes.txt', 'README.md'], dryRun: true });
+  assert.equal(r.ok, false);
+  assert.match(r.reason, /không còn khớp/);
+});

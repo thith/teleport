@@ -122,17 +122,18 @@ export function strayEntries({ untracked, ignored }, { scratchOk = true } = {}) 
  */
 export function scratchHasRepo(root, { maxEntries = WALK_MAX_ENTRIES } = {}) {
   const stack = [];
-  for (const d of SCRATCH_ROOT_DIRS) stack.push(path.join(root, d));
+  for (const d of SCRATCH_ROOT_DIRS) stack.push({ dir: path.join(root, d), top: true });
   let seen = 0;
   while (stack.length) {
-    const dir = stack.pop();
+    const { dir, top } = stack.pop();
     let ents;
     try { if (!fs.lstatSync(dir).isDirectory()) continue; ents = fs.readdirSync(dir, { withFileTypes: true }); }
-    catch (e) { if (e.code === 'ENOENT') continue; return true; }
+    catch (e) { if (e.code === 'ENOENT' && top) continue; return true; } // a vanished / unreadable subdir → can't prove "no repo"
     if (looksLikeRepo(ents)) return true;
     for (const e of ents) {
       if (++seen > maxEntries) return true;
-      if (e.isDirectory()) stack.push(path.join(dir, e.name));
+      if (e.name.includes('\uFFFD')) return true; // not valid UTF-8: Node can't name it back → can't look inside
+      if (e.isDirectory()) stack.push({ dir: path.join(dir, e.name), top: false });
     }
   }
   return false;
@@ -157,7 +158,8 @@ export function strayFingerprint(root, entries, { maxFiles = STRAY_FP_MAX_FILES 
   let files = 0;
   for (const e of [...entries].sort()) {
     const rel0 = String(e).replace(/\/+$/, '');
-    if (!rel0 || path.isAbsolute(rel0) || rel0.split('/').includes('..')) return null;
+    if (!rel0 || path.isAbsolute(rel0) || rel0.split('/').includes('..') || rel0.includes('\uFFFD')) return null; // U+FFFD: a non-UTF-8 name we can't stat
+    try { fs.lstatSync(path.join(root, rel0)); } catch { return null; } // git reported it, we can't see it → no button
     let c = 0;
     const stack = [rel0];
     while (stack.length) {
@@ -170,6 +172,7 @@ export function strayFingerprint(root, entries, { maxFiles = STRAY_FP_MAX_FILES 
         let ents;
         try { ents = fs.readdirSync(abs, { withFileTypes: true }); } catch { return null; }
         if (looksLikeRepo(ents) && !repos.includes(e)) repos.push(e); // a clone may hold unpushed commits
+        if (ents.some((x) => x.name.includes('\uFFFD'))) return null;
         for (const n of ents.map((x) => x.name).sort().reverse()) stack.push(path.join(rel, n));
         continue;
       }
@@ -371,6 +374,10 @@ export async function treeStateBlocker(L, deps, { allowStray = null, strayHash =
   // shown may go; anything NOT in that list (appeared since) still keeps it.
   const allowed = allowStray ? new Set(allowStray) : null;
   const unseen = allowed ? stray.filter((p) => !allowed.has(p)) : stray;
+  // …and the shown list must be exactly the stray set (no bogus extra entries).
+  if (allowed && !unseen.length && allowStray.some((p) => !stray.includes(p))) {
+    return { ok: false, reason: 'danh sách file ngoài git không còn khớp', notable: true, strayNew: true };
+  }
   if (unseen.length) {
     return { ok: false, reason: `có file ngoài git: ${unseen.slice(0, 5).join(', ')}${unseen.length > 5 ? ', …' : ''}`, notable: true, stray: unseen, ...(allowed ? { strayNew: true } : {}) };
   }
@@ -486,7 +493,7 @@ export async function cleanupRequested(target, {
       const fp = allowStray ? strayFingerprint(L.real, allowStray) : null;
       if (allowStray && !fp) return { ok: false, path: shown, reason: 'quá nhiều file ngoài git để liệt kê' };
       if (fp?.repos.length) return { ok: false, path: shown, reason: `có repo git ngoài git: ${fp.repos.join(', ')} — không hỏi xoá tay` };
-      return { ok: true, dryRun: true, path: shown, head: L.wt.head, branch: L.wt.branch.slice('refs/heads/'.length), pr: v.pr, ...(fp ? { strayHash: fp.hash, strayCounts: fp.counts } : {}) };
+      return { ok: true, dryRun: true, path: shown, repo: L.repo, head: L.wt.head, branch: L.wt.branch.slice('refs/heads/'.length), pr: v.pr, ...(fp ? { strayHash: fp.hash, strayCounts: fp.counts } : {}) };
     }
     const bytes = await duBytes(deps, L.real); // slow (up to 10 min) — measured BEFORE the last-moment re-check
     const late = await treeStateBlocker(L, deps, { allowStray, strayHash });

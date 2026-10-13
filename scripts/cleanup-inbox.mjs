@@ -156,7 +156,8 @@ export async function processCleanupOffers({ daemonUserId, sendText = async () =
       catch (e) { probe = { ok: false, reason: e?.message ?? String(e) }; }
       finally { lock.release(); }
       if (!probe?.ok || !probe.dryRun || !probe.strayHash) { console.error(`[daemon] cleanup offer ${v0.path} no longer applies: ${probe?.reason ?? '?'}`); continue; }
-      const o = { ...v0, path: probe.path, strayHash: probe.strayHash, counts: probe.strayCounts || {}, pr: probe.pr ?? v0.pr, branch: probe.branch || v0.branch };
+      // Everything shown comes from the daemon's own probe, not the file.
+      const o = { ...v0, path: probe.path, repo: probe.repo || null, strayHash: probe.strayHash, counts: probe.strayCounts || {}, pr: probe.pr ?? null, branch: probe.branch || '?' };
       const title = `🧹 Dọn hằng ngày${o.repo ? ` (${o.repo})` : ''}`;
       const text = formatStrayOffer({ title, path: o.path, stray: o.stray, counts: o.counts, pr: o.pr, branch: o.branch });
       const plain = escapeControls(`${title}: giữ lại ${o.path} — có ${o.stray.length} mục ngoài git (${o.stray.slice(0, 3).join(', ')}…); không gửi được nút, xem tay.`).slice(0, 1000);
@@ -249,23 +250,27 @@ export async function processCleanupRequests({ daemonUserId, sendText, sendButto
       }
       const offerText = probe ? formatStrayOffer({ title: `🧹 cleanup-request của ${who}`, path: probe.path, stray: r.stray, counts: probe.strayCounts, pr: probe.pr, branch: probe.branch }) : null;
       if (offerText && offerText.length > OFFER_TEXT_MAX) probe = null;
-      const offer = !!probe;
-      const text = formatCleanupResult(r) + (offer ? ' — đã gửi owner nút xoá tay' : '');
-      audit({ requester: req.convoId, path: req.path, ok: r.ok, ...(r.ok ? { branch: r.branch, pr: r.pr, bytes: r.bytes } : { reason: r.reason }) });
-      try { await deliver({ convoId: req.convoId, text, ok: r.ok, path: r.path }, { build: buildCleanupResultPrompt }); }
-      catch (e) { await sendText(daemonUserId, `⚠️ Không gửi được kết quả cleanup-request về ${who}: ${e?.message ?? e}`).catch(() => {}); }
-      if (offer) {
+      // The owner's button goes out FIRST, so the agent is only told about a
+      // button that was actually sent.
+      let offered = false;
+      if (probe) {
         const tok = crypto.randomBytes(8).toString('hex');
         const entry = { kind: 'cleanup', path: probe.path, convoId: req.convoId, who, head: probe.head, stray: r.stray, strayHash: probe.strayHash, createdAt: Date.now() };
         buttonStore.set(tok, entry);
         try {
           await sendButtons(daemonUserId, withDigest(offerText, entry),
             [{ text: '🧹 Xoá luôn', callback_data: `cx:${tok}` }, { text: 'Giữ', callback_data: `ck:${tok}` }]);
+          offered = true;
         } catch (e) {
           try { buttonStore.delete(tok); } catch {}
           await Promise.resolve(sendText(daemonUserId, `🧹 cleanup-request của ${who}: ${formatCleanupResult(r)} (không gửi được nút: ${e?.message ?? e})`)).catch(() => {});
         }
-      } else await Promise.resolve(sendText(daemonUserId, `🧹 cleanup-request của ${who}: ${text}`)).catch(() => {});
+      }
+      const text = formatCleanupResult(r) + (offered ? ' — đã gửi owner nút xoá tay' : '');
+      audit({ requester: req.convoId, path: req.path, ok: r.ok, ...(r.ok ? { branch: r.branch, pr: r.pr, bytes: r.bytes } : { reason: r.reason }) });
+      try { await deliver({ convoId: req.convoId, text, ok: r.ok, path: r.path }, { build: buildCleanupResultPrompt }); }
+      catch (e) { await sendText(daemonUserId, `⚠️ Không gửi được kết quả cleanup-request về ${who}: ${e?.message ?? e}`).catch(() => {}); }
+      if (!probe) await Promise.resolve(sendText(daemonUserId, `🧹 cleanup-request của ${who}: ${text}`)).catch(() => {});
     } catch (e) {
       console.error(`[daemon] cleanup request ${path.basename(file)}: ${e?.message ?? e}`);
     } finally {
