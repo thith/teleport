@@ -159,12 +159,32 @@ export function scopePreflight({ memMax }, { run = spawnSync } = {}) {
   return { ok: true };
 }
 
-/** Stop the build scope and make sure nothing is left in it. Exit 5 = already gone. */
-export function stopScope(unit, { run = spawnSync, readProcs = (cg) => { try { return fs.readFileSync(`/sys/fs/cgroup${cg}/cgroup.procs`, 'utf8').trim(); } catch { return ''; } } } = {}) {
-  const st = run('systemctl', ['--user', 'stop', unit], { encoding: 'utf8', timeout: 30_000 });
-  const cg = String(run('systemctl', ['--user', 'show', '-p', 'ControlGroup', '--value', unit], { encoding: 'utf8', timeout: 10_000 }).stdout || '').trim();
-  if (cg && readProcs(cg)) run('systemctl', ['--user', 'kill', '-s', 'KILL', unit], { encoding: 'utf8', timeout: 10_000 });
-  return st.status === 0 || st.status === 5;
+const sleepSync = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+
+/** Does the cgroup (or any descendant) still hold a process? Unreadable → true (can't prove empty). */
+export function cgroupPopulated(cg, { read = (f) => fs.readFileSync(f, 'utf8') } = {}) {
+  let t;
+  try { t = read(`/sys/fs/cgroup${cg}/cgroup.events`); } catch (e) { return e.code !== 'ENOENT'; } // gone = empty
+  const m = /^populated (\d)/m.exec(t);
+  return m ? m[1] !== '0' : true;
+}
+
+/**
+ * Stop the build scope and VERIFY nothing is left in it (descendants included).
+ * Exit 5 "not loaded" = already collected. Leftovers → SIGKILL, re-checked.
+ * → true only when the scope is proven empty / gone.
+ */
+export function stopScope(unit, { run = spawnSync, populated = cgroupPopulated, sleep = sleepSync, tries = 4 } = {}) {
+  run('systemctl', ['--user', 'stop', unit], { encoding: 'utf8', timeout: 30_000 });
+  for (let i = 0; i < tries; i++) {
+    const sh = run('systemctl', ['--user', 'show', '-p', 'ControlGroup', '--value', unit], { encoding: 'utf8', timeout: 10_000 });
+    if (sh.error || sh.status !== 0) { sleep(500); continue; } // bus trouble: can't tell — retry
+    const cg = String(sh.stdout || '').trim();
+    if (!cg || !populated(cg)) return true; // unit gone (collected) or its cgroup empty
+    run('systemctl', ['--user', 'kill', '-s', 'KILL', unit], { encoding: 'utf8', timeout: 10_000 });
+    sleep(500);
+  }
+  return false;
 }
 
 /** heavy-<pid>-*.scope units whose heavy is dead (SIGKILLed — its lock gone, its build maybe not). */
@@ -183,6 +203,21 @@ export function appSliceOomKills({ uid = process.getuid?.() ?? 0, read = (f) => 
   try { const m = /^oom_kill (\d+)/m.exec(read(`/sys/fs/cgroup/user.slice/user-${uid}.slice/user@${uid}.service/app.slice/memory.events`)); return m ? Number(m[1]) : null; } catch { return null; }
 }
 
+/** Does this Cargo TOML set build.jobs? `jobs` under [build], `build.jobs = …`, `build = { jobs = … }`; comments ignored. Pure. */
+export function tomlHasBuildJobs(text) {
+  let table = '';
+  for (const raw of String(text).split('\n')) {
+    const line = raw.replace(/#.*$/, '').trim(); // (no `#` inside our keys/values of interest)
+    if (!line) continue;
+    const h = /^\[\s*([^\]]+?)\s*\]$/.exec(line);
+    if (h) { table = h[1]; continue; }
+    if (table === 'build' && /^jobs\s*=/.test(line)) return true;
+    if (table === '' && /^build\.jobs\s*=/.test(line)) return true;
+    if (table === '' && /^build\s*=\s*\{[^}]*\bjobs\s*=/.test(line)) return true;
+  }
+  return false;
+}
+
 /** Is `build.jobs` set in a Cargo config from cwd up, or in CARGO_HOME / ~/.cargo? */
 export function cargoJobsConfigured({ cwd = process.cwd(), env = process.env, read = (f) => { try { return fs.readFileSync(f, 'utf8'); } catch { return null; } } } = {}) {
   const dirs = [];
@@ -190,8 +225,7 @@ export function cargoJobsConfigured({ cwd = process.cwd(), env = process.env, re
   dirs.push(env.CARGO_HOME || path.join(os.homedir(), '.cargo'));
   for (const d of dirs) for (const f of ['config.toml', 'config']) {
     const t = read(path.join(d, f));
-    // `jobs = 2` under [build], `build.jobs = 2`, `build = { jobs = 2 }`
-    if (t && /(^|[\s{,.])jobs\s*=/m.test(t)) return true;
+    if (t && tomlHasBuildJobs(t)) return true;
   }
   return false;
 }
@@ -326,7 +360,10 @@ export async function main(argv, {
   try {
     if (!isNested) {
       // A heavy SIGKILLed earlier lost its lock, but its build may still run: stop it now.
-      for (const u of scopeOps.orphans()) { log(`🧹 heavy: dừng build mồ côi ${u}`); scopeOps.stop(u); }
+      for (const u of scopeOps.orphans()) {
+        log(`🧹 heavy: dừng build mồ côi ${u}`);
+        if (!scopeOps.stop(u)) { log(`❌ heavy: không dừng được build mồ côi ${u} — không chạy chồng lên nó. Thử lại sau / systemctl --user kill -s KILL ${u}`); return WAIT_TIMEOUT_EXIT; }
+      }
       // Pressure may have changed while we queued: check again, now that we're next.
       if (a.ramWait) await waitRam({ minBytes: minFreeBytes(env), log });
       if (a.scope && env.TELEPORT_HEAVY_SCOPE !== '0') {
@@ -337,7 +374,19 @@ export async function main(argv, {
       }
     }
     // A Gradle daemon started earlier lives outside our scope (unlimited): stop it first.
-    if (scope && a.stop && isGradlew(a.cmd)) { log('🧹 gradlew --stop (daemon cũ, trước build)…'); try { await stopGradle(a.cmd, { env: childEnv }); } catch {} }
+    // Ctrl-C / TERM during these pre-steps cancels the build (it must not start anyway).
+    let cancelled = false;
+    const onSig = () => { cancelled = true; };
+    for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(sig, onSig);
+    try {
+      if (scope && a.stop && isGradlew(a.cmd)) {
+        log('🧹 gradlew --stop (daemon cũ, trước build)…');
+        let rc = 0;
+        try { rc = await stopGradle(a.cmd, { env: childEnv }); } catch { rc = 1; }
+        if (rc && !cancelled) log('⚠️ heavy: gradlew --stop trước build thất bại — daemon cũ (ngoài scope, không giới hạn RAM) có thể bị dùng lại.');
+      }
+    } finally { for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.off(sig, onSig); }
+    if (cancelled) { log('⏹ heavy: bị huỷ trước khi build bắt đầu — không chạy.'); return 130; }
     const oomBefore = scope ? scopeOps.oomKills() : null;
     const code = await run(a.cmd, { env: childEnv, ...(scope ? { scope } : {}) });
     // 126/127: gradlew couldn't even start — nothing to stop.
@@ -357,7 +406,7 @@ export async function main(argv, {
       let stopped = false;
       try { stopped = scopeOps.stop(scope.unit); } catch {}
       finally { for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.off(sig, ign); }
-      if (!stopped) log(`⚠️ heavy: không chắc đã dừng hết scope ${scope.unit} (systemctl lỗi) — build kế tiếp sẽ dọn nếu còn.`);
+      if (!stopped) log(`⚠️ heavy: KHÔNG xác nhận được scope ${scope.unit} đã trống (systemctl lỗi) — nhả lock để không chặn mọi build; build kế tiếp sẽ thử dọn và không chạy chồng nếu không dọn được.`);
     }
     lock.release();
   }

@@ -222,14 +222,32 @@ test('RFC20: scopePreflight checks the limits are really enforced', () => {
   assert.equal(scopePreflight({ memMax: 0 }, { run: () => ({ status: 0, stdout: 'max\nmax\n' }) }).ok, true, 'uncapped: only "can we make a scope"');
 });
 
-test('RFC20: stopScope stops the .scope unit; "not loaded" (5) is fine; leftovers → kill -s KILL', () => {
-  const calls = [];
-  const run = (bin, args) => { calls.push(args.join(' ')); if (args[1] === 'stop') return { status: 5 }; if (args[1] === 'show') return { stdout: '/user.slice/x.scope\n' }; return { status: 0 }; };
-  assert.equal(stopScope('heavy-1-a.scope', { run, readProcs: () => '123' }), true);
-  assert.deepEqual(calls, ['--user stop heavy-1-a.scope', '--user show -p ControlGroup --value heavy-1-a.scope', '--user kill -s KILL heavy-1-a.scope']);
-  calls.length = 0;
-  stopScope('heavy-1-a.scope', { run, readProcs: () => '' });
-  assert.equal(calls.length, 2, 'empty cgroup → no kill');
+test('RFC20: stopScope stops the .scope unit and VERIFIES it is empty; leftovers → KILL + recheck; unprovable → false', () => {
+  const mk = (pops, { showFail = 0 } = {}) => {
+    const calls = []; let k = 0, f = showFail;
+    const run = (bin, args) => { calls.push(args.slice(1).join(' ')); if (args[1] === 'show') { if (f-- > 0) return { status: 1, error: new Error('bus') }; return { status: 0, stdout: '/u/x.scope\n' }; } return { status: 0 }; };
+    return { calls, opts: { run, populated: () => pops[Math.min(k++, pops.length - 1)], sleep: () => {} } };
+  };
+  let t = mk([false]);
+  assert.equal(stopScope('heavy-1-a.scope', t.opts), true);
+  assert.deepEqual(t.calls, ['stop heavy-1-a.scope', 'show -p ControlGroup --value heavy-1-a.scope']);
+  t = mk([true, false]);
+  assert.equal(stopScope('heavy-1-a.scope', t.opts), true, 'leftover killed, then verified empty');
+  assert.ok(t.calls.includes('kill -s KILL heavy-1-a.scope'));
+  t = mk([true]);
+  assert.equal(stopScope('heavy-1-a.scope', t.opts), false, 'still populated after every KILL → not proven');
+  t = mk([false], { showFail: 99 });
+  assert.equal(stopScope('heavy-1-a.scope', t.opts), false, 'bus down → cannot prove');
+  const gone = { run: (b, a) => (a[1] === 'show' ? { status: 0, stdout: '\n' } : { status: 5 }), populated: () => true, sleep: () => {} };
+  assert.equal(stopScope('heavy-1-a.scope', gone), true, 'unit already collected (not loaded)');
+});
+
+test('cgroupPopulated: reads cgroup.events (descendants included); gone = empty; unreadable = populated', async () => {
+  const { cgroupPopulated } = await import('./heavy.mjs');
+  assert.equal(cgroupPopulated('/x', { read: () => 'populated 0\nfrozen 0\n' }), false);
+  assert.equal(cgroupPopulated('/x', { read: () => 'populated 1\n' }), true);
+  assert.equal(cgroupPopulated('/x', { read: () => { throw Object.assign(new Error('x'), { code: 'ENOENT' }); } }), false);
+  assert.equal(cgroupPopulated('/x', { read: () => { throw Object.assign(new Error('x'), { code: 'EACCES' }); } }), true);
 });
 
 test('RFC20: orphanScopes — only scopes of DEAD heavies (not ours, not live ones)', () => {
@@ -243,7 +261,7 @@ test('RFC20: cargoJobsConfigured finds build.jobs up the tree or in CARGO_HOME',
   const read = (f) => files[f] ?? null;
   assert.equal(cargoJobsConfigured({ cwd: '/w/proj/sub', env: { CARGO_HOME: '/h' }, read }), true);
   assert.equal(cargoJobsConfigured({ cwd: '/w/other', env: { CARGO_HOME: '/h' }, read }), false);
-  assert.equal(cargoJobsConfigured({ cwd: '/x', env: { CARGO_HOME: '/h' }, read: (f) => (f === '/h/config.toml' ? 'jobs=8' : null) }), true);
+  assert.equal(cargoJobsConfigured({ cwd: '/x', env: { CARGO_HOME: '/h' }, read: (f) => (f === '/h/config.toml' ? '[build]\njobs=8' : null) }), true);
 });
 
 test('RFC20: memPressurePath prefers user@<uid>.service/memory.pressure', () => {
@@ -315,7 +333,7 @@ test('RFC20 review: --no-scope → no preflight/scope; oom_kill rise with exit 0
   assert.equal(runOpts.scope, undefined);
   await heavyMain(['--', 'cargo', 'test'], { ...base, scopeOps: ops });
   assert.ok(!logs.some((l) => /vượt giới hạn RAM/.test(l)), 'someone else\'s OOM, our build exited 0');
-  assert.ok(logs.some((l) => /không chắc đã dừng hết scope/.test(l)));
+  assert.ok(logs.some((l) => /KHÔNG xác nhận được scope/.test(l)));
 });
 
 test('RFC20 review: cargoJobsConfigured — dotted key and inline table', () => {
@@ -323,4 +341,35 @@ test('RFC20 review: cargoJobsConfigured — dotted key and inline table', () => 
     assert.equal(cargoJobsConfigured({ cwd: '/p', env: { CARGO_HOME: '/h' }, read: (f) => (f === '/p/.cargo/config.toml' ? t : null) }), true, t);
   }
   assert.equal(cargoJobsConfigured({ cwd: '/p', env: { CARGO_HOME: '/h' }, read: (f) => (f === '/p/.cargo/config.toml' ? 'codegen-units = 1' : null) }), false);
+});
+
+test('post-merge: tomlHasBuildJobs ignores comments and other tables', async () => {
+  const { tomlHasBuildJobs } = await import('./heavy.mjs');
+  assert.equal(tomlHasBuildJobs('# jobs = 8\n[build]\n# jobs = 2\ntarget-dir = "x"'), false);
+  assert.equal(tomlHasBuildJobs('[profile.dev]\njobs = 2'), false);
+  assert.equal(tomlHasBuildJobs('[build]\njobs = 2 # fewer'), true);
+  assert.equal(tomlHasBuildJobs('build.jobs = 3'), true);
+  assert.equal(tomlHasBuildJobs('build = { jobs = 2, target = "x" }'), true);
+});
+
+test('post-merge: an orphan that cannot be stopped → refuse to run (no overlap)', async () => {
+  let ran = false;
+  const logs = [];
+  const code = await heavyMain(['--', 'cargo', 'build'], { env: {}, nested: () => false, log: (s) => logs.push(s), waitRam: async () => {},
+    scopeOps: { ...NO_SCOPE, orphans: () => ['heavy-1-dead.scope'], stop: () => false },
+    acquire: async () => ({ release() {}, waitedMs: 0 }), run: async () => { ran = true; return 0; } });
+  assert.equal(ran, false);
+  assert.equal(code, 75);
+  assert.ok(logs.some((l) => /không dừng được build mồ côi/.test(l)));
+});
+
+test('post-merge: Ctrl-C during the pre-build gradlew --stop cancels the build', async () => {
+  let ran = false;
+  const code = await heavyMain(['--', './gradlew', 'build'], { env: {}, nested: () => false, log: () => {}, waitRam: async () => {},
+    scopeOps: { ...NO_SCOPE, preflight: () => ({ ok: true }) },
+    acquire: async () => ({ release() {}, waitedMs: 0 }),
+    stopGradle: async () => { process.emit('SIGINT', 'SIGINT'); return 130; },
+    run: async () => { ran = true; return 0; } });
+  assert.equal(ran, false);
+  assert.equal(code, 130);
 });
