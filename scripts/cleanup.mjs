@@ -6,7 +6,8 @@
 //       inside the workspace · not locked · on a branch (not detached) ·
 //       a MERGED PR on exactly that branch whose headRefOid === HEAD, and no
 //       OPEN PR on it · no tracked change · untracked/ignored entries only under
-//       build dirs (target/, node_modules/, …) · no process cwd inside · no
+//       build dirs (target/, node_modules/, …) or a ROOT tmp/ (agents' scratch,
+//       removed with it) · no process cwd inside · no
 //       non-build file modified in 24h · not the cwd of a Claude transcript
 //       touched in 7 days. Then `git worktree remove --force` (single --force:
 //       git refuses a locked tree). The branch is kept. At most 30 per run.
@@ -20,6 +21,12 @@
 // ONE worktree with the same E1 judge (judgeWorktree, `requested: true`), which
 // skips only the 24h-edit and 7-day-transcript gates.
 //
+// Kept ONLY because of other files outside git (every other gate passes with
+// exactly those allowed): the owner is asked per worktree — a cleanup-request
+// at once, the daily run via offer files the daemon turns into DMs with
+// [🧹 Xoá luôn] [Giữ] (cleanup-inbox.mjs). The press removes the worktree
+// unless HEAD moved or a file outside the shown list appeared.
+//
 // CLI: node scripts/cleanup.mjs [--dry-run] [--report-to-owner]
 // Runs under the machine lock `cleanup` (busy → "already running", exit 0).
 // The daemon launches it detached (see cleanup-launch.mjs); it never runs
@@ -27,6 +34,7 @@
 
 import fs from 'node:fs';
 import os from 'node:os';
+import crypto from 'node:crypto';
 import path from 'node:path';
 import { execFile, execFileSync } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -103,7 +111,33 @@ export function parseStatusZ(out) {
  * new `build/new.sh`); only IGNORED entries may match the build allowlist.
  */
 export function strayEntries({ untracked, ignored }) {
-  return [...untracked, ...ignored.filter((p) => !isBuildPath(p))];
+  return [...untracked, ...ignored.filter((p) => !isBuildPath(p))].filter((p) => !isRootScratch(p));
+}
+
+/**
+ * A `tmp/` folder at the worktree ROOT is the agents' scratch space (logs,
+ * review prompts) — the owner's call: removable without asking, tracked or not
+ * ignored. Only entries INSIDE it (`tmp/…`); a file or symlink named `tmp`, or
+ * a deeper `src/tmp/`, stays stray. Pure.
+ */
+export const SCRATCH_ROOT_DIRS = new Set(['tmp']);
+export function isRootScratch(p) {
+  const i = String(p).indexOf('/');
+  return i > 0 && SCRATCH_ROOT_DIRS.has(String(p).slice(0, i));
+}
+
+/** Offers the daily run leaves for the daemon (owner buttons, see cleanup-inbox.mjs). */
+export const CLEANUP_OFFER_DIR = path.join(__dirname, 'tmp', 'cleanup-offers');
+export const STRAY_OFFER_MAX = 300; // more stray entries than this → no button (clean by hand)
+
+/** Write one offer file atomically (0600). → its path. */
+export function writeOffer(offer, { dir = CLEANUP_OFFER_DIR, now = Date.now() } = {}) {
+  fs.mkdirSync(dir, { recursive: true });
+  const name = `${now}-${crypto.randomBytes(4).toString('hex')}.json`;
+  const tmpFile = path.join(dir, `.${name}.tmp`);
+  fs.writeFileSync(tmpFile, JSON.stringify({ ...offer, createdAt: now }), { mode: 0o600 });
+  fs.renameSync(tmpFile, path.join(dir, name));
+  return path.join(dir, name);
 }
 
 /** `git ls-files -v -z` → paths flagged skip-worktree (S/s) or assume-unchanged (lowercase tag): edits git status cannot see. */
@@ -256,7 +290,7 @@ export const procsInside = (deps, wt) => deps.procCwds().filter((p) => isInside(
  * Run by the judge AND again right before `git worktree remove` (after the slow
  * `du`), so nothing that appeared in between is deleted.
  */
-export async function treeStateBlocker(L, deps) {
+export async function treeStateBlocker(L, deps, { allowStray = null } = {}) {
   const git = (args, opts) => deps.exec('git', args, opts);
   const { wt, real } = L;
   // HEAD may have moved since `worktree list` — re-read it right here.
@@ -265,7 +299,13 @@ export async function treeStateBlocker(L, deps) {
   const st = parseStatusZ(await git(['-C', wt.path, 'status', '--porcelain=v1', '-z', '--untracked-files=all', '--ignored=matching']));
   if (st.tracked.length) return { ok: false, reason: `có thay đổi chưa commit (${st.tracked.slice(0, 3).join(', ')}${st.tracked.length > 3 ? ', …' : ''})`, notable: true };
   const stray = strayEntries(st);
-  if (stray.length) return { ok: false, reason: `có file ngoài git: ${stray.slice(0, 5).join(', ')}${stray.length > 5 ? ', …' : ''}`, notable: true };
+  // allowStray (the owner's manual-cleanup button): the files the owner was
+  // shown may go; anything NOT in that list (appeared since) still keeps it.
+  const allowed = allowStray ? new Set(allowStray) : null;
+  const unseen = allowed ? stray.filter((p) => !allowed.has(p)) : stray;
+  if (unseen.length) {
+    return { ok: false, reason: `có file ngoài git: ${unseen.slice(0, 5).join(', ')}${unseen.length > 5 ? ', …' : ''}`, notable: true, stray: unseen, ...(allowed ? { strayNew: true } : {}) };
+  }
   const hidden = hiddenEdits(await git(['-C', wt.path, 'ls-files', '-v', '-z']));
   if (hidden.length) return { ok: false, reason: `có file skip-worktree/assume-unchanged (${hidden.slice(0, 3).join(', ')}${hidden.length > 3 ? ', …' : ''})`, notable: true };
   const procs = procsInside(deps, real);
@@ -281,7 +321,7 @@ export async function treeStateBlocker(L, deps) {
  * user) skips exactly two gates: "no Claude transcript cwd in 7 days" and "no
  * non-build file modified in 24h". Every other gate stays.
  */
-export async function judgeWorktree(L, { deps, realParent, now = Date.now(), transcriptCwds = null, requested = false }) {
+export async function judgeWorktree(L, { deps, realParent, now = Date.now(), transcriptCwds = null, requested = false, allowStray = null }) {
   const git = (args, opts) => deps.exec('git', args, opts);
   const { wt, real } = L;
   if (!real || wt.prunable) return { ok: false, reason: 'thư mục không còn', notable: false };
@@ -298,7 +338,7 @@ export async function judgeWorktree(L, { deps, realParent, now = Date.now(), tra
     '--json', 'number,state,headRefOid,headRefName', '--limit', '100'], { timeout: 60_000 }));
   const pr = judgePrs(prs, branch, wt.head);
   if (!pr.ok) return pr;
-  const bad = await treeStateBlocker(L, deps);
+  const bad = await treeStateBlocker(L, deps, { allowStray });
   if (bad) return bad;
   if (requested) return { ok: true, pr: pr.pr }; // the two "recently used" gates below don't apply
   if (!transcriptCwds) return { ok: false, reason: 'không đọc được transcript', notable: false };
@@ -346,7 +386,9 @@ export async function locateWorktree(target, { deps, realParent }) {
  * judgeWorktree). Never throws. Caller holds the `cleanup` machine lock.
  * → { ok:true, path, branch, pr, bytes } | { ok:false, path, reason }
  */
-export async function cleanupRequested(target, { parentDir = PARENT_DIR, now = Date.now(), deps: injected = {} } = {}) {
+export async function cleanupRequested(target, {
+  parentDir = PARENT_DIR, now = Date.now(), deps: injected = {}, allowStray = null, expectHead = null, dryRun = false,
+} = {}) {
   const deps = { ...defaultDeps(), ...injected };
   let shown = target;
   try {
@@ -355,10 +397,15 @@ export async function cleanupRequested(target, { parentDir = PARENT_DIR, now = D
     if (!loc.L) return { ok: false, path: shown, reason: loc.reason };
     const L = loc.L;
     shown = L.wt.path;
-    const v = await judgeWorktree(L, { deps, realParent, now, requested: true });
-    if (!v.ok) return { ok: false, path: shown, reason: v.reason };
+    // The owner's button was shown for one commit: a moved HEAD is a new state.
+    if (expectHead && L.wt.head !== expectHead) return { ok: false, path: shown, reason: 'HEAD đã đổi từ lúc gửi nút' };
+    const v = await judgeWorktree(L, { deps, realParent, now, requested: true, allowStray });
+    if (!v.ok) return { ok: false, path: shown, reason: v.reason, ...(v.stray ? { stray: v.stray } : {}), ...(v.strayNew ? { strayNew: true } : {}) };
+    // dryRun: every gate passed, nothing measured or removed (the inbox probes
+    // "would it go if the owner allowed these stray files?").
+    if (dryRun) return { ok: true, dryRun: true, path: shown, head: L.wt.head, branch: L.wt.branch.slice('refs/heads/'.length), pr: v.pr };
     const bytes = await duBytes(deps, L.real); // slow (up to 10 min) — measured BEFORE the last-moment re-check
-    const late = await treeStateBlocker(L, deps);
+    const late = await treeStateBlocker(L, deps, { allowStray });
     if (late) return { ok: false, path: shown, reason: `${late.reason} (vừa xuất hiện)` };
     await deps.exec('git', ['-C', L.main, 'worktree', 'remove', '--force', L.wt.path]);
     deps.log(`removed ${L.wt.path} (requested)`);
@@ -382,7 +429,7 @@ export async function runCleanup({
   const deps = { ...defaultDeps(), ...injected };
   const git = (args, opts) => deps.exec('git', args, opts);
   const du = (p) => duBytes(deps, p);
-  const res = { dryRun, removed: [], kept: [], targets: [], cache: [], cacheSkipped: null, errors: [] };
+  const res = { dryRun, removed: [], kept: [], targets: [], cache: [], cacheSkipped: null, errors: [], offers: [] };
   const realParent = fs.realpathSync(parentDir);
 
   // Global probes: if one fails, nothing can be proven safe → keep everything.
@@ -426,6 +473,18 @@ export async function runCleanup({
     if (res.removed.length >= maxRemovals) { capHit++; stay.push(L); continue; }
     let v;
     try { v = await judge(L); } catch (e) { v = { ok: false, reason: `lỗi: ${String(e.message || e).split('\n')[0].slice(0, 160)}`, notable: true, error: true }; }
+    if (!v.ok && v.stray?.length && v.stray.length <= STRAY_OFFER_MAX) {
+      // Kept ONLY for these stray files (every other gate passes with exactly
+      // them allowed)? → the owner is asked, one DM per worktree.
+      let probe = null;
+      try { probe = await judgeWorktree(L, { deps, realParent, now, transcriptCwds, allowStray: v.stray }); } catch {}
+      if (probe?.ok) {
+        res.offers.push({ repo: L.repo, path: L.wt.path, branch: L.wt.branch.slice('refs/heads/'.length), pr: probe.pr, head: L.wt.head, stray: v.stray });
+        res.kept.push({ repo: L.repo, path: L.wt.path, branch: L.wt.branch.slice('refs/heads/'.length), reason: v.reason, notable: true, offered: true });
+        stay.push(L);
+        continue;
+      }
+    }
     if (!v.ok) { keep(L, v.reason, v.notable); stay.push(L); continue; }
     try {
       const bytes = await du(L.real); // slow — measured BEFORE the last-moment re-check
@@ -501,12 +560,17 @@ export function formatReport(r) {
   L.push('', `Worktree ${verb} (${r.removed.length}, ${fmtGB(sum(r.removed))}):`);
   if (!r.removed.length) L.push('  (không có)');
   for (const x of r.removed) L.push(`  • ${x.repo}: ${x.branch}${x.pr ? ` (PR #${x.pr})` : ''} — ${fmtGB(x.bytes)}`);
-  const notable = r.kept.filter((k) => k.notable);
+  const offers = r.offers || [];
+  if (offers.length) {
+    L.push('', `Chỉ vướng file ngoài git — ${r.dryRun ? 'lượt thật sẽ hỏi' : 'em hỏi'} anh từng cái qua DM (${offers.length}):`);
+    for (const o of offers) L.push(`  • ${o.repo}: ${o.branch} — ${o.stray.slice(0, 3).join(', ')}${o.stray.length > 3 ? `, … (${o.stray.length} mục)` : ''}`);
+  }
+  const notable = r.kept.filter((k) => k.notable && !k.offered);
   if (notable.length) {
     L.push('', `Giữ lại — đáng chú ý (${notable.length}):`);
     for (const k of notable) L.push(`  • ${k.repo}: ${k.branch || path.basename(k.path)} — ${k.reason}`);
   }
-  const quiet = r.kept.length - notable.length;
+  const quiet = r.kept.filter((k) => !k.notable).length;
   if (quiet) L.push('', `Giữ lại ${quiet} worktree khác (PR chưa merge, detached, khoá…).`);
   if (r.targets.length) {
     L.push('', `target/ bỏ hoang ${verb} (${r.targets.length}, ${fmtGB(sum(r.targets))}):`);
@@ -549,6 +613,7 @@ function deliver(text, toOwner) {
  */
 export async function cli(argv, {
   run = runCleanup, send = deliver, stateFile = CLEANUP_STATE_FILE, lockDir = LOCK_DIR, now = Date.now,
+  offer = (o) => writeOffer(o),
 } = {}) {
   let opts;
   try { opts = parseCleanupArgs(argv); } catch (e) { console.error(e.message); return 2; }
@@ -557,11 +622,17 @@ export async function cli(argv, {
     try { send('🧹 Dọn dẹp: đang có một lượt khác chạy (lock cleanup bận) — bỏ qua lượt này.', opts.reportToOwner); } catch {}
     return 0;
   }
-  let text, ok = false;
-  try { text = formatReport(await run({ dryRun: opts.dryRun })); ok = true; }
+  let text, ok = false, res = null;
+  try { res = await run({ dryRun: opts.dryRun }); text = formatReport(res); ok = true; }
   catch (e) { text = `❌ Dọn dẹp lỗi, không xoá thêm gì: ${e instanceof Error ? e.message : e}`; }
   finally { lock.release(); }
   try { send(text, opts.reportToOwner); } catch (e) { console.error(`[cleanup] report failed: ${e.message}`); return 1; }
+  // Real run → one owner DM with buttons per stray-only worktree (the daemon sends them).
+  if (ok && !opts.dryRun && opts.reportToOwner) {
+    for (const o of res.offers || []) {
+      try { offer(o); } catch (e) { console.error(`[cleanup] cannot queue offer for ${o.path}: ${e.message}`); }
+    }
+  }
   if (ok && opts.dryRun && opts.reportToOwner) {
     try { recordDryRunReported(stateFile, now()); } catch (e) { console.error(`[cleanup] cannot record dry-run: ${e.message}`); return 1; }
   }

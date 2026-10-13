@@ -7,7 +7,7 @@ import { execFile, execFileSync } from 'node:child_process';
 import { promisify } from 'node:util';
 import {
   runCleanup, parseWorktreePorcelain, githubSlug, isBuildPath, parseStatusZ, judgePrs, formatReport,
-  findRecentFile, readTranscriptCwds, parseCleanupArgs, MAX_REMOVALS, strayEntries, hiddenEdits, scanFileCwds, cli,
+  findRecentFile, readTranscriptCwds, parseCleanupArgs, MAX_REMOVALS, strayEntries, hiddenEdits, scanFileCwds, cli, isRootScratch,
 } from './cleanup.mjs';
 import { decideScheduledRun, cleanupTick, readCleanupState, launchCleanup, parseLaunchArgs, recordDryRunReported } from './cleanup-launch.mjs';
 import { acquireLock } from './machine-lock.mjs';
@@ -223,13 +223,25 @@ test('E1: ignored .env (a secret) → kept and reported', async () => {
   assert.match(formatReport(r), /\.env/);
 });
 
-test('E1: untracked non-build dir (tmp/) → kept', async () => {
+test('E1: a root tmp/ (agents\' scratch) is disposable → removed; a deeper src/tmp/ → kept', async () => {
   const w = world();
   const a = w.add('feat-a');
   write(path.join(a.path, 'tmp', 'notes.txt'));
-  const r = await run(w, deps({ prs: { 'feat-a': merged(a) } }));
-  assert.ok(exists(a.path));
-  assert.match(keptReason(r, a), /tmp\//);
+  write(path.join(a.path, 'tmp', 'deep', 'review.log'));
+  const b = w.add('feat-b');
+  write(path.join(b.path, 'src', 'tmp', 'notes.txt'));
+  const r = await run(w, deps({ prs: { 'feat-a': merged(a), 'feat-b': merged(b, 2) } }));
+  assert.equal(exists(a.path), false, 'root tmp/ only → removed');
+  assert.ok(exists(b.path));
+  assert.match(keptReason(r, b), /src\/tmp\//);
+});
+
+test('isRootScratch: only entries inside a ROOT tmp/', () => {
+  assert.equal(isRootScratch('tmp/'), true);
+  assert.equal(isRootScratch('tmp/a/b.log'), true);
+  assert.equal(isRootScratch('tmp'), false, 'a file/symlink named tmp');
+  assert.equal(isRootScratch('src/tmp/x'), false);
+  assert.equal(isRootScratch('tmpx/a'), false);
 });
 
 test('E1: untracked .claude/settings.local.json / ignored local.properties → kept', async () => {
@@ -669,4 +681,20 @@ test('commands.json: /cleanup is admin-only and runs the detached launcher', asy
   const spec = resolveCommand('cleanup', readCommandsFile());
   assert.equal(spec.run, 'cleanup-launch.mjs');
   assert.equal(spec.minRole, 'admin');
+});
+
+test('cli: offers are queued only by a REAL run reported to the owner', async () => {
+  const d = tmp();
+  const lockDir = path.join(d, 'locks');
+  const o = { repo: 'r', path: '/w/a', branch: 'b', pr: 1, head: 'a'.repeat(40), stray: ['.env'] };
+  const res = (dryRun) => async () => ({ dryRun, removed: [], kept: [], targets: [], cache: [], cacheSkipped: null, errors: [], offers: [o] });
+  const quiet = console.log; console.log = () => {};
+  try {
+    for (const [argv, want] of [[['--report-to-owner'], 1], [['--dry-run', '--report-to-owner'], 0], [[], 0]]) {
+      const queued = [], sent = [];
+      await cli(argv, { run: res(argv.includes('--dry-run')), send: (t) => sent.push(t), stateFile: path.join(d, 's.json'), lockDir, offer: (x) => queued.push(x) });
+      assert.equal(queued.length, want, argv.join(' '));
+      assert.match(sent[0], /Chỉ vướng file ngoài git/);
+    }
+  } finally { console.log = quiet; }
 });

@@ -70,7 +70,8 @@ import { peekPersona } from './persona-store.mjs';
 import { machineWatch } from './health.mjs';
 import { recordFetchOk, startListenWatchdog } from './listen-watch.mjs';
 import { launchCleanup, startCleanupScheduler } from './cleanup-launch.mjs';
-import { processCleanupRequests } from './cleanup-inbox.mjs';
+import { processCleanupRequests, processCleanupOffers, handleCleanupButton, CLEANUP_BUTTON_RE } from './cleanup-inbox.mjs';
+import { PersistentMap } from './button-store.mjs';
 import { formatPersona } from './persona.mjs';
 import { shortConvoHash } from './convo-hash.mjs';
 
@@ -280,6 +281,12 @@ async function main() {
     answerButton: (id, text) => tg('answerCallbackQuery', { callback_query_id: id, ...(text ? { text } : {}) }).catch(() => {}),
     editButtonsMessage: (chatId, messageId, text) => tg('editMessageText', { chat_id: chatId, message_id: messageId, text, link_preview_options: { is_disabled: true } }).catch(() => {}),
   };
+  // Pending buttons (merge previews, manual cleanups) survive a restart.
+  pendingMergeButtons = new PersistentMap();
+  // The Merge button pins the head commit read here (gh, without our secrets).
+  const ghEnv = { ...process.env };
+  for (const k of secretEnvKeys) delete ghEnv[k];
+  linkMergeUi.fetchHead = (link) => defaultFetchHead(link, { env: ghEnv });
 
   // `/reload`: swap in a fresh registry + projects config (see reloadDaemonState).
   const reload = () => {
@@ -351,12 +358,13 @@ async function main() {
         if (msg.chat?.type === 'private') return true;
         return isDmControlMessage(msg.text);
       });
-      const ctx = { token, daemonUserId, projectsConfig, registry, sendText, secretEnvKeys, reload, ...linkMergeUi };
+      const ctx = { token, daemonUserId, projectsConfig, registry, sendText, secretEnvKeys, reload, ...linkMergeUi, buttonStore: pendingMergeButtons };
       if (mine.length) handleControlMessages(mine, ctx);
       // Inline-button presses (PR-link merge confirmation) — owner only.
       const presses = updates.filter((u) => u.callback_query && String(u.callback_query.from?.id) === daemonUserId);
       for (const u of presses) {
-        handleMergeButton(u.callback_query, ctx).catch((e) => console.error(`[daemon] button: ${e?.message ?? e}`));
+        const handler = CLEANUP_BUTTON_RE.test(String(u.callback_query.data || '')) ? handleCleanupButton : handleMergeButton;
+        handler(u.callback_query, ctx).catch((e) => console.error(`[daemon] button: ${e?.message ?? e}`));
       }
       // Agent merge requests (file inbox) — one pass at a time.
       if (!mergeInboxBusy) {
@@ -367,7 +375,7 @@ async function main() {
       // ~60 s waiting for the `cleanup` lock); one pass at a time.
       if (!cleanupInboxBusy) {
         cleanupInboxBusy = true;
-        processCleanupRequests(ctx, { label: requesterLabel }).catch((e) => console.error(`[daemon] cleanup inbox: ${e?.message ?? e}`)).finally(() => { cleanupInboxBusy = false; });
+        processCleanupRequests(ctx, { label: requesterLabel }).then(() => processCleanupOffers(ctx)).catch((e) => console.error(`[daemon] cleanup inbox: ${e?.message ?? e}`)).finally(() => { cleanupInboxBusy = false; });
       }
       if (updates.length) writeOffset(Math.max(...updates.map((u) => u.update_id)), daemonOffsetFile);
 
@@ -438,20 +446,47 @@ export function startupGreeting({ pid, commit, commands }) {
 
 // ── Paste a PR link → preview + [✅ Merge] [✖ Cancel] ─────────────────────────
 
-export const MERGE_BUTTON_TTL_MS = 15 * 60 * 1000;
+// 24 h: the owner may only see the DM hours later. Safe because the Merge
+// button pins the previewed head commit (--expect-head) and merge.mjs re-runs
+// every check at press time.
+export const MERGE_BUTTON_TTL_MS = 24 * 60 * 60 * 1000;
 export const PREVIEW_INLINE_MAX = 3500;
 
-// token → { links, chatId, createdAt }. In memory on purpose: a daemon restart
-// simply expires pending confirmations (the button then says so).
-export const pendingMergeButtons = new Map();
+// token → { links, chatId, createdAt, canMerge, heads?, requester? } — also the
+// manual-cleanup buttons ({ kind: 'cleanup', … }, see cleanup-inbox.mjs). A
+// plain Map for tests / imports; main() swaps in a PersistentMap
+// (scripts/tmp/pending-buttons.json) so a restart doesn't expire them.
+// eslint-disable-next-line import/no-mutable-exports
+export let pendingMergeButtons = new Map();
 
 /** One-shot take: returns the entry (if fresh) and deletes it, so a double tap can't merge twice. */
 export function takeMergeButton(tok, { now = Date.now(), store = pendingMergeButtons, ttlMs = MERGE_BUTTON_TTL_MS } = {}) {
   const e = store.get(tok);
+  if (e?.kind === 'cleanup') return null; // not a merge button (cleanup-inbox takes those)
   store.delete(tok);
   for (const [k, v] of store) if (now - v.createdAt > ttlMs) store.delete(k); // sweep
   if (!e || now - e.createdAt > ttlMs) return null;
   return e;
+}
+
+/** `gh pr view` → the PR's head commit sha (or throws). */
+export async function defaultFetchHead(link, { runner = execFileP, env = process.env } = {}) {
+  const m = String(link).match(/^https:\/\/github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)$/);
+  if (!m) throw new Error('not a canonical PR link');
+  const { stdout } = await runner('gh', ['pr', 'view', m[2], '-R', m[1], '--json', 'headRefOid', '-q', '.headRefOid'], { env, timeout: 60_000 });
+  const sha = String(stdout).trim();
+  if (!/^[0-9a-f]{40,64}$/.test(sha)) throw new Error('bad sha');
+  return sha;
+}
+
+/** heads { link: sha } → ' --expect-head=owner/name#N=sha …' (canonical links only). Pure. */
+export function expectHeadArgs(heads) {
+  let out = '';
+  for (const [link, sha] of Object.entries(heads || {})) {
+    const m = String(link).match(/^https:\/\/github\.com\/([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\/pull\/(\d+)$/);
+    if (m && /^[0-9a-f]{40,64}$/.test(String(sha))) out += ` --expect-head=${m[1]}#${m[2]}=${sha}`;
+  }
+  return out;
 }
 
 /** Child env for a dispatched script: our env minus teleport secrets, plus the sender's identity. */
@@ -470,7 +505,7 @@ function childEnv(from, role, secretEnvKeys, extra = {}) {
 export async function handlePrLinks(links, msg, {
   daemonUserId, projectsConfig, registry, sendText, sendButtons, secretEnvKeys = [],
   runner = execFileP, scriptsDir = __dirname, parentDir = PARENT_DIR, store = pendingMergeButtons,
-  requester = null, header = '', deliver = deliverResult,
+  requester = null, header = '', deliver = deliverResult, fetchHead = null,
 }) {
   const spec = resolveCommand('merge', registry);
   if (!spec || !sendButtons) return;
@@ -490,6 +525,17 @@ export async function handlePrLinks(links, msg, {
       return { ok: true, out: (r.stdout || '').trim() };
     } catch (e) { return { ok: false, out: ((e.stdout || '') + (e.stderr ? `\n${e.stderr}` : '')).trim() || `❌ ${e.message || e}` }; }
   };
+  // The head commit of each PR, read BEFORE the preview: the Merge button merges
+  // exactly these (merge.mjs --expect-head), so a push after the preview — even
+  // hours later — is refused instead of merged unseen.
+  // (main() passes fetchHead; without it — tests, older callers — nothing is pinned.)
+  const heads = {};
+  if (fetchHead) {
+    for (const l of links) {
+      const h = await Promise.resolve().then(() => fetchHead(l)).catch(() => null);
+      if (h) heads[l] = h;
+    }
+  }
   const { ok: canMerge, out } = await run(['--preview']);
   // Not mergeable → maybe still closable (all open): offer only [Close] [Cancel].
   if (!canMerge && !(await run(['--close', '--preview'])).ok) {
@@ -499,13 +545,15 @@ export async function handlePrLinks(links, msg, {
     return { offered: false };
   }
   const tok = crypto.randomBytes(8).toString('hex');
-  store.set(tok, { links, chatId: msg.chat.id, createdAt: Date.now(), canMerge, ...(requester ? { requester } : {}) });
+  store.set(tok, { links, chatId: msg.chat.id, createdAt: Date.now(), canMerge, heads, ...(requester ? { requester } : {}) });
   // Keep the button message well under Telegram's 4096 chars (status edits are
   // appended later): a long batch preview goes out first as its own message.
   const what = links.length > 1 ? `these ${links.length} PRs (in order)` : 'this PR';
   const ask = canMerge ? `Merge or close ${what}?` : `Can't merge — close ${what} without merging?`;
   const head = header ? `${header}\n\n` : '';
-  let body = `${head}${out}\n\n${ask}`;
+  const unpinned = !!fetchHead && canMerge && links.some((l) => !heads[l]);
+  const pinNote = unpinned ? '\n⚠️ Không đọc được commit của PR lúc preview — Merge sẽ merge commit mới nhất lúc bấm.' : '';
+  let body = `${head}${out}${pinNote}\n\n${ask}`;
   if (body.length > PREVIEW_INLINE_MAX) { await sendText(msg.chat.id, out); body = `${head}🔎 ${links.length} PR(s) ready — details above.\n\n${ask}`; }
   await sendButtons(msg.chat.id, body,
     [
@@ -556,7 +604,7 @@ export async function handleMergeButton(cq, ctx, { take = takeMergeButton, dispa
       await deliver({ convoId: entry.requester.convoId, text: t, mode: 'ask' }).catch(() => {});
     }
     : ctx.sendText;
-  await dispatch({ cmd: 'merge', rest: entry.links.join(' ') + (closing ? ' --close' : '') }, cq.from || {}, { ...ctx, registry, sendText });
+  await dispatch({ cmd: 'merge', rest: entry.links.join(' ') + (closing ? ' --close' : expectHeadArgs(entry.heads)) }, cq.from || {}, { ...ctx, registry, sendText });
 }
 
 // ── Agent merge requests (file inbox; see merge-request.mjs / merge-inbox.mjs) ─

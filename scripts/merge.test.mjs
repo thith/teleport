@@ -337,3 +337,25 @@ test('billing: checks GitHub never STARTED are "not run" (allowed, noted); a rea
   const gh2 = (a) => (a[0] === 'api' && /annotations/.test(a[1] || '') ? JSON.stringify([{ message: 'exit code 1' }]) : f2.gh(a));
   assert.match((await mergeOne(6, ARGS([6]), { gh: gh2 })).text, /failing checks: lint/);
 });
+
+test('--expect-head: parsed per PR (lower-cased key); bad form is an error', () => {
+  const sha = 'a'.repeat(40);
+  const a = parseMergeArgs(['https://github.com/Acme/Repo/pull/5', `--expect-head=Acme/Repo#5=${sha}`]);
+  assert.deepEqual(a.expectHeads, { 'acme/repo#5': sha });
+  assert.match(parseMergeArgs(['https://github.com/a/b/pull/5', '--expect-head=a/b#5=xyz']).error, /expect-head/);
+  assert.match(parseMergeArgs(['https://github.com/a/b/pull/5', '--expect-head']).error, /expect-head/);
+  assert.equal(parseMergeArgs(['https://github.com/a/b/pull/5']).expectHeads, undefined);
+});
+
+test('mergeOne --expect-head: a head that moved since the preview is refused, nothing merged; same head merges', async () => {
+  const t = { repo: 'acme/repo', number: 3 };
+  const moved = fakeGh({ 3: PR(3, { headRefOid: 'b'.repeat(40) }) });
+  const r = await mergeOne(t, ARGS([3], { expectHeads: { 'acme/repo#3': 'a'.repeat(40) } }), { gh: moved.gh });
+  assert.equal(r.error, true);
+  assert.match(r.text, /commit mới sau khi preview \(aaaaaaa → bbbbbbb\)/);
+  assert.equal(moved.calls.some((c) => c[2] === 'PUT'), false);
+  const same = fakeGh({ 3: PR(3, { headRefOid: 'a'.repeat(40) }) });
+  const ok = await mergeOne(t, ARGS([3], { expectHeads: { 'acme/repo#3': 'a'.repeat(40) } }), { gh: same.gh });
+  assert.equal(ok.ok, true, ok.text);
+  assert.ok(same.calls.some((c) => c[2] === 'PUT' && c.includes(`sha=${'a'.repeat(40)}`)));
+});

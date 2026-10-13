@@ -8,7 +8,7 @@ import {
   validateDaemonConfig, resolveSenderRole, acquireSingleton, releaseSingleton, daemonStatus,
   reloadDaemonState, readJsonStrict,
   prLinksOnly, takeMergeButton, handlePrLinks, handleMergeButton, startupGreeting, gitShortHead,
-  processMergeRequests, formatAutoMergeStatus, buildAllowlist,
+  processMergeRequests, formatAutoMergeStatus, buildAllowlist, expectHeadArgs, MERGE_BUTTON_TTL_MS,
 } from './daemon.mjs';
 
 test('parseDaemonCommand: extracts command + rest, strips @botname, lowercases', () => {
@@ -717,4 +717,56 @@ test('processMergeRequests: the allowlist is re-read per request (a mid-pass rem
     deliver: async () => {}, audit: () => {}, remove: () => {}, prLinks: async () => { modes.push('ask'); }, label: () => 'x',
   });
   assert.deepEqual(modes, ['auto', 'ask']);
+});
+
+// ── Merge button: 24 h, pinned to the previewed head ──────────────────────────
+
+test('MERGE_BUTTON_TTL_MS is 24 h; takeMergeButton never takes a cleanup button', () => {
+  assert.equal(MERGE_BUTTON_TTL_MS, 24 * 3600_000);
+  const store = new Map([['cccccccccccccccc', { kind: 'cleanup', path: '/w/x', createdAt: Date.now() }]]);
+  assert.equal(takeMergeButton('cccccccccccccccc', { store }), null);
+  assert.equal(store.size, 1, 'left for the cleanup handler');
+});
+
+test('expectHeadArgs: canonical links + full shas only', () => {
+  const sha = 'a'.repeat(40);
+  assert.equal(expectHeadArgs({ [L1]: sha }), ` --expect-head=thith/teleport#3=${sha}`);
+  assert.equal(expectHeadArgs({ [L1]: 'short', 'https://evil/x': sha }), '');
+  assert.equal(expectHeadArgs(undefined), '');
+});
+
+test('handlePrLinks: heads read BEFORE the preview are stored; Merge dispatches them as --expect-head', async () => {
+  const sha = 'b'.repeat(40), order = [], buttons = [], store = new Map();
+  await handlePrLinks([L1], { chat: { id: 1 }, from: { id: 1 } }, {
+    daemonUserId: '1', projectsConfig: OWNER_CFG, registry: MREG, store, scriptsDir: '/s', parentDir: '/w',
+    sendText: async () => {}, sendButtons: async (c, t, b) => buttons.push({ t, b }),
+    runner: async () => { order.push('preview'); return { stdout: '🔎 ok' }; },
+    fetchHead: async (l) => { order.push(`head:${l}`); return sha; },
+  });
+  assert.deepEqual(order, [`head:${L1}`, 'preview']);
+  const [tok, entry] = [...store.entries()][0];
+  assert.deepEqual(entry.heads, { [L1]: sha });
+  assert.doesNotMatch(buttons[0].t, /Không đọc được commit/);
+  const dispatched = [];
+  const ctx = { registry: MREG, answerButton: async () => {}, editButtonsMessage: async () => {} };
+  await handleMergeButton({ id: 'q', data: `mg:${tok}`, from: { id: 1 }, message: { chat: { id: 1 }, message_id: 5, text: 'p' } }, ctx,
+    { take: (t) => takeMergeButton(t, { store }), dispatch: async (p) => dispatched.push(p) });
+  assert.deepEqual(dispatched, [{ cmd: 'merge', rest: `${L1} --expect-head=thith/teleport#3=${sha}` }]);
+});
+
+test('handlePrLinks: a head that cannot be read → button still offered, with a warning; Close never pins', async () => {
+  const buttons = [], store = new Map();
+  await handlePrLinks([L1], { chat: { id: 1 }, from: { id: 1 } }, {
+    daemonUserId: '1', projectsConfig: OWNER_CFG, registry: MREG, store, scriptsDir: '/s', parentDir: '/w',
+    sendText: async () => {}, sendButtons: async (c, t, b) => buttons.push({ t, b }),
+    runner: async () => ({ stdout: '🔎 ok' }), fetchHead: async () => { throw new Error('gh down'); },
+  });
+  assert.match(buttons[0].t, /Không đọc được commit/);
+  const [tok] = [...store.keys()];
+  store.get(tok).heads = { [L1]: 'c'.repeat(40) };
+  const dispatched = [];
+  await handleMergeButton({ id: 'q', data: `cl:${tok}`, from: { id: 1 }, message: { chat: { id: 1 }, message_id: 5, text: 'p' } },
+    { registry: MREG, answerButton: async () => {}, editButtonsMessage: async () => {} },
+    { take: (t) => takeMergeButton(t, { store }), dispatch: async (p) => dispatched.push(p) });
+  assert.deepEqual(dispatched, [{ cmd: 'merge', rest: `${L1} --close` }]);
 });

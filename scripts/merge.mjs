@@ -52,8 +52,14 @@ export function parsePrUrl(s) {
 export function parseMergeArgs(argv) {
   const targets = [];
   let project = null, method = null, keepBranch = false, force = false, preview = false, close = false, methodConflict = null, skipMerged = false;
+  const expectHeads = {};
   argv.forEach((a, idx) => {
     if (targets.error) return;
+    // --expect-head=owner/name#N=<sha> (the daemon's Merge button): merge only if
+    // the PR's head is still the commit the owner was shown in the preview.
+    const eh = a.match(/^--expect-head=([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)#(\d+)=([0-9a-f]{40,64})$/);
+    if (eh) { expectHeads[`${eh[1].toLowerCase()}#${Number(eh[2])}`] = eh[3]; return; }
+    if (a.startsWith('--expect-head')) { targets.error = `bad ${JSON.stringify(a)} (want --expect-head=owner/name#N=<sha>).`; return; }
     if (a === '--preview') { preview = true; return; }
     if (a === '--close') { close = true; return; }
     if (a === '--skip-merged') { skipMerged = true; return; }
@@ -80,7 +86,7 @@ export function parseMergeArgs(argv) {
     if (seen.has(k)) return { error: `PR ${t.repo ? `${t.repo}` : ''}#${t.number} listed twice.` };
     seen.add(k);
   }
-  return { project, targets, method: method || DEFAULT_MERGE_METHOD, keepBranch, force, ...(preview ? { preview } : {}), ...(close ? { close } : {}), ...(skipMerged ? { skipMerged } : {}) };
+  return { project, targets, method: method || DEFAULT_MERGE_METHOD, keepBranch, force, ...(preview ? { preview } : {}), ...(close ? { close } : {}), ...(skipMerged ? { skipMerged } : {}), ...(Object.keys(expectHeads).length ? { expectHeads } : {}) };
 }
 
 const FAILING = new Set(['FAILURE', 'ERROR', 'CANCELLED', 'TIMED_OUT', 'ACTION_REQUIRED', 'STARTUP_FAILURE']);
@@ -212,7 +218,7 @@ const ghError = (e) => String(e?.stderr || e?.message || e).trim().split('\n').s
  * mergeable=UNKNOWN — normal right after a previous merge in the same batch.
  * Returns { ok, text } | { error, text }.
  */
-export async function mergeOne(target, { method, keepBranch, force, preview = false, skipMerged = false }, {
+export async function mergeOne(target, { method, keepBranch, force, preview = false, skipMerged = false, expectHeads = null }, {
   gh, sleep = (ms) => new Promise((r) => setTimeout(r, ms)), unknownTries = 5, unknownWaitMs = 2000,
   mergedHeads = [],
 }) {
@@ -229,6 +235,11 @@ export async function mergeOne(target, { method, keepBranch, force, preview = fa
   if (pr.number !== number) return { error: true, text: `❌ asked for PR ${c.label}${number} but GitHub returned #${pr.number} — refusing.` };
   // --skip-merged (daemon retries of an interrupted request): a PR that is
   // already merged counts as done instead of stopping the batch.
+  // The owner pressed Merge on a preview of a specific commit: anything pushed
+  // since then was never shown — refuse (the `sha` pin below then guards the
+  // remaining seconds until the merge call).
+  const expected = expectHeads?.[`${String(repo || '').toLowerCase()}#${number}`];
+  if (expected && pr.headRefOid !== expected) return { error: true, text: `❌ PR ${c.label}${pr.number} "${pr.title}": có commit mới sau khi preview (${expected.slice(0, 7)} → ${String(pr.headRefOid).slice(0, 7)}) — không merge. Gửi lại link / merge-request để xem preview mới.\n${pr.url}` };
   if (skipMerged && pr.state === 'MERGED') return { ok: true, head: null, text: `ℹ️ PR ${c.label}${pr.number} "${pr.title}" was already merged — skipped.\n${pr.url}` };
   // Checks GitHub refused to START (Actions billing) are "not run", like a repo
   // without CI (which the owner allows) — only real failures block.
