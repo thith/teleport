@@ -351,7 +351,11 @@ cleanup-request chỉ xoá khi PR đã merge sạch; worktree không có PR thì
 ```bash
 node ../teleport/scripts/cleanup-request.mjs <đường dẫn worktree | tên nhánh>
 ```
-`cd` ra khỏi worktree trước khi gọi (còn tiến trình nào đứng trong đó thì daemon giữ lại). Daemon kiểm tra như đợt dọn hằng ngày, trừ hai điều "mới dùng gần đây" (file sửa trong 24h, phiên Claude trong 7 ngày): PR merged đúng HEAD và không còn PR mở, không thay đổi chưa commit, file ngoài git chỉ là thư mục build, không bị khoá. Xoá bằng `git worktree remove --force`, **nhánh giữ nguyên**. **Kết quả quay về topic của bạn** như một prompt có trường `cleanupResult` (`fromRole: 'daemon'`): `✅ đã xoá worktree …, lấy lại X GB` hoặc `❌ giữ lại …: <lý do>` → tự kể NGẮN cho user.
+**Kiểm trước khi gọi** (không thì bị từ chối):
+- `git -C <worktree> status --short --untracked-files=all --ignored=matching` (đúng lệnh daemon dùng): **không được có dòng `??`** (file untracked, ở đâu cũng tính). Dòng `!!` (file đã gitignore) chỉ được nằm trong thư mục build (`target/`, `node_modules/`, `build/`, `.gradle/`, `.kotlin/`, `dist/`, `.idea/`, `__pycache__/`). Còn `tmp/`, log, `.env`, ghi chú… thì xem lại: cần thì chuyển ra chỗ khác, không cần thì xoá, rồi mới gửi.
+- Không còn thay đổi chưa commit, PR đã merge và nhánh không có commit mới sau đó.
+- Không file nào bị đánh dấu skip-worktree/assume-unchanged: `git -C <worktree> ls-files -v | grep -E '^(S|[a-z])'` phải rỗng (có thì `git update-index --no-skip-worktree --no-assume-unchanged <file>`).
+- `cd` ra khỏi worktree trước khi gọi (còn tiến trình nào đứng trong đó thì daemon giữ lại). Daemon kiểm tra như đợt dọn hằng ngày, trừ hai điều "mới dùng gần đây" (file sửa trong 24h, phiên Claude trong 7 ngày): PR merged đúng HEAD và không còn PR mở, không thay đổi chưa commit, file ngoài git chỉ là thư mục build, không bị khoá. Xoá bằng `git worktree remove --force`, **nhánh giữ nguyên**. **Kết quả quay về topic của bạn** như một prompt có trường `cleanupResult` (`fromRole: 'daemon'`): `✅ đã xoá worktree …, lấy lại X GB` hoặc `❌ giữ lại …: <lý do>` → tự kể NGẮN cho user.
 
 ## Supervisor daemon (tuỳ chọn)
 
