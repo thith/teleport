@@ -17,6 +17,7 @@
 // (merged PR at HEAD, clean tree, no process inside, …).
 
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
@@ -33,25 +34,60 @@ const gitSync = (args) => execFileSync('git', args, { encoding: 'utf8', stdio: [
 
 /**
  * <path | branch> → { path } (realpath of the worktree root) | { error }.
- * An existing path wins over a branch of the same name.
+ * `/…`, `./…`, `../…`, `~/…` are paths. Anything else is looked up as a branch;
+ * it is a path only if it contains `/` and exists, or names a linked worktree
+ * ROOT. Both interpretations, pointing at different worktrees → error.
  */
-export function resolveTarget(arg, { cwd = process.cwd(), git = gitSync } = {}) {
+export function resolveTarget(arg, { cwd = process.cwd(), git = gitSync, home = os.homedir() } = {}) {
   if (typeof arg !== 'string' || !arg) return { error: USAGE };
+  const expanded = arg === '~' || arg.startsWith('~/') ? path.join(home, arg.slice(1)) : arg;
+  // Explicit path syntax → a path, never a branch.
+  if (/^[./~]/.test(arg)) return pathTarget(path.resolve(cwd, expanded), arg, git);
+  // Otherwise the arg may be a path or a branch name (branch names contain `/`
+  // too). A bare name counts as a path only when it IS a linked worktree root —
+  // never "a subdir of the current worktree" or a stray file.
   const asPath = path.resolve(cwd, arg);
-  if (fs.existsSync(asPath)) {
-    let real;
-    try { real = fs.realpathSync(asPath); } catch (e) { return { error: `cannot resolve ${arg}: ${e.message}` }; }
-    if (!fs.statSync(real).isDirectory()) return { error: `not a directory: ${real}` };
-    let top;
-    try { top = git(['-C', real, 'rev-parse', '--show-toplevel']).trim(); } catch { return { error: `not inside a git worktree: ${real}` }; }
-    try { return { path: fs.realpathSync(top) }; } catch (e) { return { error: `cannot resolve ${top}: ${e.message}` }; }
+  let fromPath = null;
+  if (arg.includes('/')) fromPath = pathTarget(asPath, arg, git);
+  else if (isLinkedWorktreeRoot(asPath, git)) fromPath = { path: fs.realpathSync(asPath) };
+  const fromBranch = branchTarget(arg, cwd, git);
+  if (fromPath?.path && fromBranch.path && fromPath.path !== fromBranch.path) {
+    return { error: `${arg} is ambiguous: path → ${fromPath.path}, branch → ${fromBranch.path}. Pass an explicit path (./${arg} or an absolute path).` };
   }
+  if (fromBranch.path) return fromBranch;
+  if (fromPath?.path) return fromPath;
+  return { error: fromPath ? `${fromPath.error}; ${fromBranch.error}` : fromBranch.error };
+}
+
+/** A filesystem path → { path: realpath of its worktree root } | { error }. */
+function pathTarget(asPath, arg, git) {
+  let real;
+  try { real = fs.realpathSync(asPath); } catch { return { error: `no such path: ${arg}` }; }
+  if (!fs.statSync(real).isDirectory()) return { error: `not a directory: ${real}` };
+  let top;
+  try { top = git(['-C', real, 'rev-parse', '--show-toplevel']).trim(); } catch { return { error: `not inside a git worktree: ${real}` }; }
+  try { return { path: fs.realpathSync(top) }; } catch (e) { return { error: `cannot resolve ${top}: ${e.message}` }; }
+}
+
+/** Is `p` exactly the root of a LINKED (non-main) worktree? */
+function isLinkedWorktreeRoot(p, git) {
+  try {
+    const real = fs.realpathSync(p);
+    if (!fs.statSync(real).isDirectory()) return false;
+    const list = parseWorktreePorcelain(git(['-C', real, 'worktree', 'list', '--porcelain']));
+    const idx = list.findIndex((w) => { try { return fs.realpathSync(w.path) === real; } catch { return false; } });
+    return idx > 0 && !list[idx].bare;
+  } catch { return false; }
+}
+
+/** A branch checked out in a worktree of the repo containing `cwd` → { path } | { error }. */
+function branchTarget(arg, cwd, git) {
   let list;
   try { list = parseWorktreePorcelain(git(['-C', cwd, 'worktree', 'list', '--porcelain'])); }
-  catch { return { error: `${arg}: no such path, and the cwd is not in a git repo to look the branch up in` }; }
+  catch { return { error: `${arg}: not a worktree path, and the cwd is not in a git repo to look the branch up in` }; }
   const ref = arg.startsWith('refs/heads/') ? arg : `refs/heads/${arg}`;
   const hit = list.find((w) => w.branch === ref);
-  if (!hit) return { error: `${arg}: no such path, and no worktree of this repo has that branch checked out` };
+  if (!hit) return { error: `${arg}: not a worktree path, and no worktree of this repo has that branch checked out` };
   try { return { path: fs.realpathSync(hit.path) }; } catch { return { error: `worktree of ${arg} is missing on disk: ${hit.path}` }; }
 }
 

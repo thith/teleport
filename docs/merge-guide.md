@@ -90,7 +90,7 @@ cleanup-request chỉ xoá khi PR đã merge sạch; worktree không có PR thì
 node ../teleport/scripts/cleanup-request.mjs <đường dẫn worktree | tên nhánh>
 ```
 
-- Tên nhánh được tra trong `git worktree list` của repo chứa thư mục hiện tại; đường dẫn được quy về gốc worktree (realpath).
+- Bắt đầu bằng `/`, `./`, `../` hoặc `~/` là đường dẫn (quy về gốc worktree, realpath). Còn lại được tra như tên nhánh trong `git worktree list` của repo chứa thư mục hiện tại. Nếu tên đó vừa là gốc của một worktree khác vừa là một nhánh thì lệnh báo lỗi: ghi đường dẫn rõ ràng.
 - Lệnh chỉ xếp yêu cầu vào hộp thư của daemon rồi thoát ngay. Nó không xoá gì và không cấp quyền gì.
 
 **Daemon kiểm tra gì** (cùng bộ kiểm tra với đợt dọn hằng ngày, chỉ bỏ hai điều "mới dùng gần đây": file sửa trong 24h và phiên Claude trong 7 ngày, vì người xin chính là người vừa dùng):

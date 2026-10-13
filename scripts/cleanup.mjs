@@ -250,6 +250,30 @@ export const defaultDeps = () => ({
 export const procsInside = (deps, wt) => deps.procCwds().filter((p) => isInside(p.cwd, wt));
 
 /**
+ * The cheap, changeable state of a worktree: HEAD still the judged one, no
+ * tracked change, untracked/ignored only build output, no skip-worktree /
+ * assume-unchanged, no process cwd inside → null; else a KEEP verdict.
+ * Run by the judge AND again right before `git worktree remove` (after the slow
+ * `du`), so nothing that appeared in between is deleted.
+ */
+export async function treeStateBlocker(L, deps) {
+  const git = (args, opts) => deps.exec('git', args, opts);
+  const { wt, real } = L;
+  // HEAD may have moved since `worktree list` — re-read it right here.
+  const headNow = String(await git(['-C', wt.path, 'rev-parse', 'HEAD'])).trim();
+  if (headNow !== wt.head) return { ok: false, reason: 'HEAD vừa đổi', notable: true };
+  const st = parseStatusZ(await git(['-C', wt.path, 'status', '--porcelain=v1', '-z', '--untracked-files=all', '--ignored=matching']));
+  if (st.tracked.length) return { ok: false, reason: `có thay đổi chưa commit (${st.tracked.slice(0, 3).join(', ')}${st.tracked.length > 3 ? ', …' : ''})`, notable: true };
+  const stray = strayEntries(st);
+  if (stray.length) return { ok: false, reason: `có file ngoài git: ${stray.slice(0, 5).join(', ')}${stray.length > 5 ? ', …' : ''}`, notable: true };
+  const hidden = hiddenEdits(await git(['-C', wt.path, 'ls-files', '-v', '-z']));
+  if (hidden.length) return { ok: false, reason: `có file skip-worktree/assume-unchanged (${hidden.slice(0, 3).join(', ')}${hidden.length > 3 ? ', …' : ''})`, notable: true };
+  const procs = procsInside(deps, real);
+  if (procs.length) return { ok: false, reason: `có tiến trình đang ở trong (pid ${procs.slice(0, 3).map((p) => p.pid).join(', ')})`, notable: true };
+  return null;
+}
+
+/**
  * E1 verdict for one linked worktree `L` = { main, slug, wt, real } →
  * { ok:true, pr } | { ok:false, reason, notable }. May THROW (caller keeps).
  *
@@ -274,17 +298,8 @@ export async function judgeWorktree(L, { deps, realParent, now = Date.now(), tra
     '--json', 'number,state,headRefOid,headRefName', '--limit', '100'], { timeout: 60_000 }));
   const pr = judgePrs(prs, branch, wt.head);
   if (!pr.ok) return pr;
-  // HEAD may have moved since `worktree list` — re-read it right here.
-  const headNow = String(await git(['-C', wt.path, 'rev-parse', 'HEAD'])).trim();
-  if (headNow !== wt.head) return { ok: false, reason: 'HEAD vừa đổi', notable: true };
-  const st = parseStatusZ(await git(['-C', wt.path, 'status', '--porcelain=v1', '-z', '--untracked-files=all', '--ignored=matching']));
-  if (st.tracked.length) return { ok: false, reason: `có thay đổi chưa commit (${st.tracked.slice(0, 3).join(', ')}${st.tracked.length > 3 ? ', …' : ''})`, notable: true };
-  const stray = strayEntries(st);
-  if (stray.length) return { ok: false, reason: `có file ngoài git: ${stray.slice(0, 5).join(', ')}${stray.length > 5 ? ', …' : ''}`, notable: true };
-  const hidden = hiddenEdits(await git(['-C', wt.path, 'ls-files', '-v', '-z']));
-  if (hidden.length) return { ok: false, reason: `có file skip-worktree/assume-unchanged (${hidden.slice(0, 3).join(', ')}${hidden.length > 3 ? ', …' : ''})`, notable: true };
-  const procs = procsInside(deps, real);
-  if (procs.length) return { ok: false, reason: `có tiến trình đang ở trong (pid ${procs.slice(0, 3).map((p) => p.pid).join(', ')})`, notable: true };
+  const bad = await treeStateBlocker(L, deps);
+  if (bad) return bad;
   if (requested) return { ok: true, pr: pr.pr }; // the two "recently used" gates below don't apply
   if (!transcriptCwds) return { ok: false, reason: 'không đọc được transcript', notable: false };
   if (transcriptCwds.some((c) => isInside(c, real) || isInside(c, wt.path))) return { ok: false, reason: 'có phiên Claude dùng trong 7 ngày qua', notable: true };
@@ -342,9 +357,9 @@ export async function cleanupRequested(target, { parentDir = PARENT_DIR, now = D
     shown = L.wt.path;
     const v = await judgeWorktree(L, { deps, realParent, now, requested: true });
     if (!v.ok) return { ok: false, path: shown, reason: v.reason };
-    // Last-moment re-check: a process may have just cd'd in.
-    if (procsInside(deps, L.real).length) return { ok: false, path: shown, reason: 'có tiến trình vừa vào' };
-    const bytes = await duBytes(deps, L.real);
+    const bytes = await duBytes(deps, L.real); // slow (up to 10 min) — measured BEFORE the last-moment re-check
+    const late = await treeStateBlocker(L, deps);
+    if (late) return { ok: false, path: shown, reason: `${late.reason} (vừa xuất hiện)` };
     await deps.exec('git', ['-C', L.main, 'worktree', 'remove', '--force', L.wt.path]);
     deps.log(`removed ${L.wt.path} (requested)`);
     return { ok: true, path: shown, branch: L.wt.branch.slice('refs/heads/'.length), pr: v.pr, bytes };
@@ -413,9 +428,10 @@ export async function runCleanup({
     try { v = await judge(L); } catch (e) { v = { ok: false, reason: `lỗi: ${String(e.message || e).split('\n')[0].slice(0, 160)}`, notable: true, error: true }; }
     if (!v.ok) { keep(L, v.reason, v.notable); stay.push(L); continue; }
     try {
-      // Last-moment re-check: a process may have just cd'd in.
-      if (busyIn(L.real).length) { keep(L, 'có tiến trình vừa vào', true); stay.push(L); continue; }
-      const bytes = await du(L.real);
+      const bytes = await du(L.real); // slow — measured BEFORE the last-moment re-check
+      // Last-moment re-check: a process may have just cd'd in, a file appeared…
+      const late = await treeStateBlocker(L, deps);
+      if (late) { keep(L, `${late.reason} (vừa xuất hiện)`, true); stay.push(L); continue; }
       if (!dryRun) {
         await git(['-C', L.main, 'worktree', 'remove', '--force', L.wt.path]);
         deps.log(`removed ${L.wt.path}`);
