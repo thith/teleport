@@ -549,13 +549,13 @@ test('daily: stray-only worktree → offer (report says it will ask); real run q
   const h = buttonHarness();
   const dd = deps({ prs: { 'feat-a': merged(a) } });
   await processCleanupOffers(h.ctx, { claim: () => claimRequests(dir), lockDir: h.opts.lockDir, waitSec: 0, parentDir: w.parent, deps: dd,
-    run: (p, o) => cleanupRequested(p, { ...o, now: OLD_NOW }) });
+    run: (p, o) => cleanupRequested(p, { ...o, deps: dd, now: OLD_NOW }) });
   assert.equal(h.buttons.length, 1);
   assert.match(h.buttons[0].t, /^🧹 Dọn hằng ngày \(repo\): giữ lại .* vì có 1 mục ngoài git:\n• \.env/);
   assert.deepEqual(fs.readdirSync(dir), []);
   let seen;
   await handleCleanupButton(press(h.buttons[0].b[0].callback_data, h.buttons[0].t), h.ctx, { ...h.opts, parentDir: w.parent, deps: deps({ prs: { 'feat-a': merged(a) } }),
-    run: (p, o) => { seen = o; return cleanupRequested(p, { ...o, now: OLD_NOW }); } }); // files here are "30 days old"
+    run: (p, o) => { seen = o; return cleanupRequested(p, { ...o, deps: dd, now: OLD_NOW }); } }); // files here are "30 days old"
   assert.equal(seen.daily, true, 'a daily offer is pressed under the daily gates');
   assert.equal(fs.existsSync(a.path), false);
 });
@@ -776,4 +776,11 @@ test('owner press: a repo appearing around the shown files after the offer (same
   assert.equal(r.ok, false);
   assert.match(r.reason, /repo git|ngoài git/); // caught as new stray entries or as a repo, whichever git reports
   assert.ok(fs.existsSync(a.path));
+});
+
+test('childRun: cleanupRequested runs in its own process and returns its result (secrets stripped)', async () => {
+  const { childRun } = await import('./cleanup-inbox.mjs');
+  const r = await childRun(['HOME_SECRET'])('/definitely/not/here', { parentDir: tmp() });
+  assert.equal(r.ok, false);
+  assert.match(r.reason, /không tìm thấy|nằm ngoài/);
 });

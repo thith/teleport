@@ -15,16 +15,18 @@
 //     with [🧹 Xoá luôn] [Giữ] (handleCleanupButton): pressing it removes the
 //     worktree anyway — unless HEAD moved or a file NOT in the shown list
 //     appeared since. The agent's own result is unchanged (still a refusal).
-// Everything here is async (git/gh/du run as child processes), so the poll loop
+// Everything here is async: each judge / removal runs in a child process
+// (cleanup-child.mjs — its filesystem walks are synchronous), so the poll loop
 // never blocks on it.
 
 import fs from 'node:fs';
 import crypto from 'node:crypto';
 import path from 'node:path';
+import { execFile } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { claimRequests, deliverResult } from './merge-inbox.mjs';
 import { CLEANUP_REQUEST_DIR } from './cleanup-request.mjs';
-import { cleanupRequested, defaultDeps, fmtGB, CLEANUP_OFFER_DIR } from './cleanup.mjs';
+import { cleanupRequested, fmtGB, CLEANUP_OFFER_DIR } from './cleanup.mjs';
 import { acquireLock, LOCK_DIR } from './machine-lock.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -101,12 +103,27 @@ export function auditCleanupRequest(entry, file = CLEANUP_REQUEST_AUDIT_FILE) {
   } catch { /* audit is best-effort */ }
 }
 
-/** git/gh/du deps without the daemon's secrets in their env. */
-function depsWithoutSecrets(secretEnvKeys) {
-  const env = { ...process.env };
-  for (const k of secretEnvKeys) delete env[k];
-  const base = defaultDeps();
-  return { ...base, exec: (cmd, args, opts = {}) => base.exec(cmd, args, { env, ...opts }) };
+const CHILD_TIMEOUT_MS = 20 * 60 * 1000; // du alone may take 10 min
+
+/** cleanupRequested in a child process (env without the daemon's secrets). */
+export function childRun(secretEnvKeys = []) {
+  return (target, opts) => new Promise((resolve) => {
+    const env = { ...process.env };
+    for (const k of secretEnvKeys) delete env[k];
+    const child = execFile(process.execPath, [path.join(__dirname, 'cleanup-child.mjs')],
+      { env, timeout: CHILD_TIMEOUT_MS, maxBuffer: 4 * 1024 * 1024 }, (err, stdout) => {
+        try { const r = JSON.parse(String(stdout).trim().split('\n').pop()); if (r && typeof r === 'object') return resolve(r); } catch {}
+        resolve({ ok: false, path: target, reason: `lỗi tiến trình con: ${String(err?.message || 'không có kết quả').split('\n')[0].slice(0, 160)}` });
+      });
+    child.stdin.end(JSON.stringify({ target, opts }));
+  });
+}
+
+/** Injected run (tests) → as is; injected deps (tests) → in-process; else the child. */
+function pickRun(run, deps, secretEnvKeys) {
+  if (run) return run;
+  if (deps) return (t, o) => cleanupRequested(t, { ...o, deps });
+  return childRun(secretEnvKeys);
 }
 
 /** Can these entries be offered at all (count, name length)? Pure. */
@@ -143,9 +160,10 @@ export function validCleanupOffer(o, { now = Date.now(), maxAgeMs = CLEANUP_REQU
  */
 export async function processCleanupOffers({ daemonUserId, sendText = async () => {}, sendButtons = null, buttonStore = null, secretEnvKeys = [] }, {
   claim = () => claimRequests(CLEANUP_OFFER_DIR), remove = (f) => { try { fs.unlinkSync(f); } catch {} }, putBack = unclaim,
-  run = cleanupRequested, acquire = acquireLock, lockDir = LOCK_DIR, waitSec = CLEANUP_LOCK_WAIT_SEC, parentDir, deps,
+  run = null, acquire = acquireLock, lockDir = LOCK_DIR, waitSec = CLEANUP_LOCK_WAIT_SEC, parentDir, deps,
 } = {}) {
   if (!sendButtons || !buttonStore) return;
+  run = pickRun(run, deps, secretEnvKeys);
   for (const { file, body } of claim()) {
     let keepFile = false;
     try {
@@ -160,7 +178,7 @@ export async function processCleanupOffers({ daemonUserId, sendText = async () =
       if (lock.timeout) { keepFile = true; putBack(file); break; }
       if (lock.error) { console.error(`[daemon] cleanup offer: lock: ${lock.error?.message ?? lock.error}`); continue; }
       let probe;
-      try { probe = await run(v0.path, { ...(parentDir ? { parentDir } : {}), deps: deps ?? depsWithoutSecrets(secretEnvKeys), allowStray: v0.stray, expectHead: v0.head, dryRun: true, daily: true }); }
+      try { probe = await run(v0.path, { ...(parentDir ? { parentDir } : {}), allowStray: v0.stray, expectHead: v0.head, dryRun: true, daily: true }); }
       catch (e) { probe = { ok: false, reason: e?.message ?? String(e) }; }
       finally { lock.release(); }
       if (!probe?.ok || !probe.dryRun || !probe.strayHash) { console.error(`[daemon] cleanup offer ${v0.path} no longer applies: ${probe?.reason ?? '?'}`); continue; }
@@ -226,13 +244,13 @@ export function unclaim(file) {
  * and the pass stops (the rest stays queued, unclaimed).
  */
 export async function processCleanupRequests({ daemonUserId, sendText, sendButtons = null, buttonStore = null, secretEnvKeys = [] }, {
-  claim = () => claimRequests(CLEANUP_REQUEST_DIR), run = cleanupRequested, acquire = acquireLock,
+  claim = () => claimRequests(CLEANUP_REQUEST_DIR), run = null, acquire = acquireLock,
   lockDir = LOCK_DIR, waitSec = CLEANUP_LOCK_WAIT_SEC, deliver = deliverResult, audit = auditCleanupRequest,
   remove = (f) => { try { fs.unlinkSync(f); } catch {} }, putBack = unclaim, label = (c) => `#${c}`,
   parentDir, deps,
 } = {}) {
   // git/gh/du without the daemon's secrets in their env.
-  const runDeps = deps ?? depsWithoutSecrets(secretEnvKeys);
+  run = pickRun(run, deps, secretEnvKeys);
   for (const { file, body } of claim()) {
     let keepFile = false;
     try {
@@ -248,10 +266,10 @@ export async function processCleanupRequests({ daemonUserId, sendText, sendButto
       if (lock.error) r = { ok: false, path: req.path, reason: `không lấy được lock cleanup: ${lock.error?.message ?? lock.error}` };
       else {
         try {
-          r = await run(req.path, { ...(parentDir ? { parentDir } : {}), deps: runDeps });
+          r = await run(req.path, { ...(parentDir ? { parentDir } : {}) });
           // Kept for stray files only? Probe (no removal) with exactly those allowed.
           if (!r.ok && offerable(r.stray) && buttonStore && sendButtons) {
-            probe = await run(req.path, { ...(parentDir ? { parentDir } : {}), deps: runDeps, allowStray: r.stray, dryRun: true });
+            probe = await run(req.path, { ...(parentDir ? { parentDir } : {}), allowStray: r.stray, dryRun: true });
             if (!probe?.ok || !probe.dryRun || !probe.strayHash) probe = null;
           }
         } finally { lock.release(); }
@@ -294,7 +312,7 @@ export async function processCleanupRequests({ daemonUserId, sendText, sendButto
  * the offer was made for.
  */
 export async function handleCleanupButton(cq, ctx, {
-  take = takeCleanupButton, run = cleanupRequested, acquire = acquireLock, lockDir = LOCK_DIR,
+  take = takeCleanupButton, run = null, acquire = acquireLock, lockDir = LOCK_DIR,
   waitSec = CLEANUP_LOCK_WAIT_SEC, deliver = deliverResult, audit = auditCleanupRequest, parentDir, deps,
 } = {}) {
   const m = String(cq.data || '').match(CLEANUP_BUTTON_RE);
@@ -337,7 +355,7 @@ export async function handleCleanupButton(cq, ctx, {
     // Missing strayHash (never written by this code) → refuse rather than allow unpinned.
     if (!entry.strayHash) r = { ok: false, path: entry.path, reason: 'nút thiếu dấu vân tay file — gửi lại cleanup-request' };
     else {
-      try { r = await run(entry.path, { ...(parentDir ? { parentDir } : {}), deps: deps ?? depsWithoutSecrets(ctx.secretEnvKeys || []), allowStray: entry.stray, expectHead: entry.head, strayHash: entry.strayHash, daily: entry.mode === 'daily' }); }
+      try { r = await pickRun(run, deps, ctx.secretEnvKeys || [])(entry.path, { ...(parentDir ? { parentDir } : {}), allowStray: entry.stray, expectHead: entry.head, strayHash: entry.strayHash, daily: entry.mode === 'daily' }); }
       catch (e) { r = { ok: false, path: entry.path, reason: `lỗi: ${e?.message ?? e}` }; }
     }
     lock.release();

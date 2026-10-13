@@ -806,3 +806,15 @@ test('handleMergeButton: a non-canonical link in a (tampered) entry yields no pi
     { take: (t) => takeMergeButton(t, { store }), dispatch: async (p) => dispatched.push(p) });
   assert.equal(dispatched.length, 0);
 });
+
+test('handlePrLinks: a link copied from the Files tab / a comment is canonicalized BEFORE the pin is read', async () => {
+  const seen = [], buttons = [], store = new Map(), sha = 'a'.repeat(40);
+  await handlePrLinks([`${L1}/files`, `${L1}#discussion_r1`, L1.replace('https:', 'http:')], { chat: { id: 1 }, from: { id: 1 } }, {
+    daemonUserId: '1', projectsConfig: OWNER_CFG, registry: MREG, store, scriptsDir: '/s', parentDir: '/w',
+    sendText: async () => {}, sendButtons: async (c, t, b) => buttons.push({ t, b }), runner: async () => ({ stdout: '🔎 ok' }),
+    fetchHead: async (l) => { seen.push(l); return { sha, base: 'main' }; },
+  });
+  assert.deepEqual(seen, [L1], 'one canonical link');
+  assert.equal(buttons[0].b[0].text, '✅ Merge');
+  assert.deepEqual([...store.values()][0].links, [L1]);
+});
