@@ -56,7 +56,9 @@ export function validCleanupRequest(req, { now = Date.now(), maxAgeMs = CLEANUP_
 export function escapeControls(s) {
   // eslint-disable-next-line no-control-regex
   const named = { '\n': '\\n', '\r': '\\r', '\t': '\\t' };
-  return String(s).replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g, (c) => named[c] ?? `\\u${c.charCodeAt(0).toString(16).padStart(4, '0')}`);
+  // Also bidi overrides / isolates and zero-width chars: a file name must read as
+  // what it is (no `notes\u202Ehs.txt` shown reversed).
+  return String(s).replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/g, (c) => named[c] ?? `\\u${c.charCodeAt(0).toString(16).padStart(4, '0')}`);
 }
 
 /** The one-line result shown to the requester and the owner (control chars escaped). Pure. */

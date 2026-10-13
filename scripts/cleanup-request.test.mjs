@@ -732,3 +732,9 @@ test('repo under tmp/ hidden in an ignored build dir → kept; an unignored bare
   assert.equal(probe.ok, false);
   assert.match(probe.reason, /repo git/);
 });
+
+test('escapeControls: bidi overrides / zero-width chars are shown escaped', async () => {
+  const { escapeControls } = await import('./cleanup-inbox.mjs');
+  assert.equal(escapeControls('notes‮hs.txt'), 'notes\\u202ehs.txt');
+  assert.equal(escapeControls('a​b﻿'), 'a\\u200bb\\ufeff');
+});

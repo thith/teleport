@@ -455,7 +455,7 @@ export const PREVIEW_INLINE_MAX = 3500;
 // token → { links, chatId, createdAt, canMerge, heads?, requester? } — also the
 // manual-cleanup buttons ({ kind: 'cleanup', … }, see cleanup-inbox.mjs). A
 // plain Map for tests / imports; main() swaps in a PersistentMap
-// (scripts/tmp/pending-buttons.json) so a restart doesn't expire them.
+// (~/.local/state/teleport/pending-buttons.json) so a restart doesn't expire them.
 // eslint-disable-next-line import/no-mutable-exports
 export let pendingMergeButtons = new Map();
 
@@ -618,7 +618,9 @@ export async function handleMergeButton(cq, ctx, { take = takeMergeButton, dispa
   // that doesn't match the message the owner saw, is refused.
   // Every pin must be a FULL sha (a shortened one would be dropped from
   // --expect-head and the merge would go unpinned).
-  const unpinned = m[1] === 'mg' && (ctx.fetchHead || Object.keys(entry.heads || {}).length) && entry.links.some((l) => !/^[0-9a-f]{40,64}$/.test(String(entry.heads?.[l] || '')));
+  const unpinned = m[1] === 'mg' && (ctx.fetchHead || Object.keys(entry.heads || {}).length)
+    && (entry.links.some((l) => !/^[0-9a-f]{40,64}$/.test(String(entry.heads?.[l] || '')))
+      || (expectHeadArgs(entry.heads).match(/--expect-head=/g) || []).length !== entry.links.length); // every link must yield a pin
   if (unpinned || !entryMatchesMessage(entry, original)) {
     await ctx.answerButton(cq.id, 'Nút không khớp nội dung — dán lại link.');
     await ctx.editButtonsMessage(chatId, messageId, `${original}\n\n⚠️ Nút không khớp nội dung tin nhắn — không làm gì. Dán lại link / gửi lại merge-request.`);

@@ -795,3 +795,13 @@ test('handleMergeButton: a shortened (12-char) pin in the entry → refused, nev
     { take: (t) => takeMergeButton(t, { store }), dispatch: async (p) => dispatched.push(p) });
   assert.equal(dispatched.length, 0);
 });
+
+test('handleMergeButton: a non-canonical link in a (tampered) entry yields no pin → refused', async () => {
+  const sha = 'a'.repeat(40), odd = `${L1}/files`;
+  const store = new Map([['ffffffffffffffff', { links: [odd], heads: { [odd]: sha }, createdAt: Date.now(), canMerge: true }]]);
+  const dispatched = [];
+  await handleMergeButton({ id: 'q', data: 'mg:ffffffffffffffff', from: { id: 1 }, message: { chat: { id: 1 }, message_id: 5, text: `x\n📌 ${odd} @ ${sha.slice(0, 12)}` } },
+    { registry: MREG, answerButton: async () => {}, editButtonsMessage: async () => {} },
+    { take: (t) => takeMergeButton(t, { store }), dispatch: async (p) => dispatched.push(p) });
+  assert.equal(dispatched.length, 0);
+});
