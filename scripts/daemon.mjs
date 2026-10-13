@@ -70,6 +70,7 @@ import { peekPersona } from './persona-store.mjs';
 import { machineWatch } from './health.mjs';
 import { recordFetchOk, startListenWatchdog } from './listen-watch.mjs';
 import { launchCleanup, startCleanupScheduler } from './cleanup-launch.mjs';
+import { processCleanupRequests } from './cleanup-inbox.mjs';
 import { formatPersona } from './persona.mjs';
 import { shortConvoHash } from './convo-hash.mjs';
 
@@ -314,6 +315,7 @@ async function main() {
 
   let lastHeartbeat = 0;
   let mergeInboxBusy = false;
+  let cleanupInboxBusy = false;
   const watchState = {}; // machineWatch memory (previous agent list, last RAM alert)
   // eslint-disable-next-line no-constant-condition
   while (true) {
@@ -360,6 +362,12 @@ async function main() {
       if (!mergeInboxBusy) {
         mergeInboxBusy = true;
         processMergeRequests(ctx).catch((e) => console.error(`[daemon] merge inbox: ${e?.message ?? e}`)).finally(() => { mergeInboxBusy = false; });
+      }
+      // Agent cleanup requests (file inbox) — NOT awaited (git/gh/du + up to
+      // ~60 s waiting for the `cleanup` lock); one pass at a time.
+      if (!cleanupInboxBusy) {
+        cleanupInboxBusy = true;
+        processCleanupRequests(ctx, { label: requesterLabel }).catch((e) => console.error(`[daemon] cleanup inbox: ${e?.message ?? e}`)).finally(() => { cleanupInboxBusy = false; });
       }
       if (updates.length) writeOffset(Math.max(...updates.map((u) => u.update_id)), daemonOffsetFile);
 

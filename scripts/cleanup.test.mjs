@@ -442,7 +442,30 @@ test('E1: a process enters between the checks and the removal → kept', async (
   d.procCwds = () => (++n >= 2 ? [{ pid: 99, cwd: fs.realpathSync(a.path) }] : []);
   const r = await run(w, d);
   assert.ok(exists(a.path));
-  assert.match(keptReason(r, a), /vừa vào/);
+  assert.match(keptReason(r, a), /tiến trình .*vừa xuất hiện/);
+});
+
+test('E1: a file / edit / process that appears DURING du → kept (re-check after du, before remove)', async () => {
+  for (const kind of ['file', 'edit', 'proc']) {
+    const w = world();
+    const a = w.add('feat-a');
+    const d = deps({ prs: { 'feat-a': merged(a) } });
+    let started = false;
+    const exec0 = d.exec;
+    d.exec = async (cmd, args, opts) => {
+      if (cmd === 'du' && args.includes(fs.realpathSync(a.path))) {
+        if (kind === 'file') write(path.join(a.path, 'notes.txt'), 'unsaved');
+        else if (kind === 'edit') write(path.join(a.path, 'README.md'), 'edited');
+        else started = true;
+      }
+      return exec0(cmd, args, opts);
+    };
+    d.procCwds = () => (started ? [{ pid: 5, cwd: fs.realpathSync(a.path) }] : []);
+    const r = await run(w, d);
+    assert.ok(exists(a.path), kind);
+    assert.equal(r.removed.length, 0, kind);
+    assert.match(keptReason(r, a), /vừa xuất hiện/, kind);
+  }
 });
 
 // ── E2 ───────────────────────────────────────────────────────────────────────
