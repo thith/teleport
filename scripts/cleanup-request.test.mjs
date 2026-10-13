@@ -711,3 +711,24 @@ test('allowStray must equal the stray set: a bogus extra entry → refused', asy
   assert.equal(r.ok, false);
   assert.match(r.reason, /không còn khớp/);
 });
+
+test('repo under tmp/ hidden in an ignored build dir → kept; an unignored bare repo listed file-by-file → no button', async () => {
+  const w = world();
+  fs.appendFileSync(path.join(w.main, '.gitignore'), 'build/\n');
+  g(w.main, 'commit', '-qam', 'ignore build');
+  const a = w.add('feat-a');
+  fs.mkdirSync(path.join(a.path, 'tmp', 'build', 'private.git', 'objects'), { recursive: true });
+  write(path.join(a.path, 'tmp', 'build', 'private.git', 'HEAD'), 'ref: refs/heads/main\n');
+  const r = await req(w, a.path, deps({ prs: { 'feat-a': merged(a) } }));
+  assert.equal(r.ok, false);
+  assert.match(r.reason, /repo git trong tmp/);
+  const b = w.add('feat-b');
+  write(path.join(b.path, 'keep', 'mirror.git', 'HEAD'), 'ref: refs/heads/main\n');
+  write(path.join(b.path, 'keep', 'mirror.git', 'objects', 'ab', 'cdef'), 'x');
+  const d = deps({ prs: { 'feat-b': merged(b, 2) } });
+  const kept = await req(w, b.path, d);
+  assert.ok(kept.stray.every((p) => p.startsWith('keep/mirror.git/')), 'listed file by file');
+  const probe = await cleanupRequested(b.path, { parentDir: w.parent, deps: d, allowStray: kept.stray, dryRun: true });
+  assert.equal(probe.ok, false);
+  assert.match(probe.reason, /repo git/);
+});

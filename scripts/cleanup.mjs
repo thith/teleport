@@ -160,6 +160,14 @@ export function strayFingerprint(root, entries, { maxFiles = STRAY_FP_MAX_FILES 
     const rel0 = String(e).replace(/\/+$/, '');
     if (!rel0 || path.isAbsolute(rel0) || rel0.split('/').includes('..') || rel0.includes('\uFFFD')) return null; // U+FFFD: a non-UTF-8 name we can't stat
     try { fs.lstatSync(path.join(root, rel0)); } catch { return null; } // git reported it, we can't see it → no button
+    // An entry INSIDE a repo (git lists a bare repo's files one by one): look at
+    // every ancestor directory between the worktree root and the entry.
+    const parts = rel0.split('/');
+    for (let i = 1; i < parts.length; i++) {
+      let ents;
+      try { ents = fs.readdirSync(path.join(root, ...parts.slice(0, i)), { withFileTypes: true }); } catch { return null; }
+      if (looksLikeRepo(ents) && !repos.includes(e)) repos.push(e);
+    }
     let c = 0;
     const stack = [rel0];
     while (stack.length) {
@@ -369,7 +377,10 @@ export async function treeStateBlocker(L, deps, { allowStray = null, strayHash =
   if (headNow !== wt.head) return { ok: false, reason: 'HEAD vừa đổi', notable: true };
   const st = parseStatusZ(await git(['-C', wt.path, 'status', '--porcelain=v1', '-z', '--untracked-files=all', '--ignored=matching']));
   if (st.tracked.length) return { ok: false, reason: `có thay đổi chưa commit (${st.tracked.slice(0, 3).join(', ')}${st.tracked.length > 3 ? ', …' : ''})`, notable: true };
-  const stray = strayEntries(st, { scratchOk: !scratchHasRepo(real) });
+  // A git repo anywhere under the root tmp/ (even inside an ignored build dir
+  // there) may hold unpushed commits: always keep, never offer.
+  if (scratchHasRepo(real)) return { ok: false, reason: 'có repo git trong tmp/', notable: true };
+  const stray = strayEntries(st);
   // allowStray (the owner's manual-cleanup button): the files the owner was
   // shown may go; anything NOT in that list (appeared since) still keeps it.
   const allowed = allowStray ? new Set(allowStray) : null;
