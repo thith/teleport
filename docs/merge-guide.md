@@ -72,7 +72,7 @@ node ../teleport/scripts/merge-request.mjs <URL PR> [<URL PR> …]
 
 ## Dành cho agent: dọn worktree (cleanup-request)
 
-> **Kiểm trước khi gọi:** `git -C <worktree> status --short --ignored` không được còn file ngoài git nào ngoài thư mục build (`target/`, `node_modules/`, `build/`, `.gradle/`, `.kotlin/`, `dist/`, `.idea/`, `__pycache__/`). Có `tmp/`, log, `.env`, ghi chú… thì chuyển đi (nếu cần) hoặc xoá trước, không thì daemon từ chối ("có file ngoài git"). Cũng phải không còn thay đổi chưa commit, PR đã merge đúng commit hiện tại, và bạn đã `cd` ra ngoài.
+> **Kiểm trước khi gọi:** `git -C <worktree> status --short --ignored` không được còn file ngoài git nào ngoài thư mục build đã được gitignore (`target/`, `node_modules/`, `build/`, `.gradle/`, `.kotlin/`, `dist/`, `.idea/`, `__pycache__/`). Có `tmp/`, log, `.env`, ghi chú… thì chuyển đi (nếu cần) hoặc xoá trước, không thì daemon từ chối ("có file ngoài git"). Cũng phải không còn thay đổi chưa commit, PR đã merge đúng commit hiện tại, và bạn đã `cd` ra ngoài.
 
 > Phần này viết cho **agent**. Owner không phải đọc.
 
