@@ -253,7 +253,7 @@ test('cgroupPopulated: reads cgroup.events (descendants included); gone = empty;
 test('RFC20: orphanScopes — only scopes of DEAD heavies (not ours, not live ones)', () => {
   const run = () => ({ stdout: 'heavy-111-aa.scope loaded active running x\nheavy-222-bb.scope loaded active running y\nheavy-pre-5-cc.scope loaded active running\nother.scope x\n' });
   assert.deepEqual(orphanScopes({ run, alive: (pid) => pid === 222, self: 999 }), ['heavy-111-aa.scope']);
-  assert.deepEqual(orphanScopes({ run, alive: () => false, self: 111 }), ['heavy-222-bb.scope']);
+  assert.deepEqual(orphanScopes({ run, alive: () => false, self: 111 }), ['heavy-111-aa.scope', 'heavy-222-bb.scope'], 'our pid reused from a dead heavy: its scope is still an orphan');
 });
 
 test('RFC20: cargoJobsConfigured finds build.jobs up the tree or in CARGO_HOME', () => {
@@ -410,4 +410,9 @@ test('PR39 codex: stopScope re-checks after the LAST kill', () => {
   const pops = [true, true, true, true, false];
   const run = (b, a) => (a[1] === 'show' ? { status: 0, stdout: '/u/x.scope\n' } : { status: 0 });
   assert.equal(stopScope('heavy-1-a.scope', { run, populated: () => pops[Math.min(k++, pops.length - 1)], sleep: () => {} }), true);
+});
+
+test('PR39 r2: [[array]] header leaves [build]', async () => {
+  const { tomlHasBuildJobs } = await import('./heavy.mjs');
+  assert.equal(tomlHasBuildJobs('[build]\n[[bin]]\njobs = 1'), false);
 });

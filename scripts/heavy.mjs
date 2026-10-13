@@ -199,13 +199,15 @@ export function stopScope(unit, { run = spawnSync, populated = cgroupPopulated, 
  * after releasing the lock; a heavy starting in that instant won't see it as
  * stale (the one after will).
  */
-export function orphanScopes({ run = spawnSync, alive = (pid) => { try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; } }, isHeavy = (pid) => { try { return fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').includes('heavy.mjs'); } catch { return true; } }, self = process.pid } = {}) {
+export function orphanScopes({ run = spawnSync, alive = (pid) => { try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; } }, isHeavy = (pid) => { try { return fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').includes('heavy.mjs'); } catch { return true; } }} = {}) {
   const out = String(run('systemctl', ['--user', 'list-units', 'heavy-*.scope', '--all', '--plain', '--no-legend'], { encoding: 'utf8', timeout: 10_000 }).stdout || '');
   const units = [];
   for (const line of out.split('\n')) {
     const m = /^\s*(heavy-(\d+)-[a-z0-9]+\.scope)\b/.exec(line);
     const pid = m && Number(m[2]);
-    if (m && pid !== self && (!alive(pid) || !isHeavy(pid))) units.push(m[1]);
+    // (no self-exclusion: we haven't made our scope yet, and a dead heavy's pid
+    // may have been reused by US — its scope is still an orphan)
+    if (m && (!alive(pid) || !isHeavy(pid))) units.push(m[1]);
   }
   return units;
 }
@@ -235,6 +237,7 @@ export function tomlHasBuildJobs(text) {
   for (const raw of String(text).split('\n')) {
     const line = stripTomlComment(raw.replace(/\r$/, '')).trim();
     if (!line) continue;
+    if (/^\[\[/.test(line)) { table = '[[array]]'; continue; } // [[bin]] etc.: not [build]
     const h = /^\[([^\[\]]+)\]$/.exec(line);
     if (h) { table = normKey(h[1]); continue; }
     const eq = line.indexOf('=');
@@ -392,7 +395,7 @@ export async function main(argv, {
       // A heavy SIGKILLed earlier lost its lock, but its build may still run: stop it now.
       for (const u of scopeOps.orphans()) {
         log(`🧹 heavy: dừng build mồ côi ${u}`);
-        if (!scopeOps.stop(u)) { log(`❌ heavy: không dừng được build mồ côi ${u} — không chạy chồng lên nó. Thử lại sau / systemctl --user kill -s KILL ${u}`); return WAIT_TIMEOUT_EXIT; }
+        if (!scopeOps.stop(u)) { log(`❌ heavy: không dừng được build mồ côi ${u} — không chạy chồng lên nó. Thử lại sau / systemctl --user kill -s KILL ${u} (rồi systemctl --user reset-failed ${u})`); return WAIT_TIMEOUT_EXIT; }
       }
       // Pressure may have changed while we queued: check again, now that we're next.
       if (a.ramWait) await waitRam({ minBytes: minFreeBytes(env), log });
