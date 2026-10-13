@@ -24,7 +24,7 @@ Quyền: **admin**. Gửi trong DM với bot, hoặc trong topic nhóm thêm ti�
 
 ## Cách nhanh nhất: dán link
 
-Trong **DM riêng với bot**, dán tin nhắn **chỉ gồm** link PR (một hoặc nhiều, cách nhau bởi dấu cách/xuống dòng). Daemon kiểm tra như `/merge` nhưng chưa merge gì, rồi trả về tóm tắt kèm nút **[✅ Merge] [✖ Huỷ]**. Bấm Merge là merge (mỗi nút chỉ dùng được một lần, hết hạn sau 15 phút). Dán link trong topic nhóm, hoặc tin có kèm chữ khác, thì không có tác dụng.
+Trong **DM riêng với bot**, dán tin nhắn **chỉ gồm** link PR (một hoặc nhiều, cách nhau bởi dấu cách/xuống dòng). Daemon kiểm tra như `/merge` nhưng chưa merge gì, rồi trả về tóm tắt kèm nút **[✅ Merge] [✖ Huỷ]**. Bấm Merge là merge (mỗi nút chỉ dùng được một lần, hết hạn sau 24 giờ, restart daemon không mất). Merge chỉ merge đúng commit và đúng nhánh đích lúc gửi preview (ghi trong dòng 📌): nếu PR có commit mới hoặc bị đổi nhánh đích sau đó thì bị từ chối, gửi lại link / merge-request để xem preview mới. Dán link trong topic nhóm, hoặc tin có kèm chữ khác, thì không có tác dụng.
 
 ## Danh sách tự merge (owner)
 
@@ -72,7 +72,7 @@ node ../teleport/scripts/merge-request.mjs <URL PR> [<URL PR> …]
 
 ## Dành cho agent: dọn worktree (cleanup-request)
 
-> **Kiểm trước khi gọi:** chạy `git -C <worktree> status --short --untracked-files=all --ignored=matching` (đúng lệnh daemon dùng). Không được có dòng `??` (file untracked, ở đâu cũng tính); dòng `!!` (file đã gitignore) chỉ được nằm trong thư mục build (`target/`, `node_modules/`, `build/`, `.gradle/`, `.kotlin/`, `dist/`, `.idea/`, `__pycache__/`). Còn `tmp/`, log, `.env`, ghi chú… thì chuyển đi (nếu cần) hoặc xoá trước, không thì daemon từ chối ("có file ngoài git"). Cũng phải không còn thay đổi chưa commit, không file nào bị skip-worktree/assume-unchanged (`git ls-files -v | grep -E '^(S|[a-z])'` rỗng), PR đã merge đúng commit hiện tại, và bạn đã `cd` ra ngoài.
+> **Kiểm trước khi gọi:** chạy `git -C <worktree> status --short --untracked-files=all --ignored=matching` (đúng lệnh daemon dùng). Thư mục `tmp/` ở **gốc** worktree là chỗ nháp của agent: bị xoá cùng worktree, không hỏi, nên đừng để gì cần giữ trong đó. Ngoài nó ra: không được có dòng `??` (file untracked, ở đâu cũng tính); dòng `!!` (file đã gitignore) chỉ được nằm trong thư mục build (`target/`, `node_modules/`, `build/`, `.gradle/`, `.kotlin/`, `dist/`, `.idea/`, `__pycache__/`). Còn log, `.env`, ghi chú… thì chuyển đi (nếu cần) hoặc xoá trước. Nếu vẫn còn (vd hook dự án chặn xoá) mà mọi điều kiện khác đều đạt, daemon giữ worktree và gửi owner danh sách + nút **[🧹 Xoá luôn] [Giữ]**; kết quả bấm nút quay về topic của bạn. Cũng phải không còn thay đổi chưa commit, không file nào bị skip-worktree/assume-unchanged (`git ls-files -v | grep -E '^(S|[a-z])'` rỗng), PR đã merge đúng commit hiện tại, và bạn đã `cd` ra ngoài.
 
 > Phần này viết cho **agent**. Owner không phải đọc.
 
