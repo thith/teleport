@@ -2,7 +2,7 @@
 // heavy.mjs — run a heavy build under the machine-wide `build` lock (RFC 17),
 // so two agents never build at once and OOM the box.
 //
-//   node ../teleport/scripts/heavy.mjs [--no-stop] [--wait <minutes>] [--no-ram-wait] -- <command> [args…]
+//   node ../teleport/scripts/heavy.mjs [--no-stop] [--no-scope] [--wait <minutes>] [--no-ram-wait] -- <command> [args…]
 //
 // Busy → prints who holds it ("⏳ build đang bận: 🧛 Ma #c2383556 — ./gradlew …")
 // and waits (forever by default; --wait N gives up after N minutes, exit 75,
@@ -39,7 +39,10 @@
 // not a guarantee), and is stopped — leftovers killed — BEFORE the lock is
 // released. CARGO_BUILD_JOBS defaults to 4. Pressure is read where oomd reads
 // it (user@<uid>.service/memory.pressure) and re-checked after the lock.
-// TELEPORT_HEAVY_SCOPE=0 / TELEPORT_HEAVY_MEM_MAX=<size|0> tune it.
+// TELEPORT_HEAVY_SCOPE=0 / TELEPORT_HEAVY_MEM_MAX=<size|0> tune it. Anything the
+// command leaves running dies with the scope — so `--no-scope` (e.g. booting an
+// emulator that must stay up) and `--no-stop` (keep the Gradle daemon) run
+// without one.
 
 import fs from 'node:fs';
 import os from 'node:os';
@@ -50,16 +53,17 @@ import { isMainModule } from './is-direct-run.mjs';
 
 export const WAIT_TIMEOUT_EXIT = 75;
 export const HELD_ENV = 'TELEPORT_HEAVY_HELD';
-const USAGE = 'usage: heavy.mjs [--no-stop] [--wait <minutes>] [--no-ram-wait] -- <command> [args…]';
+const USAGE = 'usage: heavy.mjs [--no-stop] [--no-scope] [--wait <minutes>] [--no-ram-wait] -- <command> [args…]';
 
-/** argv → { cmd, stop, waitSec, ramWait } | { error }. Pure. */
+/** argv → { cmd, stop, scope, waitSec, ramWait } | { error }. Pure. */
 export function parseHeavyArgs(argv) {
   const sep = argv.indexOf('--');
   if (sep < 0 || sep === argv.length - 1) return { error: USAGE };
-  let stop = true, waitSec = Infinity, ramWait = true;
+  let stop = true, scope = true, waitSec = Infinity, ramWait = true;
   const opts = argv.slice(0, sep);
   for (let i = 0; i < opts.length; i++) {
-    if (opts[i] === '--no-stop') stop = false;
+    if (opts[i] === '--no-stop') { stop = false; scope = false; } // a kept daemon must outlive us: no scope to kill it
+    else if (opts[i] === '--no-scope') scope = false;
     else if (opts[i] === '--own-target') { /* no-op: each worktree always has its own target/ */ }
     else if (opts[i] === '--no-ram-wait') ramWait = false;
     else if (opts[i] === '--wait') {
@@ -68,7 +72,7 @@ export function parseHeavyArgs(argv) {
       waitSec = n * 60;
     } else return { error: `unexpected: ${opts[i]}\n${USAGE}` };
   }
-  return { cmd: argv.slice(sep + 1), stop, waitSec, ramWait };
+  return { cmd: argv.slice(sep + 1), stop, scope, waitSec, ramWait };
 }
 
 // ── RFC 18 F: wait for free RAM ──
@@ -90,7 +94,7 @@ export function readMemAvailable(file = '/proc/meminfo') {
 
 /**
  * { avail, swapTotal, swapFree, psiFull } — bytes, and PSI memory `full avg10`
- * (percent) from /proc/pressure/memory; a field that can't be read is null.
+ * (percent) from memPressurePath() (user@<uid>.service, else global); a field that can't be read is null.
  */
 export function readMemState({ meminfo = '/proc/meminfo', pressure = memPressurePath() } = {}) {
   let text = '';
@@ -102,7 +106,7 @@ export function readMemState({ meminfo = '/proc/meminfo', pressure = memPressure
 }
 
 export const PLATEAU_RISE = 256 * 1024 ** 2;
-export const PSI_FULL_MAX = 10;
+export const PSI_FULL_MAX = 10; // % — wait above this (oomd's kill threshold is 50% for 20 s)
 
 /** The memory.pressure oomd watches (user@<uid>.service) if present, else the global one. */
 export function memPressurePath({ uid = process.getuid?.() ?? 0, exists = fs.existsSync } = {}) {
@@ -145,7 +149,8 @@ export function scopeArgv({ unit, memMax }, cmd) {
 export function scopePreflight({ memMax }, { run = spawnSync } = {}) {
   const unit = `heavy-pre-${process.pid}-${Math.random().toString(36).slice(2, 8)}.scope`;
   const sh = 'd=/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup); cat "$d/memory.max" "$d/memory.swap.max"';
-  const r = run(scopeArgv({ unit, memMax }, ['sh', '-c', sh])[0], scopeArgv({ unit, memMax }, ['sh', '-c', sh]).slice(1), { encoding: 'utf8', timeout: 15_000 });
+  const argv = scopeArgv({ unit, memMax }, ['sh', '-c', sh]);
+  const r = run(argv[0], argv.slice(1), { encoding: 'utf8', timeout: 15_000 });
   if (r.error || r.status !== 0) return { ok: false, why: String(r.error?.message || r.stderr || `exit ${r.status}`).trim().split('\n')[0] };
   if (memMax > 0) {
     const [mx, sw] = String(r.stdout).trim().split('\n');
@@ -185,10 +190,11 @@ export function cargoJobsConfigured({ cwd = process.cwd(), env = process.env, re
   dirs.push(env.CARGO_HOME || path.join(os.homedir(), '.cargo'));
   for (const d of dirs) for (const f of ['config.toml', 'config']) {
     const t = read(path.join(d, f));
-    if (t && /^\s*jobs\s*=/m.test(t)) return true;
+    // `jobs = 2` under [build], `build.jobs = 2`, `build = { jobs = 2 }`
+    if (t && /(^|[\s{,.])jobs\s*=/m.test(t)) return true;
   }
   return false;
-} // % — wait above this (oomd's kill threshold is 50% for 20 s)
+}
 
 /**
  * Swap nearly full: free under max(1 GiB, 10%) — capped at 25% of the swap so a
@@ -323,7 +329,7 @@ export async function main(argv, {
       for (const u of scopeOps.orphans()) { log(`🧹 heavy: dừng build mồ côi ${u}`); scopeOps.stop(u); }
       // Pressure may have changed while we queued: check again, now that we're next.
       if (a.ramWait) await waitRam({ minBytes: minFreeBytes(env), log });
-      if (env.TELEPORT_HEAVY_SCOPE !== '0') {
+      if (a.scope && env.TELEPORT_HEAVY_SCOPE !== '0') {
         const memMax = scopeMemMax(env, scopeOps.memTotal);
         const pf = scopeOps.preflight({ memMax });
         if (pf.ok) scope = { unit: `heavy-${process.pid}-${Math.random().toString(36).slice(2, 8)}.scope`, memMax };
@@ -337,13 +343,22 @@ export async function main(argv, {
     // 126/127: gradlew couldn't even start — nothing to stop.
     if (a.stop && isGradlew(a.cmd) && code !== 126 && code !== 127) { log('🧹 gradlew --stop (trả RAM)…'); try { await stopGradle(a.cmd, { env: childEnv }); } catch {} }
     const oomAfter = scope ? scopeOps.oomKills() : null;
-    if (oomBefore != null && oomAfter != null && oomAfter > oomBefore) {
+    // (app.slice counts every agent's OOMs too: only blame the build if it died by a signal)
+    if (code >= 128 && oomBefore != null && oomAfter != null && oomAfter > oomBefore) {
       log(`⚠️ heavy: kernel đã giết tiến trình của build vì vượt giới hạn RAM ${(scope.memMax / GiB).toFixed(1)} GiB — giảm CARGO_BUILD_JOBS / chia nhỏ test, hoặc đặt TELEPORT_HEAVY_MEM_MAX.`);
     }
     return code;
   } finally {
     // Leftovers (a daemon, a stray child) die BEFORE the next build may start.
-    if (scope) { try { scopeOps.stop(scope.unit); } catch {} }
+    if (scope) {
+      // Ignore Ctrl-C / TERM while stopping: dying here would drop the lock with the build maybe still alive.
+      const ign = () => {};
+      for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(sig, ign);
+      let stopped = false;
+      try { stopped = scopeOps.stop(scope.unit); } catch {}
+      finally { for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.off(sig, ign); }
+      if (!stopped) log(`⚠️ heavy: không chắc đã dừng hết scope ${scope.unit} (systemctl lỗi) — build kế tiếp sẽ dọn nếu còn.`);
+    }
     lock.release();
   }
 }

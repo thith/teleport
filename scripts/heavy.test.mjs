@@ -1,5 +1,6 @@
 // heavy.mjs: arg parsing, never a shared cargo target (RFC 18 C removed), F (RAM wait).
 import { test } from 'node:test';
+import { EventEmitter } from 'node:events';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -35,9 +36,10 @@ function repoWithWorktree() {
 }
 
 test('parse: --own-target accepted as a no-op; --shared-target no longer exists; --no-ram-wait', () => {
-  assert.deepEqual(parseHeavyArgs(['--', 'a']), { cmd: ['a'], stop: true, waitSec: Infinity, ramWait: true });
+  assert.deepEqual(parseHeavyArgs(['--', 'a']), { cmd: ['a'], stop: true, scope: true, waitSec: Infinity, ramWait: true });
+  assert.deepEqual(parseHeavyArgs(['--no-scope', '--', 'boot-emulator']), { cmd: ['boot-emulator'], stop: true, scope: false, waitSec: Infinity, ramWait: true });
   assert.deepEqual(parseHeavyArgs(['--own-target', '--no-stop', '--no-ram-wait', '--wait', '1', '--', 'cargo', '--shared-target']),
-    { cmd: ['cargo', '--shared-target'], stop: false, waitSec: 60, ramWait: false });
+    { cmd: ['cargo', '--shared-target'], stop: false, scope: false, waitSec: 60, ramWait: false }, '--no-stop also means no scope (the kept daemon must survive)');
   assert.match(parseHeavyArgs(['--shared-target', '--', 'a']).error, /unexpected/);
 });
 
@@ -206,13 +208,11 @@ test('RFC20: scopeArgv — .scope unit, TimeoutStopSec, limits only when capped'
 
 test('RFC20: runForwarded wraps systemd-run OUTSIDE setpriv (setpriv\'s parent stays heavy)', async () => {
   let argv;
-  const spawnFn = (bin, args) => { argv = [bin, ...args]; const ee = new (require_events())(); ee.pid = 1; setImmediate(() => ee.emit('close', 0)); return ee; };
+  const spawnFn = (bin, args) => { argv = [bin, ...args]; const ee = new EventEmitter(); ee.pid = 1; setImmediate(() => ee.emit('close', 0)); return ee; };
   await runForwarded(['cargo', 'build'], { spawnFn, setpriv: true, proc: { on() {}, off() {} }, scope: { unit: 'heavy-9-x.scope', memMax: GiB } });
   assert.equal(argv[0], 'systemd-run');
   assert.deepEqual(argv.slice(argv.indexOf('--') + 1), ['setpriv', '--pdeathsig', 'TERM', '--', 'cargo', 'build']);
 });
-function require_events() { return EventEmitterRef; }
-import { EventEmitter as EventEmitterRef } from 'node:events';
 
 test('RFC20: scopePreflight checks the limits are really enforced', () => {
   const ok = scopePreflight({ memMax: GiB }, { run: () => ({ status: 0, stdout: `${GiB}\n${2 * GiB}\n` }) });
@@ -302,4 +302,25 @@ test('RFC20 main: preflight fails → runs WITHOUT a scope (warned); TELEPORT_HE
   assert.equal(runOpts.scope, undefined);
   assert.equal(runOpts.env.TELEPORT_HEAVY_HELD, '4242', 'nested keeps the outermost owner (depth 3 must still see it)');
   assert.equal(pf, 1);
+});
+
+test('RFC20 review: --no-scope → no preflight/scope; oom_kill rise with exit 0 is NOT blamed on the build; stop failure warned', async () => {
+  let pf = 0, runOpts;
+  const logs = [];
+  let n = 0;
+  const ops = { preflight: () => { pf++; return { ok: true }; }, stop: () => false, orphans: () => [], oomKills: () => n++, jobsConfigured: () => true, memTotal: 16 * GiB };
+  const base = { env: {}, nested: () => false, log: (s) => logs.push(s), waitRam: async () => {}, acquire: async () => ({ release() {}, waitedMs: 0 }), run: async (c, o) => { runOpts = o; return 0; } };
+  await heavyMain(['--no-scope', '--', 'emu'], { ...base, scopeOps: ops });
+  assert.equal(pf, 0);
+  assert.equal(runOpts.scope, undefined);
+  await heavyMain(['--', 'cargo', 'test'], { ...base, scopeOps: ops });
+  assert.ok(!logs.some((l) => /vượt giới hạn RAM/.test(l)), 'someone else\'s OOM, our build exited 0');
+  assert.ok(logs.some((l) => /không chắc đã dừng hết scope/.test(l)));
+});
+
+test('RFC20 review: cargoJobsConfigured — dotted key and inline table', () => {
+  for (const t of ['build.jobs = 2', 'build = { jobs = 2 }', '[build]\n  jobs=3']) {
+    assert.equal(cargoJobsConfigured({ cwd: '/p', env: { CARGO_HOME: '/h' }, read: (f) => (f === '/p/.cargo/config.toml' ? t : null) }), true, t);
+  }
+  assert.equal(cargoJobsConfigured({ cwd: '/p', env: { CARGO_HOME: '/h' }, read: (f) => (f === '/p/.cargo/config.toml' ? 'codegen-units = 1' : null) }), false);
 });
