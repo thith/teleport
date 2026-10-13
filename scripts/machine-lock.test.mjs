@@ -137,19 +137,22 @@ test('heavy: waiter killed while waiting leaves nothing behind (command never ru
   assert.equal(probe(dir), 'free');
 });
 
+// no real systemd here: scope preflight "fails" → the pre-RFC-20 path
+const NO_SCOPE = { preflight: () => ({ ok: false, why: 'test' }), stop: () => true, orphans: () => [], oomKills: () => null, jobsConfigured: () => true, memTotal: 16 * 1024 ** 3 };
+
 test('heavy args + gradlew --stop policy (after success AND failure, not with --no-stop, not for non-gradle)', async () => {
   assert.match(parseHeavyArgs(['./gradlew']).error, /usage/);
   assert.match(parseHeavyArgs(['--']).error, /usage/);
   assert.match(parseHeavyArgs(['--wait', 'x', '--', 'a']).error, /minutes/);
   assert.match(parseHeavyArgs(['--bogus', '--', 'a']).error, /unexpected/);
-  assert.deepEqual(parseHeavyArgs(['--no-stop', '--wait', '2', '--', 'a', '--b']), { cmd: ['a', '--b'], stop: false, waitSec: 120, ramWait: true });
+  assert.deepEqual(parseHeavyArgs(['--no-stop', '--wait', '2', '--', 'a', '--b']), { cmd: ['a', '--b'], stop: false, scope: false, waitSec: 120, ramWait: true });
   assert.equal(isGradlew(['./gradlew', 'build']), true);
   assert.equal(isGradlew(['/x/android/gradlew']), true);
   assert.equal(isGradlew(['cargo', 'build']), false);
   const run = async (argv, code) => {
     const ev = [];
     const lock = { release() { ev.push('release'); }, waitedMs: 0 };
-    const rc = await heavyMain(argv, { env: {}, waitRam: async () => {}, acquire: async () => lock, run: async () => { ev.push('run'); return code; }, stopGradle: async (c) => { ev.push(`stop ${c[0]}`); }, log: () => {} });
+    const rc = await heavyMain(argv, { env: {}, waitRam: async () => {}, nested: () => false, scopeOps: NO_SCOPE, acquire: async () => lock, run: async () => { ev.push('run'); return code; }, stopGradle: async (c) => { ev.push(`stop ${c[0]}`); }, log: () => {} });
     return { rc, ev };
   };
   // --stop runs while the lock is still held (the reason it can't hit another build's daemon)
@@ -172,7 +175,7 @@ test('heavy args + gradlew --stop policy (after success AND failure, not with --
   assert.equal(heldByAncestor({}, H({ pid: 42, alive: true })), false);
   // flock unavailable → runs anyway (fail-open), loudly
   const logs = [];
-  assert.equal(await heavyMain(['--', 'x'], { env: {}, waitRam: async () => {}, acquire: async () => { throw new Error('spawn flock ENOENT'); }, run: async () => 0, log: (s) => logs.push(s) }), 0);
+  assert.equal(await heavyMain(['--', 'x'], { env: {}, waitRam: async () => {}, acquire: async () => { throw new Error('spawn flock ENOENT'); }, nested: () => false, scopeOps: NO_SCOPE, run: async () => 0, log: (s) => logs.push(s) }), 0);
   assert.match(logs.join('\n'), /KHÔNG khoá/);
 });
 
