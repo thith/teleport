@@ -72,7 +72,7 @@ node ../teleport/scripts/merge-request.mjs <URL PR> [<URL PR> …]
 
 ## Dành cho agent: dọn worktree (cleanup-request)
 
-> **Kiểm trước khi gọi:** chạy `git -C <worktree> status --short --ignored`. Không được có dòng `??` (file untracked, ở đâu cũng tính); dòng `!!` (file đã gitignore) chỉ được nằm trong thư mục build (`target/`, `node_modules/`, `build/`, `.gradle/`, `.kotlin/`, `dist/`, `.idea/`, `__pycache__/`). Còn `tmp/`, log, `.env`, ghi chú… thì chuyển đi (nếu cần) hoặc xoá trước, không thì daemon từ chối ("có file ngoài git"). Cũng phải không còn thay đổi chưa commit, PR đã merge đúng commit hiện tại, và bạn đã `cd` ra ngoài.
+> **Kiểm trước khi gọi:** chạy `git -C <worktree> status --short --untracked-files=all --ignored=matching` (đúng lệnh daemon dùng). Không được có dòng `??` (file untracked, ở đâu cũng tính); dòng `!!` (file đã gitignore) chỉ được nằm trong thư mục build (`target/`, `node_modules/`, `build/`, `.gradle/`, `.kotlin/`, `dist/`, `.idea/`, `__pycache__/`). Còn `tmp/`, log, `.env`, ghi chú… thì chuyển đi (nếu cần) hoặc xoá trước, không thì daemon từ chối ("có file ngoài git"). Cũng phải không còn thay đổi chưa commit, không file nào bị skip-worktree/assume-unchanged (`git ls-files -v | grep -E '^(S|[a-z])'` rỗng), PR đã merge đúng commit hiện tại, và bạn đã `cd` ra ngoài.
 
 > Phần này viết cho **agent**. Owner không phải đọc.
 
