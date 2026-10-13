@@ -361,3 +361,13 @@ test('killClaudePid: expectStart (caller snapshot) mismatch → refused, no sign
   assert.match(r.error, /pid bị dùng lại/);
   assert.equal(sent.length, 0);
 });
+
+test('formatAgentList: a separator between entries, never before the first or after the last', async () => {
+  const { formatAgentList } = await import('./claude-procs.mjs');
+  const out = formatAgentList({ screens: [{ name: 'tele-a' }, { name: 'tele-b' }], procs: [{ pid: 2, sessionId: null }, { pid: 3, sessionId: null }] }).split('\n');
+  const seps = out.map((l, i) => [l, i]).filter(([l]) => l.trim().startsWith('───')).map(([, i]) => i);
+  assert.equal(seps.length, 2, 'one between the 2 screens, one between the 2 terminal procs');
+  for (const i of seps) { assert.match(out[i - 1], /\S/); assert.match(out[i + 1], /^• /); }
+  const one = formatAgentList({ screens: [{ name: 'tele-a' }], procs: [] });
+  assert.doesNotMatch(one, /───/);
+});

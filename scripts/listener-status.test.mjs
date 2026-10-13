@@ -171,7 +171,7 @@ test('formatAgentList: status line under agents with a convo only; throwing stat
   assert.match(out, new RegExp(`• tele-${shortConvoHash(cScreen)}\\n  PID 1 · a · 1:00\\n  session ${SID} · #\\w+\\n  S${cScreen}\\n`));
   assert.match(out, new RegExp(`• PID 2 · b · 1:00\\n  session ${SID_T} · #\\w+\\n  S${cTerm}\\n`));
   assert.match(out, /• PID 3 · c · 1:00\n  session \?\n\n/); // no convo → nothing extra
-  assert.match(out, /• tele-e5424020 · \(không thấy claude bên trong\)\n•/); // status null → no line
+  assert.match(out, /• tele-e5424020 · \(không thấy claude bên trong\)\n  ─+\n•/); // status null → no line (next is the separator)
   assert.deepEqual(seen.sort(), [4242, cScreen, cTerm].sort());
   const safe = formatAgentList({ procs, statusOf: () => { throw new Error('x'); }, convoOfHashtag: () => { throw new Error('y'); } });
   assert.doesNotMatch(safe, /S\d/);

@@ -231,9 +231,12 @@ export function formatAgentList({ screens = [], procs = [], personaOf = () => nu
   }
   const screenNames = [...new Set([...screens.map((s) => s.name), ...inScreen.keys()])];
 
+  // A thin rule between entries (Thi: easier to tell agents apart on a phone).
+  const SEP = '  ──────────';
   const lines = [`📺 Screen (${screenNames.length})`];
   if (!screenNames.length) lines.push('  (không có)');
-  for (const name of screenNames) {
+  for (const [i, name] of screenNames.entries()) {
+    if (i) lines.push(SEP);
     const persona = name.startsWith('tele-') ? personaOf(name.slice(5)) : null;
     const rows = inScreen.get(name) || [];
     lines.push(`• ${[name, persona].filter(Boolean).join(' · ')}${rows.length ? '' : ' · (không thấy claude bên trong)'}`);
@@ -242,7 +245,7 @@ export function formatAgentList({ screens = [], procs = [], personaOf = () => nu
   }
   lines.push('', `🖥 Terminal (${terminal.length})`);
   if (!terminal.length) lines.push('  (không có)');
-  for (const r of terminal) { lines.push(`• ${procLine(r)}`); lines.push(sess(r)); status(uuidToConvoInt(r.sessionId)); }
+  for (const [i, r] of terminal.entries()) { if (i) lines.push(SEP); lines.push(`• ${procLine(r)}`); lines.push(sess(r)); status(uuidToConvoInt(r.sessionId)); }
   lines.push('', 'Dừng (chỉ owner): /kill pid:<PID> · screen: /kill <hashtag>');
   lines.push('Chạy lại trong screen: /spawn <project> --resume-session <session>');
   return lines.join('\n');
