@@ -750,3 +750,11 @@ test('a bare repo whose objects/ is a symlink still counts as a repo (tmp/ kept)
   assert.equal(r.ok, false);
   assert.match(r.reason, /repo git trong tmp/);
 });
+
+test('escapeControls: all format / invisible chars (word joiner, ALM, soft hyphen, tags, Hangul filler)', async () => {
+  const { escapeControls } = await import('./cleanup-inbox.mjs');
+  assert.equal(escapeControls('notes⁠.txt'), 'notes\\u2060.txt');
+  assert.equal(escapeControls('a؜b­cㅤ'), 'a\\u061cb\\u00adc\\u3164');
+  assert.equal(escapeControls('x\u{E0041}'), 'x\\u{e0041}');
+  assert.equal(escapeControls('Cà Rồng 🧛'), 'Cà Rồng 🧛');
+});

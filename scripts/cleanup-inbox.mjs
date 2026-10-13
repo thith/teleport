@@ -58,7 +58,13 @@ export function escapeControls(s) {
   const named = { '\n': '\\n', '\r': '\\r', '\t': '\\t' };
   // Also bidi overrides / isolates and zero-width chars: a file name must read as
   // what it is (no `notes\u202Ehs.txt` shown reversed).
-  return String(s).replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/g, (c) => named[c] ?? `\\u${c.charCodeAt(0).toString(16).padStart(4, '0')}`);
+  // \p{Cf} = every format char (bidi marks/overrides/isolates, zero-width, word
+  // joiner, soft hyphen, tag chars…), plus the invisible fillers outside it.
+  return String(s).replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029\p{Cf}\u034f\u115f\u1160\u3164\uffa0]/gu, (c) => {
+    if (named[c]) return named[c];
+    const cp = c.codePointAt(0);
+    return cp > 0xffff ? `\\u{${cp.toString(16)}}` : `\\u${cp.toString(16).padStart(4, '0')}`;
+  });
 }
 
 /** The one-line result shown to the requester and the owner (control chars escaped). Pure. */
