@@ -416,3 +416,10 @@ test('PR39 r2: [[array]] header leaves [build]', async () => {
   const { tomlHasBuildJobs } = await import('./heavy.mjs');
   assert.equal(tomlHasBuildJobs('[build]\n[[bin]]\njobs = 1'), false);
 });
+
+test('PR39 codex r2: no false positives — a single quoted key "build.jobs", jobs= inside a string', async () => {
+  const { tomlHasBuildJobs } = await import('./heavy.mjs');
+  assert.equal(tomlHasBuildJobs('"build.jobs" = 2'), false);
+  assert.equal(tomlHasBuildJobs('build = { target-dir = "cache, jobs = 8" }'), false);
+  assert.equal(tomlHasBuildJobs('"build".jobs = 2'), true);
+});

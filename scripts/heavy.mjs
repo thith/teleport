@@ -228,8 +228,22 @@ function stripTomlComment(line) {
   }
   return line;
 }
-/** `"build" . 'jobs'` → `build.jobs` (quotes and spaces around a key path removed). Pure. */
-const normKey = (k) => k.replace(/["'\s]/g, '');
+/** A TOML key path → its segments: `"build" . 'jobs'` → ['build','jobs']; `"build.jobs"` → ['build.jobs']. Pure. */
+function keyPath(k) {
+  const segs = [];
+  let cur = '', q = null, quoted = false;
+  for (const c of k.trim()) {
+    if (q) { if (c === q) q = null; else cur += c; }
+    else if (c === '"' || c === "'") { q = c; quoted = true; }
+    else if (c === '.') { segs.push(cur.trim()); cur = ''; quoted = false; }
+    else if (!/\s/.test(c) || quoted) cur += /\s/.test(c) ? '' : c;
+  }
+  segs.push(cur.trim());
+  return segs;
+}
+const normKey = (k) => keyPath(k).join('\u0000'); // segment boundary that a quoted key can't fake with "."
+/** String contents blanked (so `"…jobs = 8…"` inside a value can't match). Pure. */
+const blankStrings = (v) => v.replace(/"(?:[^"\\]|\\.)*"|'[^']*'/g, '""');
 
 /** Does this Cargo TOML set build.jobs? `jobs` under [build], `build.jobs = …`, `build = { jobs = … }`; comments / quoted keys handled. Pure. */
 export function tomlHasBuildJobs(text) {
@@ -245,8 +259,8 @@ export function tomlHasBuildJobs(text) {
     const key = normKey(line.slice(0, eq));
     const val = line.slice(eq + 1).trim();
     if (table === 'build' && key === 'jobs') return true;
-    if (table === '' && key === 'build.jobs') return true;
-    if (table === '' && key === 'build' && val.startsWith('{') && /[{,]\s*["']?jobs["']?\s*=/.test(val)) return true;
+    if (table === '' && key === 'build\u0000jobs') return true;
+    if (table === '' && key === 'build' && val.startsWith('{') && /[{,]\s*["']?jobs["']?\s*=/.test(blankStrings(val))) return true;
   }
   return false;
 }
