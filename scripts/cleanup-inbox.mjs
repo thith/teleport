@@ -166,7 +166,7 @@ export async function processCleanupOffers({ daemonUserId, sendText = async () =
       try {
         await sendButtons(daemonUserId, text, [{ text: '🧹 Xoá luôn', callback_data: `cx:${tok}` }, { text: 'Giữ', callback_data: `ck:${tok}` }]);
       } catch (e) {
-        buttonStore.delete(tok);
+        try { buttonStore.delete(tok); } catch {} // an unsent button can't be pressed anyway
         console.error(`[daemon] cleanup offer DM failed: ${e?.message ?? e}`);
         await Promise.resolve(sendText(daemonUserId, plain)).catch(() => {});
       }
@@ -176,10 +176,12 @@ export async function processCleanupOffers({ daemonUserId, sendText = async () =
 
 /** Is every entry this button would delete written in the message the owner saw? Pure. */
 export function cleanupEntryMatchesMessage(entry, text) {
-  const t = String(text || '');
-  return typeof entry.path === 'string' && t.includes(escapeControls(entry.path))
+  // Whole fields, not substrings: the exact "giữ lại <path> vì" phrase and each
+  // bullet as a whole line (optionally followed by its " (N file)" count).
+  const lines = String(text || '').split('\n');
+  return typeof entry.path === 'string' && String(text || '').includes(`giữ lại ${escapeControls(entry.path)} vì có `)
     && Array.isArray(entry.stray) && entry.stray.length > 0
-    && entry.stray.every((p) => t.includes(`• ${escapeControls(p)}`));
+    && entry.stray.every((p) => { const b = `• ${escapeControls(p)}`; return lines.some((l) => l === b || (l.startsWith(`${b} (`) && /^ \(\d+ file\)$/.test(l.slice(b.length)))); });
 }
 
 /** One-shot take of a cleanup button (kind 'cleanup', fresh) — else null. */
@@ -245,7 +247,7 @@ export async function processCleanupRequests({ daemonUserId, sendText, sendButto
           await sendButtons(daemonUserId, offerText,
             [{ text: '🧹 Xoá luôn', callback_data: `cx:${tok}` }, { text: 'Giữ', callback_data: `ck:${tok}` }]);
         } catch (e) {
-          buttonStore.delete(tok);
+          try { buttonStore.delete(tok); } catch {}
           await Promise.resolve(sendText(daemonUserId, `🧹 cleanup-request của ${who}: ${formatCleanupResult(r)} (không gửi được nút: ${e?.message ?? e})`)).catch(() => {});
         }
       } else await Promise.resolve(sendText(daemonUserId, `🧹 cleanup-request của ${who}: ${text}`)).catch(() => {});

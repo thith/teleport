@@ -239,6 +239,7 @@ export async function mergeOne(target, { method, keepBranch, force, preview = fa
   // since then was never shown — refuse (the `sha` pin below then guards the
   // remaining seconds until the merge call).
   const expected = expectHeads?.[`${String(repo || '').toLowerCase()}#${number}`];
+  if (expectHeads && !expected) return { error: true, text: `❌ PR ${c.label}${pr.number}: không có commit đã ghim cho PR này — không merge.\n${pr.url}` };
   if (expected && pr.headRefOid !== expected) return { error: true, text: `❌ PR ${c.label}${pr.number} "${pr.title}": có commit mới sau khi preview (${expected.slice(0, 7)} → ${String(pr.headRefOid).slice(0, 7)}) — không merge. Gửi lại link / merge-request để xem preview mới.\n${pr.url}` };
   if (skipMerged && pr.state === 'MERGED') return { ok: true, head: null, text: `ℹ️ PR ${c.label}${pr.number} "${pr.title}" was already merged — skipped.\n${pr.url}` };
   // Checks GitHub refused to START (Actions billing) are "not run", like a repo

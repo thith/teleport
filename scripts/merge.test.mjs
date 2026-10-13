@@ -367,3 +367,10 @@ test('--expect-head survives the daemon path: expectHeadArgs → tokenizeArgs �
   const a = parseMergeArgs(tokenizeArgs(`${link}${expectHeadArgs({ [link]: sha })}`));
   assert.deepEqual(a.expectHeads, { 'thith/teleport#36': sha });
 });
+
+test('mergeOne: --expect-head given but none for THIS PR → refused (every target must be pinned)', async () => {
+  const f = fakeGh({ 3: PR(3, { headRefOid: 'a'.repeat(40) }) });
+  const r = await mergeOne({ repo: 'acme/repo', number: 3 }, ARGS([3], { expectHeads: { 'acme/other#3': 'a'.repeat(40) } }), { gh: f.gh });
+  assert.equal(r.error, true);
+  assert.equal(f.calls.some((c) => c[2] === 'PUT'), false);
+});

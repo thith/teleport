@@ -776,3 +776,12 @@ test('handlePrLinks: a head that cannot be read → NO button; owner and request
   assert.match(texts[0], /Không đọc được commit/);
   assert.equal(delivered[0].convoId, '42');
 });
+
+test('entryMatchesMessage: …/pull/3 does not match a message showing …/pull/36', async () => {
+  const { entryMatchesMessage } = await import('./daemon.mjs');
+  const sha = 'a'.repeat(40);
+  const msg = `🔎 x\n📌 ${L1}6 @ ${sha.slice(0, 12)}\nhttps://github.com/thith/teleport/pull/36`;
+  assert.equal(entryMatchesMessage({ links: [L1], heads: { [L1]: sha } }, msg), false);
+  assert.equal(entryMatchesMessage({ links: [L1] }, msg), false);
+  assert.equal(entryMatchesMessage({ links: [L1] }, `see ${L1}\nok`), true);
+});

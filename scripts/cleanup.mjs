@@ -129,13 +129,19 @@ export function scratchHasRepo(root, { maxEntries = WALK_MAX_ENTRIES } = {}) {
     let ents;
     try { if (!fs.lstatSync(dir).isDirectory()) continue; ents = fs.readdirSync(dir, { withFileTypes: true }); }
     catch (e) { if (e.code === 'ENOENT') continue; return true; }
+    if (looksLikeRepo(ents)) return true;
     for (const e of ents) {
       if (++seen > maxEntries) return true;
-      if (e.name === '.git') return true;
       if (e.isDirectory()) stack.push(path.join(dir, e.name));
     }
   }
   return false;
+}
+
+/** Dirents of one directory → is it (or does it hold) a git repo? `.git`, or a bare repo (HEAD + objects/). Pure. */
+export function looksLikeRepo(ents) {
+  const names = new Map(ents.map((e) => [e.name, e]));
+  return names.has('.git') || (names.get('HEAD')?.isFile?.() && names.get('objects')?.isDirectory?.()) || false;
 }
 
 /**
@@ -147,7 +153,7 @@ export function scratchHasRepo(root, { maxEntries = WALK_MAX_ENTRIES } = {}) {
 export const STRAY_FP_MAX_FILES = 5000;
 export function strayFingerprint(root, entries, { maxFiles = STRAY_FP_MAX_FILES } = {}) {
   const h = crypto.createHash('sha256');
-  const counts = {};
+  const counts = {}, repos = [];
   let files = 0;
   for (const e of [...entries].sort()) {
     const rel0 = String(e).replace(/\/+$/, '');
@@ -161,9 +167,10 @@ export function strayFingerprint(root, entries, { maxFiles = STRAY_FP_MAX_FILES 
       try { st = fs.lstatSync(abs); } catch { h.update(`${rel}\0-\n`); continue; }
       if (st.isDirectory()) {
         h.update(`${rel}/\0d\n`);
-        let names;
-        try { names = fs.readdirSync(abs).sort().reverse(); } catch { return null; }
-        for (const n of names) stack.push(path.join(rel, n));
+        let ents;
+        try { ents = fs.readdirSync(abs, { withFileTypes: true }); } catch { return null; }
+        if (looksLikeRepo(ents) && !repos.includes(e)) repos.push(e); // a clone may hold unpushed commits
+        for (const n of ents.map((x) => x.name).sort().reverse()) stack.push(path.join(rel, n));
         continue;
       }
       if (++files > maxFiles) return null;
@@ -172,7 +179,7 @@ export function strayFingerprint(root, entries, { maxFiles = STRAY_FP_MAX_FILES 
     }
     counts[e] = c;
   }
-  return { hash: h.digest('hex'), files, counts };
+  return { hash: h.digest('hex'), files, counts, repos };
 }
 
 /**
@@ -478,6 +485,7 @@ export async function cleanupRequested(target, {
     if (dryRun) {
       const fp = allowStray ? strayFingerprint(L.real, allowStray) : null;
       if (allowStray && !fp) return { ok: false, path: shown, reason: 'quá nhiều file ngoài git để liệt kê' };
+      if (fp?.repos.length) return { ok: false, path: shown, reason: `có repo git ngoài git: ${fp.repos.join(', ')} — không hỏi xoá tay` };
       return { ok: true, dryRun: true, path: shown, head: L.wt.head, branch: L.wt.branch.slice('refs/heads/'.length), pr: v.pr, ...(fp ? { strayHash: fp.hash, strayCounts: fp.counts } : {}) };
     }
     const bytes = await duBytes(deps, L.real); // slow (up to 10 min) — measured BEFORE the last-moment re-check
@@ -555,7 +563,7 @@ export async function runCleanup({
       let probe = null, fp = null;
       try { probe = await judgeWorktree(L, { deps, realParent, now, transcriptCwds, allowStray: v.stray }); } catch {}
       if (probe?.ok) fp = strayFingerprint(L.real, v.stray);
-      if (fp) {
+      if (fp && !fp.repos.length) {
         res.offers.push({ repo: L.repo, path: L.wt.path, branch: L.wt.branch.slice('refs/heads/'.length), pr: probe.pr, head: L.wt.head, stray: v.stray, strayHash: fp.hash, strayCounts: fp.counts });
         res.kept.push({ repo: L.repo, path: L.wt.path, branch: L.wt.branch.slice('refs/heads/'.length), reason: v.reason, notable: true, offered: true });
         stay.push(L);

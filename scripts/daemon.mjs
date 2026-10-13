@@ -492,7 +492,11 @@ export function pinLines(heads) {
 export function entryMatchesMessage(entry, text) {
   const t = String(text || '');
   const heads = entry.heads || {};
-  return (entry.links || []).length > 0 && entry.links.every((l) => (heads[l] ? t.includes(`📌 ${l} @ ${String(heads[l]).slice(0, 12)}`) : t.includes(l)));
+  const lines = t.split('\n');
+  // Whole lines / whole links: `…/pull/3` must not match a message showing `…/pull/36`.
+  return (entry.links || []).length > 0 && entry.links.every((l) => (heads[l]
+    ? lines.includes(`📌 ${l} @ ${String(heads[l]).slice(0, 12)}`)
+    : new RegExp(`(^|\\s)${l.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(\\s|$)`, 'm').test(t)));
 }
 
 /** heads { link: sha } → ' --expect-head=owner/name#N=sha …' (canonical links only). Pure. */

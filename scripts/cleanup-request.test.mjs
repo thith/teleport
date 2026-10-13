@@ -660,3 +660,28 @@ test('processCleanupOffers: the daemon re-judges the offer itself — no longer 
   assert.equal(h.buttons.length, 0);
   assert.deepEqual(fs.readdirSync(dir), []);
 });
+
+test('a git repo among the stray entries (vendor/x clone, or a bare repo in tmp/) → no button / tmp/ not disposable', async () => {
+  const w = world();
+  const a = w.add('feat-a');
+  fs.mkdirSync(path.join(a.path, 'vendor', 'x'), { recursive: true });
+  g(path.join(a.path, 'vendor', 'x'), 'init', '-q');
+  const h = buttonHarness();
+  writeRequest({ path: a.path, convoId: 5, dir: h.dir });
+  await processCleanupRequests(h.ctx, { ...h.opts, parentDir: w.parent, deps: deps({ prs: { 'feat-a': merged(a) } }) });
+  assert.equal(h.buttons.length, 0);
+  const b = w.add('feat-b');
+  fs.mkdirSync(path.join(b.path, 'tmp', 'mirror.git', 'objects'), { recursive: true });
+  write(path.join(b.path, 'tmp', 'mirror.git', 'HEAD'), 'ref: refs/heads/main\n');
+  const r = await req(w, b.path, deps({ prs: { 'feat-b': merged(b, 2) } }));
+  assert.equal(r.ok, false, 'bare repo inside tmp/ → tmp/ is not disposable');
+});
+
+test('cleanupEntryMatchesMessage: whole fields only (no prefix / substring matches)', async () => {
+  const { cleanupEntryMatchesMessage } = await import('./cleanup-inbox.mjs');
+  const t = formatStrayOffer({ title: 'T', path: '/p/wt-2', stray: ['ab', 'data/'], counts: { 'data/': 3 }, pr: 1, branch: 'b' });
+  assert.equal(cleanupEntryMatchesMessage({ path: '/p/wt-2', stray: ['ab', 'data/'] }, t), true);
+  assert.equal(cleanupEntryMatchesMessage({ path: '/p/wt', stray: ['ab'] }, t), false);
+  assert.equal(cleanupEntryMatchesMessage({ path: '/p/wt-2', stray: ['a'] }, t), false);
+  assert.equal(cleanupEntryMatchesMessage({ path: '/p/wt-2', stray: ['data'] }, t), false);
+});
