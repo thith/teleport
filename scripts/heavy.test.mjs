@@ -1,5 +1,6 @@
 // heavy.mjs: arg parsing, never a shared cargo target (RFC 18 C removed), F (RAM wait).
 import { test } from 'node:test';
+import { EventEmitter } from 'node:events';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -8,7 +9,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import {
   parseHeavyArgs,
-  waitForRam, minFreeBytes, readMemAvailable, readMemState, memBlockers, swapLow, main as heavyMain,
+  waitForRam, minFreeBytes, readMemAvailable, readMemState, memBlockers, swapLow, parseSize, scopeMemMax, scopeArgv, scopePreflight, stopScope, orphanScopes, cargoJobsConfigured, memPressurePath, runForwarded, main as heavyMain,
   RAM_POLL_MS, RAM_PLATEAU_MS, RAM_CAP_MS,
 } from './heavy.mjs';
 
@@ -35,9 +36,10 @@ function repoWithWorktree() {
 }
 
 test('parse: --own-target accepted as a no-op; --shared-target no longer exists; --no-ram-wait', () => {
-  assert.deepEqual(parseHeavyArgs(['--', 'a']), { cmd: ['a'], stop: true, waitSec: Infinity, ramWait: true });
+  assert.deepEqual(parseHeavyArgs(['--', 'a']), { cmd: ['a'], stop: true, scope: true, waitSec: Infinity, ramWait: true });
+  assert.deepEqual(parseHeavyArgs(['--no-scope', '--', 'boot-emulator']), { cmd: ['boot-emulator'], stop: true, scope: false, waitSec: Infinity, ramWait: true });
   assert.deepEqual(parseHeavyArgs(['--own-target', '--no-stop', '--no-ram-wait', '--wait', '1', '--', 'cargo', '--shared-target']),
-    { cmd: ['cargo', '--shared-target'], stop: false, waitSec: 60, ramWait: false });
+    { cmd: ['cargo', '--shared-target'], stop: false, scope: false, waitSec: 60, ramWait: false }, '--no-stop also means no scope (the kept daemon must survive)');
   assert.match(parseHeavyArgs(['--shared-target', '--', 'a']).error, /unexpected/);
 });
 
@@ -108,19 +110,21 @@ test('F: slowly rising RAM is capped at 15 min total', async () => {
   assert.match(f.logs.at(-1), /đã chờ 15 phút \(còn/);
 });
 
-test('F: main waits BEFORE acquiring the lock; skipped when nested or --no-ram-wait; threshold from env', async () => {
+const NO_SCOPE = { preflight: () => ({ ok: false, why: 'test' }), stop: () => true, orphans: () => [], oomKills: () => null, jobsConfigured: () => false, memTotal: 16 * 1024 ** 3 };
+
+test('F: main waits BEFORE acquiring the lock AND again after it; skipped when nested or --no-ram-wait; threshold from env', async () => {
   const go = async (argv, { nested = false, env = {} } = {}) => {
     const ev = [];
     await heavyMain(argv, {
-      env, nested: () => nested, log: () => {},
+      env, nested: () => nested, log: () => {}, scopeOps: NO_SCOPE,
       waitRam: async ({ minBytes }) => { ev.push(`ram ${minBytes / 1024 / 1024}`); },
       acquire: async () => { ev.push('acquire'); return { release() { ev.push('release'); }, waitedMs: 0 }; },
       run: async () => { ev.push('run'); return 0; },
     });
     return ev;
   };
-  assert.deepEqual(await go(['--', 'x']), ['ram 3072', 'acquire', 'run', 'release']);
-  assert.deepEqual(await go(['--', 'x'], { env: { TELEPORT_HEAVY_MIN_FREE_MB: '512' } }), ['ram 512', 'acquire', 'run', 'release']);
+  assert.deepEqual(await go(['--', 'x']), ['ram 3072', 'acquire', 'ram 3072', 'run', 'release']);
+  assert.deepEqual(await go(['--', 'x'], { env: { TELEPORT_HEAVY_MIN_FREE_MB: '512' } }), ['ram 512', 'acquire', 'ram 512', 'run', 'release']);
   assert.deepEqual(await go(['--no-ram-wait', '--', 'x']), ['acquire', 'run', 'release']);
   assert.deepEqual(await go(['--', 'x'], { nested: true }), ['run']);
   assert.equal(minFreeBytes({}), 3 * GiB);
@@ -180,4 +184,143 @@ test('F: RAM jittering by MBs does not reset the 2-min plateau', async () => {
   const r = await waitForRam({ minBytes: 3 * GiB, ...f });
   assert.equal(r.reason, 'plateau');
   assert.ok(r.waitedMs <= 3 * 60_000, `gave up after ${r.waitedMs} ms`);
+});
+
+// ── RFC 20: the build's own scope ──
+
+test('RFC20: parseSize / scopeMemMax (45% of RAM default, env override, 0 = no limit, page-aligned)', () => {
+  assert.equal(parseSize('8G'), 8 * GiB);
+  assert.equal(parseSize('512M'), 512 * 1024 ** 2);
+  assert.equal(parseSize('0'), 0);
+  assert.equal(parseSize('lots'), null);
+  assert.equal(scopeMemMax({}, 16 * GiB), Math.floor(16 * GiB * 0.45 / 4096) * 4096);
+  assert.equal(scopeMemMax({ TELEPORT_HEAVY_MEM_MAX: '8G' }, 16 * GiB), 8 * GiB);
+  assert.equal(scopeMemMax({ TELEPORT_HEAVY_MEM_MAX: '0' }, 16 * GiB), 0);
+  assert.equal(scopeMemMax({ TELEPORT_HEAVY_MEM_MAX: 'junk' }, 16 * GiB), Math.floor(16 * GiB * 0.45 / 4096) * 4096);
+});
+
+test('RFC20: scopeArgv — .scope unit, TimeoutStopSec, limits only when capped', () => {
+  const a = scopeArgv({ unit: 'heavy-1-ab.scope', memMax: 8 * GiB }, ['setpriv', '--', 'cargo', 'test']);
+  assert.deepEqual(a, ['systemd-run', '--user', '--scope', '--quiet', '--collect', '--unit=heavy-1-ab.scope', '-p', 'TimeoutStopSec=10s',
+    '-p', `MemoryMax=${8 * GiB}`, '-p', `MemorySwapMax=${2 * GiB}`, '--', 'setpriv', '--', 'cargo', 'test']);
+  assert.ok(!scopeArgv({ unit: 'u.scope', memMax: 0 }, ['x']).some((x) => /Memory/.test(x)), 'no MemoryMax=0 ever');
+});
+
+test('RFC20: runForwarded wraps systemd-run OUTSIDE setpriv (setpriv\'s parent stays heavy)', async () => {
+  let argv;
+  const spawnFn = (bin, args) => { argv = [bin, ...args]; const ee = new EventEmitter(); ee.pid = 1; setImmediate(() => ee.emit('close', 0)); return ee; };
+  await runForwarded(['cargo', 'build'], { spawnFn, setpriv: true, proc: { on() {}, off() {} }, scope: { unit: 'heavy-9-x.scope', memMax: GiB } });
+  assert.equal(argv[0], 'systemd-run');
+  assert.deepEqual(argv.slice(argv.indexOf('--') + 1), ['setpriv', '--pdeathsig', 'TERM', '--', 'cargo', 'build']);
+});
+
+test('RFC20: scopePreflight checks the limits are really enforced', () => {
+  const ok = scopePreflight({ memMax: GiB }, { run: () => ({ status: 0, stdout: `${GiB}\n${2 * GiB}\n` }) });
+  assert.equal(ok.ok, true);
+  assert.equal(scopePreflight({ memMax: GiB }, { run: () => ({ status: 0, stdout: 'max\nmax\n' }) }).ok, false);
+  assert.equal(scopePreflight({ memMax: GiB }, { run: () => ({ status: 1, stderr: 'Failed to connect to bus' }) }).ok, false);
+  assert.equal(scopePreflight({ memMax: 0 }, { run: () => ({ status: 0, stdout: 'max\nmax\n' }) }).ok, true, 'uncapped: only "can we make a scope"');
+});
+
+test('RFC20: stopScope stops the .scope unit; "not loaded" (5) is fine; leftovers → kill -s KILL', () => {
+  const calls = [];
+  const run = (bin, args) => { calls.push(args.join(' ')); if (args[1] === 'stop') return { status: 5 }; if (args[1] === 'show') return { stdout: '/user.slice/x.scope\n' }; return { status: 0 }; };
+  assert.equal(stopScope('heavy-1-a.scope', { run, readProcs: () => '123' }), true);
+  assert.deepEqual(calls, ['--user stop heavy-1-a.scope', '--user show -p ControlGroup --value heavy-1-a.scope', '--user kill -s KILL heavy-1-a.scope']);
+  calls.length = 0;
+  stopScope('heavy-1-a.scope', { run, readProcs: () => '' });
+  assert.equal(calls.length, 2, 'empty cgroup → no kill');
+});
+
+test('RFC20: orphanScopes — only scopes of DEAD heavies (not ours, not live ones)', () => {
+  const run = () => ({ stdout: 'heavy-111-aa.scope loaded active running x\nheavy-222-bb.scope loaded active running y\nheavy-pre-5-cc.scope loaded active running\nother.scope x\n' });
+  assert.deepEqual(orphanScopes({ run, alive: (pid) => pid === 222, self: 999 }), ['heavy-111-aa.scope']);
+  assert.deepEqual(orphanScopes({ run, alive: () => false, self: 111 }), ['heavy-222-bb.scope']);
+});
+
+test('RFC20: cargoJobsConfigured finds build.jobs up the tree or in CARGO_HOME', () => {
+  const files = { '/w/proj/.cargo/config.toml': '[build]\njobs = 2\n' };
+  const read = (f) => files[f] ?? null;
+  assert.equal(cargoJobsConfigured({ cwd: '/w/proj/sub', env: { CARGO_HOME: '/h' }, read }), true);
+  assert.equal(cargoJobsConfigured({ cwd: '/w/other', env: { CARGO_HOME: '/h' }, read }), false);
+  assert.equal(cargoJobsConfigured({ cwd: '/x', env: { CARGO_HOME: '/h' }, read: (f) => (f === '/h/config.toml' ? 'jobs=8' : null) }), true);
+});
+
+test('RFC20: memPressurePath prefers user@<uid>.service/memory.pressure', () => {
+  assert.equal(memPressurePath({ uid: 1000, exists: () => true }), '/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/memory.pressure');
+  assert.equal(memPressurePath({ uid: 1000, exists: () => false }), '/proc/pressure/memory');
+});
+
+test('RFC20 main: orphans stopped, scope used, gradle stopped before AND after, scope stopped BEFORE the lock is released; CARGO_BUILD_JOBS', async () => {
+  const ev = [];
+  let runOpts;
+  const ops = {
+    preflight: () => ({ ok: true }), stop: (u) => { ev.push(`stop ${u.replace(new RegExp(`-${process.pid}-[a-z0-9]+`), '-P-R')}`); return true; },
+    orphans: () => ['heavy-1-dead.scope'], oomKills: () => 0, jobsConfigured: () => false, memTotal: 16 * GiB,
+  };
+  await heavyMain(['--', './gradlew', 'test'], {
+    env: {}, nested: () => false, log: () => {}, scopeOps: ops, waitRam: async () => {},
+    acquire: async () => ({ release() { ev.push('release'); }, waitedMs: 0 }),
+    run: async (cmd, o) => { runOpts = o; ev.push('run'); return 0; },
+    stopGradle: async () => { ev.push('gradle-stop'); },
+  });
+  assert.deepEqual(ev, ['stop heavy-1-dead.scope', 'gradle-stop', 'run', 'gradle-stop', 'stop heavy-P-R.scope', 'release']);
+  assert.match(runOpts.scope.unit, /^heavy-\d+-[a-z0-9]+\.scope$/);
+  assert.equal(runOpts.env.CARGO_BUILD_JOBS, '4');
+  // agent's own setting / project config wins
+  await heavyMain(['--', 'cargo', 'build'], { env: { CARGO_BUILD_JOBS: '2' }, nested: () => false, log: () => {}, scopeOps: ops, waitRam: async () => {},
+    acquire: async () => ({ release() {}, waitedMs: 0 }), run: async (c, o) => { runOpts = o; return 0; } });
+  assert.equal(runOpts.env.CARGO_BUILD_JOBS, '2');
+  await heavyMain(['--', 'cargo', 'build'], { env: {}, nested: () => false, log: () => {}, scopeOps: { ...ops, jobsConfigured: () => true }, waitRam: async () => {},
+    acquire: async () => ({ release() {}, waitedMs: 0 }), run: async (c, o) => { runOpts = o; return 0; } });
+  assert.equal(runOpts.env.CARGO_BUILD_JOBS, undefined);
+});
+
+test('RFC20 main: scope stopped and lock released even when the build throws; oom_kill rise is reported', async () => {
+  const ev = [], logs = [];
+  let n = 0;
+  const ops = { preflight: () => ({ ok: true }), stop: () => { ev.push('stop'); return true; }, orphans: () => [], oomKills: () => n++, jobsConfigured: () => true, memTotal: 16 * GiB };
+  const code = await heavyMain(['--', 'cargo', 'test'], { env: {}, nested: () => false, log: (s) => logs.push(s), scopeOps: ops, waitRam: async () => {},
+    acquire: async () => ({ release() { ev.push('release'); }, waitedMs: 0 }), run: async () => 137 });
+  assert.equal(code, 137);
+  assert.ok(logs.some((l) => /vượt giới hạn RAM/.test(l)));
+  await assert.rejects(heavyMain(['--', 'x'], { env: {}, nested: () => false, log: () => {}, scopeOps: ops, waitRam: async () => {},
+    acquire: async () => ({ release() { ev.push('release'); }, waitedMs: 0 }), run: async () => { throw new Error('boom'); } }));
+  assert.deepEqual(ev.slice(-2), ['stop', 'release']);
+});
+
+test('RFC20 main: preflight fails → runs WITHOUT a scope (warned); TELEPORT_HEAVY_SCOPE=0 → no preflight; nested → no scope, owner pid kept', async () => {
+  let runOpts, pf = 0;
+  const logs = [];
+  const base = { nested: () => false, log: (s) => logs.push(s), waitRam: async () => {}, acquire: async () => ({ release() {}, waitedMs: 0 }), run: async (c, o) => { runOpts = o; return 0; } };
+  await heavyMain(['--', 'x'], { ...base, env: {}, scopeOps: { ...NO_SCOPE, preflight: () => { pf++; return { ok: false, why: 'no bus' }; } } });
+  assert.equal(runOpts.scope, undefined);
+  assert.ok(logs.some((l) => /không tạo được scope riêng \(no bus\)/.test(l)));
+  await heavyMain(['--', 'x'], { ...base, env: { TELEPORT_HEAVY_SCOPE: '0' }, scopeOps: { ...NO_SCOPE, preflight: () => { pf++; return { ok: true }; } } });
+  assert.equal(pf, 1);
+  await heavyMain(['--', 'x'], { ...base, nested: () => true, env: { TELEPORT_HEAVY_HELD: '4242' }, scopeOps: { ...NO_SCOPE, preflight: () => { pf++; return { ok: true }; } } });
+  assert.equal(runOpts.scope, undefined);
+  assert.equal(runOpts.env.TELEPORT_HEAVY_HELD, '4242', 'nested keeps the outermost owner (depth 3 must still see it)');
+  assert.equal(pf, 1);
+});
+
+test('RFC20 review: --no-scope → no preflight/scope; oom_kill rise with exit 0 is NOT blamed on the build; stop failure warned', async () => {
+  let pf = 0, runOpts;
+  const logs = [];
+  let n = 0;
+  const ops = { preflight: () => { pf++; return { ok: true }; }, stop: () => false, orphans: () => [], oomKills: () => n++, jobsConfigured: () => true, memTotal: 16 * GiB };
+  const base = { env: {}, nested: () => false, log: (s) => logs.push(s), waitRam: async () => {}, acquire: async () => ({ release() {}, waitedMs: 0 }), run: async (c, o) => { runOpts = o; return 0; } };
+  await heavyMain(['--no-scope', '--', 'emu'], { ...base, scopeOps: ops });
+  assert.equal(pf, 0);
+  assert.equal(runOpts.scope, undefined);
+  await heavyMain(['--', 'cargo', 'test'], { ...base, scopeOps: ops });
+  assert.ok(!logs.some((l) => /vượt giới hạn RAM/.test(l)), 'someone else\'s OOM, our build exited 0');
+  assert.ok(logs.some((l) => /không chắc đã dừng hết scope/.test(l)));
+});
+
+test('RFC20 review: cargoJobsConfigured — dotted key and inline table', () => {
+  for (const t of ['build.jobs = 2', 'build = { jobs = 2 }', '[build]\n  jobs=3']) {
+    assert.equal(cargoJobsConfigured({ cwd: '/p', env: { CARGO_HOME: '/h' }, read: (f) => (f === '/p/.cargo/config.toml' ? t : null) }), true, t);
+  }
+  assert.equal(cargoJobsConfigured({ cwd: '/p', env: { CARGO_HOME: '/h' }, read: (f) => (f === '/p/.cargo/config.toml' ? 'codegen-units = 1' : null) }), false);
 });
