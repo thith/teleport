@@ -479,6 +479,22 @@ export async function defaultFetchHead(link, { runner = execFileP, env = process
   return sha;
 }
 
+/** heads { link: sha } → '\n📌 <link> @ <sha12>' lines (shown in the button message). Pure. */
+export function pinLines(heads) {
+  return Object.entries(heads || {}).map(([l, sha]) => `\n📌 ${l} @ ${String(sha).slice(0, 12)}`).join('');
+}
+
+/**
+ * Does the pressed message show exactly what this entry would act on? Every link
+ * (and its pinned commit, when pinned) must be written in it — so a tampered
+ * persisted entry can't redirect the owner's tap. Pure.
+ */
+export function entryMatchesMessage(entry, text) {
+  const t = String(text || '');
+  const heads = entry.heads || {};
+  return (entry.links || []).length > 0 && entry.links.every((l) => (heads[l] ? t.includes(`📌 ${l} @ ${String(heads[l]).slice(0, 12)}`) : t.includes(l)));
+}
+
 /** heads { link: sha } → ' --expect-head=owner/name#N=sha …' (canonical links only). Pure. */
 export function expectHeadArgs(heads) {
   let out = '';
@@ -535,6 +551,14 @@ export async function handlePrLinks(links, msg, {
       const h = await Promise.resolve().then(() => fetchHead(l)).catch(() => null);
       if (h) heads[l] = h;
     }
+    // No pin → no button: an unpinned Merge could merge a later push unseen.
+    const missing = links.filter((l) => !heads[l]);
+    if (missing.length) {
+      const why = `⚠️ Không đọc được commit của ${missing.join(', ')} (gh lỗi) — không gửi nút. Thử lại sau.`;
+      await sendText(msg.chat.id, header ? `${header}\n\n${why}` : why);
+      if (requester) await deliver({ convoId: requester.convoId, text: `${why} (gửi lại merge-request sau)`, mode: 'ask' });
+      return { offered: false };
+    }
   }
   const { ok: canMerge, out } = await run(['--preview']);
   // Not mergeable → maybe still closable (all open): offer only [Close] [Cancel].
@@ -551,10 +575,11 @@ export async function handlePrLinks(links, msg, {
   const what = links.length > 1 ? `these ${links.length} PRs (in order)` : 'this PR';
   const ask = canMerge ? `Merge or close ${what}?` : `Can't merge — close ${what} without merging?`;
   const head = header ? `${header}\n\n` : '';
-  const unpinned = !!fetchHead && canMerge && links.some((l) => !heads[l]);
-  const pinNote = unpinned ? '\n⚠️ Không đọc được commit của PR lúc preview — Merge sẽ merge commit mới nhất lúc bấm.' : '';
-  let body = `${head}${out}${pinNote}\n\n${ask}`;
-  if (body.length > PREVIEW_INLINE_MAX) { await sendText(msg.chat.id, out); body = `${head}🔎 ${links.length} PR(s) ready — details above.\n\n${ask}`; }
+  // The pinned commits are part of the button message itself: a press is only
+  // honoured if what it would act on is written in the message the owner saw.
+  const pins = pinLines(heads);
+  let body = `${head}${out}${pins}\n\n${ask}`;
+  if (body.length > PREVIEW_INLINE_MAX) { await sendText(msg.chat.id, out); body = `${head}🔎 ${links.length} PR(s) ready — details above.${pins}\n\n${ask}`; }
   await sendButtons(msg.chat.id, body,
     [
       ...(canMerge ? [{ text: '✅ Merge', callback_data: `mg:${tok}` }] : []),
@@ -583,6 +608,14 @@ export async function handleMergeButton(cq, ctx, { take = takeMergeButton, dispa
   }
   if (m[1] === 'mg' && entry.canMerge === false) { // never offered — refuse a forged press
     await ctx.answerButton(cq.id, 'Không merge được PR này.');
+    return;
+  }
+  // Production pins every Merge (ctx.fetchHead): an entry without pins, or one
+  // that doesn't match the message the owner saw, is refused.
+  const unpinned = m[1] === 'mg' && ctx.fetchHead && entry.links.some((l) => !entry.heads?.[l]);
+  if (unpinned || !entryMatchesMessage(entry, original)) {
+    await ctx.answerButton(cq.id, 'Nút không khớp nội dung — dán lại link.');
+    await ctx.editButtonsMessage(chatId, messageId, `${original}\n\n⚠️ Nút không khớp nội dung tin nhắn — không làm gì. Dán lại link / gửi lại merge-request.`);
     return;
   }
   const closing = m[1] === 'cl';

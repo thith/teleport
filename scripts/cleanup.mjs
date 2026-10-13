@@ -110,8 +110,69 @@ export function parseStatusZ(out) {
  * file is always stray, even under a build-named dir (tracked `build/ci.sh` +
  * new `build/new.sh`); only IGNORED entries may match the build allowlist.
  */
-export function strayEntries({ untracked, ignored }) {
-  return [...untracked, ...ignored.filter((p) => !isBuildPath(p))].filter((p) => !isRootScratch(p));
+export function strayEntries({ untracked, ignored }, { scratchOk = true } = {}) {
+  const stray = [...untracked, ...ignored.filter((p) => !isBuildPath(p))];
+  return scratchOk ? stray.filter((p) => !isRootScratch(p)) : stray;
+}
+
+/**
+ * A root tmp/ is only disposable when no git repo sits inside it (a clone there
+ * may hold unpushed commits). Bounded walk, never follows symlinks; truncated
+ * or unreadable → "has one" (keep / ask).
+ */
+export function scratchHasRepo(root, { maxEntries = WALK_MAX_ENTRIES } = {}) {
+  const stack = [];
+  for (const d of SCRATCH_ROOT_DIRS) stack.push(path.join(root, d));
+  let seen = 0;
+  while (stack.length) {
+    const dir = stack.pop();
+    let ents;
+    try { if (!fs.lstatSync(dir).isDirectory()) continue; ents = fs.readdirSync(dir, { withFileTypes: true }); }
+    catch (e) { if (e.code === 'ENOENT') continue; return true; }
+    for (const e of ents) {
+      if (++seen > maxEntries) return true;
+      if (e.name === '.git') return true;
+      if (e.isDirectory()) stack.push(path.join(dir, e.name));
+    }
+  }
+  return false;
+}
+
+/**
+ * Fingerprint of the stray entries the owner is shown: every file under them
+ * (an ignored DIRECTORY is one git entry — new files inside must count), with
+ * size + mtime, never following symlinks. → { hash, files, counts } | null
+ * (too many files, or an entry escaping the worktree).
+ */
+export const STRAY_FP_MAX_FILES = 5000;
+export function strayFingerprint(root, entries, { maxFiles = STRAY_FP_MAX_FILES } = {}) {
+  const h = crypto.createHash('sha256');
+  const counts = {};
+  let files = 0;
+  for (const e of [...entries].sort()) {
+    const rel0 = String(e).replace(/\/+$/, '');
+    if (!rel0 || path.isAbsolute(rel0) || rel0.split('/').includes('..')) return null;
+    let c = 0;
+    const stack = [rel0];
+    while (stack.length) {
+      const rel = stack.pop();
+      const abs = path.join(root, rel);
+      let st;
+      try { st = fs.lstatSync(abs); } catch { h.update(`${rel}\0-\n`); continue; }
+      if (st.isDirectory()) {
+        h.update(`${rel}/\0d\n`);
+        let names;
+        try { names = fs.readdirSync(abs).sort().reverse(); } catch { return null; }
+        for (const n of names) stack.push(path.join(rel, n));
+        continue;
+      }
+      if (++files > maxFiles) return null;
+      c++;
+      h.update(`${rel}\0${st.isSymbolicLink() ? 'l' : 'f'}\0${st.size}\0${st.mtimeMs}\n`);
+    }
+    counts[e] = c;
+  }
+  return { hash: h.digest('hex'), files, counts };
 }
 
 /**
@@ -128,7 +189,7 @@ export function isRootScratch(p) {
 
 /** Offers the daily run leaves for the daemon (owner buttons, see cleanup-inbox.mjs). */
 export const CLEANUP_OFFER_DIR = path.join(__dirname, 'tmp', 'cleanup-offers');
-export const STRAY_OFFER_MAX = 300; // more stray entries than this → no button (clean by hand)
+export const STRAY_OFFER_MAX = 20; // more stray entries than this → no button (every one must be shown)
 
 /** Write one offer file atomically (0600). → its path. */
 export function writeOffer(offer, { dir = CLEANUP_OFFER_DIR, now = Date.now() } = {}) {
@@ -290,7 +351,7 @@ export const procsInside = (deps, wt) => deps.procCwds().filter((p) => isInside(
  * Run by the judge AND again right before `git worktree remove` (after the slow
  * `du`), so nothing that appeared in between is deleted.
  */
-export async function treeStateBlocker(L, deps, { allowStray = null } = {}) {
+export async function treeStateBlocker(L, deps, { allowStray = null, strayHash = null } = {}) {
   const git = (args, opts) => deps.exec('git', args, opts);
   const { wt, real } = L;
   // HEAD may have moved since `worktree list` — re-read it right here.
@@ -298,13 +359,19 @@ export async function treeStateBlocker(L, deps, { allowStray = null } = {}) {
   if (headNow !== wt.head) return { ok: false, reason: 'HEAD vừa đổi', notable: true };
   const st = parseStatusZ(await git(['-C', wt.path, 'status', '--porcelain=v1', '-z', '--untracked-files=all', '--ignored=matching']));
   if (st.tracked.length) return { ok: false, reason: `có thay đổi chưa commit (${st.tracked.slice(0, 3).join(', ')}${st.tracked.length > 3 ? ', …' : ''})`, notable: true };
-  const stray = strayEntries(st);
+  const stray = strayEntries(st, { scratchOk: !scratchHasRepo(real) });
   // allowStray (the owner's manual-cleanup button): the files the owner was
   // shown may go; anything NOT in that list (appeared since) still keeps it.
   const allowed = allowStray ? new Set(allowStray) : null;
   const unseen = allowed ? stray.filter((p) => !allowed.has(p)) : stray;
   if (unseen.length) {
     return { ok: false, reason: `có file ngoài git: ${unseen.slice(0, 5).join(', ')}${unseen.length > 5 ? ', …' : ''}`, notable: true, stray: unseen, ...(allowed ? { strayNew: true } : {}) };
+  }
+  // The allowed entries must be exactly what the owner was shown: same files,
+  // same sizes / mtimes (a file added inside a shown directory, or a shown file
+  // rewritten since, is a new state).
+  if (allowed && strayHash && strayFingerprint(real, allowStray)?.hash !== strayHash) {
+    return { ok: false, reason: 'các mục ngoài git đã thay đổi từ lúc gửi nút', notable: true, strayNew: true };
   }
   const hidden = hiddenEdits(await git(['-C', wt.path, 'ls-files', '-v', '-z']));
   if (hidden.length) return { ok: false, reason: `có file skip-worktree/assume-unchanged (${hidden.slice(0, 3).join(', ')}${hidden.length > 3 ? ', …' : ''})`, notable: true };
@@ -321,7 +388,7 @@ export async function treeStateBlocker(L, deps, { allowStray = null } = {}) {
  * user) skips exactly two gates: "no Claude transcript cwd in 7 days" and "no
  * non-build file modified in 24h". Every other gate stays.
  */
-export async function judgeWorktree(L, { deps, realParent, now = Date.now(), transcriptCwds = null, requested = false, allowStray = null }) {
+export async function judgeWorktree(L, { deps, realParent, now = Date.now(), transcriptCwds = null, requested = false, allowStray = null, strayHash = null }) {
   const git = (args, opts) => deps.exec('git', args, opts);
   const { wt, real } = L;
   if (!real || wt.prunable) return { ok: false, reason: 'thư mục không còn', notable: false };
@@ -338,7 +405,7 @@ export async function judgeWorktree(L, { deps, realParent, now = Date.now(), tra
     '--json', 'number,state,headRefOid,headRefName', '--limit', '100'], { timeout: 60_000 }));
   const pr = judgePrs(prs, branch, wt.head);
   if (!pr.ok) return pr;
-  const bad = await treeStateBlocker(L, deps, { allowStray });
+  const bad = await treeStateBlocker(L, deps, { allowStray, strayHash });
   if (bad) return bad;
   if (requested) return { ok: true, pr: pr.pr }; // the two "recently used" gates below don't apply
   if (!transcriptCwds) return { ok: false, reason: 'không đọc được transcript', notable: false };
@@ -388,6 +455,7 @@ export async function locateWorktree(target, { deps, realParent }) {
  */
 export async function cleanupRequested(target, {
   parentDir = PARENT_DIR, now = Date.now(), deps: injected = {}, allowStray = null, expectHead = null, dryRun = false,
+  strayHash = null, daily = false,
 } = {}) {
   const deps = { ...defaultDeps(), ...injected };
   let shown = target;
@@ -399,13 +467,21 @@ export async function cleanupRequested(target, {
     shown = L.wt.path;
     // The owner's button was shown for one commit: a moved HEAD is a new state.
     if (expectHead && L.wt.head !== expectHead) return { ok: false, path: shown, reason: 'HEAD đã đổi từ lúc gửi nút' };
-    const v = await judgeWorktree(L, { deps, realParent, now, requested: true, allowStray });
+    // daily: the owner's button for a DAILY offer — judged as the daily run
+    // judged it (24h-edit + 7-day-transcript gates too), not as a request.
+    let transcriptCwds = null;
+    if (daily) transcriptCwds = [...deps.transcriptCwds(now - TRANSCRIPT_WINDOW_MS)];
+    const v = await judgeWorktree(L, { deps, realParent, now, requested: !daily, transcriptCwds, allowStray, strayHash });
     if (!v.ok) return { ok: false, path: shown, reason: v.reason, ...(v.stray ? { stray: v.stray } : {}), ...(v.strayNew ? { strayNew: true } : {}) };
     // dryRun: every gate passed, nothing measured or removed (the inbox probes
     // "would it go if the owner allowed these stray files?").
-    if (dryRun) return { ok: true, dryRun: true, path: shown, head: L.wt.head, branch: L.wt.branch.slice('refs/heads/'.length), pr: v.pr };
+    if (dryRun) {
+      const fp = allowStray ? strayFingerprint(L.real, allowStray) : null;
+      if (allowStray && !fp) return { ok: false, path: shown, reason: 'quá nhiều file ngoài git để liệt kê' };
+      return { ok: true, dryRun: true, path: shown, head: L.wt.head, branch: L.wt.branch.slice('refs/heads/'.length), pr: v.pr, ...(fp ? { strayHash: fp.hash, strayCounts: fp.counts } : {}) };
+    }
     const bytes = await duBytes(deps, L.real); // slow (up to 10 min) — measured BEFORE the last-moment re-check
-    const late = await treeStateBlocker(L, deps, { allowStray });
+    const late = await treeStateBlocker(L, deps, { allowStray, strayHash });
     if (late) return { ok: false, path: shown, reason: `${late.reason} (vừa xuất hiện)` };
     await deps.exec('git', ['-C', L.main, 'worktree', 'remove', '--force', L.wt.path]);
     deps.log(`removed ${L.wt.path} (requested)`);
@@ -473,13 +549,14 @@ export async function runCleanup({
     if (res.removed.length >= maxRemovals) { capHit++; stay.push(L); continue; }
     let v;
     try { v = await judge(L); } catch (e) { v = { ok: false, reason: `lỗi: ${String(e.message || e).split('\n')[0].slice(0, 160)}`, notable: true, error: true }; }
-    if (!v.ok && v.stray?.length && v.stray.length <= STRAY_OFFER_MAX) {
+    if (!v.ok && v.stray?.length && v.stray.length <= STRAY_OFFER_MAX && v.stray.every((p) => p.length <= 300)) {
       // Kept ONLY for these stray files (every other gate passes with exactly
       // them allowed)? → the owner is asked, one DM per worktree.
-      let probe = null;
+      let probe = null, fp = null;
       try { probe = await judgeWorktree(L, { deps, realParent, now, transcriptCwds, allowStray: v.stray }); } catch {}
-      if (probe?.ok) {
-        res.offers.push({ repo: L.repo, path: L.wt.path, branch: L.wt.branch.slice('refs/heads/'.length), pr: probe.pr, head: L.wt.head, stray: v.stray });
+      if (probe?.ok) fp = strayFingerprint(L.real, v.stray);
+      if (fp) {
+        res.offers.push({ repo: L.repo, path: L.wt.path, branch: L.wt.branch.slice('refs/heads/'.length), pr: probe.pr, head: L.wt.head, stray: v.stray, strayHash: fp.hash, strayCounts: fp.counts });
         res.kept.push({ repo: L.repo, path: L.wt.path, branch: L.wt.branch.slice('refs/heads/'.length), reason: v.reason, notable: true, offered: true });
         stay.push(L);
         continue;

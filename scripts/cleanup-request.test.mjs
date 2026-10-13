@@ -10,7 +10,7 @@ import {
   validCleanupRequest, formatCleanupResult, buildCleanupResultPrompt, processCleanupRequests, unclaim,
   handleCleanupButton, processCleanupOffers, validCleanupOffer, takeCleanupButton, formatStrayOffer,
 } from './cleanup-inbox.mjs';
-import { cleanupRequested, runCleanup, writeOffer } from './cleanup.mjs';
+import { cleanupRequested, runCleanup, writeOffer, strayFingerprint } from './cleanup.mjs';
 import { claimRequests, deliverResult } from './merge-inbox.mjs';
 import { acquireLock } from './machine-lock.mjs';
 
@@ -449,7 +449,7 @@ function buttonHarness() {
   });
   return { ...h, store, buttons, edits, answers };
 }
-const press = (data) => ({ id: 'q', data, from: { id: 1 }, message: { chat: { id: 1 }, message_id: 9, text: 'offer' } });
+const press = (data, text = 'offer') => ({ id: 'q', data, from: { id: 1 }, message: { chat: { id: 1 }, message_id: 9, text } });
 
 test('processCleanupRequests: kept ONLY for stray files → owner gets the list + [Xoá luôn][Giữ]; agent told', async () => {
   const w = world();
@@ -470,7 +470,12 @@ test('processCleanupRequests: kept ONLY for stray files → owner gets the list 
   assert.deepEqual(entry.stray, ['notes.txt']);
   // press 🧹 → removed, agent told, message edited
   const tok = h.buttons[0].b[0].callback_data;
-  await handleCleanupButton(press(tok), h.ctx, { ...h.opts, parentDir: w.parent, deps: deps({ prs: { 'feat-a': merged(a) } }) });
+  // a press on a message that doesn't show the entry's files → refused, nothing deleted
+  const [[tk, ent]] = [...h.store.entries()];
+  await handleCleanupButton(press(tok, 'some other message'), h.ctx, { ...h.opts, run: async () => { throw new Error('must not run'); } });
+  assert.match(h.edits.at(-1), /không khớp/);
+  h.store.set(tk, ent); // put it back for the real press
+  await handleCleanupButton(press(tok, h.buttons[0].t), h.ctx, { ...h.opts, parentDir: w.parent, deps: deps({ prs: { 'feat-a': merged(a) } }) });
   assert.equal(fs.existsSync(a.path), false);
   assert.match(h.edits.at(-1), /✅ đã xoá worktree/);
   assert.match(h.delivered.at(-1).cleanupResult.text, /owner bấm xoá tay, kể cả 1 mục ngoài git/);
@@ -500,14 +505,16 @@ test('handleCleanupButton: Giữ keeps + tells the agent; a file that appeared a
   const a = w.add('feat-a');
   write(path.join(a.path, 'notes.txt'));
   const h = buttonHarness();
-  h.store.set('aaaaaaaaaaaaaaaa', { kind: 'cleanup', path: a.path, convoId: '5', head: a.head, stray: ['notes.txt'], createdAt: Date.now() });
-  h.store.set('bbbbbbbbbbbbbbbb', { kind: 'cleanup', path: a.path, convoId: null, head: a.head, stray: ['notes.txt'], createdAt: Date.now() });
-  await handleCleanupButton(press('ck:aaaaaaaaaaaaaaaa'), h.ctx, h.opts);
+  const strayHash = strayFingerprint(a.path, ['notes.txt']).hash;
+  h.store.set('aaaaaaaaaaaaaaaa', { kind: 'cleanup', path: a.path, convoId: '5', head: a.head, stray: ['notes.txt'], strayHash, createdAt: Date.now() });
+  h.store.set('bbbbbbbbbbbbbbbb', { kind: 'cleanup', path: a.path, convoId: null, head: a.head, stray: ['notes.txt'], strayHash, createdAt: Date.now() });
+  const shown = formatStrayOffer({ title: 'T', path: a.path, stray: ['notes.txt'], pr: 1, branch: 'feat-a' });
+  await handleCleanupButton(press('ck:aaaaaaaaaaaaaaaa', shown), h.ctx, h.opts);
   assert.ok(fs.existsSync(a.path));
   assert.match(h.edits.at(-1), /giữ lại/);
   assert.match(h.delivered.at(-1).cleanupResult.text, /owner chọn giữ lại/);
   write(path.join(a.path, 'later.txt'));
-  await handleCleanupButton(press('cx:bbbbbbbbbbbbbbbb'), h.ctx, { ...h.opts, parentDir: w.parent, deps: deps({ prs: { 'feat-a': merged(a) } }) });
+  await handleCleanupButton(press('cx:bbbbbbbbbbbbbbbb', shown), h.ctx, { ...h.opts, parentDir: w.parent, deps: deps({ prs: { 'feat-a': merged(a) } }) });
   assert.ok(fs.existsSync(a.path));
   assert.match(h.edits.at(-1), /❌ giữ lại .*later\.txt/);
   assert.equal(h.delivered.length, 1, 'daily offer (no convoId) → no agent to tell');
@@ -532,30 +539,124 @@ test('daily: stray-only worktree → offer (report says it will ask); real run q
   const r = await daily(w, deps({ prs: { 'feat-a': merged(a) } }), OLD_NOW);
   assert.ok(fs.existsSync(a.path));
   assert.equal(r.offers.length, 1);
-  assert.deepEqual(r.offers[0], { repo: 'repo', path: a.path, branch: 'feat-a', pr: 1, head: a.head, stray: ['.env'] });
+  const { strayHash, strayCounts, ...rest } = r.offers[0];
+  assert.deepEqual(rest, { repo: 'repo', path: a.path, branch: 'feat-a', pr: 1, head: a.head, stray: ['.env'] });
+  assert.match(strayHash, /^[0-9a-f]{64}$/);
+  assert.deepEqual(strayCounts, { '.env': 1 });
   const dir = path.join(tmp(), 'offers');
   writeOffer(r.offers[0], { dir });
   const h = buttonHarness();
-  await processCleanupOffers(h.ctx, { claim: () => claimRequests(dir) });
+  const dd = deps({ prs: { 'feat-a': merged(a) } });
+  await processCleanupOffers(h.ctx, { claim: () => claimRequests(dir), lockDir: h.opts.lockDir, waitSec: 0, parentDir: w.parent, deps: dd,
+    run: (p, o) => cleanupRequested(p, { ...o, now: OLD_NOW }) });
   assert.equal(h.buttons.length, 1);
   assert.match(h.buttons[0].t, /^🧹 Dọn hằng ngày \(repo\): giữ lại .* vì có 1 mục ngoài git:\n• \.env/);
   assert.deepEqual(fs.readdirSync(dir), []);
-  await handleCleanupButton(press(h.buttons[0].b[0].callback_data), h.ctx, { ...h.opts, parentDir: w.parent, deps: deps({ prs: { 'feat-a': merged(a) } }) });
+  let seen;
+  await handleCleanupButton(press(h.buttons[0].b[0].callback_data, h.buttons[0].t), h.ctx, { ...h.opts, parentDir: w.parent, deps: deps({ prs: { 'feat-a': merged(a) } }),
+    run: (p, o) => { seen = o; return cleanupRequested(p, { ...o, now: OLD_NOW }); } }); // files here are "30 days old"
+  assert.equal(seen.daily, true, 'a daily offer is pressed under the daily gates');
   assert.equal(fs.existsSync(a.path), false);
 });
 
 test('validCleanupOffer: junk / stale / huge → null', () => {
   const now = Date.now(), head = 'a'.repeat(40);
-  const ok = { path: '/w/a', head, stray: ['x'], pr: 1, branch: 'b', repo: 'r', createdAt: now };
+  const ok = { path: '/w/a', head, stray: ['x'], strayHash: 'c'.repeat(64), pr: 1, branch: 'b', repo: 'r', createdAt: now };
   assert.equal(validCleanupOffer(ok, { now }).path, '/w/a');
   for (const bad of [null, [], { ...ok, path: 'rel' }, { ...ok, head: 'zz' }, { ...ok, stray: [] }, { ...ok, stray: 'x' },
-    { ...ok, stray: Array(301).fill('x') }, { ...ok, createdAt: now - 25 * 3600_000 }, { ...ok, path: '/a\nb' }]) {
+    { ...ok, stray: Array(21).fill('x') }, { ...ok, createdAt: now - 25 * 3600_000 }, { ...ok, path: '/a\nb' },
+    { ...ok, strayHash: undefined }, { ...ok, stray: ['../x'] }, { ...ok, stray: ['/etc/x'] }, { ...ok, stray: ['a'.repeat(301)] }]) {
     assert.equal(validCleanupOffer(bad, { now }), null, JSON.stringify(bad)?.slice(0, 60));
   }
 });
 
-test('formatStrayOffer: lists at most 20 entries, control chars escaped', () => {
-  const t = formatStrayOffer({ title: 'T', path: '/w/a', stray: [...Array(25).keys()].map((i) => `f${i}`).concat(['evil\nline']), pr: 2, branch: 'b' });
-  assert.match(t, /• f19\n• … và 6 mục khác/);
+test('formatStrayOffer: EVERY entry shown in full, directories with their file count, control chars escaped', () => {
+  const long = `${'d'.repeat(250)}.log`;
+  const t = formatStrayOffer({ title: 'T', path: '/w/a', stray: ['data/', long, 'evil\nline'], counts: { 'data/': 12 }, pr: 2, branch: 'b' });
+  assert.match(t, /• data\/ \(12 file\)/);
+  assert.ok(t.includes(long), 'not truncated');
   assert.doesNotMatch(t, /evil\nline/);
+});
+
+test('owner button: an ignored DIRECTORY gets a new file / a shown file is rewritten after the offer → refused', async () => {
+  const w = world();
+  fs.appendFileSync(path.join(w.main, '.gitignore'), 'data/\n');
+  g(w.main, 'commit', '-qam', 'ignore data');
+  const a = w.add('feat-a');
+  write(path.join(a.path, 'data', 'one.txt'));
+  write(path.join(a.path, 'notes.txt'), 'v1');
+  const d = deps({ prs: { 'feat-a': merged(a) } });
+  const kept = await req(w, a.path, d);
+  assert.deepEqual([...kept.stray].sort(), ['data/', 'notes.txt'], 'one git entry for the whole ignored dir');
+  const dry = await cleanupRequested(a.path, { parentDir: w.parent, deps: d, allowStray: kept.stray, dryRun: true });
+  assert.equal(dry.strayCounts['data/'], 1);
+  const pin = { parentDir: w.parent, deps: d, allowStray: kept.stray, expectHead: a.head, strayHash: dry.strayHash };
+  write(path.join(a.path, 'data', 'sub', 'new-work.txt'));
+  assert.match((await cleanupRequested(a.path, pin)).reason, /đã thay đổi/);
+  fs.rmSync(path.join(a.path, 'data', 'sub'), { recursive: true });
+  write(path.join(a.path, 'notes.txt'), 'v2 — longer');
+  assert.match((await cleanupRequested(a.path, pin)).reason, /đã thay đổi/);
+  assert.ok(fs.existsSync(a.path));
+});
+
+test('owner button for a DAILY offer re-applies the recent-use gates (a Claude session used it since → kept)', async () => {
+  const w = world();
+  const a = w.add('feat-a');
+  write(path.join(a.path, '.env'), 'K=v');
+  const d = deps({ prs: { 'feat-a': merged(a) }, transcripts: [a.path] });
+  const fp = strayFingerprint(a.path, ['.env']);
+  const daily = await cleanupRequested(a.path, { parentDir: w.parent, deps: d, now: OLD_NOW, allowStray: ['.env'], expectHead: a.head, strayHash: fp.hash, daily: true });
+  assert.equal(daily.ok, false);
+  assert.match(daily.reason, /phiên Claude/);
+  const asReq = await cleanupRequested(a.path, { parentDir: w.parent, deps: d, now: OLD_NOW, allowStray: ['.env'], expectHead: a.head, strayHash: fp.hash });
+  assert.equal(asReq.ok, true, 'a request skips that gate');
+});
+
+test('a git repo inside the root tmp/ → tmp/ is NOT disposable (kept, owner asked)', async () => {
+  const w = world();
+  const a = w.add('feat-a');
+  fs.mkdirSync(path.join(a.path, 'tmp', 'clone'), { recursive: true });
+  g(path.join(a.path, 'tmp', 'clone'), 'init', '-q');
+  const r = await req(w, a.path, deps({ prs: { 'feat-a': merged(a) } }));
+  assert.equal(r.ok, false);
+  assert.match(r.reason, /tmp\//);
+});
+
+test('more than 20 stray entries → no button (plain FYI)', async () => {
+  const w = world();
+  const a = w.add('feat-a');
+  for (let i = 0; i < 21; i++) write(path.join(a.path, `n${i}.txt`));
+  const h = buttonHarness();
+  writeRequest({ path: a.path, convoId: 5, dir: h.dir });
+  await processCleanupRequests(h.ctx, { ...h.opts, parentDir: w.parent, deps: deps({ prs: { 'feat-a': merged(a) } }) });
+  assert.equal(h.buttons.length, 0);
+  assert.equal(h.dms.length, 1);
+});
+
+test('processCleanupOffers: button DM fails → plain-text fallback to the owner, token dropped', async () => {
+  const dir = path.join(tmp(), 'offers');
+  writeOffer({ repo: 'r', path: '/w/a', branch: 'b', pr: 1, head: 'a'.repeat(40), stray: ['.env'], strayHash: 'c'.repeat(64) }, { dir });
+  const h = buttonHarness();
+  h.ctx.sendButtons = async () => { throw new Error('400 too long'); };
+  await processCleanupOffers(h.ctx, { claim: () => claimRequests(dir), lockDir: h.opts.lockDir, waitSec: 0,
+    run: async (p) => ({ ok: true, dryRun: true, path: p, head: 'a'.repeat(40), branch: 'b', pr: 1, strayHash: 'e'.repeat(64), strayCounts: {} }) });
+  assert.equal(h.store.size, 0);
+  assert.match(h.dms[0][1], /không gửi được nút/);
+});
+
+test('processCleanupOffers: the daemon re-judges the offer itself — no longer applies → no button; lock busy → back in queue', async () => {
+  const dir = path.join(tmp(), 'offers');
+  writeOffer({ repo: 'r', path: '/w/a', branch: 'b', pr: 1, head: 'a'.repeat(40), stray: ['.env'], strayHash: 'c'.repeat(64) }, { dir });
+  const h = buttonHarness();
+  const held = await acquireLock('cleanup', { waitSec: 0, dir: h.opts.lockDir, cmd: 'test' });
+  try { await processCleanupOffers(h.ctx, { claim: () => claimRequests(dir), lockDir: h.opts.lockDir, waitSec: 0, run: async () => { throw new Error('must not run'); } }); }
+  finally { held.release(); }
+  assert.equal(fs.readdirSync(dir).filter((n) => n.endsWith('.json')).length, 1);
+  let seen;
+  await processCleanupOffers(h.ctx, { claim: () => claimRequests(dir), lockDir: h.opts.lockDir, waitSec: 0, run: async (p, o) => { seen = o; return { ok: false, reason: 'HEAD đã đổi' }; } });
+  assert.equal(seen.daily, true);
+  assert.equal(seen.dryRun, true);
+  assert.equal(seen.expectHead, 'a'.repeat(40));
+  assert.equal(h.buttons.length, 0);
+  assert.deepEqual(fs.readdirSync(dir), []);
 });

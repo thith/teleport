@@ -424,6 +424,8 @@ test('reloadDaemonState: a corrupt projects.json (strict reader) or an empty reg
 const MREG = { merge: { run: 'merge.mjs', args: [], needsProject: false, minRole: 'admin' } };
 const OWNER_CFG = { _default: { roles: { '1': { role: 'admin' }, '9': { role: 'member' } } } };
 const L1 = 'https://github.com/thith/teleport/pull/3';
+// The text of the pressed button message: a press acts only on links written in it.
+const SHOWN = `preview ${L1} https://github.com/icetea-labs/umipay-hub/pull/5`;
 
 test('prLinksOnly: only messages made of PR links (deduped); anything else → null', () => {
   assert.deepEqual(prLinksOnly(` ${L1} `), [L1]);
@@ -477,7 +479,7 @@ test('handleMergeButton: Merge dispatches /merge <links> once; Cancel and expire
   const take = (t) => takeMergeButton(t, { store });
   const ev = [], dispatched = [];
   const ctx = { registry: MREG, answerButton: async (id, t) => ev.push(`answer:${t || ''}`), editButtonsMessage: async (c, m, t) => ev.push(`edit:${t.split('\n').pop()}`) };
-  const cq = (data) => ({ id: 'q', data, from: { id: 1 }, message: { chat: { id: 1 }, message_id: 5, text: 'preview' } });
+  const cq = (data) => ({ id: 'q', data, from: { id: 1 }, message: { chat: { id: 1 }, message_id: 5, text: SHOWN } });
   const dispatch = async (parsed) => dispatched.push(parsed);
   await handleMergeButton(cq('mg:aaaaaaaaaaaaaaaa'), ctx, { take, dispatch });
   assert.deepEqual(dispatched, [{ cmd: 'merge', rest: L1 }]);
@@ -548,7 +550,7 @@ test('handlePrLinks: not mergeable but still open → only [Close] [Huỷ]; Merg
   const dispatched = [];
   const ctx = { registry: MREG, answerButton: async () => {}, editButtonsMessage: async () => {} };
   const take = (t) => takeMergeButton(t, { store });
-  const cq = (data) => ({ id: 'q', data, from: { id: 1 }, message: { chat: { id: 1 }, message_id: 5, text: 'p' } });
+  const cq = (data) => ({ id: 'q', data, from: { id: 1 }, message: { chat: { id: 1 }, message_id: 5, text: SHOWN } });
   await handleMergeButton(cq(`mg:${tok}`), ctx, { take: (t) => ({ ...store.get(t), _: take }), dispatch: async (p) => dispatched.push(p) });
   assert.equal(dispatched.length, 0, 'forged Merge on a close-only preview is refused');
   await handleMergeButton(cq(`cl:${tok}`), ctx, { take, dispatch: async (p) => dispatched.push(p) });
@@ -563,7 +565,7 @@ test('a deployment arg --close never turns Merge into close (preview and dispatc
   assert.deepEqual(argvs[0], ['/s/merge.mjs', L1, '--preview'], 'merge preview without the deployment --close');
   const tok = buttons[0][0].callback_data.slice(3);
   let seen;
-  await handleMergeButton({ id: 'q', data: `mg:${tok}`, from: { id: 1 }, message: { chat: { id: 1 }, message_id: 1, text: 'p' } },
+  await handleMergeButton({ id: 'q', data: `mg:${tok}`, from: { id: 1 }, message: { chat: { id: 1 }, message_id: 1, text: SHOWN } },
     { registry: reg, answerButton: async () => {}, editButtonsMessage: async () => {} },
     { take: (t) => takeMergeButton(t, { store }), dispatch: async (p, f, c) => { seen = { p, args: c.registry.merge.args }; } });
   assert.deepEqual(seen, { p: { cmd: 'merge', rest: L1 }, args: [] });
@@ -573,7 +575,7 @@ test('the --close strip also holds when merge is an alias to a command with --cl
   const store = new Map([['cccccccccccccccc', { links: [L1], createdAt: Date.now(), canMerge: true }]]);
   const reg = { merge: { alias: 'closer' }, closer: { run: 'merge.mjs', args: ['--close', '--rebase'], minRole: 'admin' } };
   let seen;
-  await handleMergeButton({ id: 'q', data: 'mg:cccccccccccccccc', from: { id: 1 }, message: { chat: { id: 1 }, message_id: 1, text: 'p' } },
+  await handleMergeButton({ id: 'q', data: 'mg:cccccccccccccccc', from: { id: 1 }, message: { chat: { id: 1 }, message_id: 1, text: SHOWN } },
     { registry: reg, answerButton: async () => {}, editButtonsMessage: async () => {} },
     { take: (t) => takeMergeButton(t, { store }), dispatch: async (p, f, c) => { seen = c.registry.merge; } });
   assert.deepEqual(seen.args, ['--rebase']);
@@ -636,7 +638,7 @@ test('button result for an agent request goes back to that agent too; Cancel tel
     ['eeeeeeeeeeeeeeee', { links: [RQ], createdAt: Date.now(), canMerge: true, requester: { convoId: '42', label: 'Giun' } }]]);
   const delivered = [], owner = [], audits = [];
   const ctx = { registry: MREG, sendText: async (c, t) => owner.push(t), answerButton: async () => {}, editButtonsMessage: async () => {} };
-  const cq = (d) => ({ id: 'q', data: d, from: { id: 1 }, message: { chat: { id: 1 }, message_id: 1, text: 'p' } });
+  const cq = (d) => ({ id: 'q', data: d, from: { id: 1 }, message: { chat: { id: 1 }, message_id: 1, text: SHOWN } });
   await handleMergeButton(cq('mg:dddddddddddddddd'), ctx, {
     take: (t) => takeMergeButton(t, { store }), deliver: async (r) => delivered.push(r), audit: (a) => audits.push(a),
     dispatch: async (p, f, c) => { await c.sendText('1', '✅ merged PR #5'); },
@@ -657,7 +659,7 @@ test('/automerge: admin only; on/off/status', async () => {
 test('button audit: a partly failed batch is not ok; owner-unreachable ASK tells the agent', async () => {
   const store = new Map([['ffffffffffffffff', { links: [RQ], createdAt: Date.now(), canMerge: true, requester: { convoId: '42', label: 'G' } }]]);
   const audits = [];
-  await handleMergeButton({ id: 'q', data: 'mg:ffffffffffffffff', from: { id: 1 }, message: { chat: { id: 1 }, message_id: 1, text: 'p' } },
+  await handleMergeButton({ id: 'q', data: 'mg:ffffffffffffffff', from: { id: 1 }, message: { chat: { id: 1 }, message_id: 1, text: SHOWN } },
     { registry: MREG, sendText: async () => {}, answerButton: async () => {}, editButtonsMessage: async () => {} },
     { take: (t) => takeMergeButton(t, { store }), deliver: async () => {}, audit: (a) => audits.push(a),
       dispatch: async (p, f, c) => { await c.sendText('1', '✅ merged PR #1\n\n❌ PR #2: conflicts\n\n⏹ stopped. merged: #1'); } });
@@ -735,7 +737,7 @@ test('expectHeadArgs: canonical links + full shas only', () => {
   assert.equal(expectHeadArgs(undefined), '');
 });
 
-test('handlePrLinks: heads read BEFORE the preview are stored; Merge dispatches them as --expect-head', async () => {
+test('handlePrLinks: heads read BEFORE the preview are pinned IN the message; Merge dispatches them as --expect-head', async () => {
   const sha = 'b'.repeat(40), order = [], buttons = [], store = new Map();
   await handlePrLinks([L1], { chat: { id: 1 }, from: { id: 1 } }, {
     daemonUserId: '1', projectsConfig: OWNER_CFG, registry: MREG, store, scriptsDir: '/s', parentDir: '/w',
@@ -744,29 +746,33 @@ test('handlePrLinks: heads read BEFORE the preview are stored; Merge dispatches 
     fetchHead: async (l) => { order.push(`head:${l}`); return sha; },
   });
   assert.deepEqual(order, [`head:${L1}`, 'preview']);
+  assert.ok(buttons[0].t.includes(`📌 ${L1} @ ${sha.slice(0, 12)}`));
   const [tok, entry] = [...store.entries()][0];
   assert.deepEqual(entry.heads, { [L1]: sha });
-  assert.doesNotMatch(buttons[0].t, /Không đọc được commit/);
   const dispatched = [];
-  const ctx = { registry: MREG, answerButton: async () => {}, editButtonsMessage: async () => {} };
-  await handleMergeButton({ id: 'q', data: `mg:${tok}`, from: { id: 1 }, message: { chat: { id: 1 }, message_id: 5, text: 'p' } }, ctx,
-    { take: (t) => takeMergeButton(t, { store }), dispatch: async (p) => dispatched.push(p) });
+  const ctx = { registry: MREG, fetchHead: () => sha, answerButton: async () => {}, editButtonsMessage: async () => {} };
+  const pressed = (data, text) => ({ id: 'q', data, from: { id: 1 }, message: { chat: { id: 1 }, message_id: 5, text } });
+  await handleMergeButton(pressed(`mg:${tok}`, buttons[0].t), ctx, { take: (t) => takeMergeButton(t, { store }), dispatch: async (p) => dispatched.push(p) });
   assert.deepEqual(dispatched, [{ cmd: 'merge', rest: `${L1} --expect-head=thith/teleport#3=${sha}` }]);
+  // a tampered persisted entry (other head / other PR than the message shows) → refused
+  for (const bad of [{ links: [L1], heads: { [L1]: 'c'.repeat(40) } }, { links: ['https://github.com/evil/x/pull/1'], heads: { 'https://github.com/evil/x/pull/1': sha } }, { links: [L1] }]) {
+    store.set('dddddddddddddddd', { ...bad, createdAt: Date.now(), canMerge: true });
+    await handleMergeButton(pressed('mg:dddddddddddddddd', buttons[0].t), ctx, { take: (t) => takeMergeButton(t, { store }), dispatch: async (p) => dispatched.push(p) });
+  }
+  assert.equal(dispatched.length, 1, 'nothing dispatched for tampered / unpinned entries');
 });
 
-test('handlePrLinks: a head that cannot be read → button still offered, with a warning; Close never pins', async () => {
-  const buttons = [], store = new Map();
-  await handlePrLinks([L1], { chat: { id: 1 }, from: { id: 1 } }, {
+test('handlePrLinks: a head that cannot be read → NO button; owner and requesting agent told', async () => {
+  const buttons = [], texts = [], delivered = [], store = new Map();
+  const r = await handlePrLinks([L1], { chat: { id: 1 }, from: { id: 1 } }, {
     daemonUserId: '1', projectsConfig: OWNER_CFG, registry: MREG, store, scriptsDir: '/s', parentDir: '/w',
-    sendText: async () => {}, sendButtons: async (c, t, b) => buttons.push({ t, b }),
+    sendText: async (c, t) => texts.push(t), sendButtons: async (c, t, b) => buttons.push({ t, b }),
     runner: async () => ({ stdout: '🔎 ok' }), fetchHead: async () => { throw new Error('gh down'); },
+    requester: { convoId: '42' }, deliver: async (x) => delivered.push(x),
   });
-  assert.match(buttons[0].t, /Không đọc được commit/);
-  const [tok] = [...store.keys()];
-  store.get(tok).heads = { [L1]: 'c'.repeat(40) };
-  const dispatched = [];
-  await handleMergeButton({ id: 'q', data: `cl:${tok}`, from: { id: 1 }, message: { chat: { id: 1 }, message_id: 5, text: 'p' } },
-    { registry: MREG, answerButton: async () => {}, editButtonsMessage: async () => {} },
-    { take: (t) => takeMergeButton(t, { store }), dispatch: async (p) => dispatched.push(p) });
-  assert.deepEqual(dispatched, [{ cmd: 'merge', rest: `${L1} --close` }]);
+  assert.deepEqual(r, { offered: false });
+  assert.equal(buttons.length, 0);
+  assert.equal(store.size, 0);
+  assert.match(texts[0], /Không đọc được commit/);
+  assert.equal(delivered[0].convoId, '42');
 });

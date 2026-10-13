@@ -359,3 +359,11 @@ test('mergeOne --expect-head: a head that moved since the preview is refused, no
   assert.equal(ok.ok, true, ok.text);
   assert.ok(same.calls.some((c) => c[2] === 'PUT' && c.includes(`sha=${'a'.repeat(40)}`)));
 });
+
+test('--expect-head survives the daemon path: expectHeadArgs → tokenizeArgs → parseMergeArgs', async () => {
+  const { expectHeadArgs } = await import('./daemon.mjs');
+  const { tokenizeArgs } = await import('./commands.mjs');
+  const sha = 'd'.repeat(40), link = 'https://github.com/Thith/Teleport/pull/36';
+  const a = parseMergeArgs(tokenizeArgs(`${link}${expectHeadArgs({ [link]: sha })}`));
+  assert.deepEqual(a.expectHeads, { 'thith/teleport#36': sha });
+});

@@ -29,3 +29,20 @@ test('PersistentMap: missing / corrupt file → empty; cap drops the oldest', ()
   m.set('a', { createdAt: 1 }); m.set('b', { createdAt: 3 }); m.set('c', { createdAt: 2 });
   assert.deepEqual([...new PersistentMap(f).keys()].sort(), ['b', 'c']);
 });
+
+test('PersistentMap: a consumption that cannot be written THROWS (the button must not come back after a restart)', () => {
+  const f = tmpFile();
+  const m = new PersistentMap(f);
+  m.set('t', { createdAt: 1 });
+  fs.chmodSync(path.dirname(f), 0o500); // rename into the dir now fails
+  try {
+    assert.throws(() => m.delete('t'));
+    m.set('u', { createdAt: 2 }); // a set failure is only logged
+  } finally { fs.chmodSync(path.dirname(f), 0o700); }
+});
+
+test('BUTTON_STORE_FILE lives in the daemon state dir, not the agents\' scripts/tmp', async () => {
+  const { BUTTON_STORE_FILE } = await import('./button-store.mjs');
+  assert.match(BUTTON_STORE_FILE, /teleport\/pending-buttons\.json$/);
+  assert.doesNotMatch(BUTTON_STORE_FILE, /scripts\/tmp/);
+});

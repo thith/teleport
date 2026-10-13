@@ -32,8 +32,11 @@ export const CLEANUP_REQUEST_AUDIT_FILE = path.join(__dirname, 'tmp', 'cleanup-r
 export const CLEANUP_REQUEST_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 export const CLEANUP_LOCK_WAIT_SEC = 60;
 export const CLEANUP_BUTTON_TTL_MS = 24 * 60 * 60 * 1000;
-export const STRAY_BUTTON_MAX = 300;   // more stray entries than this → no button (clean by hand)
-export const STRAY_SHOWN_MAX = 20;     // entries listed in the owner's DM
+// The owner must SEE every entry the button deletes: at most this many, each
+// shown in full (a directory with its file count) — else no button.
+export const STRAY_BUTTON_MAX = 20;
+export const STRAY_NAME_MAX = 300;
+export const OFFER_TEXT_MAX = 3500;    // Telegram caps a message at 4096 (results are appended on press)
 export const CLEANUP_BUTTON_RE = /^(cx|ck):([0-9a-f]{16})$/;
 
 /** Validate a parsed request body → { path, convoId } | null. Pure. */
@@ -98,10 +101,15 @@ function depsWithoutSecrets(secretEnvKeys) {
   return { ...base, exec: (cmd, args, opts = {}) => base.exec(cmd, args, { env, ...opts }) };
 }
 
-/** The owner's DM offering a manual cleanup: the stray files, then the question. Pure. */
-export function formatStrayOffer({ title, path: wtPath, stray, pr, branch }) {
-  const shown = stray.slice(0, STRAY_SHOWN_MAX).map((p) => `• ${escapeControls(p).slice(0, 160)}`);
-  if (stray.length > STRAY_SHOWN_MAX) shown.push(`• … và ${stray.length - STRAY_SHOWN_MAX} mục khác`);
+/** Can these entries be offered at all (count, name length)? Pure. */
+export function offerable(stray) {
+  return Array.isArray(stray) && stray.length > 0 && stray.length <= STRAY_BUTTON_MAX
+    && stray.every((p) => typeof p === 'string' && p.length <= STRAY_NAME_MAX && !path.isAbsolute(p) && !p.split('/').includes('..'));
+}
+
+/** The owner's DM offering a manual cleanup: EVERY stray entry, then the question. Pure. */
+export function formatStrayOffer({ title, path: wtPath, stray, counts = {}, pr, branch }) {
+  const shown = stray.map((p) => `• ${escapeControls(p)}${p.endsWith('/') && Number.isFinite(counts[p]) ? ` (${counts[p]} file)` : ''}`);
   return escapeControls(`${title}: giữ lại ${wtPath} vì có ${stray.length} mục ngoài git:`)
     + `\n${shown.join('\n')}\n\n`
     + escapeControls(`Ngoài các mục trên, worktree đủ điều kiện xoá (nhánh ${branch}${pr ? `, PR #${pr} đã merge` : ''}, không có thay đổi chưa commit). Xoá luôn worktree cùng các mục này?`);
@@ -112,32 +120,66 @@ export function validCleanupOffer(o, { now = Date.now(), maxAgeMs = CLEANUP_REQU
   if (!o || typeof o !== 'object' || Array.isArray(o)) return null;
   if (typeof o.path !== 'string' || !path.isAbsolute(o.path) || o.path.length > 4096 || /[\0\n\r]/.test(o.path)) return null;
   if (!/^[0-9a-f]{40,64}$/.test(String(o.head || ''))) return null;
-  if (!Array.isArray(o.stray) || !o.stray.length || o.stray.length > STRAY_BUTTON_MAX || !o.stray.every((p) => typeof p === 'string' && p.length <= 4096)) return null;
+  if (!offerable(o.stray)) return null;
+  if (!/^[0-9a-f]{64}$/.test(String(o.strayHash || ''))) return null;
   if (!Number.isFinite(o.createdAt) || now - o.createdAt > maxAgeMs) return null;
   const str = (v) => (typeof v === 'string' ? v.slice(0, 200) : null);
-  return { path: path.normalize(o.path), head: o.head, stray: o.stray, pr: Number.isSafeInteger(o.pr) ? o.pr : null, branch: str(o.branch) || '?', repo: str(o.repo) };
+  const counts = {};
+  if (o.strayCounts && typeof o.strayCounts === 'object') for (const p of o.stray) if (Number.isSafeInteger(o.strayCounts[p])) counts[p] = o.strayCounts[p];
+  return { path: path.normalize(o.path), head: o.head, stray: o.stray, strayHash: o.strayHash, counts, pr: Number.isSafeInteger(o.pr) ? o.pr : null, branch: str(o.branch) || '?', repo: str(o.repo) };
 }
 
 /**
  * Offers queued by the daily run (cleanup.mjs writeOffer): one owner DM with
  * [🧹 Xoá luôn] [Giữ] each. Pressing re-checks everything (handleCleanupButton).
  */
-export async function processCleanupOffers({ daemonUserId, sendButtons = null, buttonStore = null }, {
-  claim = () => claimRequests(CLEANUP_OFFER_DIR), remove = (f) => { try { fs.unlinkSync(f); } catch {} },
+export async function processCleanupOffers({ daemonUserId, sendText = async () => {}, sendButtons = null, buttonStore = null, secretEnvKeys = [] }, {
+  claim = () => claimRequests(CLEANUP_OFFER_DIR), remove = (f) => { try { fs.unlinkSync(f); } catch {} }, putBack = unclaim,
+  run = cleanupRequested, acquire = acquireLock, lockDir = LOCK_DIR, waitSec = CLEANUP_LOCK_WAIT_SEC, parentDir, deps,
 } = {}) {
   if (!sendButtons || !buttonStore) return;
   for (const { file, body } of claim()) {
+    let keepFile = false;
     try {
-      const o = validCleanupOffer(body);
-      if (!o) { console.error(`[daemon] dropped malformed/stale cleanup offer ${path.basename(file)}`); continue; }
+      const v0 = validCleanupOffer(body);
+      if (!v0) { console.error(`[daemon] dropped malformed/stale cleanup offer ${path.basename(file)}`); continue; }
+      // The file is only a hint (any local process can write one): the daemon
+      // re-judges the worktree itself — daily gates, the offered HEAD, exactly
+      // these entries allowed — and pins ITS OWN fingerprint of them.
+      let lock;
+      try { lock = await acquire('cleanup', { waitSec, dir: lockDir, label: 'teleport daemon (cleanup offer)', cmd: `cleanup offer ${v0.path}` }); }
+      catch (e) { lock = { error: e }; }
+      if (lock.timeout) { keepFile = true; putBack(file); break; }
+      if (lock.error) { console.error(`[daemon] cleanup offer: lock: ${lock.error?.message ?? lock.error}`); continue; }
+      let probe;
+      try { probe = await run(v0.path, { ...(parentDir ? { parentDir } : {}), deps: deps ?? depsWithoutSecrets(secretEnvKeys), allowStray: v0.stray, expectHead: v0.head, dryRun: true, daily: true }); }
+      catch (e) { probe = { ok: false, reason: e?.message ?? String(e) }; }
+      finally { lock.release(); }
+      if (!probe?.ok || !probe.dryRun || !probe.strayHash) { console.error(`[daemon] cleanup offer ${v0.path} no longer applies: ${probe?.reason ?? '?'}`); continue; }
+      const o = { ...v0, path: probe.path, strayHash: probe.strayHash, counts: probe.strayCounts || {}, pr: probe.pr ?? v0.pr, branch: probe.branch || v0.branch };
+      const title = `🧹 Dọn hằng ngày${o.repo ? ` (${o.repo})` : ''}`;
+      const text = formatStrayOffer({ title, path: o.path, stray: o.stray, counts: o.counts, pr: o.pr, branch: o.branch });
+      const plain = escapeControls(`${title}: giữ lại ${o.path} — có ${o.stray.length} mục ngoài git (${o.stray.slice(0, 3).join(', ')}…); không gửi được nút, xem tay.`).slice(0, 1000);
+      if (text.length > OFFER_TEXT_MAX) { await Promise.resolve(sendText(daemonUserId, plain)).catch(() => {}); continue; }
       const tok = crypto.randomBytes(8).toString('hex');
-      buttonStore.set(tok, { kind: 'cleanup', path: o.path, convoId: null, who: 'dọn hằng ngày', head: o.head, stray: o.stray, createdAt: Date.now() });
+      buttonStore.set(tok, { kind: 'cleanup', mode: 'daily', path: o.path, convoId: null, who: 'dọn hằng ngày', head: o.head, stray: o.stray, strayHash: o.strayHash, createdAt: Date.now() });
       try {
-        await sendButtons(daemonUserId, formatStrayOffer({ title: `🧹 Dọn hằng ngày${o.repo ? ` (${o.repo})` : ''}`, path: o.path, stray: o.stray, pr: o.pr, branch: o.branch }),
-          [{ text: '🧹 Xoá luôn', callback_data: `cx:${tok}` }, { text: 'Giữ', callback_data: `ck:${tok}` }]);
-      } catch (e) { buttonStore.delete(tok); console.error(`[daemon] cleanup offer DM failed: ${e?.message ?? e}`); }
-    } finally { remove(file); }
+        await sendButtons(daemonUserId, text, [{ text: '🧹 Xoá luôn', callback_data: `cx:${tok}` }, { text: 'Giữ', callback_data: `ck:${tok}` }]);
+      } catch (e) {
+        buttonStore.delete(tok);
+        console.error(`[daemon] cleanup offer DM failed: ${e?.message ?? e}`);
+        await Promise.resolve(sendText(daemonUserId, plain)).catch(() => {});
+      }
+    } finally { if (!keepFile) remove(file); }
   }
+}
+
+/** Is every entry this button would delete written in the message the owner saw? Pure. */
+export function cleanupEntryMatchesMessage(entry, text) {
+  const t = String(text || '');
+  return typeof entry.path === 'string' && t.includes(escapeControls(entry.path))
+    && Array.isArray(entry.stray) && entry.stray.length > 0
+    && entry.stray.every((p) => t.includes(`• ${escapeControls(p)}`));
 }
 
 /** One-shot take of a cleanup button (kind 'cleanup', fresh) — else null. */
@@ -183,12 +225,14 @@ export async function processCleanupRequests({ daemonUserId, sendText, sendButto
         try {
           r = await run(req.path, { ...(parentDir ? { parentDir } : {}), deps: runDeps });
           // Kept for stray files only? Probe (no removal) with exactly those allowed.
-          if (!r.ok && r.stray?.length && r.stray.length <= STRAY_BUTTON_MAX && buttonStore && sendButtons) {
+          if (!r.ok && offerable(r.stray) && buttonStore && sendButtons) {
             probe = await run(req.path, { ...(parentDir ? { parentDir } : {}), deps: runDeps, allowStray: r.stray, dryRun: true });
-            if (!probe?.ok || !probe.dryRun) probe = null;
+            if (!probe?.ok || !probe.dryRun || !probe.strayHash) probe = null;
           }
         } finally { lock.release(); }
       }
+      const offerText = probe ? formatStrayOffer({ title: `🧹 cleanup-request của ${who}`, path: probe.path, stray: r.stray, counts: probe.strayCounts, pr: probe.pr, branch: probe.branch }) : null;
+      if (offerText && offerText.length > OFFER_TEXT_MAX) probe = null;
       const offer = !!probe;
       const text = formatCleanupResult(r) + (offer ? ' — đã gửi owner nút xoá tay' : '');
       audit({ requester: req.convoId, path: req.path, ok: r.ok, ...(r.ok ? { branch: r.branch, pr: r.pr, bytes: r.bytes } : { reason: r.reason }) });
@@ -196,9 +240,9 @@ export async function processCleanupRequests({ daemonUserId, sendText, sendButto
       catch (e) { await sendText(daemonUserId, `⚠️ Không gửi được kết quả cleanup-request về ${who}: ${e?.message ?? e}`).catch(() => {}); }
       if (offer) {
         const tok = crypto.randomBytes(8).toString('hex');
-        buttonStore.set(tok, { kind: 'cleanup', path: probe.path, convoId: req.convoId, who, head: probe.head, stray: r.stray, createdAt: Date.now() });
+        buttonStore.set(tok, { kind: 'cleanup', path: probe.path, convoId: req.convoId, who, head: probe.head, stray: r.stray, strayHash: probe.strayHash, createdAt: Date.now() });
         try {
-          await sendButtons(daemonUserId, formatStrayOffer({ title: `🧹 cleanup-request của ${who}`, path: probe.path, stray: r.stray, pr: probe.pr, branch: probe.branch }),
+          await sendButtons(daemonUserId, offerText,
             [{ text: '🧹 Xoá luôn', callback_data: `cx:${tok}` }, { text: 'Giữ', callback_data: `ck:${tok}` }]);
         } catch (e) {
           buttonStore.delete(tok);
@@ -227,7 +271,10 @@ export async function handleCleanupButton(cq, ctx, {
   if (!m) { await ctx.answerButton(cq.id); return; }
   const store = ctx.buttonStore;
   const chatId = cq.message?.chat?.id, messageId = cq.message?.message_id;
-  const original = cq.message?.text || '';
+  // Trimmed so the appended status always fits Telegram's 4096 chars (the edit is
+  // the only place a daily offer's result is shown).
+  const msgText = cq.message?.text || '';
+  const original = msgText.length > OFFER_TEXT_MAX ? `${msgText.slice(0, OFFER_TEXT_MAX)}…` : msgText;
   const entry = store ? take(m[2], { store }) : null;
   if (!entry) {
     await ctx.answerButton(cq.id, '⌛ Hết hạn hoặc đã xử lý.');
@@ -242,6 +289,13 @@ export async function handleCleanupButton(cq, ctx, {
     await tell(escapeControls(`✋ owner chọn giữ lại ${entry.path} (không xoá).`), false);
     return;
   }
+  // A tampered persisted entry can't redirect the tap: everything it would
+  // delete must be written in the pressed message.
+  if (!cleanupEntryMatchesMessage(entry, msgText)) {
+    await ctx.answerButton(cq.id, 'Nút không khớp nội dung.');
+    await ctx.editButtonsMessage(chatId, messageId, `${original}\n\n⚠️ Nút không khớp nội dung tin nhắn — không xoá gì.`);
+    return;
+  }
   await ctx.answerButton(cq.id, 'Đang xoá…');
   await ctx.editButtonsMessage(chatId, messageId, `${original}\n\n⏳ Đang xoá…`);
   let lock;
@@ -250,8 +304,13 @@ export async function handleCleanupButton(cq, ctx, {
   let r;
   if (lock.timeout || lock.error) r = { ok: false, path: entry.path, reason: lock.timeout ? 'đợt dọn khác đang chạy — nhờ agent gửi lại cleanup-request sau' : `không lấy được lock cleanup: ${lock.error?.message ?? lock.error}` };
   else {
-    try { r = await run(entry.path, { ...(parentDir ? { parentDir } : {}), deps: deps ?? depsWithoutSecrets(ctx.secretEnvKeys || []), allowStray: entry.stray, expectHead: entry.head }); }
-    finally { lock.release(); }
+    // Missing strayHash (never written by this code) → refuse rather than allow unpinned.
+    if (!entry.strayHash) r = { ok: false, path: entry.path, reason: 'nút thiếu dấu vân tay file — gửi lại cleanup-request' };
+    else {
+      try { r = await run(entry.path, { ...(parentDir ? { parentDir } : {}), deps: deps ?? depsWithoutSecrets(ctx.secretEnvKeys || []), allowStray: entry.stray, expectHead: entry.head, strayHash: entry.strayHash, daily: entry.mode === 'daily' }); }
+      catch (e) { r = { ok: false, path: entry.path, reason: `lỗi: ${e?.message ?? e}` }; }
+    }
+    lock.release();
   }
   const text = formatCleanupResult(r);
   audit({ requester: entry.convoId, path: entry.path, ok: r.ok, mode: 'button-remove', ...(r.ok ? { branch: r.branch, pr: r.pr, bytes: r.bytes, stray: entry.stray.length } : { reason: r.reason }) });
