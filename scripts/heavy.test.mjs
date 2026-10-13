@@ -34,18 +34,19 @@ function repoWithWorktree() {
   return { root, repo, wt };
 }
 
-test('parse: --own-target / --no-ram-wait (defaults off/on), mixed with old flags', () => {
-  assert.deepEqual(parseHeavyArgs(['--', 'a']), { cmd: ['a'], stop: true, waitSec: Infinity, ownTarget: false, ramWait: true });
-  assert.deepEqual(parseHeavyArgs(['--own-target', '--no-stop', '--no-ram-wait', '--wait', '1', '--', 'cargo', '--own-target']),
-    { cmd: ['cargo', '--own-target'], stop: false, waitSec: 60, ownTarget: true, ramWait: false });
+test('parse: --shared-target is opt-in (default off); --own-target still accepted; --no-ram-wait', () => {
+  assert.deepEqual(parseHeavyArgs(['--', 'a']), { cmd: ['a'], stop: true, waitSec: Infinity, sharedTarget: false, ramWait: true });
+  assert.deepEqual(parseHeavyArgs(['--shared-target', '--no-stop', '--no-ram-wait', '--wait', '1', '--', 'cargo', '--own-target']),
+    { cmd: ['cargo', '--own-target'], stop: false, waitSec: 60, sharedTarget: true, ramWait: false });
+  assert.equal(parseHeavyArgs(['--own-target', '--', 'a']).sharedTarget, false);
 });
 
 test('C: every worktree (and subdir) of one repo → the same <repo>-<hash6> dir under ~/.cache/teleport/cargo-target', () => {
   const { repo, wt } = repoWithWorktree();
   const home = '/h';
-  const a = resolveCargoTarget({ env: {}, cwd: repo, home });
-  const b = resolveCargoTarget({ env: {}, cwd: wt, home });
-  const c = resolveCargoTarget({ env: {}, cwd: path.join(wt, 'sub'), home });
+  const a = resolveCargoTarget({ env: {}, sharedTarget: true, cwd: repo, home });
+  const b = resolveCargoTarget({ env: {}, sharedTarget: true, cwd: wt, home });
+  const c = resolveCargoTarget({ env: {}, sharedTarget: true, cwd: path.join(wt, 'sub'), home });
   assert.match(a, /^\/h\/\.cache\/teleport\/cargo-target\/myrepo-[0-9a-f]{6}$/);
   assert.equal(b, a);
   assert.equal(c, a);
@@ -54,18 +55,18 @@ test('C: every worktree (and subdir) of one repo → the same <repo>-<hash6> dir
   assert.notEqual(sharedTargetDir('/x/myrepo/.git', home), sharedTargetDir('/y/myrepo/.git', home));
 });
 
-test('C: inherited CARGO_TARGET_DIR respected; --own-target; outside git → unset', () => {
+test('C: shared target is opt-in; inherited CARGO_TARGET_DIR respected; outside git → unset', () => {
   const { repo } = repoWithWorktree();
-  assert.equal(resolveCargoTarget({ env: { CARGO_TARGET_DIR: '/mine' }, cwd: repo }), null);
-  assert.equal(resolveCargoTarget({ env: {}, ownTarget: true, cwd: repo }), null);
+  assert.equal(resolveCargoTarget({ env: { CARGO_TARGET_DIR: '/mine' }, sharedTarget: true, cwd: repo }), null);
+  assert.equal(resolveCargoTarget({ env: {}, cwd: repo }), null, 'default: no shared target (each worktree builds into its own target/)');
   // HOME="" / relative → would be a relative (per-worktree) dir → don't set
-  assert.equal(resolveCargoTarget({ env: {}, cwd: repo, home: '' }), null);
-  assert.equal(resolveCargoTarget({ env: {}, cwd: repo, home: 'rel/home' }), null);
-  assert.ok(path.isAbsolute(resolveCargoTarget({ env: {}, cwd: repo, home: '/h' })));
+  assert.equal(resolveCargoTarget({ env: {}, sharedTarget: true, cwd: repo, home: '' }), null);
+  assert.equal(resolveCargoTarget({ env: {}, sharedTarget: true, cwd: repo, home: 'rel/home' }), null);
+  assert.ok(path.isAbsolute(resolveCargoTarget({ env: {}, sharedTarget: true, cwd: repo, home: '/h' })));
   const out = tmp('tp-heavy-nogit-');
   assert.equal(gitCommonDir(out), null, 'tmpdir is not inside a git repo');
-  assert.equal(resolveCargoTarget({ env: {}, cwd: out }), null);
-  assert.equal(resolveCargoTarget({ env: {}, cwd: out, commonDir: () => null }), null);
+  assert.equal(resolveCargoTarget({ env: {}, sharedTarget: true, cwd: out }), null);
+  assert.equal(resolveCargoTarget({ env: {}, sharedTarget: true, cwd: out, commonDir: () => null }), null);
 });
 
 test('C: main passes CARGO_TARGET_DIR to the command (and gradlew --stop), says so; cargo clean warns but still runs', async () => {
@@ -73,23 +74,23 @@ test('C: main passes CARGO_TARGET_DIR to the command (and gradlew --stop), says 
     const logs = [], envs = [];
     const rc = await heavyMain(argv, {
       env, log: (s) => logs.push(s), nested: () => false, waitRam: async () => {},
-      cargoTarget: ({ env: e, ownTarget }) => (e.CARGO_TARGET_DIR || ownTarget ? null : target),
+      cargoTarget: ({ env: e, sharedTarget }) => (!sharedTarget || e.CARGO_TARGET_DIR ? null : target),
       acquire: async () => ({ release() {}, waitedMs: 0 }),
       run: async (cmd, o) => { envs.push(o.env.CARGO_TARGET_DIR); return 0; },
       stopGradle: async (cmd, o) => { envs.push(`stop ${o.env.CARGO_TARGET_DIR}`); },
     });
     return { rc, logs: logs.join('\n'), envs };
   };
-  let r = await go(['--', './gradlew', 'build']);
+  let r = await go(['--shared-target', '--', './gradlew', 'build']);
   assert.deepEqual(r.envs, ['/t/repo-abc123', 'stop /t/repo-abc123']);
-  assert.match(r.logs, /ℹ️ CARGO_TARGET_DIR=\/t\/repo-abc123 \(dùng chung giữa các worktree; --own-target để tắt\)/);
-  r = await go(['--own-target', '--', 'cargo', 'build']);
+  assert.match(r.logs, /ℹ️ CARGO_TARGET_DIR=\/t\/repo-abc123 \(dùng chung giữa các worktree — opt-in/);
+  r = await go(['--', 'cargo', 'build']);
   assert.deepEqual(r.envs, [undefined]);
   assert.doesNotMatch(r.logs, /CARGO_TARGET_DIR/);
   r = await go(['--', 'cargo', 'build'], { CARGO_TARGET_DIR: '/mine' });
   assert.deepEqual(r.envs, ['/mine']);
   assert.doesNotMatch(r.logs, /ℹ️/);
-  r = await go(['--', 'cargo', 'clean']);
+  r = await go(['--shared-target', '--', 'cargo', 'clean']);
   assert.equal(r.rc, 0);
   assert.deepEqual(r.envs, ['/t/repo-abc123'], 'still runs');
   assert.match(r.logs, /cargo clean.*DÙNG CHUNG/);
@@ -116,14 +117,14 @@ test('C: hasCargoClean — `cargo [+tc] [-flags] clean` (also inside sh -c), but
   assert.equal(hasCargoClean(['sh', '-c', 'cargo clean -p foo; cargo clean']), true, '-p of another command does not count');
 });
 
-test('C: real process — inside a repo the command sees the shared dir; outside git it does not', { skip: spawnSync('git', ['--version']).status !== 0 }, async () => {
+test('C: real process — by default no shared dir; with --shared-target inside a repo the command sees it; outside git never', { skip: spawnSync('git', ['--version']).status !== 0 }, async () => {
   const { wt } = repoWithWorktree();
   const lockDir = tmp('tp-heavy-lock-');
   const home = tmp('tp-heavy-home-');
-  const runIn = (cwd) => new Promise((resolve) => {
+  const runIn = (cwd, flags = ['--shared-target']) => new Promise((resolve) => {
     const env = { ...process.env, TELEPORT_LOCK_DIR: lockDir, TELEPORT_HEAVY_MIN_FREE_MB: '0', HOME: home, GIT_CEILING_DIRECTORIES: path.dirname(cwd) };
     delete env.TELEPORT_HEAVY_HELD; delete env.CARGO_TARGET_DIR;
-    const c = spawn(process.execPath, [HEAVY, '--', 'sh', '-c', 'echo "T=${CARGO_TARGET_DIR:-none}"'], { cwd, env, stdio: ['ignore', 'pipe', 'pipe'] });
+    const c = spawn(process.execPath, [HEAVY, ...flags, '--', 'sh', '-c', 'echo "T=${CARGO_TARGET_DIR:-none}"'], { cwd, env, stdio: ['ignore', 'pipe', 'pipe'] });
     let out = '', err = '';
     c.stdout.on('data', (d) => { out += d; });
     c.stderr.on('data', (d) => { err += d; });
@@ -133,6 +134,9 @@ test('C: real process — inside a repo the command sees the shared dir; outside
   assert.equal(r.code, 0, r.err);
   assert.match(r.out, new RegExp(`T=${home}/\\.cache/teleport/cargo-target/myrepo-[0-9a-f]{6}`));
   assert.match(r.err, /ℹ️ CARGO_TARGET_DIR=/);
+  const r0 = await runIn(wt, []);
+  assert.match(r0.out, /T=none/, 'default: own target');
+  assert.doesNotMatch(r0.err, /ℹ️ CARGO_TARGET_DIR/);
   const r2 = await runIn(fs.realpathSync(tmp('tp-heavy-nogit-')));
   assert.equal(r2.code, 0, r2.err);
   assert.match(r2.out, /T=none/);
