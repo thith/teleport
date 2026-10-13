@@ -373,3 +373,28 @@ test('post-merge: Ctrl-C during the pre-build gradlew --stop cancels the build',
   assert.equal(ran, false);
   assert.equal(code, 130);
 });
+
+test('PR39 review: orphan = dead pid OR pid reused by a non-heavy process; a live heavy (any lock dir) is never touched', () => {
+  const run = () => ({ stdout: 'heavy-111-aa.scope loaded active running x\nheavy-222-bb.scope loaded active running y\nheavy-333-cc.scope loaded active running z\n' });
+  const alive = (pid) => pid !== 111;
+  const isHeavy = (pid) => pid === 222;
+  assert.deepEqual(orphanScopes({ run, alive, isHeavy, self: 999 }), ['heavy-111-aa.scope', 'heavy-333-cc.scope']);
+});
+
+test('PR39 review: cancel exit code follows the signal; no signal listeners leak; lock released even when the final stop fails', async () => {
+  const before = ['SIGINT', 'SIGTERM', 'SIGHUP'].map((s) => process.listenerCount(s));
+  const code = await heavyMain(['--', './gradlew', 'build'], { env: {}, nested: () => false, log: () => {}, waitRam: async () => {},
+    scopeOps: { ...NO_SCOPE, preflight: () => ({ ok: true }) }, acquire: async () => ({ release() {}, waitedMs: 0 }),
+    stopGradle: async () => { process.emit('SIGTERM', 'SIGTERM'); return 143; }, run: async () => 0 });
+  assert.equal(code, 143);
+  let released = false;
+  await heavyMain(['--', 'cargo', 'b'], { env: {}, nested: () => false, log: () => {}, waitRam: async () => {},
+    scopeOps: { ...NO_SCOPE, preflight: () => ({ ok: true }), stop: () => false }, acquire: async () => ({ release() { released = true; }, waitedMs: 0 }), run: async () => 0 });
+  assert.equal(released, true);
+  assert.deepEqual(['SIGINT', 'SIGTERM', 'SIGHUP'].map((s) => process.listenerCount(s)), before);
+});
+
+test('PR39 review: tomlHasBuildJobs — CRLF and a header with a trailing comment', async () => {
+  const { tomlHasBuildJobs } = await import('./heavy.mjs');
+  assert.equal(tomlHasBuildJobs('[build] # cargo\r\njobs = 2\r\n'), true);
+});

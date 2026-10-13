@@ -187,13 +187,21 @@ export function stopScope(unit, { run = spawnSync, populated = cgroupPopulated, 
   return false;
 }
 
-/** heavy-<pid>-*.scope units whose heavy is dead (SIGKILLed — its lock gone, its build maybe not). */
-export function orphanScopes({ run = spawnSync, alive = (pid) => { try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; } }, self = process.pid } = {}) {
+/**
+ * Stale heavy-<pid>-*.scope units: their heavy is dead, or the pid now belongs
+ * to something that isn't heavy.mjs (reused). A LIVE heavy's scope is never
+ * touched — even one holding a different lock dir (tests, TELEPORT_LOCK_DIR).
+ * Known gap: a holder whose final cleanup failed is still alive for a moment
+ * after releasing the lock; a heavy starting in that instant won't see it as
+ * stale (the one after will).
+ */
+export function orphanScopes({ run = spawnSync, alive = (pid) => { try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; } }, isHeavy = (pid) => { try { return fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').includes('heavy.mjs'); } catch { return true; } }, self = process.pid } = {}) {
   const out = String(run('systemctl', ['--user', 'list-units', 'heavy-*.scope', '--all', '--plain', '--no-legend'], { encoding: 'utf8', timeout: 10_000 }).stdout || '');
   const units = [];
   for (const line of out.split('\n')) {
     const m = /^\s*(heavy-(\d+)-[a-z0-9]+\.scope)\b/.exec(line);
-    if (m && Number(m[2]) !== self && !alive(Number(m[2]))) units.push(m[1]);
+    const pid = m && Number(m[2]);
+    if (m && pid !== self && (!alive(pid) || !isHeavy(pid))) units.push(m[1]);
   }
   return units;
 }
@@ -207,7 +215,7 @@ export function appSliceOomKills({ uid = process.getuid?.() ?? 0, read = (f) => 
 export function tomlHasBuildJobs(text) {
   let table = '';
   for (const raw of String(text).split('\n')) {
-    const line = raw.replace(/#.*$/, '').trim(); // (no `#` inside our keys/values of interest)
+    const line = raw.replace(/\r$/, '').replace(/#.*$/, '').trim(); // (no `#` inside our keys/values of interest)
     if (!line) continue;
     const h = /^\[\s*([^\]]+?)\s*\]$/.exec(line);
     if (h) { table = h[1]; continue; }
@@ -375,8 +383,8 @@ export async function main(argv, {
     }
     // A Gradle daemon started earlier lives outside our scope (unlimited): stop it first.
     // Ctrl-C / TERM during these pre-steps cancels the build (it must not start anyway).
-    let cancelled = false;
-    const onSig = () => { cancelled = true; };
+    let cancelled = null;
+    const onSig = (sig) => { cancelled = sig || 'SIGINT'; };
     for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(sig, onSig);
     try {
       if (scope && a.stop && isGradlew(a.cmd)) {
@@ -386,7 +394,7 @@ export async function main(argv, {
         if (rc && !cancelled) log('⚠️ heavy: gradlew --stop trước build thất bại — daemon cũ (ngoài scope, không giới hạn RAM) có thể bị dùng lại.');
       }
     } finally { for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.off(sig, onSig); }
-    if (cancelled) { log('⏹ heavy: bị huỷ trước khi build bắt đầu — không chạy.'); return 130; }
+    if (cancelled) { log('⏹ heavy: bị huỷ trước khi build bắt đầu — không chạy.'); return 128 + (os.constants.signals[cancelled] || 2); }
     const oomBefore = scope ? scopeOps.oomKills() : null;
     const code = await run(a.cmd, { env: childEnv, ...(scope ? { scope } : {}) });
     // 126/127: gradlew couldn't even start — nothing to stop.
