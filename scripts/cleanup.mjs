@@ -399,8 +399,10 @@ export async function treeStateBlocker(L, deps, { allowStray = null, strayHash =
   // The allowed entries must be exactly what the owner was shown: same files,
   // same sizes / mtimes (a file added inside a shown directory, or a shown file
   // rewritten since, is a new state).
-  if (allowed && strayHash && strayFingerprint(real, allowStray)?.hash !== strayHash) {
-    return { ok: false, reason: 'các mục ngoài git đã thay đổi từ lúc gửi nút', notable: true, strayNew: true };
+  if (allowed && strayHash) {
+    const fp = strayFingerprint(real, allowStray);
+    if (!fp || fp.hash !== strayHash) return { ok: false, reason: 'các mục ngoài git đã thay đổi từ lúc gửi nút', notable: true, strayNew: true };
+    if (fp.repos.length) return { ok: false, reason: `có repo git ngoài git: ${fp.repos.join(', ')}`, notable: true, strayNew: true }; // appeared since (same files, new repo around them)
   }
   const hidden = hiddenEdits(await git(['-C', wt.path, 'ls-files', '-v', '-z']));
   if (hidden.length) return { ok: false, reason: `có file skip-worktree/assume-unchanged (${hidden.slice(0, 3).join(', ')}${hidden.length > 3 ? ', …' : ''})`, notable: true };

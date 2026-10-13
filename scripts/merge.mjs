@@ -275,6 +275,15 @@ export async function mergeOne(target, { method, keepBranch, force, preview = fa
     const { total } = summarizeChecks(pr.statusCheckRollup);
     return { ok: true, head: pr.isCrossRepository ? null : `${repo || ''}:${pr.headRefName}`, text: `🔎 PR ${c.label}${pr.number} "${pr.title}"\n${pr.headRefName} → ${pr.baseRefName} · checks: ${total ? (notRun.length ? 'not run' : 'all passed') : 'none'} · ready to ${method}${ciNote}\n${pr.url}` };
   }
+  // A pinned base is re-read right before the merge: the checks above made
+  // several GitHub calls, and the merge API can only pin the head (sha=), not
+  // the base. (Narrows the window to one round trip; not atomic.)
+  if (expectedBase) {
+    let now;
+    try { now = JSON.parse(gh(['pr', 'view', String(number), ...c.R, '--json', 'baseRefName,headRefOid'])); }
+    catch (e) { return { error: true, text: `❌ PR ${c.label}${pr.number}: cannot re-check its base before merging: ${ghError(e)}\n${pr.url}` }; }
+    if (now.baseRefName !== expectedBase || now.headRefOid !== pr.headRefOid) return { error: true, text: `❌ PR ${c.label}${pr.number} "${pr.title}": vừa đổi nhánh đích / commit (${expectedBase} → ${now.baseRefName}) — không merge.\n${pr.url}` };
+  }
   try {
     gh(['api', '-X', 'PUT', `${c.api}/pulls/${pr.number}/merge`,
       '-f', `merge_method=${method}`, '-f', `sha=${pr.headRefOid}`]);

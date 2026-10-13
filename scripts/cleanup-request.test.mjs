@@ -758,3 +758,22 @@ test('escapeControls: all format / invisible chars (word joiner, ALM, soft hyphe
   assert.equal(escapeControls('x\u{E0041}'), 'x\\u{e0041}');
   assert.equal(escapeControls('Cà Rồng 🧛'), 'Cà Rồng 🧛');
 });
+
+test('owner press: a repo appearing around the shown files after the offer (same files, same fingerprint) → refused', async () => {
+  const w = world();
+  fs.appendFileSync(path.join(w.main, '.gitignore'), 'build/\nHEAD\nobjects/\n');
+  g(w.main, 'commit', '-qam', 'ignore');
+  const a = w.add('feat-a');
+  write(path.join(a.path, 'box', 'notes'), 'x');
+  const d = deps({ prs: { 'feat-a': merged(a) } });
+  const kept = await req(w, a.path, d);
+  const dry = await cleanupRequested(a.path, { parentDir: w.parent, deps: d, allowStray: kept.stray, dryRun: true });
+  assert.equal(dry.ok, true, dry.reason);
+  // box/ turns into a bare repo (its markers ignored → the stray set is unchanged)
+  write(path.join(a.path, 'box', 'HEAD'), 'ref: refs/heads/main\n');
+  fs.mkdirSync(path.join(a.path, 'box', 'objects'));
+  const r = await cleanupRequested(a.path, { parentDir: w.parent, deps: d, allowStray: kept.stray, expectHead: a.head, strayHash: dry.strayHash });
+  assert.equal(r.ok, false);
+  assert.match(r.reason, /repo git|ngoài git/); // caught as new stray entries or as a repo, whichever git reports
+  assert.ok(fs.existsSync(a.path));
+});

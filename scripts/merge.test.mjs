@@ -389,3 +389,17 @@ test('--expect-base: a PR retargeted since the preview is refused; missing base 
   const ok = fakeGh({ 3: PR(3, { headRefOid: sha }) });
   assert.equal((await mergeOne(t, ARGS([3], { expectHeads: a.expectHeads, expectBases: a.expectBases }), { gh: ok.gh })).ok, true);
 });
+
+test('--expect-base is re-checked right before the PUT (a retarget during the checks → refused)', async () => {
+  const sha = 'a'.repeat(40);
+  const f = fakeGh({ 3: PR(3, { headRefOid: sha }) });
+  let views = 0;
+  const gh = (args) => {
+    if (args[0] === 'pr' && args[1] === 'view' && ++views === 2) return JSON.stringify({ ...PR(3, { headRefOid: sha }), baseRefName: 'release' });
+    return f.gh(args);
+  };
+  const r = await mergeOne({ repo: 'acme/repo', number: 3 }, ARGS([3], { expectHeads: { 'acme/repo#3': sha }, expectBases: { 'acme/repo#3': 'main' } }), { gh });
+  assert.equal(r.error, true, r.text);
+  assert.match(r.text, /vừa đổi nhánh đích/);
+  assert.equal(f.calls.some((c) => c[2] === 'PUT'), false);
+});
