@@ -99,13 +99,13 @@ test('F: stops after 2 min without any rise (plateau), with a warning', async ()
 });
 
 test('F: slowly rising RAM is capped at 15 min total', async () => {
-  let v = 0.5;
+  let v = 0.1;
   const f = fake([]);
-  f.readMem = () => (v += 0.001) * GiB; // always rising, never enough
+  f.readMem = () => (v += 0.03) * GiB; // rising ~30 MiB per poll (a real rise), never enough
   const r = await waitForRam({ minBytes: 3 * GiB, ...f });
   assert.equal(r.reason, 'cap');
   assert.equal(r.waitedMs, RAM_CAP_MS);
-  assert.match(f.logs.at(-1), /đã chờ RAM 15 phút/);
+  assert.match(f.logs.at(-1), /đã chờ 15 phút \(còn/);
 });
 
 test('F: main waits BEFORE acquiring the lock; skipped when nested or --no-ram-wait; threshold from env', async () => {
@@ -140,9 +140,9 @@ test('F: readMemAvailable parses kB from meminfo; missing file / field → null'
 
 test('F: swap nearly full or high memory pressure → wait too, even with enough MemAvailable', async () => {
   const seq = [
-    { avail: 8 * GiB, swapTotal: 33 * GiB, swapFree: 0.5 * GiB, psiFull: 0 },
-    { avail: 8 * GiB, swapTotal: 33 * GiB, swapFree: 20 * GiB, psiFull: 35 },
-    { avail: 8 * GiB, swapTotal: 33 * GiB, swapFree: 20 * GiB, psiFull: 1 },
+    { avail: 5 * GiB, swapTotal: 33 * GiB, swapFree: 0.5 * GiB, psiFull: 0 },
+    { avail: 5 * GiB, swapTotal: 33 * GiB, swapFree: 20 * GiB, psiFull: 35 },
+    { avail: 5 * GiB, swapTotal: 33 * GiB, swapFree: 20 * GiB, psiFull: 1 },
   ];
   let t = 0, i = 0;
   const logs = [];
@@ -152,11 +152,14 @@ test('F: swap nearly full or high memory pressure → wait too, even with enough
 });
 
 test('F: memBlockers / swapLow thresholds; TELEPORT_HEAVY_MIN_FREE_MB=0 disables every wait', () => {
-  assert.equal(swapLow({ swapTotal: 2 * GiB, swapFree: 0.9 * GiB }), true, '< 1 GiB');
+  assert.equal(swapLow({ swapTotal: 2 * GiB, swapFree: 0.4 * GiB }), true, '< 25% of a small swap');
+  assert.equal(swapLow({ swapTotal: 2 * GiB, swapFree: 0.9 * GiB }), false, 'a 2 GiB swap is not "full" at half use');
+  assert.equal(swapLow({ swapTotal: 0.5 * GiB, swapFree: 0.2 * GiB }), false, '512 MiB swap, 40% free');
   assert.equal(swapLow({ swapTotal: 33 * GiB, swapFree: 3 * GiB }), true, '< 10% of a big swap');
   assert.equal(swapLow({ swapTotal: 33 * GiB, swapFree: 4 * GiB }), false);
   assert.equal(swapLow({ swapTotal: 0, swapFree: 0 }), false, 'no swap at all');
   assert.deepEqual(memBlockers({ avail: 8 * GiB, swapTotal: 33 * GiB, swapFree: 20 * GiB, psiFull: 9.9 }, 3 * GiB), []);
+  assert.deepEqual(memBlockers({ avail: 8 * GiB, swapTotal: 33 * GiB, swapFree: 0.5 * GiB }, 3 * GiB), [], 'full swap with plenty of free RAM is not a reason');
   assert.equal(memBlockers({ avail: 8 * GiB, psiFull: 10 }, 3 * GiB).length, 1);
   assert.deepEqual(memBlockers({ avail: 0, swapTotal: 2 * GiB, swapFree: 0, psiFull: 90 }, 0), []);
 });
@@ -168,4 +171,13 @@ test('F: readMemState parses meminfo + PSI; missing pieces → null', () => {
   fs.writeFileSync(ps, 'some avg10=3.10 avg60=1.00 avg300=0.50 total=1\nfull avg10=2.50 avg60=0.75 avg300=0.33 total=1\n');
   assert.deepEqual(readMemState({ meminfo: mi, pressure: ps }), { avail: 2 * GiB, swapTotal: 4 * GiB, swapFree: 1 * GiB, psiFull: 2.5 });
   assert.deepEqual(readMemState({ meminfo: path.join(d, 'no'), pressure: path.join(d, 'no') }), { avail: null, swapTotal: null, swapFree: null, psiFull: null });
+});
+
+test('F: RAM jittering by MBs does not reset the 2-min plateau', async () => {
+  let v = 1, i = 0;
+  const f = fake([]);
+  f.readMem = () => (v + ((i++ % 2) ? 0.002 : 0) + i * 0.0005) * GiB; // tiny wobble + creep, never a real rise
+  const r = await waitForRam({ minBytes: 3 * GiB, ...f });
+  assert.equal(r.reason, 'plateau');
+  assert.ok(r.waitedMs <= 3 * 60_000, `gave up after ${r.waitedMs} ms`);
 });

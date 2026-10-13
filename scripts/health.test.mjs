@@ -259,12 +259,13 @@ test('machineWatch wires the disk alert (follow-up not awaited); real du on a ti
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('oomdSummary + deathText: an oomd scope kill that names no agent pid/unit → "nhiều khả năng do HẾT RAM"', async () => {
+test('oomdSummary + deathText: an oomd scope kill naming no agent → shown as context ("có thể liên quan")', async () => {
   const { oomdSummary, deathText } = await import('./health.mjs');
   const j = 'Oct 13 09:38:17 admin123 systemd[1403]: run-r008f.scope: systemd-oomd killed 125 process(es) in this unit.\nOct 13 09:38:18 admin123 systemd-oomd[1]: Killed /user.slice/… due to memory pressure';
-  assert.deepEqual(oomdSummary(j), { kills: 1, procs: 125, at: '09:38' });
+  assert.deepEqual(oomdSummary(j), { kills: 1, procs: 125, at: '09:38', units: ['run-r008f.scope'] });
   assert.equal(oomdSummary('nothing here'), null);
+  assert.equal(oomdSummary(j, { skipUnits: ['run-r008f.scope'] }), null, "a living agent's own unit is not context for another's death");
   const t = deathText([{ pid: 7, name: 'Tiên', hashtag: 'x1' }], { oomd: oomdSummary(j) });
-  assert.match(t, /Tiên #x1 \(PID 7\) đã tắt — nhiều khả năng do HẾT RAM: systemd-oomd vừa giết 125 tiến trình lúc 09:38/);
+  assert.match(t, /Tiên #x1 \(PID 7\) đã tắt \(lúc 09:38 systemd-oomd có giết 125 tiến trình ở run-r008f\.scope vì máy thiếu bộ nhớ — có thể liên quan\)/);
   assert.match(deathText([{ pid: 7, name: 'A' }], {}), /không rõ lý do/);
 });
