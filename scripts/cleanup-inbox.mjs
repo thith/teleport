@@ -105,13 +105,19 @@ export function auditCleanupRequest(entry, file = CLEANUP_REQUEST_AUDIT_FILE) {
 
 const CHILD_TIMEOUT_MS = 20 * 60 * 1000; // du alone may take 10 min
 
-/** cleanupRequested in a child process (env without the daemon's secrets). */
-export function childRun(secretEnvKeys = []) {
+/**
+ * cleanupRequested in a child process (env without the daemon's secrets).
+ * Any failure (exit, timeout, garbled output) is a refusal, never ok. On a
+ * timeout only the node child is killed — a git/du it started may finish later
+ * (the safe direction: at worst a removal the owner was told failed).
+ */
+export function childRun(secretEnvKeys = [], { script = path.join(__dirname, 'cleanup-child.mjs'), timeout = CHILD_TIMEOUT_MS } = {}) {
   return (target, opts) => new Promise((resolve) => {
     const env = { ...process.env };
     for (const k of secretEnvKeys) delete env[k];
-    const child = execFile(process.execPath, [path.join(__dirname, 'cleanup-child.mjs')],
-      { env, timeout: CHILD_TIMEOUT_MS, maxBuffer: 4 * 1024 * 1024 }, (err, stdout) => {
+    const child = execFile(process.execPath, [script],
+      { env, timeout, maxBuffer: 4 * 1024 * 1024 }, (err, stdout, stderr) => {
+        if (stderr) process.stderr.write(stderr); // the child's [cleanup] log lines → the daemon log
         try { const r = JSON.parse(String(stdout).trim().split('\n').pop()); if (r && typeof r === 'object') return resolve(r); } catch {}
         resolve({ ok: false, path: target, reason: `lỗi tiến trình con: ${String(err?.message || 'không có kết quả').split('\n')[0].slice(0, 160)}` });
       });

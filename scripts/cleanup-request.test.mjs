@@ -784,3 +784,19 @@ test('childRun: cleanupRequested runs in its own process and returns its result 
   assert.equal(r.ok, false);
   assert.match(r.reason, /không tìm thấy|nằm ngoài/);
 });
+
+test('childRun: success comes back through the child; garbage / non-zero exit / timeout → refusal, never ok', async () => {
+  const { childRun } = await import('./cleanup-inbox.mjs');
+  const dir = tmp('tp-child-');
+  const stub = (name, body) => { const f = path.join(dir, name); fs.writeFileSync(f, body); return f; };
+  const okS = stub('ok.mjs', "process.stdin.resume(); process.stdin.on('end', () => console.log(JSON.stringify({ ok: true, path: '/w/a' })));");
+  assert.deepEqual(await childRun([], { script: okS })('/w/a', {}), { ok: true, path: '/w/a' });
+  const garbage = stub('g.mjs', "process.stdin.resume(); process.stdin.on('end', () => console.log('ok: true'));");
+  const exit1 = stub('e.mjs', 'process.exit(1);');
+  const hang = stub('h.mjs', 'setInterval(() => {}, 1000);');
+  for (const [script, timeout] of [[garbage, 5000], [exit1, 5000], [hang, 300]]) {
+    const r = await childRun([], { script, timeout })('/w/a', {});
+    assert.equal(r.ok, false, script);
+    assert.match(r.reason, /tiến trình con/);
+  }
+});
