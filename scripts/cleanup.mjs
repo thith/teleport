@@ -16,6 +16,10 @@
 //       `~/.cache/teleport/cargo-target/*`: subdirs untouched for 14 days, only
 //       while the `build` machine lock is free (held during the prune).
 //
+// An agent's cleanup-request (cleanup-request.mjs → cleanup-inbox.mjs) judges
+// ONE worktree with the same E1 judge (judgeWorktree, `requested: true`), which
+// skips only the 24h-edit and 7-day-transcript gates.
+//
 // CLI: node scripts/cleanup.mjs [--dry-run] [--report-to-owner]
 // Runs under the machine lock `cleanup` (busy → "already running", exit 0).
 // The daemon launches it detached (see cleanup-launch.mjs); it never runs
@@ -232,13 +236,122 @@ export function readTranscriptCwds({ root = TRANSCRIPTS_DIR, since } = {}) {
 
 // ── Default effects ──────────────────────────────────────────────────────────
 
-const defaultDeps = () => ({
+export const defaultDeps = () => ({
   exec: async (cmd, args, opts = {}) => (await execFileP(cmd, args, { timeout: 120_000, maxBuffer: 64 * 1024 * 1024, ...opts })).stdout,
   procCwds: () => readProcCwds(),
   transcriptCwds: (since) => readTranscriptCwds({ since }),
   rm: (p) => fs.rmSync(p, { recursive: true, force: true }),
   log: (m) => console.error(`[cleanup] ${m}`),
 });
+
+// ── The E1 judge (shared with cleanup-request, see cleanup-inbox.mjs) ─────────
+
+/** Live processes whose cwd is inside `wt`. */
+export const procsInside = (deps, wt) => deps.procCwds().filter((p) => isInside(p.cwd, wt));
+
+/**
+ * E1 verdict for one linked worktree `L` = { main, slug, wt, real } →
+ * { ok:true, pr } | { ok:false, reason, notable }. May THROW (caller keeps).
+ *
+ * `requested: true` (an agent's cleanup-request — the requester IS the recent
+ * user) skips exactly two gates: "no Claude transcript cwd in 7 days" and "no
+ * non-build file modified in 24h". Every other gate stays.
+ */
+export async function judgeWorktree(L, { deps, realParent, now = Date.now(), transcriptCwds = null, requested = false }) {
+  const git = (args, opts) => deps.exec('git', args, opts);
+  const { wt, real } = L;
+  if (!real || wt.prunable) return { ok: false, reason: 'thư mục không còn', notable: false };
+  if (!fs.lstatSync(wt.path).isDirectory()) return { ok: false, reason: 'không phải thư mục', notable: false };
+  if (!isInside(real, realParent) || real === realParent) return { ok: false, reason: 'nằm ngoài workspace', notable: false };
+  // (No "top-level folder" exemption: on this workspace agents always create
+  // worktrees as siblings — ~/Projects/<repo>-<topic> — so it exempted everything.)
+  if (wt.locked) return { ok: false, reason: 'bị khoá (git worktree lock)', notable: false };
+  if (wt.detached || !wt.branch || !wt.branch.startsWith('refs/heads/')) return { ok: false, reason: 'detached HEAD', notable: false };
+  if (!/^[0-9a-f]{40,64}$/.test(wt.head || '')) return { ok: false, reason: 'không đọc được HEAD', notable: false };
+  const branch = wt.branch.slice('refs/heads/'.length);
+  if (!L.slug) return { ok: false, reason: 'remote origin không phải GitHub', notable: false };
+  const prs = JSON.parse(await deps.exec('gh', ['pr', 'list', '-R', L.slug, '--head', branch, '--state', 'all',
+    '--json', 'number,state,headRefOid,headRefName', '--limit', '100'], { timeout: 60_000 }));
+  const pr = judgePrs(prs, branch, wt.head);
+  if (!pr.ok) return pr;
+  // HEAD may have moved since `worktree list` — re-read it right here.
+  const headNow = String(await git(['-C', wt.path, 'rev-parse', 'HEAD'])).trim();
+  if (headNow !== wt.head) return { ok: false, reason: 'HEAD vừa đổi', notable: true };
+  const st = parseStatusZ(await git(['-C', wt.path, 'status', '--porcelain=v1', '-z', '--untracked-files=all', '--ignored=matching']));
+  if (st.tracked.length) return { ok: false, reason: `có thay đổi chưa commit (${st.tracked.slice(0, 3).join(', ')}${st.tracked.length > 3 ? ', …' : ''})`, notable: true };
+  const stray = strayEntries(st);
+  if (stray.length) return { ok: false, reason: `có file ngoài git: ${stray.slice(0, 5).join(', ')}${stray.length > 5 ? ', …' : ''}`, notable: true };
+  const hidden = hiddenEdits(await git(['-C', wt.path, 'ls-files', '-v', '-z']));
+  if (hidden.length) return { ok: false, reason: `có file skip-worktree/assume-unchanged (${hidden.slice(0, 3).join(', ')}${hidden.length > 3 ? ', …' : ''})`, notable: true };
+  const procs = procsInside(deps, real);
+  if (procs.length) return { ok: false, reason: `có tiến trình đang ở trong (pid ${procs.slice(0, 3).map((p) => p.pid).join(', ')})`, notable: true };
+  if (requested) return { ok: true, pr: pr.pr }; // the two "recently used" gates below don't apply
+  if (!transcriptCwds) return { ok: false, reason: 'không đọc được transcript', notable: false };
+  if (transcriptCwds.some((c) => isInside(c, real) || isInside(c, wt.path))) return { ok: false, reason: 'có phiên Claude dùng trong 7 ngày qua', notable: true };
+  const r = findRecentFile(real, { since: now - RECENT_EDIT_MS });
+  if (r.truncated) return { ok: false, reason: 'quá nhiều file để quét', notable: true };
+  if (r.recent) return { ok: false, reason: `có file sửa trong 24h (${path.relative(real, r.recent)})`, notable: true };
+  return { ok: true, pr: pr.pr };
+}
+
+/** `du -sb` → bytes, or null on any error. */
+export async function duBytes(deps, p) {
+  try { const n = parseInt(String(await deps.exec('du', ['-sb', p], { timeout: 600_000 })).split(/\s/)[0], 10); return Number.isFinite(n) ? n : null; } catch { return null; }
+}
+
+// ── cleanup-request: one worktree, asked for by an agent ─────────────────────
+
+/**
+ * A requested path → { L } (the same shape runCleanup judges) | { reason }.
+ * The path must be the ROOT of a LINKED worktree inside the workspace; no git
+ * runs on anything outside the workspace.
+ */
+export async function locateWorktree(target, { deps, realParent }) {
+  const git = (args, opts) => deps.exec('git', args, opts);
+  let real;
+  try { real = fs.realpathSync(target); } catch { return { reason: 'không tìm thấy thư mục' }; }
+  if (!isInside(real, realParent) || real === realParent) return { reason: 'nằm ngoài workspace' };
+  if (!fs.statSync(real).isDirectory()) return { reason: 'không phải thư mục' };
+  const common = path.resolve(real, String(await git(['-C', real, 'rev-parse', '--git-common-dir'])).trim());
+  if (path.basename(common) !== '.git') return { reason: 'không phải worktree của một repo thường' };
+  const main = path.dirname(common);
+  const realMain = fs.realpathSync(main);
+  if (real === realMain) return { reason: 'là checkout chính — không bao giờ xoá' };
+  const list = parseWorktreePorcelain(await git(['-C', main, 'worktree', 'list', '--porcelain']));
+  const idx = list.findIndex((w) => { try { return fs.realpathSync(w.path) === real; } catch { return false; } });
+  if (idx < 0) return { reason: 'không phải gốc của một worktree' };
+  if (idx === 0 || list[idx].bare) return { reason: 'là checkout chính — không bao giờ xoá' };
+  let slug = null;
+  try { slug = githubSlug(await git(['-C', main, 'remote', 'get-url', 'origin'])); } catch {}
+  return { L: { repo: path.basename(main), main, slug, wt: list[idx], real } };
+}
+
+/**
+ * Judge + remove ONE worktree for a cleanup-request (requested mode: see
+ * judgeWorktree). Never throws. Caller holds the `cleanup` machine lock.
+ * → { ok:true, path, branch, pr, bytes } | { ok:false, path, reason }
+ */
+export async function cleanupRequested(target, { parentDir = PARENT_DIR, now = Date.now(), deps: injected = {} } = {}) {
+  const deps = { ...defaultDeps(), ...injected };
+  let shown = target;
+  try {
+    const realParent = fs.realpathSync(parentDir);
+    const loc = await locateWorktree(target, { deps, realParent });
+    if (!loc.L) return { ok: false, path: shown, reason: loc.reason };
+    const L = loc.L;
+    shown = L.wt.path;
+    const v = await judgeWorktree(L, { deps, realParent, now, requested: true });
+    if (!v.ok) return { ok: false, path: shown, reason: v.reason };
+    // Last-moment re-check: a process may have just cd'd in.
+    if (procsInside(deps, L.real).length) return { ok: false, path: shown, reason: 'có tiến trình vừa vào' };
+    const bytes = await duBytes(deps, L.real);
+    await deps.exec('git', ['-C', L.main, 'worktree', 'remove', '--force', L.wt.path]);
+    deps.log(`removed ${L.wt.path} (requested)`);
+    return { ok: true, path: shown, branch: L.wt.branch.slice('refs/heads/'.length), pr: v.pr, bytes };
+  } catch (e) {
+    return { ok: false, path: shown, reason: `lỗi: ${String(e.message || e).split('\n')[0].slice(0, 160)}` };
+  }
+}
 
 // ── The run ──────────────────────────────────────────────────────────────────
 
@@ -253,9 +366,7 @@ export async function runCleanup({
 } = {}) {
   const deps = { ...defaultDeps(), ...injected };
   const git = (args, opts) => deps.exec('git', args, opts);
-  const du = async (p) => {
-    try { const n = parseInt(String(await deps.exec('du', ['-sb', p], { timeout: 600_000 })).split(/\s/)[0], 10); return Number.isFinite(n) ? n : null; } catch { return null; }
-  };
+  const du = (p) => duBytes(deps, p);
   const res = { dryRun, removed: [], kept: [], targets: [], cache: [], cacheSkipped: null, errors: [] };
   const realParent = fs.realpathSync(parentDir);
 
@@ -265,7 +376,7 @@ export async function runCleanup({
     res.errors.push(`đọc transcript lỗi: ${e.message} — không xoá worktree nào`);
     transcriptCwds = null;
   }
-  const busyIn = (wt) => deps.procCwds().filter((p) => isInside(p.cwd, wt));
+  const busyIn = (wt) => procsInside(deps, wt);
 
   const linked = []; // { repo, main, wt } for every linked worktree that exists
   let entries;
@@ -292,41 +403,7 @@ export async function runCleanup({
 
   const keep = (L, reason, notable) => res.kept.push({ repo: L.repo, path: L.wt.path, branch: L.wt.branch?.replace(/^refs\/heads\//, '') ?? null, reason, notable });
 
-  /** E1 verdict for one worktree → { ok:true, pr } | { ok:false, reason, notable }. */
-  const judge = async (L) => {
-    const { wt, real } = L;
-    if (!real || wt.prunable) return { ok: false, reason: 'thư mục không còn', notable: false };
-    if (!fs.lstatSync(wt.path).isDirectory()) return { ok: false, reason: 'không phải thư mục', notable: false };
-    if (!isInside(real, realParent) || real === realParent) return { ok: false, reason: 'nằm ngoài workspace', notable: false };
-    // (No "top-level folder" exemption: on this workspace agents always create
-    // worktrees as siblings — ~/Projects/<repo>-<topic> — so it exempted everything.)
-    if (wt.locked) return { ok: false, reason: 'bị khoá (git worktree lock)', notable: false };
-    if (wt.detached || !wt.branch || !wt.branch.startsWith('refs/heads/')) return { ok: false, reason: 'detached HEAD', notable: false };
-    if (!/^[0-9a-f]{40,64}$/.test(wt.head || '')) return { ok: false, reason: 'không đọc được HEAD', notable: false };
-    const branch = wt.branch.slice('refs/heads/'.length);
-    if (!L.slug) return { ok: false, reason: 'remote origin không phải GitHub', notable: false };
-    const prs = JSON.parse(await deps.exec('gh', ['pr', 'list', '-R', L.slug, '--head', branch, '--state', 'all',
-      '--json', 'number,state,headRefOid,headRefName', '--limit', '100'], { timeout: 60_000 }));
-    const pr = judgePrs(prs, branch, wt.head);
-    if (!pr.ok) return pr;
-    // HEAD may have moved since `worktree list` — re-read it right here.
-    const headNow = String(await git(['-C', wt.path, 'rev-parse', 'HEAD'])).trim();
-    if (headNow !== wt.head) return { ok: false, reason: 'HEAD vừa đổi', notable: true };
-    const st = parseStatusZ(await git(['-C', wt.path, 'status', '--porcelain=v1', '-z', '--untracked-files=all', '--ignored=matching']));
-    if (st.tracked.length) return { ok: false, reason: `có thay đổi chưa commit (${st.tracked.slice(0, 3).join(', ')}${st.tracked.length > 3 ? ', …' : ''})`, notable: true };
-    const stray = strayEntries(st);
-    if (stray.length) return { ok: false, reason: `có file ngoài git: ${stray.slice(0, 5).join(', ')}${stray.length > 5 ? ', …' : ''}`, notable: true };
-    const hidden = hiddenEdits(await git(['-C', wt.path, 'ls-files', '-v', '-z']));
-    if (hidden.length) return { ok: false, reason: `có file skip-worktree/assume-unchanged (${hidden.slice(0, 3).join(', ')}${hidden.length > 3 ? ', …' : ''})`, notable: true };
-    const procs = busyIn(real);
-    if (procs.length) return { ok: false, reason: `có tiến trình đang ở trong (pid ${procs.slice(0, 3).map((p) => p.pid).join(', ')})`, notable: true };
-    if (!transcriptCwds) return { ok: false, reason: 'không đọc được transcript', notable: false };
-    if (transcriptCwds.some((c) => isInside(c, real) || isInside(c, wt.path))) return { ok: false, reason: 'có phiên Claude dùng trong 7 ngày qua', notable: true };
-    const r = findRecentFile(real, { since: now - RECENT_EDIT_MS });
-    if (r.truncated) return { ok: false, reason: 'quá nhiều file để quét', notable: true };
-    if (r.recent) return { ok: false, reason: `có file sửa trong 24h (${path.relative(real, r.recent)})`, notable: true };
-    return { ok: true, pr: pr.pr };
-  };
+  const judge = (L) => judgeWorktree(L, { deps, realParent, now, transcriptCwds });
 
   const stay = []; // linked worktrees that remain → E2
   let capHit = 0;

@@ -175,7 +175,7 @@ export function buildMergeResultPrompt({ convoId, chatId, text, mode }) {
     // Something merged → the moment to free its worktree (preserve disk). Agent-only; the owner's DM stays short.
     // Only merge.mjs's own line-leading "✅ merged PR" counts — a PR title (attacker-written,
     // single-line, always after "PR o/r#N") saying "✅ merged" on a REFUSED merge must not trigger it.
-    + (/^✅ merged PR /m.test(data) ? '\n→ PR đã merge: worktree của nhánh đó nếu do bạn tạo và không còn việc dở thì xoá ngay (`git worktree remove <path>`).' : '');
+    + (/^✅ merged PR /m.test(data) ? '\n→ PR đã merge: worktree của nhánh đó nếu do bạn (hoặc subagent của bạn) tạo và không còn việc dở thì `git worktree remove <path>`; bị chặn thì `node ../teleport/scripts/cleanup-request.mjs <path>`.' : '');
   return {
     text: body, messageId: null, chatId: chatId == null ? null : String(chatId),
     fromUserId: null, fromName: 'teleport daemon', fromRole: 'daemon', fromMember: null,
@@ -193,11 +193,13 @@ export function chatOfConvo(convoId, store) {
   return null;
 }
 
-export async function deliverResult({ convoId, text, mode }, {
-  store = readTopicsStore(), tmpDir = DEFAULT_TMP_DIR, write = durableWrite,
+/** Inject a daemon result into the requester's prompt queue. `build` frames it (merge by default; cleanup-inbox passes its own). */
+export async function deliverResult(result, {
+  store = readTopicsStore(), tmpDir = DEFAULT_TMP_DIR, write = durableWrite, build = buildMergeResultPrompt,
 } = {}) {
+  const { convoId } = result;
   const chatId = chatOfConvo(convoId, store);
-  const prompt = buildMergeResultPrompt({ convoId, chatId, text, mode });
+  const prompt = build({ ...result, chatId });
   await write(prompt, path.join(tmpDir, `prompt-convo-${convoId}.json`));
   return { chatId };
 }
