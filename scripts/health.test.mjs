@@ -269,3 +269,8 @@ test('oomdSummary + deathText: an oomd scope kill naming no agent → shown as c
   assert.match(t, /Tiên #x1 \(PID 7\) đã tắt \(lúc 09:38 systemd-oomd có giết 125 tiến trình ở run-r008f\.scope vì máy thiếu bộ nhớ — có thể liên quan\)/);
   assert.match(deathText([{ pid: 7, name: 'A' }], {}), /không rõ lý do/);
 });
+
+test('oomdSummary: a single-digit day (journalctl pads it with a space) still gives the time', async () => {
+  const { oomdSummary } = await import('./health.mjs');
+  assert.equal(oomdSummary('Oct  3 09:38:17 h systemd[1]: run-x.scope: systemd-oomd killed 4 process(es) in this unit.').at, '09:38');
+});

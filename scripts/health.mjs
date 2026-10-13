@@ -291,7 +291,7 @@ export function oomdSummary(journalText, { skipUnits = [] } = {}) {
     if (!m || skipUnits.includes(m[1])) continue;
     kills++; procs += Number(m[2]);
     if (!units.includes(m[1])) units.push(m[1]);
-    at = (/^\w{3} \d+ (\d\d:\d\d)/.exec(l) || [])[1] || at;
+    at = (/^\w{3}\s+\d+ (\d\d:\d\d)/.exec(l) || [])[1] || at; // journalctl pads days 1–9 with a space
   }
   return kills ? { kills, procs, at, units } : null;
 }
