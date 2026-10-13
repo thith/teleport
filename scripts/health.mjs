@@ -278,15 +278,38 @@ export function oomVictim(row, journalText, unit = null) {
 }
 
 /**
- * Death notice text. `oomOf(row)` → OOM evidence for that agent; `killedByOwner`
- * = { pids, hashtags } from the kill audit (the owner's own /kill is not news). Pure.
+ * systemd-oomd kills in a journal window → { kills, procs, at, units } (at = time
+ * of the last one) | null. oomd kills a whole scope under memory pressure, so its
+ * line often names neither the agent's pid nor a unit we recorded. Kills of a
+ * unit in `skipUnits` (a still-living agent's) are not counted. Pure.
  */
-export function deathText(rows, { oomOf = () => false, killedByOwner = { pids: new Set(), hashtags: new Set() } } = {}) {
+export function oomdSummary(journalText, { skipUnits = [] } = {}) {
+  let kills = 0, procs = 0, at = null;
+  const units = [];
+  for (const l of String(journalText || '').split('\n')) {
+    const m = /\s([^\s:]+): systemd-oomd killed (\d+) process/i.exec(l);
+    if (!m || skipUnits.includes(m[1])) continue;
+    kills++; procs += Number(m[2]);
+    if (!units.includes(m[1])) units.push(m[1]);
+    at = (/^\w{3}\s+\d+ (\d\d:\d\d)/.exec(l) || [])[1] || at; // journalctl pads days 1–9 with a space
+  }
+  return kills ? { kills, procs, at, units } : null;
+}
+
+/**
+ * Death notice text. `oomOf(row)` → OOM evidence for that agent; `oomd` → an
+ * oomd kill in the same window that names nobody (shown as context, not as the
+ * cause); `killedByOwner` = { pids, hashtags } from the kill audit (the owner's
+ * own /kill is not news). Pure.
+ */
+export function deathText(rows, { oomOf = () => false, oomd = null, killedByOwner = { pids: new Set(), hashtags: new Set() } } = {}) {
   const lines = [];
   for (const r of rows) {
     if (killedByOwner.pids?.has(r.pid) || (r.hashtag && killedByOwner.hashtags?.has(r.hashtag))) continue;
     const who = `${r.name || 'agent'}${r.hashtag ? ` #${r.hashtag}` : ''}`;
-    const why = oomOf(r) ? ' — do HẾT RAM (bị OOM-killer giết)' : ' (không rõ lý do — có thể đã thoát bình thường)';
+    const why = oomOf(r) ? ' — do HẾT RAM (bị OOM-killer giết)'
+      : oomd ? ` (lúc ${oomd.at || 'đó'} systemd-oomd có giết ${oomd.procs} tiến trình ở ${oomd.units.slice(0, 2).join(', ')} vì máy thiếu bộ nhớ — có thể liên quan)`
+        : ' (không rõ lý do — có thể đã thoát bình thường)';
     lines.push(`💀 ${who} (PID ${r.pid}) đã tắt${why}. Bật lại: /resume ${r.hashtag ? `#${r.hashtag}` : (r.name || '<tên>')}`);
   }
   return lines.join('\n');
@@ -362,7 +385,7 @@ export async function machineWatch(state, send, {
     if (gone.length) {
       const sinceSec = (state.lastCheckSec || Math.floor(t / 1000) - 120) - 5;
       const journal = await journalSince(sinceSec);
-      const text = deathText(gone, { oomOf: (r) => oomVictim(r, journal, state.units?.[key(r)]), killedByOwner: recentKills() });
+      const text = deathText(gone, { oomOf: (r) => oomVictim(r, journal, state.units?.[key(r)]), oomd: oomdSummary(journal, { skipUnits: agents.map((r) => state.units?.[key(r)]).filter(Boolean) }), killedByOwner: recentKills() });
       if (text) await send(text);
     }
   }

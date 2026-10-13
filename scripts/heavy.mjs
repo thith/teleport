@@ -26,8 +26,10 @@
 // it (found by 🪱 Giun, 2026-10-13). Each worktree keeps its own target/; disk is
 // reclaimed by the daily cleanup. `--own-target` is still accepted (a no-op).
 // RFC 18 F — RAM wait: before queueing for the lock (not while holding it), wait
-// while MemAvailable < TELEPORT_HEAVY_MIN_FREE_MB (default 3 GiB); give up — and
-// build anyway, with a warning — once it has not risen for 2 min, or after 15 min.
+// while MemAvailable < TELEPORT_HEAVY_MIN_FREE_MB (default 3 GiB), OR swap is
+// nearly full (free < 10% and < 1 GiB… see swapLow), OR memory pressure is high
+// (PSI `full avg10` ≥ 10% — systemd-oomd kills at 50% sustained); give up — and
+// build anyway, with a warning — once RAM has not risen for 2 min, or after 15 min.
 // Skipped for nested heavy and with --no-ram-wait.
 
 import fs from 'node:fs';
@@ -67,6 +69,7 @@ export const RAM_PLATEAU_MS = 2 * 60_000;
 export const RAM_CAP_MS = 15 * 60_000;
 const RAM_LOG_EVERY_MS = 60_000;
 const GiB = 1024 ** 3;
+const gib = (b) => (b / GiB).toFixed(1);
 
 /** MemAvailable in bytes from /proc/meminfo, or null if unreadable. */
 export function readMemAvailable(file = '/proc/meminfo') {
@@ -76,6 +79,42 @@ export function readMemAvailable(file = '/proc/meminfo') {
   } catch { return null; }
 }
 
+/**
+ * { avail, swapTotal, swapFree, psiFull } — bytes, and PSI memory `full avg10`
+ * (percent) from /proc/pressure/memory; a field that can't be read is null.
+ */
+export function readMemState({ meminfo = '/proc/meminfo', pressure = '/proc/pressure/memory' } = {}) {
+  let text = '';
+  try { text = fs.readFileSync(meminfo, 'utf8'); } catch {}
+  const kb = (k) => { const m = new RegExp(`^${k}:\\s+(\\d+)\\s*kB`, 'm').exec(text); return m ? Number(m[1]) * 1024 : null; };
+  let psiFull = null;
+  try { const m = /^full\s.*?avg10=([\d.]+)/m.exec(fs.readFileSync(pressure, 'utf8')); if (m) psiFull = Number(m[1]); } catch {}
+  return { avail: kb('MemAvailable'), swapTotal: kb('SwapTotal'), swapFree: kb('SwapFree'), psiFull };
+}
+
+export const PLATEAU_RISE = 256 * 1024 ** 2;
+export const PSI_FULL_MAX = 10; // % — wait above this (oomd's kill threshold is 50% for 20 s)
+
+/**
+ * Swap nearly full: free under max(1 GiB, 10%) — capped at 25% of the swap so a
+ * small swap isn't "full" at half use. No swap → not "low". Pure.
+ */
+export function swapLow({ swapTotal, swapFree }) {
+  if (!swapTotal || swapFree == null) return false;
+  return swapFree < Math.min(Math.max(GiB, swapTotal * 0.1), swapTotal * 0.25);
+}
+
+/** Why a build should wait now ([] = go). Pure. */
+export function memBlockers(st, minBytes) {
+  const why = [];
+  if (st.avail != null && st.avail < minBytes) why.push(`còn ${gib(st.avail)} GiB, cần ${gib(minBytes)} GiB`);
+  // Full swap with plenty of free RAM is old swapped-out pages, not danger:
+  // it only counts while RAM is also tight.
+  if (minBytes > 0 && swapLow(st) && st.avail != null && st.avail < 2 * minBytes) why.push(`swap gần đầy (còn ${gib(st.swapFree)} / ${gib(st.swapTotal)} GiB)`);
+  if (minBytes > 0 && st.psiFull != null && st.psiFull >= PSI_FULL_MAX) why.push(`memory pressure ${st.psiFull}%`);
+  return why;
+}
+
 /** Threshold in bytes from TELEPORT_HEAVY_MIN_FREE_MB (default 3 GiB; 0 = never wait). */
 export function minFreeBytes(env = process.env) {
   const v = env.TELEPORT_HEAVY_MIN_FREE_MB;
@@ -83,30 +122,35 @@ export function minFreeBytes(env = process.env) {
   return Number.isFinite(n) && n >= 0 ? n * 1024 * 1024 : 3 * GiB;
 }
 
-const gib = (b) => (b / GiB).toFixed(1);
 
 /**
- * Wait while MemAvailable < minBytes. Resolves { reason, waitedMs }:
- * 'ok' (enough RAM), 'unreadable' (no meminfo → no wait), 'plateau' (no rise for
- * 2 min), 'cap' (15 min total). Injectable readMem/sleep/now/log for tests.
+ * Wait while memBlockers() says so (low MemAvailable, swap nearly full, high
+ * memory pressure). Resolves { reason, waitedMs }: 'ok', 'unreadable' (no
+ * meminfo → no wait), 'plateau' (RAM no rise for 2 min), 'cap' (15 min total).
+ * Injectable readState (or the older readMem → bytes) / sleep / now / log.
  */
-export async function waitForRam({ minBytes, readMem = readMemAvailable, sleep = (ms) => new Promise((r) => setTimeout(r, ms)), now = Date.now, log = (s) => console.error(s) } = {}) {
+export async function waitForRam({ minBytes, readMem = null, readState = null, sleep = (ms) => new Promise((r) => setTimeout(r, ms)), now = Date.now, log = (s) => console.error(s) } = {}) {
+  const read = readState || (readMem ? () => ({ avail: readMem() }) : () => readMemState());
   const start = now();
-  let mem = readMem();
+  let st = read();
+  let mem = st.avail;
   if (mem == null) return { reason: 'unreadable', waitedMs: 0 };
-  if (mem >= minBytes) return { reason: 'ok', waitedMs: 0 };
+  let why = memBlockers(st, minBytes);
+  if (!why.length) return { reason: 'ok', waitedMs: 0 };
   let best = mem, bestAt = start, loggedAt = -Infinity;
   for (;;) {
     const t = now();
-    if (t - loggedAt >= RAM_LOG_EVERY_MS) { log(`⏳ chờ RAM: còn ${gib(mem)} GiB, cần ${gib(minBytes)} GiB…`); loggedAt = t; }
+    if (t - loggedAt >= RAM_LOG_EVERY_MS) { log(`⏳ chờ RAM: ${why.join(' · ')}…`); loggedAt = t; }
     await sleep(RAM_POLL_MS);
     const t2 = now();
-    mem = readMem();
+    st = read();
+    mem = st.avail;
     if (mem == null) return { reason: 'unreadable', waitedMs: t2 - start };
-    if (mem >= minBytes) return { reason: 'ok', waitedMs: t2 - start };
-    if (mem > best) { best = mem; bestAt = t2; }
-    if (t2 - start >= RAM_CAP_MS) { log(`⚠️ heavy: đã chờ RAM ${Math.round((t2 - start) / 60000)} phút (còn ${gib(mem)} GiB) — chạy luôn, dễ OOM.`); return { reason: 'cap', waitedMs: t2 - start }; }
-    if (t2 - bestAt >= RAM_PLATEAU_MS) { log(`⚠️ heavy: RAM không tăng trong 2 phút (còn ${gib(mem)} GiB, có tiến trình sống lâu đang giữ) — chạy luôn, dễ OOM.`); return { reason: 'plateau', waitedMs: t2 - start }; }
+    why = memBlockers(st, minBytes);
+    if (!why.length) return { reason: 'ok', waitedMs: t2 - start };
+    if (mem > best + PLATEAU_RISE) { best = mem; bestAt = t2; } // a real rise, not MB-level jitter
+    if (t2 - start >= RAM_CAP_MS) { log(`⚠️ heavy: đã chờ ${Math.round((t2 - start) / 60000)} phút (${why.join(' · ')}) — chạy luôn, dễ OOM.`); return { reason: 'cap', waitedMs: t2 - start }; }
+    if (t2 - bestAt >= RAM_PLATEAU_MS) { log(`⚠️ heavy: RAM không tăng trong 2 phút (${why.join(' · ')}; có tiến trình sống lâu đang giữ) — chạy luôn, dễ OOM.`); return { reason: 'plateau', waitedMs: t2 - start }; }
   }
 }
 
