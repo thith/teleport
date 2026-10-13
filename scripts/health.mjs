@@ -281,12 +281,30 @@ export function oomVictim(row, journalText, unit = null) {
  * Death notice text. `oomOf(row)` → OOM evidence for that agent; `killedByOwner`
  * = { pids, hashtags } from the kill audit (the owner's own /kill is not news). Pure.
  */
-export function deathText(rows, { oomOf = () => false, killedByOwner = { pids: new Set(), hashtags: new Set() } } = {}) {
+/**
+ * systemd-oomd kills in a journal window → { kills, procs, at } (at = time text
+ * of the last one) | null. oomd kills a whole scope under memory pressure, so
+ * its line often names neither the agent's pid nor a unit we recorded. Pure.
+ */
+export function oomdSummary(journalText) {
+  let kills = 0, procs = 0, at = null;
+  for (const l of String(journalText || '').split('\n')) {
+    const m = /systemd-oomd killed (\d+) process/i.exec(l);
+    if (!m) continue;
+    kills++; procs += Number(m[1]);
+    at = (/^\w{3} \d+ (\d\d:\d\d)/.exec(l) || [])[1] || at;
+  }
+  return kills ? { kills, procs, at } : null;
+}
+
+export function deathText(rows, { oomOf = () => false, oomd = null, killedByOwner = { pids: new Set(), hashtags: new Set() } } = {}) {
   const lines = [];
   for (const r of rows) {
     if (killedByOwner.pids?.has(r.pid) || (r.hashtag && killedByOwner.hashtags?.has(r.hashtag))) continue;
     const who = `${r.name || 'agent'}${r.hashtag ? ` #${r.hashtag}` : ''}`;
-    const why = oomOf(r) ? ' — do HẾT RAM (bị OOM-killer giết)' : ' (không rõ lý do — có thể đã thoát bình thường)';
+    const why = oomOf(r) ? ' — do HẾT RAM (bị OOM-killer giết)'
+      : oomd ? ` — nhiều khả năng do HẾT RAM: systemd-oomd vừa giết ${oomd.procs} tiến trình${oomd.at ? ` lúc ${oomd.at}` : ''} vì máy thiếu bộ nhớ (memory pressure)`
+        : ' (không rõ lý do — có thể đã thoát bình thường)';
     lines.push(`💀 ${who} (PID ${r.pid}) đã tắt${why}. Bật lại: /resume ${r.hashtag ? `#${r.hashtag}` : (r.name || '<tên>')}`);
   }
   return lines.join('\n');
@@ -362,7 +380,7 @@ export async function machineWatch(state, send, {
     if (gone.length) {
       const sinceSec = (state.lastCheckSec || Math.floor(t / 1000) - 120) - 5;
       const journal = await journalSince(sinceSec);
-      const text = deathText(gone, { oomOf: (r) => oomVictim(r, journal, state.units?.[key(r)]), killedByOwner: recentKills() });
+      const text = deathText(gone, { oomOf: (r) => oomVictim(r, journal, state.units?.[key(r)]), oomd: oomdSummary(journal), killedByOwner: recentKills() });
       if (text) await send(text);
     }
   }

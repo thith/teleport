@@ -8,7 +8,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import {
   parseHeavyArgs,
-  waitForRam, minFreeBytes, readMemAvailable, main as heavyMain,
+  waitForRam, minFreeBytes, readMemAvailable, readMemState, memBlockers, swapLow, main as heavyMain,
   RAM_POLL_MS, RAM_PLATEAU_MS, RAM_CAP_MS,
 } from './heavy.mjs';
 
@@ -136,4 +136,36 @@ test('F: readMemAvailable parses kB from meminfo; missing file / field → null'
   fs.writeFileSync(f, 'MemTotal: 1 kB\n');
   assert.equal(readMemAvailable(f), null);
   assert.equal(readMemAvailable(path.join(d, 'nope')), null);
+});
+
+test('F: swap nearly full or high memory pressure → wait too, even with enough MemAvailable', async () => {
+  const seq = [
+    { avail: 8 * GiB, swapTotal: 33 * GiB, swapFree: 0.5 * GiB, psiFull: 0 },
+    { avail: 8 * GiB, swapTotal: 33 * GiB, swapFree: 20 * GiB, psiFull: 35 },
+    { avail: 8 * GiB, swapTotal: 33 * GiB, swapFree: 20 * GiB, psiFull: 1 },
+  ];
+  let t = 0, i = 0;
+  const logs = [];
+  const r = await waitForRam({ minBytes: 3 * GiB, readState: () => seq[Math.min(i++, seq.length - 1)], now: () => t, sleep: async (ms) => { t += ms; }, log: (s) => logs.push(s) });
+  assert.deepEqual(r, { reason: 'ok', waitedMs: 2 * RAM_POLL_MS });
+  assert.match(logs[0], /swap gần đầy \(còn 0\.5 \/ 33\.0 GiB\)/);
+});
+
+test('F: memBlockers / swapLow thresholds; TELEPORT_HEAVY_MIN_FREE_MB=0 disables every wait', () => {
+  assert.equal(swapLow({ swapTotal: 2 * GiB, swapFree: 0.9 * GiB }), true, '< 1 GiB');
+  assert.equal(swapLow({ swapTotal: 33 * GiB, swapFree: 3 * GiB }), true, '< 10% of a big swap');
+  assert.equal(swapLow({ swapTotal: 33 * GiB, swapFree: 4 * GiB }), false);
+  assert.equal(swapLow({ swapTotal: 0, swapFree: 0 }), false, 'no swap at all');
+  assert.deepEqual(memBlockers({ avail: 8 * GiB, swapTotal: 33 * GiB, swapFree: 20 * GiB, psiFull: 9.9 }, 3 * GiB), []);
+  assert.equal(memBlockers({ avail: 8 * GiB, psiFull: 10 }, 3 * GiB).length, 1);
+  assert.deepEqual(memBlockers({ avail: 0, swapTotal: 2 * GiB, swapFree: 0, psiFull: 90 }, 0), []);
+});
+
+test('F: readMemState parses meminfo + PSI; missing pieces → null', () => {
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), 'tp-psi-'));
+  const mi = path.join(d, 'meminfo'), ps = path.join(d, 'pressure');
+  fs.writeFileSync(mi, 'MemAvailable:    2097152 kB\nSwapTotal:      4194304 kB\nSwapFree:       1048576 kB\n');
+  fs.writeFileSync(ps, 'some avg10=3.10 avg60=1.00 avg300=0.50 total=1\nfull avg10=2.50 avg60=0.75 avg300=0.33 total=1\n');
+  assert.deepEqual(readMemState({ meminfo: mi, pressure: ps }), { avail: 2 * GiB, swapTotal: 4 * GiB, swapFree: 1 * GiB, psiFull: 2.5 });
+  assert.deepEqual(readMemState({ meminfo: path.join(d, 'no'), pressure: path.join(d, 'no') }), { avail: null, swapTotal: null, swapFree: null, psiFull: null });
 });

@@ -19,7 +19,7 @@ node ../teleport/scripts/heavy.mjs -- cargo nextest run --workspace
 ## `target/` và chờ RAM (RFC 18)
 
 - **`target/` riêng mỗi worktree:** wrapper không bao giờ đặt `CARGO_TARGET_DIR`, mỗi worktree build vào `target/` của nó. Dùng chung `target/` giữa các worktree đã bị bỏ: các worktree có crate cùng tên/phiên bản nên cargo có thể link nhầm mã của nhánh khác, kể cả cho test chạy xanh trên mã sai (🪱 Giun phát hiện, 2026-10-13). Disk được lấy lại nhờ dọn hằng ngày (xoá `target/` bỏ hoang) và `cargo clean` khi xong việc. `--own-target` vẫn được nhận (không làm gì).
-- **Chờ RAM:** trước khi xếp hàng lấy lock, nếu `MemAvailable` dưới 3 GiB (đổi bằng `TELEPORT_HEAVY_MIN_FREE_MB`), wrapper chờ và in `⏳ chờ RAM: còn X GiB, cần Y GiB…` tối đa mỗi phút một lần. Nếu RAM không tăng trong 2 phút, hoặc đã chờ 15 phút, wrapper vẫn chạy kèm cảnh báo. `--no-ram-wait` để bỏ bước chờ. Heavy lồng nhau không chờ. `--wait N` chỉ tính thời gian chờ lock, không tính thời gian chờ RAM, nên trường hợp xấu nhất là 15 + N phút.
+- **Chờ RAM:** trước khi xếp hàng lấy lock, wrapper chờ nếu `MemAvailable` dưới 3 GiB (đổi bằng `TELEPORT_HEAVY_MIN_FREE_MB`; `0` = không bao giờ chờ), **hoặc** swap gần đầy (còn dưới 1 GiB / dưới 10% swap), **hoặc** memory pressure cao (PSI `full avg10` ≥ 10%; systemd-oomd giết agent khi mức này ở 50% liên tục 20 giây). Nó in `⏳ chờ RAM: <lý do>…` tối đa mỗi phút một lần. Nếu RAM không tăng trong 2 phút, hoặc đã chờ 15 phút, wrapper vẫn chạy kèm cảnh báo. `--no-ram-wait` để bỏ bước chờ. Heavy lồng nhau không chờ. `--wait N` chỉ tính thời gian chờ lock, không tính thời gian chờ RAM, nên trường hợp xấu nhất là 15 + N phút.
 
 ## Chờ lâu thì sao
 
