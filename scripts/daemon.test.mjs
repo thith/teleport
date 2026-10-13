@@ -785,3 +785,13 @@ test('entryMatchesMessage: …/pull/3 does not match a message showing …/pull/
   assert.equal(entryMatchesMessage({ links: [L1] }, msg), false);
   assert.equal(entryMatchesMessage({ links: [L1] }, `see ${L1}\nok`), true);
 });
+
+test('handleMergeButton: a shortened (12-char) pin in the entry → refused, never an unpinned merge', async () => {
+  const sha = 'a'.repeat(40);
+  const store = new Map([['eeeeeeeeeeeeeeee', { links: [L1], heads: { [L1]: sha.slice(0, 12) }, createdAt: Date.now(), canMerge: true }]]);
+  const dispatched = [];
+  await handleMergeButton({ id: 'q', data: 'mg:eeeeeeeeeeeeeeee', from: { id: 1 }, message: { chat: { id: 1 }, message_id: 5, text: `x\n📌 ${L1} @ ${sha.slice(0, 12)}` } },
+    { registry: MREG, answerButton: async () => {}, editButtonsMessage: async () => {} },
+    { take: (t) => takeMergeButton(t, { store }), dispatch: async (p) => dispatched.push(p) });
+  assert.equal(dispatched.length, 0);
+});

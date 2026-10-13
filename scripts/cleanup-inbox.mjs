@@ -162,9 +162,10 @@ export async function processCleanupOffers({ daemonUserId, sendText = async () =
       const plain = escapeControls(`${title}: giữ lại ${o.path} — có ${o.stray.length} mục ngoài git (${o.stray.slice(0, 3).join(', ')}…); không gửi được nút, xem tay.`).slice(0, 1000);
       if (text.length > OFFER_TEXT_MAX) { await Promise.resolve(sendText(daemonUserId, plain)).catch(() => {}); continue; }
       const tok = crypto.randomBytes(8).toString('hex');
-      buttonStore.set(tok, { kind: 'cleanup', mode: 'daily', path: o.path, convoId: null, who: 'dọn hằng ngày', head: o.head, stray: o.stray, strayHash: o.strayHash, createdAt: Date.now() });
+      const entry = { kind: 'cleanup', mode: 'daily', path: o.path, convoId: null, who: 'dọn hằng ngày', head: o.head, stray: o.stray, strayHash: o.strayHash, createdAt: Date.now() };
+      buttonStore.set(tok, entry);
       try {
-        await sendButtons(daemonUserId, text, [{ text: '🧹 Xoá luôn', callback_data: `cx:${tok}` }, { text: 'Giữ', callback_data: `ck:${tok}` }]);
+        await sendButtons(daemonUserId, withDigest(text, entry), [{ text: '🧹 Xoá luôn', callback_data: `cx:${tok}` }, { text: 'Giữ', callback_data: `ck:${tok}` }]);
       } catch (e) {
         try { buttonStore.delete(tok); } catch {} // an unsent button can't be pressed anyway
         console.error(`[daemon] cleanup offer DM failed: ${e?.message ?? e}`);
@@ -174,11 +175,24 @@ export async function processCleanupOffers({ daemonUserId, sendText = async () =
   }
 }
 
-/** Is every entry this button would delete written in the message the owner saw? Pure. */
+/**
+ * Digest of EVERYTHING a cleanup press would act on (path, entries, HEAD,
+ * fingerprint, mode, requester, creation time) — printed in the button message
+ * ("🔑 …") so a persisted entry edited afterwards no longer matches. Pure.
+ */
+export function cleanupActionDigest(e) {
+  return crypto.createHash('sha256').update(JSON.stringify([
+    e.path, [...(e.stray || [])].sort(), e.head ?? null, e.strayHash ?? null, e.mode || 'request', e.convoId ?? null, e.createdAt ?? null,
+  ])).digest('hex').slice(0, 16);
+}
+export const withDigest = (text, entry) => `${text}\n🔑 ${cleanupActionDigest(entry)}`;
+
+/** Is every entry this button would delete written in the message the owner saw (and its digest)? Pure. */
 export function cleanupEntryMatchesMessage(entry, text) {
   // Whole fields, not substrings: the exact "giữ lại <path> vì" phrase and each
   // bullet as a whole line (optionally followed by its " (N file)" count).
   const lines = String(text || '').split('\n');
+  if (!lines.includes(`🔑 ${cleanupActionDigest(entry)}`)) return false;
   return typeof entry.path === 'string' && String(text || '').includes(`giữ lại ${escapeControls(entry.path)} vì có `)
     && Array.isArray(entry.stray) && entry.stray.length > 0
     && entry.stray.every((p) => { const b = `• ${escapeControls(p)}`; return lines.some((l) => l === b || (l.startsWith(`${b} (`) && /^ \(\d+ file\)$/.test(l.slice(b.length)))); });
@@ -242,9 +256,10 @@ export async function processCleanupRequests({ daemonUserId, sendText, sendButto
       catch (e) { await sendText(daemonUserId, `⚠️ Không gửi được kết quả cleanup-request về ${who}: ${e?.message ?? e}`).catch(() => {}); }
       if (offer) {
         const tok = crypto.randomBytes(8).toString('hex');
-        buttonStore.set(tok, { kind: 'cleanup', path: probe.path, convoId: req.convoId, who, head: probe.head, stray: r.stray, strayHash: probe.strayHash, createdAt: Date.now() });
+        const entry = { kind: 'cleanup', path: probe.path, convoId: req.convoId, who, head: probe.head, stray: r.stray, strayHash: probe.strayHash, createdAt: Date.now() };
+        buttonStore.set(tok, entry);
         try {
-          await sendButtons(daemonUserId, offerText,
+          await sendButtons(daemonUserId, withDigest(offerText, entry),
             [{ text: '🧹 Xoá luôn', callback_data: `cx:${tok}` }, { text: 'Giữ', callback_data: `ck:${tok}` }]);
         } catch (e) {
           try { buttonStore.delete(tok); } catch {}

@@ -8,7 +8,7 @@ import { promisify } from 'node:util';
 import { resolveTarget, writeRequest } from './cleanup-request.mjs';
 import {
   validCleanupRequest, formatCleanupResult, buildCleanupResultPrompt, processCleanupRequests, unclaim,
-  handleCleanupButton, processCleanupOffers, validCleanupOffer, takeCleanupButton, formatStrayOffer,
+  handleCleanupButton, processCleanupOffers, validCleanupOffer, takeCleanupButton, formatStrayOffer, withDigest,
 } from './cleanup-inbox.mjs';
 import { cleanupRequested, runCleanup, writeOffer, strayFingerprint } from './cleanup.mjs';
 import { claimRequests, deliverResult } from './merge-inbox.mjs';
@@ -508,8 +508,9 @@ test('handleCleanupButton: Giữ keeps + tells the agent; a file that appeared a
   const strayHash = strayFingerprint(a.path, ['notes.txt']).hash;
   h.store.set('aaaaaaaaaaaaaaaa', { kind: 'cleanup', path: a.path, convoId: '5', head: a.head, stray: ['notes.txt'], strayHash, createdAt: Date.now() });
   h.store.set('bbbbbbbbbbbbbbbb', { kind: 'cleanup', path: a.path, convoId: null, head: a.head, stray: ['notes.txt'], strayHash, createdAt: Date.now() });
-  const shown = formatStrayOffer({ title: 'T', path: a.path, stray: ['notes.txt'], pr: 1, branch: 'feat-a' });
-  await handleCleanupButton(press('ck:aaaaaaaaaaaaaaaa', shown), h.ctx, h.opts);
+  const offer = formatStrayOffer({ title: 'T', path: a.path, stray: ['notes.txt'], pr: 1, branch: 'feat-a' });
+  await handleCleanupButton(press('ck:aaaaaaaaaaaaaaaa', withDigest(offer, h.store.get('aaaaaaaaaaaaaaaa'))), h.ctx, h.opts);
+  const shown = withDigest(offer, h.store.get('bbbbbbbbbbbbbbbb'));
   assert.ok(fs.existsSync(a.path));
   assert.match(h.edits.at(-1), /giữ lại/);
   assert.match(h.delivered.at(-1).cleanupResult.text, /owner chọn giữ lại/);
@@ -679,9 +680,11 @@ test('a git repo among the stray entries (vendor/x clone, or a bare repo in tmp/
 
 test('cleanupEntryMatchesMessage: whole fields only (no prefix / substring matches)', async () => {
   const { cleanupEntryMatchesMessage } = await import('./cleanup-inbox.mjs');
-  const t = formatStrayOffer({ title: 'T', path: '/p/wt-2', stray: ['ab', 'data/'], counts: { 'data/': 3 }, pr: 1, branch: 'b' });
-  assert.equal(cleanupEntryMatchesMessage({ path: '/p/wt-2', stray: ['ab', 'data/'] }, t), true);
-  assert.equal(cleanupEntryMatchesMessage({ path: '/p/wt', stray: ['ab'] }, t), false);
-  assert.equal(cleanupEntryMatchesMessage({ path: '/p/wt-2', stray: ['a'] }, t), false);
-  assert.equal(cleanupEntryMatchesMessage({ path: '/p/wt-2', stray: ['data'] }, t), false);
+  const e = { path: '/p/wt-2', stray: ['ab', 'data/'], head: 'a'.repeat(40), strayHash: 'b'.repeat(64), createdAt: 1 };
+  const t = withDigest(formatStrayOffer({ title: 'T', path: '/p/wt-2', stray: ['ab', 'data/'], counts: { 'data/': 3 }, pr: 1, branch: 'b' }), e);
+  assert.equal(cleanupEntryMatchesMessage(e, t), true);
+  for (const bad of [{ path: '/p/wt', stray: ['ab'] }, { stray: ['a'] }, { stray: ['data'] },
+    { strayHash: 'c'.repeat(64) }, { head: 'f'.repeat(40) }, { mode: 'request-turned-daily' }, { createdAt: 2 }]) {
+    assert.equal(cleanupEntryMatchesMessage({ ...e, ...bad }, t), false, JSON.stringify(bad));
+  }
 });

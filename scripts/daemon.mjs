@@ -616,7 +616,9 @@ export async function handleMergeButton(cq, ctx, { take = takeMergeButton, dispa
   }
   // Production pins every Merge (ctx.fetchHead): an entry without pins, or one
   // that doesn't match the message the owner saw, is refused.
-  const unpinned = m[1] === 'mg' && ctx.fetchHead && entry.links.some((l) => !entry.heads?.[l]);
+  // Every pin must be a FULL sha (a shortened one would be dropped from
+  // --expect-head and the merge would go unpinned).
+  const unpinned = m[1] === 'mg' && (ctx.fetchHead || Object.keys(entry.heads || {}).length) && entry.links.some((l) => !/^[0-9a-f]{40,64}$/.test(String(entry.heads?.[l] || '')));
   if (unpinned || !entryMatchesMessage(entry, original)) {
     await ctx.answerButton(cq.id, 'Nút không khớp nội dung — dán lại link.');
     await ctx.editButtonsMessage(chatId, messageId, `${original}\n\n⚠️ Nút không khớp nội dung tin nhắn — không làm gì. Dán lại link / gửi lại merge-request.`);
