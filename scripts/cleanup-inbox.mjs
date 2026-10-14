@@ -359,7 +359,8 @@ export async function handleCleanupButton(cq, ctx, {
   try { lock = await acquire('cleanup', { waitSec, dir: lockDir, label: 'teleport daemon (cleanup button)', convoId: null, cmd: `cleanup ${entry.path}` }); }
   catch (e) { lock = { error: e }; }
   let r;
-  if (lock.timeout || lock.error) r = { ok: false, path: entry.path, reason: lock.timeout ? 'đợt dọn khác đang chạy — nhờ agent gửi lại cleanup-request sau' : `không lấy được lock cleanup: ${lock.error?.message ?? lock.error}` };
+  if (lock.left) r = { ok: false, path: entry.path, reason: 'lượt chờ lock cleanup đã bị huỷ (lock-queue.mjs leave)' };
+  else if (lock.timeout || lock.error) r = { ok: false, path: entry.path, reason: lock.timeout ? 'đợt dọn khác đang chạy — nhờ agent gửi lại cleanup-request sau' : `không lấy được lock cleanup: ${lock.error?.message ?? lock.error}` };
   else {
     // Missing strayHash (never written by this code) → refuse rather than allow unpinned.
     if (!entry.strayHash) r = { ok: false, path: entry.path, reason: 'nút thiếu dấu vân tay file — gửi lại cleanup-request' };

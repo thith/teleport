@@ -400,7 +400,7 @@ export async function main(argv, {
     });
   } catch (e) {
     // Only a missing flock binary may run unlocked (as before); any other failure stops here.
-    if (e?.code !== 'ENOENT') { log(`❌ heavy: lỗi build lock (${e?.message ?? e}) — không chạy.`); return 1; }
+    if (!(e?.code === 'ENOENT' && (e.syscall === 'spawn flock' || e.path === 'flock'))) { log(`❌ heavy: lỗi build lock (${e?.message ?? e}) — không chạy.`); return 1; }
     log(`⚠️ heavy: không lấy được build lock (${e.message}) — chạy KHÔNG khoá.`);
     lock = { release() {}, waitedMs: 0 };
   }

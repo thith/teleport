@@ -10,19 +10,20 @@
 // the same instant, the atomic claim (.json → .acq) decides — the loser gives
 // way. A job already running is never touched.
 
-import { LOCK_DIR, readQueue, readHolder, cancelTickets, selfConvoId, describeHolder } from './machine-lock.mjs';
+import { LOCK_DIR, readQueue, readHolder, cancelTickets, selfConvoId, describeHolder, readStruck, readClaimed } from './machine-lock.mjs';
 import { isMainModule } from './is-direct-run.mjs';
 
 export const LOCK_NAMES = ['build', 'merge', 'cleanup'];
 export const LIST_MAX = 10;
 
 const mins = (ms) => Math.max(0, Math.round(ms / 60000));
-const STATUS_TEXT = { live: 'chờ', stalled: 'kẹt (mất nhịp tim / bị dừng)' };
+const STATUS_TEXT = { live: 'chờ', stalled: 'kẹt (mất nhịp tim)', stopped: 'bị dừng (ctrl-Z)', left: 'đã gạch (đang rời)' };
 
 /** One lock's holder + queue as text lines (read-only). */
-export function formatQueue(name, { dir = LOCK_DIR, now = Date.now(), max = LIST_MAX, read = readQueue, holderOf = readHolder } = {}) {
+export function formatQueue(name, { dir = LOCK_DIR, now = Date.now(), max = LIST_MAX, read = readQueue, struck = readStruck, holderOf = readHolder } = {}) {
   const holder = holderOf(`${dir}/${name}.holder.json`);
-  const q = read(name, { dir, now }).filter((t) => t.status !== 'dead' && !(holder?.alive && holder.ticket && holder.ticket === t.name));
+  const q = [...read(name, { dir, now }).filter((t) => t.status !== 'dead'), ...struck(name, { dir }).map((t) => ({ ...t, status: 'left' }))]
+    .sort((a, b) => (a.name < b.name ? -1 : 1));
   const lines = [`🔒 ${name}: ${holder?.alive ? `đang giữ — ${describeHolder(holder, now)}` : q.length ? `trống — ${q[0].label || `pid ${q[0].pid}`} đang nhận lock` : 'trống'}`];
   q.slice(0, max).forEach((t, i) => lines.push(`  ${i + 1}. ${t.label || `pid ${t.pid}`}${t.cmd ? ` — ${t.cmd}` : ''} — ${STATUS_TEXT[t.status] || t.status} ${mins(now - t.createdAt)} phút (pid ${t.pid})`));
   if (q.length > max) lines.push(`  … và ${q.length - max} vé nữa`);
@@ -42,7 +43,7 @@ export function parseArgs(argv) {
 }
 
 /** leave → { lines, code } (code 0 = something struck, 1 = nothing to leave / refused). */
-export function leave({ lock = null, pid = null }, { dir = LOCK_DIR, convoId = selfConvoId(), cancel = cancelTickets, holderOf = readHolder } = {}) {
+export function leave({ lock = null, pid = null }, { dir = LOCK_DIR, convoId = selfConvoId(), cancel = cancelTickets, holderOf = readHolder, claimed = readClaimed } = {}) {
   if (pid == null && convoId == null) return { code: 1, lines: ['❌ Không xác định được convo của bạn — dùng --pid N (chỉ admin/maintainer).'] };
   const match = pid != null ? (t) => t.pid === pid : (t) => t.convoId != null && String(t.convoId) === String(convoId);
   const lines = [];
@@ -50,7 +51,9 @@ export function leave({ lock = null, pid = null }, { dir = LOCK_DIR, convoId = s
   for (const name of lock ? [lock] : LOCK_NAMES) {
     for (const t of cancel(name, match, { dir })) { struck++; lines.push(`✅ đã rời hàng ${name}: ${t.label || `pid ${t.pid}`}${t.cmd ? ` — ${t.cmd}` : ''} (sẽ không chạy)`); }
     const h = holderOf(`${dir}/${name}.holder.json`);
-    if (h?.alive && (pid != null ? h.pid === pid : h.convoId != null && String(h.convoId) === String(convoId))) lines.push(`ℹ️ ${name}: việc của bạn đang chạy rồi (${h.cmd || `pid ${h.pid}`}) — không rời được; muốn dừng thì dừng chính tiến trình đó.`);
+    // (a ticket claimed a moment ago — .acq, holder file not written yet — is running too)
+    const running = [...(h?.alive ? [h] : []), ...claimed(name, { dir })].find((x) => match(x));
+    if (running) lines.push(`ℹ️ ${name}: việc của bạn đang chạy rồi (${running.cmd || `pid ${running.pid}`}) — không rời được; muốn dừng thì dừng chính tiến trình đó.`);
   }
   if (!lines.length) lines.push('ℹ️ Không có vé nào của bạn đang chờ.');
   return { code: struck ? 0 : 1, lines };

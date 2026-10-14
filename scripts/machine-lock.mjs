@@ -66,15 +66,16 @@ function writeJsonAtomic(file, obj) {
 }
 
 /**
- * A ticket's status: 'dead' (anyone may delete) | 'stalled' (alive but no
- * heartbeat / stopped — skipped, kept) | 'live'. (Struck tickets are `.left`
+ * A ticket's status: 'dead' (anyone may delete) | 'stopped' (ctrl-Z / traced)
+ * | 'stalled' (alive, no heartbeat 30 s) — both skipped, kept | 'live'. (Struck tickets are `.left`
  * files, not in the queue at all.) Pure given stat.
  */
 export function ticketStatus(t, mtimeMs, { now = Date.now(), stat = procStat, stallMs = TICKET_STALL_MS } = {}) {
   if (!t || !Number.isSafeInteger(t.pid)) return 'dead';
   const st = stat(t.pid);
   if (!st || st.state === 'Z' || st.state === 'X' || (t.procStart != null && String(st.start) !== String(t.procStart))) return 'dead';
-  if (st.state === 'T' || st.state === 't' || now - mtimeMs > stallMs) return 'stalled';
+  if (st.state === 'T' || st.state === 't') return 'stopped';
+  if (now - mtimeMs > stallMs) return 'stalled';
   return 'live';
 }
 
@@ -108,10 +109,32 @@ export function readQueue(name, { dir = LOCK_DIR, now = Date.now(), stat = procS
 export function cancelTickets(name, match, { dir = LOCK_DIR, stat = procStat } = {}) {
   const struck = [];
   for (const t of readQueue(name, { dir, stat })) {
-    if ((t.status !== 'live' && t.status !== 'stalled') || !match(t)) continue;
+    if (t.status === 'dead' || !match(t)) continue;
     try { fs.renameSync(t.file, t.file.replace(/\.json$/, '.left')); struck.push(t); } catch {}
   }
   return struck;
+}
+
+/** Struck tickets still waiting for their owner to notice (`.left` of a live process), oldest first. */
+export function readStruck(name, { dir = LOCK_DIR, stat = procStat } = {}) {
+  const q = lockPaths(name, dir).queue;
+  let files = [];
+  try { files = fs.readdirSync(q).filter((f) => /^\d{15}-\d+-[a-z0-9]+\.left$/.test(f)).sort(); } catch { return []; }
+  const out = [];
+  for (const f of files) {
+    try { const t = JSON.parse(fs.readFileSync(path.join(q, f), 'utf8')); if (stat(t.pid)) out.push({ ...t, name: f }); } catch {}
+  }
+  return out;
+}
+
+/** Tickets just claimed (`.acq`: won flock, holder file not written yet) of live processes. */
+export function readClaimed(name, { dir = LOCK_DIR, stat = procStat } = {}) {
+  const q = lockPaths(name, dir).queue;
+  let files = [];
+  try { files = fs.readdirSync(q).filter((f) => /^\d{15}-\d+-[a-z0-9]+\.acq$/.test(f)); } catch { return []; }
+  const out = [];
+  for (const f of files) { try { const t = JSON.parse(fs.readFileSync(path.join(q, f), 'utf8')); if (stat(t.pid)) out.push(t); } catch {} }
+  return out;
 }
 
 /** Housekeeping: `.left` / `.acq` files of dead owners, and `.tmp` files older than a minute (writer died mid-write). */
@@ -197,7 +220,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
  */
 export async function acquireLock(name, {
   waitSec = Infinity, label = selfLabel(), cmd = '', onWait = () => {}, pollMs = 1000, noticeMs = 60000, dir = LOCK_DIR, now = Date.now,
-  convoId = selfConvoId(), warn = (m) => console.error(m), stat = procStat,
+  convoId = selfConvoId(), warn = (m) => console.error(m), stat = procStat, beforeClaim = null,
 } = {}) {
   const p = lockPaths(name, dir);
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
@@ -226,8 +249,15 @@ export async function acquireLock(name, {
         process.on('exit', dropTicket);
       } catch (e) { warn(`⚠️ lock ${name}: không ghi được vé hàng đợi (${e.message}) — chờ kiểu cũ, không theo thứ tự.`); }
       let lastNotice = -Infinity, lastKey = null;
-      // Read every poll (not only at the head): a struck ticket (renamed to .left, or removed by hand) = leave.
-      const mineState = () => { if (!ticket) return 'ok'; try { fs.accessSync(ticket); return 'ok'; } catch (e) { return e.code === 'ENOENT' ? 'left' : 'ok'; } };
+      // Read every poll (not only at the head): struck (renamed to .left) = leave. Vanished WITHOUT a
+      // .left (e.g. pruned by a process that misjudged us dead) = not a leave: put it back, same place.
+      const mineState = () => {
+        if (!ticket) return 'ok';
+        try { fs.accessSync(ticket); return 'ok'; } catch (e) { if (e.code !== 'ENOENT') return 'ok'; }
+        if (fs.existsSync(ticket.replace(/\.json$/, '.left'))) return 'left';
+        try { writeJsonAtomic(ticket, body); warn(`⚠️ lock ${name}: vé hàng đợi bị xoá (không phải leave) — đã ghi lại đúng chỗ cũ.`); } catch {}
+        return 'ok';
+      };
       for (;;) {
         const ms = mineState();
         if (ms !== 'ok') { done(); close(); return { timeout: true, left: true, holder: readHolder(p.holder) }; } // gone = removed by hand: never resurrect
@@ -236,11 +266,12 @@ export async function acquireLock(name, {
         const ahead = ticket ? others.filter((t) => t.name < path.basename(ticket) && t.status === 'live') : [];
         if (!ahead.length) {
           let r = await tryFlock(fd);
-          if (r !== 'acquired' && !readHolder(p.holder)) { await sleep(100); r = await tryFlock(fd); } // a try-once caller just gave it back
+          if (r !== 'acquired' && !readHolder(p.holder)?.alive) { await sleep(100); r = await tryFlock(fd); } // a try-once caller just gave it back
           if (r === 'acquired') {
             // The atomic hand-off: WE rename our ticket to .acq, or `leave` renamed it to .left —
             // exactly one rename succeeds. Lost → give the lock straight back.
             if (!ticket) break;
+            if (beforeClaim) await beforeClaim(ticket); // (test seam: strike right here)
             try { fs.renameSync(ticket, ticket.replace(/\.json$/, '.acq')); ticket = ticket.replace(/\.json$/, '.acq'); break; }
             catch (e) { if (e.code !== 'ENOENT') throw e; done(); close(); return { timeout: true, left: true, holder: null }; }
           }
