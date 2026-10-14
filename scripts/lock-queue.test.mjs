@@ -202,6 +202,7 @@ test('several tickets in ONE process (the daemon): served in order, each release
   const got = [];
   const p1 = acquireLock('build', { dir, pollMs: 20, label: 'one', convoId: null }).then((l) => { got.push('one'); return l; });
   await queuedFor(dir, 'one');
+  await new Promise((r) => setTimeout(r, 5)); // distinct ms → 'two' sorts after 'one' (same pid; else the random suffix decides)
   const p2 = acquireLock('build', { dir, pollMs: 20, label: 'two', convoId: null }).then((l) => { got.push('two'); return l; });
   await queuedFor(dir, 'two');
   h.release();

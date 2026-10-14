@@ -133,7 +133,7 @@ export function readClaimed(name, { dir = LOCK_DIR, stat = procStat } = {}) {
   let files = [];
   try { files = fs.readdirSync(q).filter((f) => /^\d{15}-\d+-[a-z0-9]+\.acq$/.test(f)); } catch { return []; }
   const out = [];
-  for (const f of files) { try { const t = JSON.parse(fs.readFileSync(path.join(q, f), 'utf8')); if (stat(t.pid)) out.push(t); } catch {} }
+  for (const f of files) { try { const t = JSON.parse(fs.readFileSync(path.join(q, f), 'utf8')); if (ticketStatus(t, Date.now(), { stat }) !== 'dead') out.push(t); } catch {} } // dead rule: pid reuse too
   return out;
 }
 
