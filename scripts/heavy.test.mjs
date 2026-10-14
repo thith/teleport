@@ -423,3 +423,19 @@ test('PR39 codex r2: no false positives — a single quoted key "build.jobs", jo
   assert.equal(tomlHasBuildJobs('build = { target-dir = "cache, jobs = 8" }'), false);
   assert.equal(tomlHasBuildJobs('"build".jobs = 2'), true);
 });
+
+test('RFC21: struck from the queue → exit 76, nothing run; a non-ENOENT lock error never runs unlocked', async () => {
+  let ran = false;
+  const base = { env: {}, nested: () => false, log: () => {}, waitRam: async () => {}, scopeOps: NO_SCOPE, run: async () => { ran = true; return 0; } };
+  assert.equal(await heavyMain(['--', 'cargo', 'b'], { ...base, acquire: async () => ({ timeout: true, left: true, holder: null }) }), 76);
+  assert.equal(await heavyMain(['--', 'cargo', 'b'], { ...base, acquire: async () => { throw Object.assign(new Error('EACCES queue'), { code: 'EACCES' }); } }), 1);
+  assert.equal(ran, false);
+});
+
+test('RFC21: the wait notice shows the place in line and how to leave', async () => {
+  const logs = [];
+  await heavyMain(['--', 'cargo', 'b'], { env: {}, nested: () => false, log: (s) => logs.push(s), waitRam: async () => {}, scopeOps: NO_SCOPE, run: async () => 0,
+    acquire: async (n, o) => { o.onWait({ alive: true, pid: 1, label: 'X', startedAt: Date.now() }, 0, { position: 3, ahead: ['🐭 Chuột', '🤖 Robot 2'] }); return { release() {}, waitedMs: 0 }; } });
+  assert.match(logs.join('\n'), /bạn đứng thứ 3, trước bạn: 🐭 Chuột, 🤖 Robot 2/);
+  assert.match(logs.join('\n'), /lock-queue\.mjs leave/);
+});

@@ -403,6 +403,7 @@ if (isMainModule(import.meta.url)) {
       lock = await acquireLock('merge', { waitSec, cmd: `merge ${canon.targets.map((t) => `${t.repo}#${t.number}`).join(' ')}`,
         onWait: (h) => console.error(`⏳ đang có merge khác chạy: ${describeHolder(h)} — chờ…`) });
     } catch (e) { console.log(`❌ cannot take the merge lock (${e.message}) — not merging.`); process.exit(1); }
+    if (lock.left) { console.log('⏹ đã rời hàng đợi merge — không merge.'); process.exit(1); }
     if (lock.timeout) { console.log(`❌ đang có merge khác chạy quá ${waitSec}s: ${describeHolder(lock.holder)} — thử lại sau.`); process.exit(1); }
   }
   const r = await mergeMany({ ...args, targets: canon.targets }, { gh });

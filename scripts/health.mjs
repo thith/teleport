@@ -5,6 +5,7 @@
 // below read /proc, df, ps and the user journal (best effort — a missing source
 // just drops that line).
 
+import { formatQueue, LOCK_NAMES } from './lock-queue.mjs';
 import fs from 'node:fs';
 import os from 'node:os';
 import { execFileSync, execFile } from 'node:child_process';
@@ -48,7 +49,7 @@ export function countOomKills(journalText) {
 }
 
 /** Build the /health message. All inputs passed in → pure. */
-export function formatHealth({ cores, load, mem, disk, agents, top, oomKills }) {
+export function formatHealth({ cores, load, mem, disk, agents, top, oomKills, locks = null }) {
   const warn = [];
   const lines = ['🩺 Tình trạng máy', ''];
   if (load) {
@@ -79,6 +80,8 @@ export function formatHealth({ cores, load, mem, disk, agents, top, oomKills }) 
     lines.push('', 'Ăn RAM nhiều nhất:');
     for (const t of top) lines.push(`• ${t.name}${t.count > 1 ? ` ×${t.count}` : ''}: ${t.mb >= 1024 ? `${(t.mb / 1024).toFixed(1)} GB` : `${t.mb} MB`}`);
   }
+  // RFC 21: machine locks — who holds each, who waits (in order).
+  if (locks && locks.length) lines.push('', 'Hàng đợi lock:', ...locks);
   if (oomKills) warn.push(`${oomKills} lần OOM-kill trong 24 giờ qua (systemd-oomd). Có thể có agent đã bị tắt, xem /ls`);
   lines.push('', warn.length ? `⚠️ ${warn.join('\n⚠️ ')}` : '✅ Không có cảnh báo.');
   return lines.join('\n');
@@ -331,6 +334,7 @@ if (isMainModule(import.meta.url)) {
     cores: os.cpus().length, load: os.loadavg(), mem,
     disk: dfOut ? parseDf(dfOut) : null, agents,
     top: psOut ? topMemory(psOut) : null, oomKills: journal ? countOomKills(journal) : 0,
+    locks: (() => { try { return LOCK_NAMES.flatMap((n) => formatQueue(n)); } catch { return null; } })(),
   }) + '\n');
 }
 
