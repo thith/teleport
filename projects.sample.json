@@ -1,7 +1,8 @@
 {
   "_config": {
     "daemonUserId": "100000001",
-    "quietHours": { "start": 22, "end": 8 }
+    "quietHours": { "start": 22, "end": 8 },
+    "contextWindows": { "claude-opus-5-5": 1000000 }
   },
   "_default": {
     "chatId": "-1003456789012",

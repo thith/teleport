@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {
-  parsePsOutput, parseSessionFile, cwdToProjectSlug, hashtagForSession, styFromEnviron,
+  parsePsOutput, parseSessionFile, cwdToProjectSlug, hashtagForSession, styFromEnviron, styPidFromEnviron,
   procStartFromStat, screenFromAncestors, buildProcRows, formatAgentList, parseKillPidArg, findUnidentifiedProcs,
   checkKillTarget, killClaudePid, findProcForSession, etimeToSeconds, guessSessionFromTranscripts,
   inspectPid, readPs, listClaudeProcs,
@@ -44,11 +44,18 @@ test('etimeToSeconds: all ps shapes', () => {
 
 test('parseSessionFile: picks the useful fields, rejects junk / bad uuid', () => {
   const s = parseSessionFile(JSON.stringify({ pid: 830318, sessionId: SID, cwd: '/w/umipay', name: '🪱 Giun', status: 'idle', kind: 'interactive', procStart: '5943432' }));
-  assert.deepEqual(s, { pid: 830318, sessionId: SID, cwd: '/w/umipay', name: '🪱 Giun', status: 'idle', kind: 'interactive', procStart: '5943432' });
+  assert.deepEqual(s, { pid: 830318, sessionId: SID, cwd: '/w/umipay', name: '🪱 Giun', status: 'idle', bridgeSessionId: null, kind: 'interactive', procStart: '5943432' });
+  assert.equal(parseSessionFile(JSON.stringify({ pid: 1, bridgeSessionId: 'session_01K' })).bridgeSessionId, 'session_01K');
+  assert.equal(parseSessionFile(JSON.stringify({ pid: 1, bridgeSessionId: null })).bridgeSessionId, null);
   assert.equal(parseSessionFile('not json'), null);
   assert.equal(parseSessionFile(null), null);
   assert.equal(parseSessionFile(JSON.stringify({ sessionId: SID })), null); // no pid
   assert.equal(parseSessionFile(JSON.stringify({ pid: 1, sessionId: '../etc' })).sessionId, null);
+});
+
+test('styPidFromEnviron: the SCREEN pid from STY; null without STY', () => {
+  assert.equal(styPidFromEnviron('A=1\0STY=331130.tele-d8133684\0B=2'), 331130);
+  assert.equal(styPidFromEnviron('A=1\0B=2'), null);
 });
 
 test('cwdToProjectSlug matches Claude Code project dir names', () => {

@@ -74,6 +74,8 @@ export function parseSessionFile(text) {
     cwd: typeof j.cwd === 'string' ? j.cwd : null,
     name: typeof j.name === 'string' && j.name ? j.name : null,
     status: typeof j.status === 'string' ? j.status : null,
+    // Remote Control: set while bridged; the key is absent until first used (→ null = off).
+    bridgeSessionId: typeof j.bridgeSessionId === 'string' && j.bridgeSessionId ? j.bridgeSessionId : null,
     kind: typeof j.kind === 'string' ? j.kind : null,
     procStart: j.procStart != null ? String(j.procStart) : null,
   };
@@ -95,6 +97,15 @@ export function hashtagForSession(sessionId) {
 export function styFromEnviron(environ) {
   for (const kv of String(environ ?? '').split('\0')) {
     if (kv.startsWith('STY=')) return kv.slice(4).replace(/^\d+\./, '') || null;
+  }
+  return null;
+}
+
+/** The `<pid>` part of `STY=<pid>.<name>` (the SCREEN server's pid), or null. */
+export function styPidFromEnviron(environ) {
+  for (const kv of String(environ ?? '').split('\0')) {
+    const m = kv.match(/^STY=(\d+)\./);
+    if (m) return Number(m[1]);
   }
   return null;
 }
@@ -166,14 +177,19 @@ export function buildProcRows({ psRows, uid, sessions = new Map(), procExtras = 
       const g = up == null ? null : guessSession(cwd, claimed, nowMs - up * 1000 - 2000);
       if (g?.sessionId) { sessionId = g.sessionId; guessed = true; }
     }
+    const parent = byPid.get(r.ppid);
     out.push({
-      pid: r.pid, tty: r.tty, etime: r.etime, cwd,
+      pid: r.pid, ppid: r.ppid, tty: r.tty, etime: r.etime, cwd,
       screen: extra.sty ?? screenFromAncestors(r.pid, byPid),
+      // The SCREEN server's pid (STY prefix, else a direct `screen` parent) — /type
+      // only types into a claude that is the screen's DIRECT child (its window 0).
+      screenPid: extra.styPid ?? (parent && /^screen$/i.test(parent.comm) ? parent.pid : null),
       procStart: extra.procStart ?? null, // pid-reuse fingerprint of THIS process
       sessionId, guessed,
       hashtag: hashtagForSession(sessionId),
       name: sess?.name ?? null,
       status: sess?.status ?? null,
+      bridgeSessionId: sess?.bridgeSessionId ?? null,
     });
   }
   return out.sort((a, b) => a.pid - b.pid);
@@ -194,7 +210,7 @@ export function buildProcRows({ psRows, uid, sessions = new Map(), procExtras = 
  *   convoOfHashtag(hashtag) → convoId | null — recovers a tele-* screen's convo
  *                 when no claude inside carries a session id with that hashtag.
  */
-export function formatAgentList({ screens = [], procs = [], personaOf = () => null, home = os.homedir(), statusOf = () => null, convoOfHashtag = () => null } = {}) {
+export function formatAgentList({ screens = [], procs = [], personaOf = () => null, home = os.homedir(), statusOf = () => null, convoOfHashtag = () => null, ctxOf = () => null } = {}) {
   // Folder name only (Thi: "chỉ hiện tên folder") — the full path is noise on a phone.
   const short = (p) => (p ? (p === home ? '~' : path.basename(p)) : null);
   const sess = (r) => (r.sessionId
@@ -218,9 +234,10 @@ export function formatAgentList({ screens = [], procs = [], personaOf = () => nu
     try { return convoOfHashtag(h) ?? null; } catch { return null; }
   };
   // No tty column (Thi: only useful at the keyboard). r.tty stays in the row/audit.
+  const ctxSafe = (r) => { try { return ctxOf(r); } catch { return null; } }; // context fill (RFC 22) — never breaks /ls
   const procLine = (r) => [
     `PID ${r.pid}`, r.name ? `${r.name}${r.status ? ` (${r.status})` : ''}` : (r.status ? `(${r.status})` : null),
-    short(r.cwd) ?? '?', r.etime,
+    short(r.cwd) ?? '?', r.etime, ctxSafe(r), r.bridgeSessionId ? '📡' : null,
   ].filter(Boolean).join(' · ');
 
   const inScreen = new Map(); // screen name → claude rows inside it
@@ -353,7 +370,7 @@ export function listClaudeProcs({
     try { cwd = fs.readlinkSync(path.join(base, 'cwd')); } catch {}
     procExtras.set(r.pid, {
       procStart: procStartFromStat(readFileOrNull(path.join(base, 'stat'))),
-      sty: styFromEnviron(readFileOrNull(path.join(base, 'environ'))),
+      ...(() => { const env = readFileOrNull(path.join(base, 'environ')); return { sty: styFromEnviron(env), styPid: styPidFromEnviron(env) }; })(),
       cwd,
     });
   }
