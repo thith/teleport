@@ -52,6 +52,7 @@ import { acquireLock, describeHolder, readHolder, lockPaths } from './machine-lo
 import { isMainModule } from './is-direct-run.mjs';
 
 export const WAIT_TIMEOUT_EXIT = 75;
+export const LEFT_QUEUE_EXIT = 76; // RFC 21: cancelled with lock-queue.mjs leave while waiting
 export const HELD_ENV = 'TELEPORT_HEAVY_HELD';
 const USAGE = 'usage: heavy.mjs [--no-stop] [--no-scope] [--wait <minutes>] [--no-ram-wait] -- <command> [args…]';
 
@@ -395,12 +396,15 @@ export async function main(argv, {
   } else try {
     lock = await acquire('build', {
       waitSec: a.waitSec, cmd: cmdText,
-      onWait: (h, waited) => log(`⏳ build đang bận: ${describeHolder(h)} — ${waited ? `đã chờ ${Math.round(waited / 60000)} phút, ` : ''}chờ tới lượt…`),
+      onWait: (h, waited, q) => log(`⏳ build đang bận: ${describeHolder(h)}${q?.position > 1 ? ` — bạn đứng thứ ${q.position}, trước bạn: ${q.ahead.join(', ')}` : q ? ' — bạn đứng đầu hàng' : ''} — ${waited ? `đã chờ ${Math.round(waited / 60000)} phút, ` : ''}chờ tới lượt… (rời hàng: node ../teleport/scripts/lock-queue.mjs leave)`),
     });
   } catch (e) {
+    // Only a missing flock binary may run unlocked (as before); any other failure stops here.
+    if (e?.code !== 'ENOENT') { log(`❌ heavy: lỗi build lock (${e?.message ?? e}) — không chạy.`); return 1; }
     log(`⚠️ heavy: không lấy được build lock (${e.message}) — chạy KHÔNG khoá.`);
     lock = { release() {}, waitedMs: 0 };
   }
+  if (lock.left) { log('⏹ heavy: đã rời hàng đợi build — không chạy.'); return LEFT_QUEUE_EXIT; }
   if (lock.timeout) { log(`❌ heavy: chờ quá ${a.waitSec / 60} phút, build vẫn bận: ${describeHolder(lock.holder)} — không chạy.`); return WAIT_TIMEOUT_EXIT; }
   if (lock.waitedMs > 1000) log(`▶️ tới lượt (đã chờ ${Math.round(lock.waitedMs / 1000)}s): ${cmdText}`);
   let scope = null;

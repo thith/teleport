@@ -175,7 +175,7 @@ test('heavy args + gradlew --stop policy (after success AND failure, not with --
   assert.equal(heldByAncestor({}, H({ pid: 42, alive: true })), false);
   // flock unavailable → runs anyway (fail-open), loudly
   const logs = [];
-  assert.equal(await heavyMain(['--', 'x'], { env: {}, waitRam: async () => {}, acquire: async () => { throw new Error('spawn flock ENOENT'); }, nested: () => false, scopeOps: NO_SCOPE, run: async () => 0, log: (s) => logs.push(s) }), 0);
+  assert.equal(await heavyMain(['--', 'x'], { env: {}, waitRam: async () => {}, acquire: async () => { throw Object.assign(new Error('spawn flock ENOENT'), { code: 'ENOENT' }); }, nested: () => false, scopeOps: NO_SCOPE, run: async () => 0, log: (s) => logs.push(s) }), 0);
   assert.match(logs.join('\n'), /KHÔNG khoá/);
 });
 

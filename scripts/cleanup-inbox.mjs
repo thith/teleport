@@ -179,8 +179,9 @@ export async function processCleanupOffers({ daemonUserId, sendText = async () =
       // re-judges the worktree itself — daily gates, the offered HEAD, exactly
       // these entries allowed — and pins ITS OWN fingerprint of them.
       let lock;
-      try { lock = await acquire('cleanup', { waitSec, dir: lockDir, label: 'teleport daemon (cleanup offer)', cmd: `cleanup offer ${v0.path}` }); }
+      try { lock = await acquire('cleanup', { waitSec, dir: lockDir, label: 'teleport daemon (cleanup offer)', convoId: null, cmd: `cleanup offer ${v0.path}` }); }
       catch (e) { lock = { error: e }; }
+      if (lock.left) { console.error(`[daemon] cleanup offer ${v0.path}: struck from the lock queue (lock-queue.mjs leave) — dropped`); continue; }
       if (lock.timeout) { keepFile = true; putBack(file); break; }
       if (lock.error) { console.error(`[daemon] cleanup offer: lock: ${lock.error?.message ?? lock.error}`); continue; }
       let probe;
@@ -265,11 +266,13 @@ export async function processCleanupRequests({ daemonUserId, sendText, sendButto
       const who = label(req.convoId);
       let lock;
       try {
-        lock = await acquire('cleanup', { waitSec, dir: lockDir, label: `teleport daemon (cleanup-request ${who})`, cmd: `cleanup-request ${req.path}` });
+        lock = await acquire('cleanup', { waitSec, dir: lockDir, label: `teleport daemon (cleanup-request ${who})`, convoId: null, cmd: `cleanup-request ${req.path}` });
       } catch (e) { lock = { error: e }; }
-      if (lock.timeout) { keepFile = true; putBack(file); break; } // daily cleanup running → retry later
+      // Struck from the queue (an admin's lock-queue.mjs leave --pid): cancel this request, don't re-queue it.
+      if (!lock.left && lock.timeout) { keepFile = true; putBack(file); break; } // daily cleanup running → retry later
       let r, probe = null;
-      if (lock.error) r = { ok: false, path: req.path, reason: `không lấy được lock cleanup: ${lock.error?.message ?? lock.error}` };
+      if (lock.left) r = { ok: false, path: req.path, reason: 'lượt chờ lock cleanup đã bị huỷ (lock-queue.mjs leave) — gửi lại cleanup-request nếu vẫn cần' };
+      else if (lock.error) r = { ok: false, path: req.path, reason: `không lấy được lock cleanup: ${lock.error?.message ?? lock.error}` };
       else {
         try {
           r = await run(req.path, { ...(parentDir ? { parentDir } : {}) });
@@ -353,7 +356,7 @@ export async function handleCleanupButton(cq, ctx, {
   await ctx.answerButton(cq.id, 'Đang xoá…');
   await ctx.editButtonsMessage(chatId, messageId, `${original}\n\n⏳ Đang xoá…`);
   let lock;
-  try { lock = await acquire('cleanup', { waitSec, dir: lockDir, label: 'teleport daemon (cleanup button)', cmd: `cleanup ${entry.path}` }); }
+  try { lock = await acquire('cleanup', { waitSec, dir: lockDir, label: 'teleport daemon (cleanup button)', convoId: null, cmd: `cleanup ${entry.path}` }); }
   catch (e) { lock = { error: e }; }
   let r;
   if (lock.timeout || lock.error) r = { ok: false, path: entry.path, reason: lock.timeout ? 'đợt dọn khác đang chạy — nhờ agent gửi lại cleanup-request sau' : `không lấy được lock cleanup: ${lock.error?.message ?? lock.error}` };

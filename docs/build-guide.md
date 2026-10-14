@@ -11,7 +11,9 @@ node ../teleport/scripts/heavy.mjs -- cargo nextest run --workspace
 ```
 
 - **Build nặng là:** Gradle (build/test/lint), `cargo build/test/clippy/nextest`, các script CI local (`scripts/ci/*-check.sh`), boot emulator. Lệnh nhỏ (`npm test` vài giây, `cargo fmt`) thì không cần.
-- **Đang có build khác:** in `⏳ build đang bận: 🧛 Ma #c2383556 — ./gradlew … — từ 12:40 (3 phút)` rồi chờ tới lượt. Mặc định chờ vô hạn. `--wait <phút>` để bỏ cuộc (exit 75, lệnh không chạy).
+- **Đang có build khác — xếp hàng (RFC 21):** các job chờ được **đến trước lấy trước** (không còn chen hàng). Wrapper in `⏳ build đang bận: 🧛 Ma #c2383556 — ./gradlew … — từ 12:40 (3 phút) — bạn đứng thứ 2, trước bạn: 🐭 Chuột …` rồi chờ tới lượt. Mặc định chờ vô hạn. `--wait <phút>` để bỏ cuộc (exit 75, lệnh không chạy).
+- **Xem hàng:** `node ../teleport/scripts/lock-queue.mjs ls` (hoặc `/health` trên Telegram): ai đang giữ build/merge/cleanup lock, ai đang chờ theo thứ tự.
+- **Rời hàng khi không cần build nữa:** `node ../teleport/scripts/lock-queue.mjs leave` — rời **mọi** vé đang chờ của convo bạn (subagent dùng chung convo cũng rời); job đang chờ thoát với **exit 76** ("đã rời hàng"), không chạy. Job đã bắt đầu chạy thì không rời được (dừng chính tiến trình đó). Hoặc dừng thẳng tiến trình heavy đang chờ. `--pid N` chỉ dành cho admin/maintainer. Lúc đang **chờ RAM** (trước khi vào hàng) thì chưa có vé: muốn huỷ thì dừng tiến trình heavy.
 - **Exit code** là exit code của lệnh.
 - **Lệnh là `gradlew`:** sau khi xong, wrapper tự chạy `gradlew --stop` để trả vài GB RAM của Gradle daemon. Dùng `--no-stop` nếu sắp build tiếp ngay. Gọi `gradlew` **trực tiếp** (`./gradlew -p android …`), không gọi qua `sh -c "cd … && ./gradlew"`, nếu không sẽ không được nhận ra.
 - Build chết (Ctrl-C, timeout, bị kill) thì lock tự nhả, không bao giờ kẹt.
