@@ -236,7 +236,8 @@ export function formatAgentList({ screens = [], procs = [], personaOf = () => nu
   // No tty column (Thi: only useful at the keyboard). r.tty stays in the row/audit.
   const ctxSafe = (r) => { try { return ctxOf(r); } catch { return null; } }; // context fill (RFC 22) — never breaks /ls
   const procLine = (r) => [
-    `PID ${r.pid}`, r.name ? `${r.name}${r.status ? ` (${r.status})` : ''}` : (r.status ? `(${r.status})` : null),
+    // 📨 = the session's name — the address for Claude's cross-session messages (SendMessage to=<name>)
+    `PID ${r.pid}`, r.name ? `📨 ${r.name}${r.status ? ` (${r.status})` : ''}` : (r.status ? `(${r.status})` : null),
     short(r.cwd) ?? '?', r.etime, ctxSafe(r), r.bridgeSessionId ? '📡' : null,
   ].filter(Boolean).join(' · ');
 
@@ -263,7 +264,8 @@ export function formatAgentList({ screens = [], procs = [], personaOf = () => nu
   lines.push('', `🖥 Terminal (${terminal.length})`);
   if (!terminal.length) lines.push('  (không có)');
   for (const [i, r] of terminal.entries()) { if (i) lines.push(SEP); lines.push(`• ${procLine(r)}`); lines.push(sess(r)); status(uuidToConvoInt(r.sessionId)); }
-  lines.push('', 'Dừng (chỉ owner): /kill pid:<PID> · screen: /kill <hashtag>');
+  lines.push('', '📨 = tên phiên để agent nhắn trực tiếp (Claude cross-session: SendMessage to="<tên>")');
+  lines.push('Dừng (chỉ owner): /kill pid:<PID> · screen: /kill <hashtag>');
   lines.push('Chạy lại trong screen: /spawn <project> --resume-session <session>');
   return lines.join('\n');
 }

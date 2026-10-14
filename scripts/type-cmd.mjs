@@ -27,6 +27,7 @@ export const ESC_GAP_MS = 3000;          // two quick Escs at idle open the Rewi
 export const RC_DIALOG_WAIT_MS = 5000;
 export const RC_BRIDGE_WAIT_MS = 15000;
 export const COMPACT_WATCH_MS = 5 * 60 * 1000;
+export const COMPACT_QUEUED_WATCH_MS = 30 * 60 * 1000; // queued behind a running turn
 export const AUDIT_FILE = path.join(process.env.XDG_STATE_HOME || path.join(os.homedir(), '.local', 'state'), 'teleport', 'type-audit.jsonl');
 
 // op letter (callback data) → command. Fixed table: the command never comes from stored data.
@@ -49,8 +50,16 @@ export const STATE_LABEL = { idle: 'rảnh', busy: 'đang bận', waiting: 'đan
 /** Which ops a state allows (buttons shown / presses accepted). Pure. */
 export function allowedOps(state, bridgeSessionId) {
   if (state === 'idle') return bridgeSessionId ? ['c'] : ['c', 'r'];
-  if (state === 'busy' || state === 'waiting') return ['e'];
+  // Busy: /compact is QUEUED by Claude and runs as the command when the turn ends (probed
+  // 2.1.300). Waiting (a dialog is open): Enter would answer the dialog → Esc only.
+  if (state === 'busy') return ['c', 'e'];
+  if (state === 'waiting') return ['e'];
   return [];
+}
+
+/** Claude shows this while messages are queued for after the turn. Pure. */
+export function hasQueuedInput(screenText) {
+  return /Press up to edit queued messages/.test(String(screenText || '').replace(/\0/g, ''));
 }
 
 /**
@@ -209,12 +218,17 @@ export class TypeRunner {
   }
 
   /** Common part: check → type the command → verify on screen → re-check → Enter. → { ok } | { text }. */
-  async typeAndEnter(t, cmd, audit, { needNoBridge = false } = {}) {
+  async typeAndEnter(t, cmd, audit, { needNoBridge = false, allowBusy = false } = {}) {
     const io = this.io, sid = screenId(t);
+    const ok = (st) => st === 'idle' || (allowBusy && st === 'busy');
     const pre = observe(t, io);
     if (pre.mismatch) { audit('refused', { reason: pre.mismatch }); return { text: `❌ agent đã đổi phiên (${pre.mismatch}) — gõ /type lại.` }; }
-    if (pre.state !== 'idle') { audit('refused', { reason: pre.state }); return { text: `❌ agent ${STATE_LABEL[pre.state]} — không gõ ${cmd}.${pre.state === 'busy' ? ' Bấm ⎋ Esc trước nếu cần dừng.' : ''}` }; }
+    if (!ok(pre.state)) { audit('refused', { reason: pre.state }); return { text: `❌ agent ${STATE_LABEL[pre.state]} — không gõ ${cmd}.${pre.state === 'busy' ? ' Bấm ⎋ Esc trước nếu cần dừng.' : ''}` }; }
     if (needNoBridge && pre.bridge) return { text: `📡 Remote Control đang bật: https://claude.ai/code/${pre.bridge}` };
+    if (pre.state === 'busy' && hasQueuedInput(await io.hardcopy(sid))) { // don't stack onto a queue we can't see
+      audit('refused', { reason: 'queued' });
+      return { text: `❌ agent đang bận và đã có tin xếp hàng — không gõ thêm ${cmd}.` };
+    }
     io.stuff(sid, cmd);
     audit('typed', { status: pre.status });
     await io.sleep(TYPE_GAP_MS);
@@ -226,7 +240,7 @@ export class TypeRunner {
     }
     const mid = observe(t, io);
     if (this.cancel.get(t.pid)) { audit('cancelled'); return { text: `✖ đã huỷ (⎋ Esc) — đã gõ ${cmd} nhưng KHÔNG Enter.` }; }
-    if (mid.mismatch || mid.state !== 'idle') {
+    if (mid.mismatch || !ok(mid.state)) {
       audit('changed-before-enter', { reason: mid.mismatch || mid.state });
       return { text: `⚠️ agent vừa đổi trạng thái (${mid.mismatch || STATE_LABEL[mid.state]}) — đã gõ ${cmd} nhưng KHÔNG Enter. Kiểm tra tay.` };
     }
@@ -234,16 +248,16 @@ export class TypeRunner {
     const offset = file ? io.transcriptSize(file) : null; // { size, ino, dev } — replacement-proof baseline
     io.stuff(sid, '\r');
     this.cooldown.set(t.pid, io.now() + COOLDOWN_MS);
-    audit('enter');
-    return { ok: true, file, offset, screenBefore: scr };
+    audit('enter', { queued: mid.state === 'busy' });
+    return { ok: true, file, offset, screenBefore: scr, queued: mid.state === 'busy' };
   }
 
   async compact(t, audit) {
-    const r = await this.typeAndEnter(t, '/compact', audit);
+    const r = await this.typeAndEnter(t, '/compact', audit, { allowBusy: true });
     if (!r.ok) return r;
     const io = this.io;
     const watch = async () => {
-      const until = io.now() + COMPACT_WATCH_MS;
+      const until = io.now() + (r.queued ? COMPACT_QUEUED_WATCH_MS : COMPACT_WATCH_MS);
       await io.sleep(3000);
       const scr = await io.hardcopy(screenId(t));
       if (compactRefusedOnScreen(scr)) { // tied to the LAST submitted /compact — an old one may still be on screen
@@ -261,9 +275,9 @@ export class TypeRunner {
         await io.sleep(5000);
       }
       audit('result', { result: 'timeout' });
-      return '❔ chưa thấy compact xong sau 5 phút — kiểm tra tay.';
+      return `❔ chưa thấy compact xong sau ${r.queued ? 30 : 5} phút — kiểm tra tay.`;
     };
-    return { text: `⌨️ đã gõ /compact vào #${t.hashtag} — đang chờ kết quả…`, watch };
+    return { text: `⌨️ đã gõ /compact vào #${t.hashtag}${r.queued ? ' (đang bận → đã xếp hàng, chạy khi xong lượt)' : ''} — đang chờ kết quả…`, watch };
   }
 
   async remoteControl(t, audit) {

@@ -22,10 +22,10 @@ test('classify: idle / shell+turn-over = rảnh; shell mid-turn = bận; unknown
   assert.equal(classify('something-new', true), 'unknown');
 });
 
-test('allowedOps: commands only when idle (/remote-control only when not bridged); Esc only busy/waiting', () => {
+test('allowedOps: idle → both commands (/remote-control only when not bridged); busy → /compact (queued) + Esc; waiting → Esc only', () => {
   assert.deepEqual(allowedOps('idle', null), ['c', 'r']);
   assert.deepEqual(allowedOps('idle', 'session_x'), ['c']);
-  assert.deepEqual(allowedOps('busy', null), ['e']);
+  assert.deepEqual(allowedOps('busy', null), ['c', 'e']);
   assert.deepEqual(allowedOps('waiting', null), ['e']);
   assert.deepEqual(allowedOps('unknown', null), []);
 });
@@ -130,8 +130,8 @@ test('runner /compact: "Not enough messages" is reported', async () => {
   assert.match(await r.watch(), /chưa đủ tin nhắn/);
 });
 
-test('runner: busy / waiting / unknown / drifted target → refused, NO key sent', async () => {
-  for (const [status, ended, re] of [['busy', true, /đang bận.*Esc/], ['waiting', true, /hộp thoại/], ['shell', false, /đang bận/], ['shell', null, /không rõ/], [null, true, /không rõ/]]) {
+test('runner /compact: waiting (a dialog) / unknown / drifted target → refused, NO key sent', async () => {
+  for (const [status, ended, re] of [['waiting', true, /hộp thoại/], ['shell', null, /không rõ/], [null, true, /không rõ/]]) {
     const { io, st } = fakeIo({ status, ended });
     const r = await new TypeRunner(io).run('c', T);
     assert.match(r.text, re);
@@ -152,7 +152,7 @@ test('runner: a draft in the input box → typed but NO Enter and no other key (
 });
 
 test('runner: state changes between typing and Enter → no Enter', async () => {
-  const { io, st } = fakeIo({ screens: [hc('compact-typed')], onStuff: (s, d) => { if (d === '/compact') s.status = 'busy'; } });
+  const { io, st } = fakeIo({ screens: [hc('compact-typed')], onStuff: (s, d) => { if (d === '/compact') s.status = 'waiting'; } });
   const r = await new TypeRunner(io).run('c', T);
   assert.deepEqual(st.keys, ['/compact']);
   assert.match(r.text, /vừa đổi trạng thái.*KHÔNG Enter/);
@@ -338,4 +338,20 @@ test('Esc after a remote-control chain sent its last key: not reported as a canc
   const runner = new TypeRunner(io);
   runner.locks.add(T.pid); runner.keysDone.add(T.pid);
   assert.match((await runner.run('e', T)).text, /không có gì để dừng/);
+});
+
+test('runner /compact while BUSY: queued (Claude runs it when the turn ends); refused if something is already queued; /remote-control stays idle-only', async () => {
+  const busyScreen = hc('compact-typed').replace('auto mode on', 'auto mode on · esc to interrupt');
+  const { io, st } = fakeIo({ status: 'busy', screens: [busyScreen, hc('compact-typed'), hc('compact-typed')], compact: { preTokens: 733000, postTokens: 9000 } });
+  const r = await new TypeRunner(io).run('c', T);
+  assert.deepEqual(st.keys, ['/compact', '\r']);
+  assert.match(r.text, /đã xếp hàng/);
+  assert.equal(await r.watch(), '✅ đã compact: 733k → 9k');
+  assert.equal(st.audits.find((a) => a.step === 'enter').queued, true);
+  const q = fakeIo({ status: 'busy', screens: [hc('compact-typed') + '\n  Press up to edit queued messages'] });
+  assert.match((await new TypeRunner(q.io).run('c', T)).text, /đã có tin xếp hàng/);
+  assert.deepEqual(q.st.keys, []);
+  const rc = fakeIo({ status: 'busy' });
+  assert.match((await new TypeRunner(rc.io).run('r', T)).text, /đang bận/);
+  assert.deepEqual(rc.st.keys, []);
 });

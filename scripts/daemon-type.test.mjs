@@ -23,10 +23,11 @@ function ui() {
 }
 const cq = (data, text, messageId = 100) => ({ id: 'q', data, from: { id: 42 }, message: { chat: { id: 42 }, message_id: messageId, text } });
 
-test('typeStep2: buttons follow the state (idle → /compact + /remote-control; busy → Esc; bridged → no /remote-control)', () => {
+test('typeStep2: buttons follow the state (idle → /compact + /remote-control; busy → /compact (queued) + Esc; waiting → Esc; bridged → no /remote-control)', () => {
   const ops = (obs) => typeStep2({ target: T, obs, tok: 'a'.repeat(16) }).rows[0].map((b) => b.callback_data.split(':')[2]);
   assert.deepEqual(ops(idle), ['c', 'r', 'x']);
-  assert.deepEqual(ops({ ...idle, state: 'busy' }), ['e', 'x']);
+  assert.deepEqual(ops({ ...idle, state: 'busy' }), ['c', 'e', 'x']);
+  assert.deepEqual(ops({ ...idle, state: 'waiting' }), ['e', 'x']);
   assert.deepEqual(ops({ ...idle, bridge: 'session_B' }), ['c', 'x']);
   assert.deepEqual(ops({ mismatch: 'phiên đã đổi' }), ['x']);
   const s = typeStep2({ target: T, obs: { ...idle, bridge: 'session_B' }, persona: '🧛 Ma', tok: 'a'.repeat(16) });
