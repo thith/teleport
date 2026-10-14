@@ -13,7 +13,7 @@ import { isMainModule } from './is-direct-run.mjs';
 import { listClaudeProcs } from './claude-procs.mjs';
 import { personaByHashtag, normalizeAgentName } from './spawn.mjs';
 import { formatPersona } from './persona.mjs';
-import { shortConvoHash } from './convo-hash.mjs';
+import { uuidToConvoInt } from './convo-registry.mjs';
 
 /**
  * Live sessions matching `query` — a persona name (emoji/case ignored), `#hashtag`, bare hashtag,
@@ -23,14 +23,16 @@ export function resolveSessionNames(query, rows, personaOf = () => null) {
   const q = String(query ?? '').trim();
   if (!q) return [];
   // `#abcd1234` / a convoId = a hashtag only; a bare 8-char word may be a hashtag OR a name ("elephant").
-  const exact = /^#[0-9a-z]{8}$/i.test(q) ? q.slice(1).toLowerCase() : /^\d{9,}$/.test(q) ? shortConvoHash(q) : null;
+  const convo = /^\d{9,}$/.test(q) ? q : null; // a full convoId is compared in FULL (its hashtag is only the last digits)
+  const exact = /^#[0-9a-z]{8}$/i.test(q) ? q.slice(1).toLowerCase() : null;
   const bare = !exact && /^[0-9a-z]{8}$/i.test(q) ? q.toLowerCase() : null;
   const nq = normalizeAgentName(q);
   const byName = (r) => (r.persona && normalizeAgentName(r.persona) === nq) || normalizeAgentName(r.name) === nq;
   return rows
     .filter((r) => r.name)
     .map((r) => ({ ...r, persona: r.hashtag ? personaOf(r.hashtag) : null }))
-    .filter((r) => (exact ? r.hashtag === exact : (bare && r.hashtag === bare) || byName(r)));
+    .filter((r) => (convo ? String(uuidToConvoInt(r.sessionId)) === convo
+      : exact ? r.hashtag === exact : (bare && r.hashtag === bare) || byName(r)));
 }
 
 /** "👻 Ma #c2383556 → 📨 umipay-ae · PID 644406 · busy". Pure. */

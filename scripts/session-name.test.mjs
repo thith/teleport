@@ -1,9 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { resolveSessionNames, formatMatch } from './session-name.mjs';
+import { uuidToConvoInt } from './convo-registry.mjs';
 
 const rows = [
-  { pid: 644406, name: 'umipay-ae', hashtag: 'c2383556', status: 'busy' },
+  { pid: 644406, name: 'umipay-ae', hashtag: 'c2383556', status: 'busy', sessionId: 'ae61d4f1-5ecc-46fe-9cea-75b4c9d9b751' },
   { pid: 331131, name: '🤖 Robot', hashtag: 'd8133684', status: 'shell' },
   { pid: 5, name: 'elephant', hashtag: 'aaaa0000', status: 'idle' },
   { pid: 6, name: null, hashtag: 'bbbb1111' },          // no name → can't be messaged
@@ -20,7 +21,8 @@ test('persona name (emoji / case ignored) → the live session name', () => {
 
 test('#hashtag, convoId, or the session name itself', () => {
   assert.deepEqual(names('#c2383556'), ['umipay-ae']);
-  assert.deepEqual(names('3067763322383556'), ['umipay-ae']); // convoId → its hashtag
+  assert.deepEqual(names(String(uuidToConvoInt('ae61d4f1-5ecc-46fe-9cea-75b4c9d9b751'))), ['umipay-ae']); // full convoId
+  assert.deepEqual(names('2067763322383556'), []); // same last digits, different convo → no match
   assert.deepEqual(names('umipay-ae'), ['umipay-ae']);
   assert.deepEqual(names('x-1'), ['x-1']);
 });
