@@ -84,6 +84,7 @@ test('formatContext / contextWindowFor: % only with a configured window (never g
   assert.equal(contextWindowFor(cfg, { hashtag: 'abcd1234', model: 'claude-opus-5-5' }), 200000); // per-agent first
   assert.equal(contextWindowFor(cfg, { hashtag: 'ffff0000', model: 'claude-opus-5-5' }), 1000000);
   assert.equal(contextWindowFor({}, { model: 'claude-opus-5-5' }), null);
+  assert.equal(contextWindowFor({ _config: { contextWindows: { abcd1234: 300000 } } }, { hashtag: 'abcd1234' }), 300000); // bare hashtag key
 });
 
 test('parseJsonl / readTail: a cut first line and garbage are skipped; the window grows until it decides', () => {
@@ -112,6 +113,14 @@ test('compactAfter: only a NEW manual boundary after the recorded offset; shrunk
   assert.deepEqual(compactAfter(f, offset), { preTokens: 763065, postTokens: 8080 });
   fs.writeFileSync(f, '');
   assert.match(compactAfter(f, offset).error, /cắt ngắn/);
+  // replaced by ANOTHER (bigger) file holding a manual boundary → not attributed to us
+  const g = path.join(dir, 'g.jsonl');
+  fs.writeFileSync(f, 'x'.repeat(10) + '\n');
+  const st = fs.statSync(f);
+  const base = { size: st.size, ino: st.ino, dev: st.dev };
+  fs.writeFileSync(g, 'x'.repeat(10) + '\n' + JSON.stringify(sys('compact_boundary', { compactMetadata: { trigger: 'manual', postTokens: 1 } })) + '\n');
+  fs.renameSync(g, f);
+  assert.match(compactAfter(f, base).error, /thay file/);
   assert.match(compactAfter(path.join(dir, 'gone'), 0).error, /biến mất/);
 });
 

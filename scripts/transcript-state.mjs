@@ -87,13 +87,13 @@ export function fmtTokens(n) {
 }
 
 /**
- * Context window for a session: `_config.contextWindows` keyed by hashtag (`#abcd1234`) or model id.
+ * Context window for a session: `_config.contextWindows` keyed by hashtag (`#abcd1234` or `abcd1234`) or model id.
  * Never guessed from the model id alone (the transcript's id has no `[1m]`). → number | null. Pure.
  */
 export function contextWindowFor(cfg, { hashtag = null, model = null } = {}) {
   const w = cfg?._config?.contextWindows;
   if (!w || typeof w !== 'object') return null;
-  for (const k of [hashtag && `#${hashtag}`, model]) {
+  for (const k of [hashtag && `#${hashtag}`, hashtag, model]) {
     const v = k ? Number(w[k]) : NaN;
     if (Number.isFinite(v) && v > 0) return v;
   }
@@ -167,24 +167,26 @@ export function transcriptState(sessionId, cwd, opts = {}) {
 }
 
 /**
- * A manual compact_boundary written AFTER byte `offset` (the size recorded before typing).
- * → { postTokens, preTokens } | null (not yet) | { error } (file shrank / replaced).
+ * A manual compact_boundary written AFTER the baseline `{ size, ino, dev }` recorded before typing
+ * (a bare number = size only). → { postTokens, preTokens } | null (not yet) | { error } (file shrank
+ * or was replaced — a boundary in another file can't be attributed to our command).
  */
-export function compactAfter(file, offset) {
-  let size;
-  try { size = fs.statSync(file).size; } catch { return { error: 'transcript biến mất' }; }
-  if (size < offset) return { error: 'transcript bị cắt ngắn / thay' };
-  if (size === offset) return null;
-  let text = '';
+export function compactAfter(file, base) {
+  const b = typeof base === 'number' ? { size: base } : (base || {});
+  let fd;
+  try { fd = fs.openSync(file, 'r'); } catch { return { error: 'transcript biến mất' }; }
   try {
-    const fd = fs.openSync(file, 'r');
-    try { const buf = Buffer.alloc(size - offset); fs.readSync(fd, buf, 0, size - offset, offset); text = buf.toString('utf8'); }
-    finally { fs.closeSync(fd); }
-  } catch { return null; }
-  for (const j of parseJsonl(text)) {
-    if (j.type === 'system' && j.subtype === 'compact_boundary' && !j.isSidechain && j.compactMetadata?.trigger === 'manual') {
-      return { postTokens: Number(j.compactMetadata.postTokens) || null, preTokens: Number(j.compactMetadata.preTokens) || null };
+    const st = fs.fstatSync(fd); // identity + size of the file we actually read
+    if ((b.ino != null && st.ino !== b.ino) || (b.dev != null && st.dev !== b.dev)) return { error: 'transcript bị thay file' };
+    if (st.size < b.size) return { error: 'transcript bị cắt ngắn / thay' };
+    if (st.size === b.size) return null;
+    const buf = Buffer.alloc(st.size - b.size);
+    fs.readSync(fd, buf, 0, buf.length, b.size);
+    for (const j of parseJsonl(buf.toString('utf8'))) {
+      if (j.type === 'system' && j.subtype === 'compact_boundary' && !j.isSidechain && j.compactMetadata?.trigger === 'manual') {
+        return { postTokens: Number(j.compactMetadata.postTokens) || null, preTokens: Number(j.compactMetadata.preTokens) || null };
+      }
     }
-  }
-  return null;
+    return null;
+  } catch { return null; } finally { try { fs.closeSync(fd); } catch {} }
 }

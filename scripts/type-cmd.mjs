@@ -53,9 +53,12 @@ export function allowedOps(state, bridgeSessionId) {
   return [];
 }
 
-/** listClaudeProcs rows → agents /type can reach: a tele-* screen whose DIRECT child is claude, known session. Pure. */
+/**
+ * listClaudeProcs rows → agents /type can reach: screen `tele-<its own hashtag>` (a session switched
+ * in place no longer matches its screen → not listed), claude its DIRECT child, known session. Pure.
+ */
 export function typeTargets(rows) {
-  return rows.filter((r) => typeof r.screen === 'string' && r.screen.startsWith('tele-')
+  return rows.filter((r) => typeof r.screen === 'string' && r.hashtag && r.screen === `tele-${r.hashtag}`
     && r.screenPid && r.ppid === r.screenPid && r.sessionId && !r.guessed && r.procStart);
 }
 
@@ -83,12 +86,15 @@ export function messageNamesTarget(text, t) {
  * are indented. → its text (trimmed) or null. Pure.
  */
 export function parseInputLine(screenText) {
-  let found = null;
-  for (const raw of String(screenText || '').split('\n')) {
-    const l = raw.replace(/\0/g, '');
-    if (/^[^\s] /.test(l)) found = l.slice(2).replace(/[\s ]+$/, '');
-  }
-  return found;
+  const lines = String(screenText || '').split('\n');
+  let idx = -1;
+  for (const [i, raw] of lines.entries()) if (/^[^\s]\u00a0/.test(raw.replace(/\0/g, ''))) idx = i;
+  if (idx < 0) return null;
+  const text = lines[idx].replace(/\0/g, '').slice(2).replace(/[\s\u00a0]+$/, '');
+  // The box's bottom border ('─' → NUL bytes in hardcopy) must follow: anything else is a
+  // multi-line draft below the prompt line → reported as extra text (never equals the command).
+  const next = lines[idx + 1] ?? '';
+  return /^\0+\s*$/.test(next) ? text : `${text} ⏎ ${next.replace(/\0/g, '').trim()}…`;
 }
 
 /** The suggestion box selects `cmd` (marker + cmd + description). Pure. */
@@ -123,7 +129,7 @@ export function defaultIo({ exec = execFileSync, sessionsDir = SESSIONS_DIR } = 
     proc: (pid) => inspectPid(pid),
     session: (pid) => { try { return parseSessionFile(fs.readFileSync(path.join(sessionsDir, `${pid}.json`), 'utf8')); } catch { return null; } },
     ppid: (pid) => { try { const s = fs.readFileSync(`/proc/${pid}/stat`, 'utf8'); return Number(s.slice(s.lastIndexOf(')') + 2).split(' ')[1]); } catch { return null; } },
-    windows: (sid) => { try { const out = String(exec('screen', ['-S', sid, '-Q', 'windows'], { encoding: 'utf8', timeout: 5000 })); return (out.match(/(?:^|\s{2})\d+\S*\s/g) || []).length; } catch { return null; } },
+    windows: (sid) => { try { const out = String(exec('screen', ['-S', sid, '-Q', 'windows'], { encoding: 'utf8', timeout: 5000 })); return (out.match(/(?:^|\s{2})\d+\S*(?:\s|$)/g) || []).length; } catch { return null; } },
     stuff: (sid, data) => exec('screen', ['-S', sid, '-p', '0', '-X', 'stuff', data], { timeout: 5000 }),
     hardcopy: async (sid) => {
       const f = path.join(os.tmpdir(), `teleport-type-${process.pid}-${crypto.randomBytes(4).toString('hex')}.txt`);
@@ -138,7 +144,7 @@ export function defaultIo({ exec = execFileSync, sessionsDir = SESSIONS_DIR } = 
     },
     transcript: (sessionId, cwd) => transcriptState(sessionId, cwd),
     transcriptFile: (sessionId, cwd) => findTranscript(sessionId, cwd),
-    transcriptSize: (file) => { try { return fs.statSync(file).size; } catch { return null; } },
+    transcriptSize: (file) => { try { const st = fs.statSync(file); return { size: st.size, ino: st.ino, dev: st.dev }; } catch { return null; } },
     compactAfter,
     audit: (entry) => { try { fs.mkdirSync(path.dirname(AUDIT_FILE), { recursive: true }); fs.appendFileSync(AUDIT_FILE, JSON.stringify({ at: new Date().toISOString(), ...entry }) + '\n', { mode: 0o600 }); } catch {} },
   };
@@ -172,7 +178,8 @@ export class TypeRunner {
     this.io = io;
     this.locks = new Set();
     this.cooldown = new Map(); // pid → until
-    this.lastEsc = new Map();  // pid → at
+    this.lastEsc = new Map();  // pid → time of the last Esc actually SENT
+    this.escInFlight = new Set();
     this.cancel = new Map();   // pid → true while a chain should stop
   }
 
@@ -205,16 +212,17 @@ export class TypeRunner {
       return { text: `⚠️ ô nhập có chữ khác (đọc được: "${line ?? '?'}") — đã gõ ${cmd} nhưng KHÔNG Enter, không gửi thêm phím nào. Vào xoá tay.` };
     }
     const mid = observe(t, io);
+    if (this.cancel.get(t.pid)) { audit('cancelled'); return { text: `✖ đã huỷ (⎋ Esc) — đã gõ ${cmd} nhưng KHÔNG Enter.` }; }
     if (mid.mismatch || mid.state !== 'idle') {
       audit('changed-before-enter', { reason: mid.mismatch || mid.state });
       return { text: `⚠️ agent vừa đổi trạng thái (${mid.mismatch || STATE_LABEL[mid.state]}) — đã gõ ${cmd} nhưng KHÔNG Enter. Kiểm tra tay.` };
     }
     const file = io.transcriptFile(t.sessionId, t.cwd);
-    const offset = file ? io.transcriptSize(file) : null;
+    const offset = file ? io.transcriptSize(file) : null; // { size, ino, dev } — replacement-proof baseline
     io.stuff(sid, '\r');
     this.cooldown.set(t.pid, io.now() + COOLDOWN_MS);
     audit('enter');
-    return { ok: true, file, offset };
+    return { ok: true, file, offset, screenBefore: scr };
   }
 
   async compact(t, audit) {
@@ -225,7 +233,11 @@ export class TypeRunner {
       const until = io.now() + COMPACT_WATCH_MS;
       await io.sleep(3000);
       const scr = await io.hardcopy(screenId(t));
-      if (/Not enough messages to compact/.test(scr || '')) { audit('result', { result: 'not-enough' }); return 'ℹ️ Claude báo: chưa đủ tin nhắn để compact.'; }
+      const notEnough = (x) => (String(x || '').match(/Not enough messages to compact/g) || []).length;
+      if (notEnough(scr) > notEnough(r.screenBefore)) { // a NEW one — an old line may still be on screen
+        audit('result', { result: 'not-enough' });
+        return 'ℹ️ Claude báo: chưa đủ tin nhắn để compact.';
+      }
       if (!r.file || r.offset == null) return '❔ không tìm thấy transcript để theo dõi kết quả.';
       while (io.now() < until) {
         const c = io.compactAfter(r.file, r.offset);
@@ -275,26 +287,42 @@ export class TypeRunner {
 
   async esc(t, audit) {
     const io = this.io;
+    // One Esc in flight per agent (across every wait below), and the 3 s gap is measured
+    // against ACTUAL sends — two quick Escs at idle open the Rewind menu.
+    if (this.escInFlight.has(t.pid)) return { text: '⏳ đang gửi Esc — đợi chút.' };
     const last = this.lastEsc.get(t.pid);
     if (last != null && io.now() - last < ESC_GAP_MS) return { text: '⏳ vừa gửi Esc — đợi 3 giây (Esc kép mở menu Rewind).' };
-    this.lastEsc.set(t.pid, io.now()); // claim now: a second press during the waits below is refused
-    const unclaim = () => { if (last == null) this.lastEsc.delete(t.pid); else this.lastEsc.set(t.pid, last); };
-    this.cancel.set(t.pid, true); // a /remote-control chain in progress stops at its next step
-    const cool = (this.cooldown.get(t.pid) || 0) - io.now();
-    if (cool > 0) await io.sleep(cool); // right after Enter the session file still says idle
-    const o = observe(t, io);
-    if (o.mismatch) { unclaim(); audit('refused', { reason: o.mismatch }); return { text: `❌ agent đã đổi phiên (${o.mismatch}) — gõ /type lại.` }; }
-    if (o.state !== 'busy' && o.state !== 'waiting') { unclaim(); audit('refused', { reason: o.state }); return { text: `ℹ️ agent ${STATE_LABEL[o.state]} — không có gì để dừng.` }; }
-    await io.sleep(300); // quiet before, so it isn't read as part of an escape sequence
-    io.stuff(screenId(t), '\x1b');
-    this.lastEsc.set(t.pid, io.now());
-    audit('esc', { status: o.status });
-    await io.sleep(ESC_GAP_MS);
-    const after = observe(t, io);
-    const text = after.mismatch ? `⌨️ đã gửi Esc; giờ ${after.mismatch}.`
-      : after.state === 'idle' ? '⌨️ đã gửi Esc — đã ngắt, giờ rảnh.'
-        : `⌨️ đã gửi Esc — giờ ${STATE_LABEL[after.state]}.`;
-    audit('result', { result: after.mismatch || after.state });
-    return { text };
+    this.escInFlight.add(t.pid);
+    try {
+      // A /remote-control chain in progress stops at its next step — and the owner is told so,
+      // even when there is nothing for the Esc key itself to stop.
+      const chain = this.locks.has(t.pid);
+      this.cancel.set(t.pid, true);
+      // Right after an Enter the session file still says idle: wait (≤ cool-down) until it shows busy/waiting.
+      while ((this.cooldown.get(t.pid) || 0) > io.now()) {
+        const w = observe(t, io);
+        if (w.mismatch || w.state === 'busy' || w.state === 'waiting') break;
+        await io.sleep(250);
+      }
+      await io.sleep(300); // quiet before, so it isn't read as part of an escape sequence
+      const o = observe(t, io); // validated IMMEDIATELY before the key
+      if (o.mismatch) { audit('refused', { reason: o.mismatch }); return { text: `❌ agent đã đổi phiên (${o.mismatch}) — gõ /type lại.` }; }
+      if (o.state !== 'busy' && o.state !== 'waiting') {
+        audit('refused', { reason: o.state, chain });
+        return { text: chain ? '✖ đã huỷ lệnh đang gõ dở (không gửi phím Esc — agent không bận).' : `ℹ️ agent ${STATE_LABEL[o.state]} — không có gì để dừng.` };
+      }
+      const prev = this.lastEsc.get(t.pid);
+      if (prev != null && io.now() - prev < ESC_GAP_MS) return { text: '⏳ vừa gửi Esc — đợi 3 giây (Esc kép mở menu Rewind).' };
+      io.stuff(screenId(t), '\x1b');
+      this.lastEsc.set(t.pid, io.now());
+      audit('esc', { status: o.status });
+      await io.sleep(ESC_GAP_MS);
+      const after = observe(t, io);
+      const text = after.mismatch ? `⌨️ đã gửi Esc; giờ ${after.mismatch}.`
+        : after.state === 'idle' ? '⌨️ đã gửi Esc — đã ngắt, giờ rảnh.'
+          : `⌨️ đã gửi Esc — giờ ${STATE_LABEL[after.state]}.`;
+      audit('result', { result: after.mismatch || after.state });
+      return { text };
+    } finally { this.escInFlight.delete(t.pid); }
   }
 }
