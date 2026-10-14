@@ -87,7 +87,7 @@ export function readQueue(name, { dir = LOCK_DIR, now = Date.now(), stat = procS
   const q = lockPaths(name, dir).queue;
   let files = [];
   try { files = fs.readdirSync(q).filter((f) => TICKET_RE.test(f)).sort(); } catch { return []; }
-  if (prune) pruneLeft(q, stat);
+  if (prune) { pruneLeft(q, stat); pruneHolderTmp(dir); }
   const out = [];
   for (const f of files) {
     const file = path.join(q, f);
@@ -137,6 +137,13 @@ export function readClaimed(name, { dir = LOCK_DIR, stat = procStat } = {}) {
   return out;
 }
 
+/** A holder.json temp file left by a writer that died mid-write (older than a minute). */
+function pruneHolderTmp(dir, now = Date.now()) {
+  let files = [];
+  try { files = fs.readdirSync(dir).filter((f) => /\.holder\.json\.\d+\.[a-z0-9]+\.tmp$/.test(f)); } catch { return; }
+  for (const f of files) { try { const file = path.join(dir, f); if (now - fs.statSync(file).mtimeMs > 60_000) fs.unlinkSync(file); } catch {} }
+}
+
 /** Housekeeping: `.left` / `.acq` files of dead owners, and `.tmp` files older than a minute (writer died mid-write). */
 function pruneLeft(q, stat, now = Date.now()) {
   let files = [];
@@ -144,7 +151,10 @@ function pruneLeft(q, stat, now = Date.now()) {
   for (const f of files) {
     const file = path.join(q, f);
     if (/^\d{15}-(\d+)-[a-z0-9]+\.(left|acq)$/.test(f)) {
-      if (!stat(Number(f.split('-')[1]))) { try { fs.unlinkSync(file); } catch {} }
+      let t = null;
+      try { t = JSON.parse(fs.readFileSync(file, 'utf8')); } catch {}
+      // same "dead" rule as tickets: gone, zombie, or the pid now belongs to another process
+      if (ticketStatus(t || { pid: Number(f.split('-')[1]) }, now, { now, stat }) === 'dead') { try { fs.unlinkSync(file); } catch {} }
     } else if (f.endsWith('.tmp')) {
       try { if (now - fs.statSync(file).mtimeMs > 60_000) fs.unlinkSync(file); } catch {}
     }
@@ -298,7 +308,8 @@ export async function acquireLock(name, {
     if (released) return;
     released = true;
     // Holder file first, while we still hold the lock — no race with the next holder.
-    try { if (readHolder(p.holder)?.pid === process.pid) fs.unlinkSync(p.holder); } catch {}
+    // (match this acquisition, not just our pid: the daemon may hold several in turn)
+    try { const h = readHolder(p.holder); if (h?.pid === process.pid && h.startedAt === me.startedAt && h.ticket === me.ticket) fs.unlinkSync(p.holder); } catch {}
     try { fs.closeSync(fd); } catch {}
   };
   return { release, waitedMs: me.startedAt - start };

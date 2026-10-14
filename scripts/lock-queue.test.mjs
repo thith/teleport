@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { acquireLock, readQueue, cancelTickets, ticketStatus, procStat, lockPaths } from './machine-lock.mjs';
+import { acquireLock, readQueue, readHolder, cancelTickets, ticketStatus, procStat, lockPaths } from './machine-lock.mjs';
 import { leave, formatQueue, parseArgs } from './lock-queue.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -13,6 +13,9 @@ const tmpDir = () => fs.mkdtempSync(path.join(os.tmpdir(), 'tp-q-'));
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // Wait (≤10 s) until `label` has a ticket in the queue — child start-up time varies with load.
 async function queuedFor(dir, label) { for (let i = 0; i < 200; i++) { if (readQueue('build', { dir }).some((t) => t.label === label)) return; await sleep(50); } throw new Error(`no ticket for ${label}`); }
+
+// The test process itself holds the lock (no child start-up race), and releases it when told.
+async function holdHere(dir) { const l = await acquireLock('build', { dir, waitSec: 5, label: 'H', convoId: null }); assert.ok(l.release); return l; }
 
 // A child that takes lock `build` in `dir`, prints "got <label>", holds `holdMs`, exits.
 function child(dir, label, holdMs, extra = {}) {
@@ -32,16 +35,15 @@ function child(dir, label, holdMs, extra = {}) {
 
 test('FIFO: waiters get the lock in arrival order (no racing past an older waiter)', async () => {
   const dir = tmpDir();
-  const order = [];
-  const a = child(dir, 'A', 3000);
-  for (let i = 0; i < 200 && !a.out.includes('got A'); i++) await sleep(50);
+  const h = await holdHere(dir); // held until every waiter has published its ticket
   const kids = [];
   for (const l of ['B', 'C', 'D', 'E']) { kids.push(child(dir, l, 150)); await queuedFor(dir, l); }
-  const all = [a, ...kids];
-  await Promise.all(all.map((k) => k.done));
-  // (from each child's own "got X <ms>" line — a listener attached late could miss one)
-  for (const k of all) for (const m of k.out.matchAll(/got (\w) (\d+)/g)) order.push([m[1], Number(m[2])]);
-  assert.deepEqual(order.sort((x, y) => x[1] - y[1]).map((x) => x[0]), ['A', 'B', 'C', 'D', 'E']);
+  h.release();
+  const codes = await Promise.all(kids.map((k) => k.done));
+  assert.deepEqual(codes, [0, 0, 0, 0]);
+  const order = [];
+  for (const k of kids) for (const m of k.out.matchAll(/got (\w) (\d+)/g)) order.push([m[1], Number(m[2])]);
+  assert.deepEqual(order.sort((x, y) => x[1] - y[1]).map((x) => x[0]), ['B', 'C', 'D', 'E']);
   assert.deepEqual(fs.readdirSync(lockPaths('build', dir).queue).filter((f) => !f.startsWith('.')), [], 'no tickets left behind');
 });
 
@@ -66,8 +68,6 @@ test('try-once never jumps a LIVE waiter, but a stalled / stopped one does not b
 });
 
 
-// The test process itself holds the lock (no child start-up race), and releases it when told.
-async function holdHere(dir) { const l = await acquireLock('build', { dir, waitSec: 5, label: 'H', convoId: null }); assert.ok(l.release); return l; }
 
 test('leave: a struck waiter exits without ever holding the lock; the next one goes on', async () => {
   const dir = tmpDir();
@@ -193,4 +193,30 @@ test('formatQueue (for /health and ls): holder, order, every status incl. struck
   assert.match(lines[4], /4\. pid 4 — bị dừng/);
   assert.deepEqual(parseArgs(['leave', '--lock', 'build', '--pid', '42']), { cmd: 'leave', lock: 'build', pid: 42 });
   assert.match(parseArgs(['leave', '--lock', 'nope']).error, /lock phải/);
+});
+
+test('several tickets in ONE process (the daemon): served in order, each release removes only its own holder record', async () => {
+  const dir = tmpDir();
+  const h = await holdHere(dir);
+  const got = [];
+  const p1 = acquireLock('build', { dir, pollMs: 20, label: 'one', convoId: null }).then((l) => { got.push('one'); return l; });
+  await queuedFor(dir, 'one');
+  const p2 = acquireLock('build', { dir, pollMs: 20, label: 'two', convoId: null }).then((l) => { got.push('two'); return l; });
+  await queuedFor(dir, 'two');
+  h.release();
+  const l1 = await p1;
+  assert.equal(readHolder(lockPaths('build', dir).holder).label, 'one');
+  l1.release();
+  const l2 = await p2;
+  l1.release(); // a late/double release of the first must not remove the second's record
+  assert.equal(readHolder(lockPaths('build', dir).holder).label, 'two');
+  l2.release();
+  assert.deepEqual(got, ['one', 'two']);
+});
+
+test('formatQueue: "đang nhận lock" names the first LIVE ticket, never a stopped / stalled one', () => {
+  const lines = formatQueue('build', { holderOf: () => null, struck: () => [],
+    read: () => [{ name: 'a.json', status: 'stopped', pid: 1, label: 'S', createdAt: 0 }, { name: 'b.json', status: 'live', pid: 2, label: 'L', createdAt: 0 }] });
+  assert.match(lines[0], /trống — L đang nhận lock/);
+  assert.match(formatQueue('build', { holderOf: () => null, struck: () => [], read: () => [{ name: 'a.json', status: 'stalled', pid: 1, createdAt: 0 }] })[0], /build: trống$/);
 });

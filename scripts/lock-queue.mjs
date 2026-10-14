@@ -24,7 +24,8 @@ export function formatQueue(name, { dir = LOCK_DIR, now = Date.now(), max = LIST
   const holder = holderOf(`${dir}/${name}.holder.json`);
   const q = [...read(name, { dir, now }).filter((t) => t.status !== 'dead'), ...struck(name, { dir }).map((t) => ({ ...t, status: 'left' }))]
     .sort((a, b) => (a.name < b.name ? -1 : 1));
-  const lines = [`🔒 ${name}: ${holder?.alive ? `đang giữ — ${describeHolder(holder, now)}` : q.length ? `trống — ${q[0].label || `pid ${q[0].pid}`} đang nhận lock` : 'trống'}`];
+  const head = q.find((t) => t.status === 'live');
+  const lines = [`🔒 ${name}: ${holder?.alive ? `đang giữ — ${describeHolder(holder, now)}` : head ? `trống — ${head.label || `pid ${head.pid}`} đang nhận lock` : 'trống'}`];
   q.slice(0, max).forEach((t, i) => lines.push(`  ${i + 1}. ${t.label || `pid ${t.pid}`}${t.cmd ? ` — ${t.cmd}` : ''} — ${STATUS_TEXT[t.status] || t.status} ${mins(now - t.createdAt)} phút (pid ${t.pid})`));
   if (q.length > max) lines.push(`  … và ${q.length - max} vé nữa`);
   return lines;
