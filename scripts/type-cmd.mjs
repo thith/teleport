@@ -18,7 +18,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { listClaudeProcs, parseSessionFile, inspectPid, SESSIONS_DIR } from './claude-procs.mjs';
-import { transcriptState, findTranscript, compactAfter, formatContext, contextWindowFor } from './transcript-state.mjs';
+import { transcriptState, findTranscript, compactAfter, formatContext, contextWindowFor, fmtTokens } from './transcript-state.mjs';
 
 export const TYPE_BUTTON_TTL_MS = 10 * 60 * 1000;
 export const TYPE_GAP_MS = 500;          // text → Enter (paste detection / suggestion box)
@@ -103,6 +103,17 @@ export function suggestionSelects(screenText, cmd) {
   return new RegExp(`^\\s+\\S ${esc}\\s{2,}\\S`, 'm').test(String(screenText || '').replace(/\0/g, ''));
 }
 
+/**
+ * "Not enough messages to compact" printed for the LAST submitted `/compact` (a history line
+ * "<glyph> /compact" with a plain space), i.e. below it — not an older one still on screen. Pure.
+ */
+export function compactRefusedOnScreen(screenText) {
+  const lines = String(screenText || '').split('\n').map((l) => l.replace(/\0/g, ''));
+  let last = -1;
+  for (const [i, l] of lines.entries()) if (/^\S \/compact\s*$/.test(l)) last = i;
+  return last >= 0 && lines.slice(last + 1).some((l) => /Not enough messages to compact/.test(l));
+}
+
 /** Remote Control's enable dialog is up with option 1 ("Enable") selected. Pure. */
 export function rcDialogReady(screenText) {
   return /^\s*\S\s+1\.\s+Enable Remote Control/m.test(String(screenText || '').replace(/\0/g, ''));
@@ -180,6 +191,7 @@ export class TypeRunner {
     this.cooldown = new Map(); // pid → until
     this.lastEsc = new Map();  // pid → time of the last Esc actually SENT
     this.escInFlight = new Set();
+    this.keysDone = new Set(); // pid whose running chain has sent its last key
     this.cancel = new Map();   // pid → true while a chain should stop
   }
 
@@ -191,8 +203,9 @@ export class TypeRunner {
     if ((this.cooldown.get(t.pid) || 0) > this.io.now()) return { text: '⏳ vừa gõ lệnh vào agent này — đợi vài giây rồi thử lại.' };
     this.locks.add(t.pid);
     this.cancel.delete(t.pid);
+    this.keysDone.delete(t.pid);
     try { return op === 'c' ? await this.compact(t, audit) : await this.remoteControl(t, audit); }
-    finally { this.locks.delete(t.pid); }
+    finally { this.locks.delete(t.pid); this.keysDone.delete(t.pid); }
   }
 
   /** Common part: check → type the command → verify on screen → re-check → Enter. → { ok } | { text }. */
@@ -233,8 +246,7 @@ export class TypeRunner {
       const until = io.now() + COMPACT_WATCH_MS;
       await io.sleep(3000);
       const scr = await io.hardcopy(screenId(t));
-      const notEnough = (x) => (String(x || '').match(/Not enough messages to compact/g) || []).length;
-      if (notEnough(scr) > notEnough(r.screenBefore)) { // a NEW one — an old line may still be on screen
+      if (compactRefusedOnScreen(scr)) { // tied to the LAST submitted /compact — an old one may still be on screen
         audit('result', { result: 'not-enough' });
         return 'ℹ️ Claude báo: chưa đủ tin nhắn để compact.';
       }
@@ -244,8 +256,7 @@ export class TypeRunner {
         if (c?.error) { audit('result', { result: c.error }); return `❔ không theo dõi được (${c.error}).`; }
         if (c) {
           audit('result', { result: 'compacted', ...c });
-          const fmt = (n) => (n == null ? '?' : n >= 1000 ? `${Math.round(n / 1000)}k` : String(n));
-          return `✅ đã compact: ${fmt(c.preTokens)} → ${fmt(c.postTokens)}`;
+          return `✅ đã compact: ${fmtTokens(c.preTokens)} → ${fmtTokens(c.postTokens)}`;
         }
         await io.sleep(5000);
       }
@@ -275,6 +286,7 @@ export class TypeRunner {
       return { text: '✖ dừng trước Enter thứ hai (đã huỷ hoặc trạng thái đổi) — kiểm tra tay.' };
     }
     io.stuff(sid, '\r');
+    this.keysDone.add(t.pid);
     audit('enter2');
     for (const end = io.now() + RC_BRIDGE_WAIT_MS; io.now() < end;) {
       await io.sleep(1000);
@@ -296,7 +308,7 @@ export class TypeRunner {
     try {
       // A /remote-control chain in progress stops at its next step — and the owner is told so,
       // even when there is nothing for the Esc key itself to stop.
-      const chain = this.locks.has(t.pid);
+      const chain = this.locks.has(t.pid) && !this.keysDone.has(t.pid); // a chain that can still send keys
       this.cancel.set(t.pid, true);
       // Right after an Enter the session file still says idle: wait (≤ cool-down) until it shows busy/waiting.
       while ((this.cooldown.get(t.pid) || 0) > io.now()) {

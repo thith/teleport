@@ -912,9 +912,11 @@ export function typeStep2({ target, obs, persona, cfg = {}, tok }) {
 export async function startType(rest, ctx, { list = listForType, io = defaultIo() } = {}) {
   const { daemonUserId, projectsConfig, sendText, sendButtonRows, buttonStore } = ctx;
   if (!sendButtonRows || !buttonStore) { await sendText(daemonUserId, '❌ /type cần chạy trong daemon.'); return; }
+  const toks = tokenizeArgs(rest);
+  const want = (toks[0] || '').replace(/^#/, '').toLowerCase();
+  if (toks.length > 1 || (want && !/^[0-9a-z]{8}$/.test(want))) { await sendText(daemonUserId, 'usage: /type  ·  /type #<hashtag>   (lệnh chọn bằng nút)'); return; }
   const personaOf = personaLookup();
   const agents = list({ personaOf, cfg: projectsConfig, io });
-  const want = String(rest || '').trim().replace(/^#/, '').toLowerCase();
   if (want) {
     const a = agents.find((x) => x.target.hashtag === want);
     if (!a) { await sendText(daemonUserId, `❌ không thấy agent #${want} trong screen tele-* (agent mở trong terminal thường không gõ vào được).`); return; }

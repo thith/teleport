@@ -184,7 +184,8 @@ export function compactAfter(file, base) {
     fs.readSync(fd, buf, 0, buf.length, b.size);
     for (const j of parseJsonl(buf.toString('utf8'))) {
       if (j.type === 'system' && j.subtype === 'compact_boundary' && !j.isSidechain && j.compactMetadata?.trigger === 'manual') {
-        return { postTokens: Number(j.compactMetadata.postTokens) || null, preTokens: Number(j.compactMetadata.preTokens) || null };
+        const num = (v) => (v != null && Number.isFinite(Number(v)) ? Number(v) : null);
+        return { postTokens: num(j.compactMetadata.postTokens), preTokens: num(j.compactMetadata.preTokens) };
       }
     }
     return null;

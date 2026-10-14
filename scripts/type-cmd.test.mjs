@@ -5,7 +5,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   classify, allowedOps, typeTargets, pinTarget, agentLine, messageNamesTarget, parseInputLine, suggestionSelects,
-  rcDialogReady, targetMismatch, TypeRunner, TYPE_BUTTON_RE, COOLDOWN_MS, defaultIo,
+  rcDialogReady, targetMismatch, TypeRunner, TYPE_BUTTON_RE, COOLDOWN_MS, defaultIo, compactRefusedOnScreen,
 } from './type-cmd.mjs';
 
 const FIX = path.join(path.dirname(fileURLToPath(import.meta.url)), 'fixtures', 'type-hardcopy');
@@ -315,4 +315,27 @@ test('Esc while a /remote-control chain runs but the agent is not busy: chain ca
   assert.deepEqual(st.keys, []);
   assert.equal(runner.cancel.get(T.pid), true);
   assert.match(r.text, /đã huỷ lệnh đang gõ dở/);
+});
+
+test('compactRefusedOnScreen: only an error BELOW the last submitted /compact counts (old ones may scroll off or stay)', () => {
+  assert.equal(compactRefusedOnScreen(hc('compact-done-empty')), true); // our /compact, error right below
+  const old = 'o /compact\n  x  Not enough messages to compact.\no /compact\n  x  Compacted\n';
+  assert.equal(compactRefusedOnScreen(old), false); // the error belongs to an EARLIER /compact
+  const scrolledOff = 'o /compact\n  x  Not enough messages to compact.\n'; // old error scrolled away; only ours visible
+  assert.equal(compactRefusedOnScreen(scrolledOff), true);
+  assert.equal(compactRefusedOnScreen(hc('compact-typed')), false); // nothing submitted yet
+});
+
+test('/compact: a NEW refusal is seen even when an old one scrolled off (same count on screen)', async () => {
+  const before = hc('compact-typed') + '\n  x  Not enough messages to compact.';
+  const { io } = fakeIo({ screens: [before, hc('compact-done-empty')] });
+  const r = await new TypeRunner(io).run('c', T);
+  assert.match(await r.watch(), /chưa đủ tin nhắn/);
+});
+
+test('Esc after a remote-control chain sent its last key: not reported as a cancel', async () => {
+  const { io } = fakeIo({ status: 'idle' });
+  const runner = new TypeRunner(io);
+  runner.locks.add(T.pid); runner.keysDone.add(T.pid);
+  assert.match((await runner.run('e', T)).text, /không có gì để dừng/);
 });

@@ -119,3 +119,11 @@ test('button store: merge taker never consumes /type (or any kind) entries; /typ
   assert.equal(takeTypeButton('f', { store: fresh, now: 1000 }).kind, 'type');
   assert.equal(fresh.size, 0);
 });
+
+test('/type arguments: one optional #hashtag; anything else → usage (never a lookup of junk)', async () => {
+  for (const bad of ['#c2383556 /compact', 'not-a-hash', '#c23835']) {
+    const { ctx, calls } = ui();
+    await startType(bad, ctx, { list: () => { throw new Error('must not list'); } });
+    assert.match(calls[0][1], /usage: \/type/);
+  }
+});
