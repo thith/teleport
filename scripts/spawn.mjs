@@ -44,6 +44,7 @@ import {
   formatAgentList, parseKillPidArg, killClaudePid, KILL_PID_GRACE_MS, inspectPid, etimeToSeconds,
 } from './claude-procs.mjs';
 import { readProjectsConfig, resolveDaemonUserId } from './projects-config.mjs';
+import { transcriptState, formatContext, contextWindowFor } from './transcript-state.mjs';
 import { splitForwarded, misplacedFlag, parseExtraArgs, saveExtraArgs, clearExtraArgs, loadExtraArgs, isOwnerCaller } from './spawn-extra-args.mjs';
 
 export const SPAWN_PROMPT = 'Find and read process.md and review-guide.md if present in this project, then Telegram me and wait for instructions';
@@ -1207,6 +1208,8 @@ if (isDirectRun) {
     let wiped = [];
     const screens = hasBinary('screen') ? listSpawnSessions(undefined, { onWiped: (n) => { wiped = n; } }) : [];
     const pmap = personaByHashtag();
+    let cfg = {};
+    try { cfg = readProjectsConfig(path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'projects.json')); } catch {}
     // Listener alive / unread / busy per convo — best-effort, never blocks /ls.
     let statusOf = () => null;
     let cmap = {};
@@ -1215,6 +1218,11 @@ if (isDirectRun) {
       screens, procs: listClaudeProcs(),
       personaOf: (h) => (pmap[h] ? formatPersona(pmap[h]) : null),
       statusOf, convoOfHashtag: (h) => cmap[h] ?? null,
+      ctxOf: (r) => {
+        if (!r.sessionId || r.guessed) return null;
+        const u = transcriptState(r.sessionId, r.cwd).usage;
+        return formatContext(u, contextWindowFor(cfg, { hashtag: r.hashtag, model: u?.model }));
+      },
     }));
     if (wiped.length) console.log(`\n🧹 đã dọn ${wiped.length} screen chết: ${wiped.join(', ')}`);
     process.exit(0);

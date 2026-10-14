@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {
-  parsePsOutput, parseSessionFile, cwdToProjectSlug, hashtagForSession, styFromEnviron,
+  parsePsOutput, parseSessionFile, cwdToProjectSlug, hashtagForSession, styFromEnviron, styPidFromEnviron,
   procStartFromStat, screenFromAncestors, buildProcRows, formatAgentList, parseKillPidArg, findUnidentifiedProcs,
   checkKillTarget, killClaudePid, findProcForSession, etimeToSeconds, guessSessionFromTranscripts,
   inspectPid, readPs, listClaudeProcs,
@@ -44,11 +44,18 @@ test('etimeToSeconds: all ps shapes', () => {
 
 test('parseSessionFile: picks the useful fields, rejects junk / bad uuid', () => {
   const s = parseSessionFile(JSON.stringify({ pid: 830318, sessionId: SID, cwd: '/w/umipay', name: '🪱 Giun', status: 'idle', kind: 'interactive', procStart: '5943432' }));
-  assert.deepEqual(s, { pid: 830318, sessionId: SID, cwd: '/w/umipay', name: '🪱 Giun', status: 'idle', kind: 'interactive', procStart: '5943432' });
+  assert.deepEqual(s, { pid: 830318, sessionId: SID, cwd: '/w/umipay', name: '🪱 Giun', status: 'idle', bridgeSessionId: null, kind: 'interactive', procStart: '5943432' });
+  assert.equal(parseSessionFile(JSON.stringify({ pid: 1, bridgeSessionId: 'session_01K' })).bridgeSessionId, 'session_01K');
+  assert.equal(parseSessionFile(JSON.stringify({ pid: 1, bridgeSessionId: null })).bridgeSessionId, null);
   assert.equal(parseSessionFile('not json'), null);
   assert.equal(parseSessionFile(null), null);
   assert.equal(parseSessionFile(JSON.stringify({ sessionId: SID })), null); // no pid
   assert.equal(parseSessionFile(JSON.stringify({ pid: 1, sessionId: '../etc' })).sessionId, null);
+});
+
+test('styPidFromEnviron: the SCREEN pid from STY; null without STY', () => {
+  assert.equal(styPidFromEnviron('A=1\0STY=331130.tele-d8133684\0B=2'), 331130);
+  assert.equal(styPidFromEnviron('A=1\0B=2'), null);
 });
 
 test('cwdToProjectSlug matches Claude Code project dir names', () => {
@@ -151,9 +158,9 @@ test('formatAgentList: screens section first (with the claude inside), then term
   assert.ok(iScreen === 0 && iTerm > iScreen, out);
   assert.match(out, /• tele-i0744244 · 🦛 Hà Mã\n  PID 9 · \? · 00:01\n  session 5ce13594-1e43-4d2d-afd3-ac16ccfece93 \(đoán\) · #i0744244/);
   assert.match(out, /• tele-empty123 · \(không thấy claude bên trong\)/);
-  assert.match(out, /• work\n  PID 11 · x · w · 00:02\n  session \?/); // non-tele screen hosting a claude
+  assert.match(out, /• work\n  PID 11 · 📨 x · w · 00:02\n  session \?/); // non-tele screen hosting a claude
   const term = out.slice(iTerm);
-  assert.match(term, new RegExp(`• PID 830318 · 🪱 Giun \\(idle\\) · umipay · 2-00:49:26\\n  session ${SID} · #a7611284`));
+  assert.match(term, new RegExp(`• PID 830318 · 📨 🪱 Giun \\(idle\\) · umipay · 2-00:49:26\\n  session ${SID} · #a7611284`));
   assert.doesNotMatch(term, /PID 9 /); // a screen claude is not repeated under Terminal
   assert.doesNotMatch(out, /pts\//);   // no tty column
   assert.match(out, /\/kill pid:<PID>/);

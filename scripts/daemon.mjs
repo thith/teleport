@@ -74,6 +74,12 @@ import { processCleanupRequests, processCleanupOffers, handleCleanupButton, CLEA
 import { PersistentMap } from './button-store.mjs';
 import { formatPersona } from './persona.mjs';
 import { shortConvoHash } from './convo-hash.mjs';
+import { personaByHashtag } from './spawn.mjs';
+import {
+  TypeRunner, listForType, allowedOps, agentLine, messageNamesTarget, defaultIo,
+  TYPE_BUTTON_RE, TYPE_BUTTON_TTL_MS, TYPE_OPS, STATE_LABEL,
+} from './type-cmd.mjs';
+import { formatContext, contextWindowFor } from './transcript-state.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ENV_FILE = path.join(__dirname, '..', '.env');
@@ -280,6 +286,9 @@ async function main() {
     sendButtons: (chatId, text, buttons) => tg('sendMessage', { chat_id: chatId, text, reply_markup: { inline_keyboard: [buttons] }, link_preview_options: { is_disabled: true } }),
     answerButton: (id, text) => tg('answerCallbackQuery', { callback_query_id: id, ...(text ? { text } : {}) }).catch(() => {}),
     editButtonsMessage: (chatId, messageId, text) => tg('editMessageText', { chat_id: chatId, message_id: messageId, text, link_preview_options: { is_disabled: true } }).catch(() => {}),
+    // Several rows of buttons (/type); edit = replace text AND keyboard (rows = [] removes it).
+    sendButtonRows: (chatId, text, rows) => tg('sendMessage', { chat_id: chatId, text, reply_markup: { inline_keyboard: rows }, link_preview_options: { is_disabled: true } }),
+    editButtonRows: (chatId, messageId, text, rows) => tg('editMessageText', { chat_id: chatId, message_id: messageId, text, reply_markup: { inline_keyboard: rows }, link_preview_options: { is_disabled: true } }).catch(() => {}),
   };
   // Pending buttons (merge previews, manual cleanups) survive a restart.
   pendingMergeButtons = new PersistentMap();
@@ -363,7 +372,8 @@ async function main() {
       // Inline-button presses (PR-link merge confirmation) — owner only.
       const presses = updates.filter((u) => u.callback_query && String(u.callback_query.from?.id) === daemonUserId);
       for (const u of presses) {
-        const handler = CLEANUP_BUTTON_RE.test(String(u.callback_query.data || '')) ? handleCleanupButton : handleMergeButton;
+        const data = String(u.callback_query.data || '');
+        const handler = TYPE_BUTTON_RE.test(data) ? handleTypeButton : CLEANUP_BUTTON_RE.test(data) ? handleCleanupButton : handleMergeButton;
         handler(u.callback_query, ctx).catch((e) => console.error(`[daemon] button: ${e?.message ?? e}`));
       }
       // Agent merge requests (file inbox) — one pass at a time.
@@ -462,7 +472,7 @@ export let pendingMergeButtons = new Map();
 /** One-shot take: returns the entry (if fresh) and deletes it, so a double tap can't merge twice. */
 export function takeMergeButton(tok, { now = Date.now(), store = pendingMergeButtons, ttlMs = MERGE_BUTTON_TTL_MS } = {}) {
   const e = store.get(tok);
-  if (e?.kind === 'cleanup') return null; // not a merge button (cleanup-inbox takes those)
+  if (e?.kind) return null; // allow-list: merge entries carry no kind (cleanup / type have their own takers)
   store.delete(tok);
   for (const [k, v] of store) if (now - v.createdAt > ttlMs) store.delete(k); // sweep
   if (!e || now - e.createdAt > ttlMs) return null;
@@ -763,7 +773,7 @@ export async function processMergeRequests(ctx, {
 export async function dispatchCommand(parsed, from, {
   daemonUserId, projectsConfig, registry, sendText, secretEnvKeys = [],
   runner = execFileP, scriptsDir = __dirname, parentDir = PARENT_DIR, reload = null,
-  automergeStateFile = AUTOMERGE_STATE_FILE,
+  automergeStateFile = AUTOMERGE_STATE_FILE, ...extra
 }, replyText = null, messageId = null) {
   // Built-in: handled in-process, never via the registry (a `_commands` entry
   // named `reload` can't shadow it). Admin-only.
@@ -783,6 +793,12 @@ export async function dispatchCommand(parsed, from, {
       if (r.error) { await sendText(daemonUserId, `❌ ${r.error}`); return; }
     } else if (op !== 'status') { await sendText(daemonUserId, usage); return; }
     await sendText(daemonUserId, formatAutoMergeStatus({ enabled: readAutoMerge(f), list: buildAllowlist(projectsConfig, { state: () => readAutoMergeState(f) }) }));
+    return;
+  }
+  if (parsed.cmd === TYPE_COMMAND) {
+    // Owner only (not just admin): it types keys into another agent's session.
+    if (String(from?.id) !== String(daemonUserId)) { await sendText(daemonUserId, `❌ /${TYPE_COMMAND} chỉ owner dùng được.`); return; }
+    await startType(parsed.rest, { daemonUserId, projectsConfig, sendText, ...extra });
     return;
   }
   if (parsed.cmd === RELOAD_COMMAND && reload) {
@@ -863,5 +879,108 @@ if (isDirectRun) {
     process.exit(0);
   } else {
     main().catch((e) => { console.error(`[daemon] fatal: ${e instanceof Error ? e.stack : e}`); releaseSingleton(); process.exit(1); });
+  }
+}
+
+// ── /type (RFC 22): type /compact, /remote-control or ⎋ Esc into an agent's screen ──
+
+export const TYPE_COMMAND = 'type';
+const TYPE_OP_LABEL = { c: '/compact', r: '/remote-control', e: '⎋ Esc' };
+let typeRunner = null; // one per daemon: per-agent locks, cool-down, Esc rate limit
+const getTypeRunner = () => (typeRunner ||= new TypeRunner(defaultIo()));
+
+const personaLookup = () => {
+  let pmap = {};
+  try { pmap = personaByHashtag(); } catch {}
+  return (h) => (pmap[h] ? formatPersona(pmap[h]) : null);
+};
+
+/** Step 2 text + keyboard for one agent (fresh observation). Pure-ish (no I/O beyond `obs`). */
+export function typeStep2({ target, obs, persona, cfg = {}, tok }) {
+  const ctx = obs.mismatch ? null : formatContext(obs.usage, contextWindowFor(cfg, { hashtag: target.hashtag, model: obs.usage?.model }));
+  const line = agentLine(target, { persona, state: obs.mismatch ? 'unknown' : obs.state, ctx, bridge: obs.bridge });
+  const ops = obs.mismatch ? [] : allowedOps(obs.state, obs.bridge);
+  const text = `⌨️ /type — ${line}\n`
+    + (ops.length ? 'Chọn lệnh (nút hết hạn sau 10 phút):' : `Không có lệnh nào gõ được lúc này (${obs.mismatch || STATE_LABEL[obs.state]}).`)
+    + (obs.bridge ? `\n📡 Remote Control đang bật: https://claude.ai/code/${obs.bridge}` : '');
+  const row = ops.map((op) => ({ text: TYPE_OP_LABEL[op], callback_data: `ty:${tok}:${op}` }));
+  row.push({ text: '✖ Huỷ', callback_data: `ty:${tok}:x` });
+  return { text, rows: [row], ops };
+}
+
+/** `/type` (agent menu) or `/type #hash` (straight to the commands). */
+export async function startType(rest, ctx, { list = listForType, io = defaultIo() } = {}) {
+  const { daemonUserId, projectsConfig, sendText, sendButtonRows, buttonStore } = ctx;
+  if (!sendButtonRows || !buttonStore) { await sendText(daemonUserId, '❌ /type cần chạy trong daemon.'); return; }
+  const toks = tokenizeArgs(rest);
+  const want = (toks[0] || '').replace(/^#/, '').toLowerCase();
+  if (toks.length > 1 || (want && !/^[0-9a-z]{8}$/.test(want))) { await sendText(daemonUserId, 'usage: /type  ·  /type #<hashtag>   (lệnh chọn bằng nút)'); return; }
+  const personaOf = personaLookup();
+  const agents = list({ personaOf, cfg: projectsConfig, io });
+  if (want) {
+    const a = agents.find((x) => x.target.hashtag === want);
+    if (!a) { await sendText(daemonUserId, `❌ không thấy agent #${want} trong screen tele-* (agent mở trong terminal thường không gõ vào được).`); return; }
+    const tok = crypto.randomBytes(8).toString('hex');
+    const step = typeStep2({ target: a.target, obs: a.obs, persona: personaOf(want), cfg: projectsConfig, tok });
+    const sent = await sendButtonRows(daemonUserId, step.text, step.rows);
+    buttonStore.set(tok, { kind: 'type', target: a.target, chatId: daemonUserId, messageId: sent?.message_id ?? null, createdAt: Date.now() });
+    return;
+  }
+  if (!agents.length) { await sendText(daemonUserId, 'ℹ️ không có agent nào trong screen tele-* để gõ.'); return; }
+  const text = `⌨️ /type — chọn agent:\n${agents.map((a) => `• ${a.line}`).join('\n')}`;
+  const rows = agents.map((a) => [{ text: `${personaOf(a.target.hashtag) || ''} #${a.target.hashtag}`.trim(), callback_data: `ty:pick:${a.target.hashtag}` }]);
+  await sendButtonRows(daemonUserId, text, rows);
+}
+
+/** One-shot take of a /type entry (10 min); sweeps expired /type entries only. */
+export function takeTypeButton(tok, { store = pendingMergeButtons, now = Date.now(), ttlMs = TYPE_BUTTON_TTL_MS } = {}) {
+  const e = store.get(tok);
+  for (const [k, v] of store) if (v?.kind === 'type' && k !== tok && now - v.createdAt > ttlMs) { try { store.delete(k); } catch {} }
+  if (!e || e.kind !== 'type') return null;
+  store.delete(tok); // throws if the consumption can't be persisted → caller does nothing
+  return now - e.createdAt > ttlMs ? null : e;
+}
+
+export async function handleTypeButton(cq, ctx, { runner = getTypeRunner(), list = listForType, io = defaultIo() } = {}) {
+  const m = String(cq.data || '').match(TYPE_BUTTON_RE);
+  const chatId = cq.message?.chat?.id, messageId = cq.message?.message_id;
+  const original = cq.message?.text || '';
+  if (!m || chatId == null) { await ctx.answerButton(cq.id); return; }
+  if (m[1]) { // step 1 → 2: no stored entry; the agent is looked up FRESH, and must be in the message
+    const h = m[1];
+    if (!new RegExp(`#${h}\\b`).test(original)) { await ctx.answerButton(cq.id, 'Nút không khớp tin nhắn.'); return; }
+    const personaOf = personaLookup();
+    const a = list({ personaOf, cfg: ctx.projectsConfig, io }).find((x) => x.target.hashtag === h);
+    if (!a) { await ctx.answerButton(cq.id, 'Agent không còn.'); await ctx.editButtonRows(chatId, messageId, `${original}\n\n❌ #${h} không còn trong screen — gõ /type lại.`, []); return; }
+    const tok = crypto.randomBytes(8).toString('hex');
+    const step = typeStep2({ target: a.target, obs: a.obs, persona: personaOf(h), cfg: ctx.projectsConfig, tok });
+    ctx.buttonStore.set(tok, { kind: 'type', target: a.target, chatId, messageId, createdAt: Date.now() });
+    await ctx.answerButton(cq.id);
+    await ctx.editButtonRows(chatId, messageId, step.text, step.rows);
+    return;
+  }
+  const [, , tok, op] = m;
+  let entry;
+  try { entry = takeTypeButton(tok, { store: ctx.buttonStore }); } catch { await ctx.answerButton(cq.id, 'Lỗi lưu trạng thái nút — không làm gì.'); return; }
+  if (!entry) {
+    await ctx.answerButton(cq.id, '⌛ Hết hạn hoặc đã dùng — gõ /type lại.');
+    await ctx.editButtonRows(chatId, messageId, `${original}\n\n⌛ Hết hạn.`, []);
+    return;
+  }
+  // The stored file is not trusted alone: same chat + message, and the message names the target.
+  if (String(entry.chatId) !== String(chatId) || (entry.messageId != null && entry.messageId !== messageId) || !messageNamesTarget(original, entry.target)) {
+    await ctx.answerButton(cq.id, 'Nút không khớp nội dung — gõ /type lại.');
+    await ctx.editButtonRows(chatId, messageId, `${original}\n\n⚠️ Nút không khớp nội dung tin nhắn — không làm gì.`, []);
+    return;
+  }
+  if (op === 'x') { await ctx.answerButton(cq.id, 'Đã huỷ'); await ctx.editButtonRows(chatId, messageId, `${original}\n\n✖ Đã huỷ.`, []); return; }
+  const base = original.split('\n')[0];
+  await ctx.answerButton(cq.id, `Đang gõ ${TYPE_OPS[op] === 'esc' ? 'Esc' : TYPE_OPS[op]}…`);
+  await ctx.editButtonRows(chatId, messageId, `${base}\n\n⏳ đang gõ ${TYPE_OP_LABEL[op]}…`, []);
+  const r = await runner.run(op, entry.target, String(cq.from?.id ?? 'owner'));
+  await ctx.editButtonRows(chatId, messageId, `${base}\n\n${r.text}`, []);
+  if (r.watch) {
+    const more = await r.watch().catch((e) => `❔ ${e?.message ?? e}`);
+    await ctx.editButtonRows(chatId, messageId, `${base}\n\n${r.text.replace(/ — đang chờ kết quả…$/, '')}\n${more}`, []);
   }
 }
