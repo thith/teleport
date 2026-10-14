@@ -125,7 +125,7 @@ test('runner /compact: idle (shell + turn over) → text, verify, Enter; result 
 });
 
 test('runner /compact: "Not enough messages" is reported', async () => {
-  const { io } = fakeIo({ screens: [hc('compact-typed'), hc('compact-done-empty')] }); // before: none · after: one
+  const { io } = fakeIo({ screens: [hc('compact-typed'), hc('compact-typed'), hc('compact-done-empty')] }); // before: none · after: one
   const r = await new TypeRunner(io).run('c', T);
   assert.match(await r.watch(), /chưa đủ tin nhắn/);
 });
@@ -170,7 +170,7 @@ test('runner: cool-down after Enter blocks another command; per-agent lock block
 
 test('runner /remote-control: off → type, Enter, wait for the Enable dialog, Enter #2 → URL', async () => {
   const { io, st } = fakeIo({
-    status: 'idle', screens: [hc('rc-typed'), hc('rc-dialog')],
+    status: 'idle', screens: [hc('rc-typed'), hc('rc-typed'), hc('rc-dialog')],
     onStuff: (s, d) => { if (d === '\r' && s.keys.length === 2) s.status = 'waiting'; if (d === '\r' && s.keys.length === 3) { s.status = 'idle'; s.bridge = 'session_ABC'; } },
   });
   const r = await new TypeRunner(io).run('r', T);
@@ -186,14 +186,14 @@ test('runner /remote-control: already on → nothing typed, URL returned', async
 });
 
 test('runner /remote-control: dialog not recognised → no second Enter, no Esc', async () => {
-  const { io, st } = fakeIo({ status: 'idle', screens: [hc('rc-typed'), hc('rewind')], onStuff: (s, d) => { if (d === '\r') s.status = 'waiting'; } });
+  const { io, st } = fakeIo({ status: 'idle', screens: [hc('rc-typed'), hc('rc-typed'), hc('rewind')], onStuff: (s, d) => { if (d === '\r') s.status = 'waiting'; } });
   const r = await new TypeRunner(io).run('r', T);
   assert.deepEqual(st.keys, ['/remote-control', '\r']);
   assert.match(r.text, /không thấy hộp thoại/);
 });
 
 test('runner /remote-control: Esc during the chain cancels it before Enter #2', async () => {
-  const { io, st } = fakeIo({ status: 'idle', screens: [hc('rc-typed'), hc('rc-dialog')] });
+  const { io, st } = fakeIo({ status: 'idle', screens: [hc('rc-typed'), hc('rc-typed'), hc('rc-dialog')] });
   const runner = new TypeRunner(io);
   io.stuff = ((orig) => (sid, d) => { orig(sid, d); if (d === '\r' && st.keys.length === 2) { st.status = 'waiting'; runner.cancel.set(T.pid, true); } })(io.stuff);
   const r = await runner.run('r', T);
@@ -328,7 +328,7 @@ test('compactRefusedOnScreen: only an error BELOW the last submitted /compact co
 
 test('/compact: a NEW refusal is seen even when an old one scrolled off (same count on screen)', async () => {
   const before = hc('compact-typed') + '\n  x  Not enough messages to compact.';
-  const { io } = fakeIo({ screens: [before, hc('compact-done-empty')] });
+  const { io } = fakeIo({ screens: [before, before, hc('compact-done-empty')] });
   const r = await new TypeRunner(io).run('c', T);
   assert.match(await r.watch(), /chưa đủ tin nhắn/);
 });
@@ -354,4 +354,11 @@ test('runner /compact while BUSY: queued (Claude runs it when the turn ends); re
   const rc = fakeIo({ status: 'busy' });
   assert.match((await new TypeRunner(rc.io).run('r', T)).text, /đang bận/);
   assert.deepEqual(rc.st.keys, []);
+});
+
+test('/compact while busy: a dialog appearing right before Enter (second screen read) → NO Enter', async () => {
+  const { io, st } = fakeIo({ status: 'busy', screens: [hc('compact-typed'), hc('compact-typed'), hc('rc-dialog')] });
+  const r = await new TypeRunner(io).run('c', T);
+  assert.deepEqual(st.keys, ['/compact']);
+  assert.match(r.text, /màn hình vừa đổi.*KHÔNG Enter/);
 });

@@ -246,10 +246,22 @@ export class TypeRunner {
     }
     const file = io.transcriptFile(t.sessionId, t.cwd);
     const offset = file ? io.transcriptSize(file) : null; // { size, ino, dev } — replacement-proof baseline
+    // A busy agent can open a dialog (permission / question) at any moment, and Enter would answer
+    // it: read the screen AGAIN, then status, then Enter with no await in between.
+    const scr2 = await io.hardcopy(sid);
+    if (parseInputLine(scr2) !== cmd || !suggestionSelects(scr2, cmd)) {
+      audit('changed-before-enter', { reason: 'screen' });
+      return { text: `⚠️ màn hình vừa đổi (có thể một hộp thoại mở ra) — đã gõ ${cmd} nhưng KHÔNG Enter. Kiểm tra tay.` };
+    }
+    const last = observe(t, io);
+    if (this.cancel.get(t.pid) || last.mismatch || !ok(last.state)) {
+      audit('changed-before-enter', { reason: last.mismatch || last.state });
+      return { text: `⚠️ agent vừa đổi trạng thái (${last.mismatch || STATE_LABEL[last.state]}) — đã gõ ${cmd} nhưng KHÔNG Enter. Kiểm tra tay.` };
+    }
     io.stuff(sid, '\r');
     this.cooldown.set(t.pid, io.now() + COOLDOWN_MS);
-    audit('enter', { queued: mid.state === 'busy' });
-    return { ok: true, file, offset, screenBefore: scr, queued: mid.state === 'busy' };
+    audit('enter', { queued: last.state === 'busy' });
+    return { ok: true, file, offset, screenBefore: scr, queued: last.state === 'busy' };
   }
 
   async compact(t, audit) {
