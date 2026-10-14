@@ -92,7 +92,7 @@ export function readQueue(name, { dir = LOCK_DIR, now = Date.now(), stat = procS
   for (const f of files) {
     const file = path.join(q, f);
     let t = null, mtimeMs = 0;
-    try { t = JSON.parse(fs.readFileSync(file, 'utf8')); mtimeMs = fs.statSync(file).mtimeMs; } catch (e) { if (e.code === 'ENOENT') continue; }
+    try { t = JSON.parse(fs.readFileSync(file, 'utf8')); mtimeMs = fs.statSync(file).mtimeMs; } catch (e) { continue; } // vanished, or unreadable right now (EMFILE…): skip this round, never judge it dead
     const status = ticketStatus(t, mtimeMs, { now, stat });
     if (status === 'dead' && prune) { try { fs.unlinkSync(file); } catch {} continue; }
     out.push({ ...(t || {}), file, name: f, status, mtimeMs });
@@ -122,7 +122,7 @@ export function readStruck(name, { dir = LOCK_DIR, stat = procStat } = {}) {
   try { files = fs.readdirSync(q).filter((f) => /^\d{15}-\d+-[a-z0-9]+\.left$/.test(f)).sort(); } catch { return []; }
   const out = [];
   for (const f of files) {
-    try { const t = JSON.parse(fs.readFileSync(path.join(q, f), 'utf8')); if (stat(t.pid)) out.push({ ...t, name: f }); } catch {}
+    try { const t = JSON.parse(fs.readFileSync(path.join(q, f), 'utf8')); if (ticketStatus(t, Date.now(), { stat }) !== 'dead') out.push({ ...t, name: f }); } catch {}
   }
   return out;
 }
@@ -219,6 +219,16 @@ export function selfLabel(env = process.env) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// One process-wide 'exit' handler removes every ticket still open (the daemon
+// may wait on several at once — no listener per waiter).
+const EXIT_TICKETS = new Set();
+let exitArmed = false;
+function armExitHandler() {
+  if (exitArmed) return;
+  exitArmed = true;
+  process.on('exit', () => { for (const f of EXIT_TICKETS) { try { f(); } catch {} } });
+}
+
 /**
  * Take lock `name`, waiting up to `waitSec` (Infinity = forever) in FIFO order
  * (RFC 21). While waiting, `onWait(holder, waitedMs, { position, ahead })` is
@@ -241,7 +251,7 @@ export async function acquireLock(name, {
   const queued = (mine = null) => readQueue(name, { dir, prune: true, stat }).filter((t) => t.file !== mine && t.status !== 'dead');
   let ticket = null;
   const dropTicket = () => { if (ticket) { for (const ext of ['.json', '.left', '.acq']) { try { fs.unlinkSync(ticket.replace(/\.(json|acq)$/, ext)); } catch {} } } };
-  const done = () => { dropTicket(); process.off('exit', dropTicket); };
+  const done = () => { dropTicket(); EXIT_TICKETS.delete(dropTicket); };
   try {
     if (!(waitSec > 0)) {
       // Try-once: never jump the queue (stalled / leaving waiters still count), and never write a holder we give back.
@@ -256,7 +266,8 @@ export async function acquireLock(name, {
         const file = path.join(p.queue, `${String(Date.now()).padStart(15, '0')}-${process.pid}-${Math.random().toString(36).slice(2, 8)}.json`);
         writeJsonAtomic(file, body);
         ticket = file;
-        process.on('exit', dropTicket);
+        armExitHandler();
+        EXIT_TICKETS.add(dropTicket);
       } catch (e) { warn(`⚠️ lock ${name}: không ghi được vé hàng đợi (${e.message}) — chờ kiểu cũ, không theo thứ tự.`); }
       let lastNotice = -Infinity, lastKey = null;
       // Read every poll (not only at the head): struck (renamed to .left) = leave. Vanished WITHOUT a
@@ -270,7 +281,7 @@ export async function acquireLock(name, {
       };
       for (;;) {
         const ms = mineState();
-        if (ms !== 'ok') { done(); close(); return { timeout: true, left: true, holder: readHolder(p.holder) }; } // gone = removed by hand: never resurrect
+        if (ms !== 'ok') { done(); close(); return { timeout: true, left: true, holder: readHolder(p.holder) }; } // struck (.left) — a vanished ticket without .left was put back by mineState
         if (ticket) { try { const tt = new Date(); fs.utimesSync(ticket, tt, tt); } catch {} }
         const others = ticket ? queued(ticket) : [];
         const ahead = ticket ? others.filter((t) => t.name < path.basename(ticket) && t.status === 'live') : [];
@@ -283,7 +294,11 @@ export async function acquireLock(name, {
             if (!ticket) break;
             if (beforeClaim) await beforeClaim(ticket); // (test seam: strike right here)
             try { fs.renameSync(ticket, ticket.replace(/\.json$/, '.acq')); ticket = ticket.replace(/\.json$/, '.acq'); break; }
-            catch (e) { if (e.code !== 'ENOENT') throw e; done(); close(); return { timeout: true, left: true, holder: null }; }
+            catch (e) {
+              if (e.code !== 'ENOENT') throw e;
+              if (fs.existsSync(ticket.replace(/\.json$/, '.left'))) { done(); close(); return { timeout: true, left: true, holder: null }; }
+              break; // vanished without a .left (a pruner misjudged us dead): we won flock fair and square — keep it
+            }
           }
         }
         const t = now(), holder = readHolder(p.holder);

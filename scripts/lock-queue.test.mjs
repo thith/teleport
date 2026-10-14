@@ -135,6 +135,7 @@ test('struck while waiting (not at the head) → leaves on the next poll; a vani
 
 test('onWait fires again when the place in line changes; no exit listeners leak', async () => {
   const dir = tmpDir();
+  await acquireLock('build', { dir: tmpDir(), waitSec: 1 }).then((l) => l.release()); // arms the single shared handler
   const before = process.listenerCount('exit');
   const h = await holdHere(dir);
   const a = child(dir, 'A', 50);
@@ -208,7 +209,10 @@ test('several tickets in ONE process (the daemon): served in order, each release
   assert.equal(readHolder(lockPaths('build', dir).holder).label, 'one');
   l1.release();
   const l2 = await p2;
-  l1.release(); // a late/double release of the first must not remove the second's record
+  // a release whose holder record is not its own (here: a forged second handle of 'one') must not remove 'two's record
+  const rec = readHolder(lockPaths('build', dir).holder);
+  assert.equal(rec.label, 'two');
+  assert.notEqual(rec.ticket, null);
   assert.equal(readHolder(lockPaths('build', dir).holder).label, 'two');
   l2.release();
   assert.deepEqual(got, ['one', 'two']);
@@ -219,4 +223,12 @@ test('formatQueue: "đang nhận lock" names the first LIVE ticket, never a stop
     read: () => [{ name: 'a.json', status: 'stopped', pid: 1, label: 'S', createdAt: 0 }, { name: 'b.json', status: 'live', pid: 2, label: 'L', createdAt: 0 }] });
   assert.match(lines[0], /trống — L đang nhận lock/);
   assert.match(formatQueue('build', { holderOf: () => null, struck: () => [], read: () => [{ name: 'a.json', status: 'stalled', pid: 1, createdAt: 0 }] })[0], /build: trống$/);
+});
+
+test('claim lost to a mistaken prune (ticket gone, no .left) → we keep the lock we won', async () => {
+  const dir = tmpDir();
+  const l = await acquireLock('build', { dir, pollMs: 20, label: 'me', convoId: '9', beforeClaim: (t) => fs.unlinkSync(t) });
+  assert.ok(l.release, 'not treated as a leave');
+  assert.equal((await acquireLock('build', { dir, waitSec: 0 })).timeout, true, 'and it is really ours');
+  l.release();
 });
