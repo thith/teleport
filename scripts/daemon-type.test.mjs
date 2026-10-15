@@ -69,16 +69,23 @@ test('pick: hash must be in the message; the agent is looked up FRESH; step 2 re
   assert.match(calls.at(-1)[1], /không còn trong screen/);
 });
 
-test('op press: runs the FIXED op on the stored target; one-shot; result edited in', async () => {
+test('op press: runs the FIXED op on the stored target; one-shot; result edited in; the agent is told after a confirmed compact', async () => {
   const { ctx, calls } = ui();
-  ctx.buttonStore.set('a'.repeat(16), { kind: 'type', target: T, chatId: 42, messageId: 100, createdAt: Date.now() });
+  const target = { ...T, sessionId: 'ae61d4f1-5ecc-46fe-9cea-75b4c9d9b751' };
+  ctx.buttonStore.set('a'.repeat(16), { kind: 'type', target, chatId: 42, messageId: 100, createdAt: Date.now() });
+  const delivered = [];
+  const deliver = async (res, opts) => { delivered.push(opts.build({ ...res, chatId: '-100' })); };
   const ran = [];
   const runner = { run: async (op, t) => { ran.push([op, t.pid]); return { text: '⌨️ đã gõ /compact vào #c2383556 — đang chờ kết quả…', watch: async () => '✅ đã compact: 763k → 8k' }; } };
   const text = '⌨️ /type — #c2383556 · PID 644406 · rảnh\nChọn lệnh';
-  await handleTypeButton(cq(`ty:${'a'.repeat(16)}:c`, text), ctx, { runner });
+  await handleTypeButton(cq(`ty:${'a'.repeat(16)}:c`, text), ctx, { runner, deliver });
   assert.deepEqual(ran, [['c', 644406]]);
   assert.match(calls.at(-1)[1], /đã gõ \/compact vào #c2383556\n✅ đã compact: 763k → 8k/);
-  await handleTypeButton(cq(`ty:${'a'.repeat(16)}:c`, text), ctx, { runner }); // double tap
+  assert.equal(delivered.length, 1);
+  assert.equal(delivered[0].convoId, 3067763322383556); // the compacted agent's own convo
+  assert.equal(delivered[0].text, '🤖 Teleport daemon: Owner vừa compact bạn thông qua daemon (/type) — 763k → 8k.');
+  assert.equal(delivered[0].fromRole, 'daemon');
+  await handleTypeButton(cq(`ty:${'a'.repeat(16)}:c`, text), ctx, { runner, deliver }); // double tap
   assert.equal(ran.length, 1);
   assert.match(calls.at(-1)[1], /Hết hạn/);
 });
@@ -126,5 +133,22 @@ test('/type arguments: one optional #hashtag; anything else → usage (never a l
     const { ctx, calls } = ui();
     await startType(bad, ctx, { list: () => { throw new Error('must not list'); } });
     assert.match(calls[0][1], /usage: \/type/);
+  }
+});
+
+test('compact notice: only after a CONFIRMED compaction (not on "not enough", timeout, Esc or /remote-control)', async () => {
+  const target = { ...T, sessionId: 'ae61d4f1-5ecc-46fe-9cea-75b4c9d9b751' };
+  const text = '⌨️ /type — #c2383556 · PID 644406 · rảnh';
+  for (const [op, res] of [
+    ['c', { text: '⌨️ đã gõ /compact vào #c2383556 — đang chờ kết quả…', watch: async () => 'ℹ️ Claude báo: chưa đủ tin nhắn để compact.' }],
+    ['c', { text: '⌨️ đã gõ /compact vào #c2383556 — đang chờ kết quả…', watch: async () => '❔ chưa thấy compact xong sau 5 phút — kiểm tra tay.' }],
+    ['e', { text: '⌨️ đã gửi Esc — đã ngắt, giờ rảnh.' }],
+    ['r', { text: '📡 Remote Control đã bật: https://claude.ai/code/session_X' }],
+  ]) {
+    const { ctx } = ui();
+    ctx.buttonStore.set('c'.repeat(16), { kind: 'type', target, chatId: 42, messageId: 100, createdAt: Date.now() });
+    const delivered = [];
+    await handleTypeButton(cq(`ty:${'c'.repeat(16)}:${op}`, text), ctx, { runner: { run: async () => res }, deliver: async (r) => { delivered.push(r); } });
+    assert.equal(delivered.length, 0, `${op}: ${res.text}`);
   }
 });

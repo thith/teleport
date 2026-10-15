@@ -32,6 +32,7 @@ export const AUDIT_FILE = path.join(process.env.XDG_STATE_HOME || path.join(os.h
 
 // op letter (callback data) → command. Fixed table: the command never comes from stored data.
 export const TYPE_OPS = { c: '/compact', r: '/remote-control', e: 'esc' };
+export const COMPACT_OK = '✅ đã compact'; // a watch() result starting with this = a confirmed compaction
 export const TYPE_BUTTON_RE = /^ty:(?:pick:([0-9a-z]{8})|([0-9a-f]{16}):([crex]))$/;
 
 // ── Pure helpers ──────────────────────────────────────────────────────────────
@@ -282,7 +283,7 @@ export class TypeRunner {
         if (c?.error) { audit('result', { result: c.error }); return `❔ không theo dõi được (${c.error}).`; }
         if (c) {
           audit('result', { result: 'compacted', ...c });
-          return `✅ đã compact: ${fmtTokens(c.preTokens)} → ${fmtTokens(c.postTokens)}`;
+          return `${COMPACT_OK}: ${fmtTokens(c.preTokens)} → ${fmtTokens(c.postTokens)}`;
         }
         await io.sleep(5000);
       }

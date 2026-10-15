@@ -77,8 +77,9 @@ import { shortConvoHash } from './convo-hash.mjs';
 import { personaByHashtag } from './spawn.mjs';
 import {
   TypeRunner, listForType, allowedOps, agentLine, messageNamesTarget, defaultIo,
-  TYPE_BUTTON_RE, TYPE_BUTTON_TTL_MS, TYPE_OPS, STATE_LABEL,
+  TYPE_BUTTON_RE, TYPE_BUTTON_TTL_MS, TYPE_OPS, STATE_LABEL, COMPACT_OK,
 } from './type-cmd.mjs';
+import { uuidToConvoInt } from './convo-registry.mjs';
 import { formatContext, contextWindowFor } from './transcript-state.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -941,7 +942,22 @@ export function takeTypeButton(tok, { store = pendingMergeButtons, now = Date.no
   return now - e.createdAt > ttlMs ? null : e;
 }
 
-export async function handleTypeButton(cq, ctx, { runner = getTypeRunner(), list = listForType, io = defaultIo() } = {}) {
+/**
+ * The agent's own notice after a confirmed /compact (Thi: only for compact) — after it the agent only
+ * sees "Compacted" as if typed at its terminal. Daemon-framed, carries no instruction. Pure.
+ */
+export function buildCompactNoticePrompt({ convoId, chatId, text }) {
+  return {
+    text: `🤖 Teleport daemon: Owner vừa compact bạn thông qua daemon (/type) — ${String(text).replace(`${COMPACT_OK}: `, '')}.`,
+    messageId: null, chatId: chatId == null ? null : String(chatId),
+    fromUserId: null, fromName: 'teleport daemon', fromRole: 'daemon', fromMember: null,
+    replyToMessageId: null, replyToText: null, quotedText: null,
+    timestamp: Math.floor(Date.now() / 1000), attachments: [], convoId: Number(convoId),
+    typeNotice: { op: '/compact', text },
+  };
+}
+
+export async function handleTypeButton(cq, ctx, { runner = getTypeRunner(), list = listForType, io = defaultIo(), deliver = deliverResult } = {}) {
   const m = String(cq.data || '').match(TYPE_BUTTON_RE);
   const chatId = cq.message?.chat?.id, messageId = cq.message?.message_id;
   const original = cq.message?.text || '';
@@ -982,5 +998,9 @@ export async function handleTypeButton(cq, ctx, { runner = getTypeRunner(), list
   if (r.watch) {
     const more = await r.watch().catch((e) => `❔ ${e?.message ?? e}`);
     await ctx.editButtonRows(chatId, messageId, `${base}\n\n${r.text.replace(/ — đang chờ kết quả…$/, '')}\n${more}`, []);
+    const convoId = uuidToConvoInt(entry.target.sessionId);
+    if (String(more).startsWith(COMPACT_OK) && convoId != null) { // tell the agent itself (its prompt queue, not its topic)
+      await deliver({ convoId, text: more }, { build: buildCompactNoticePrompt }).catch((e) => console.error(`[daemon] compact notice: ${e?.message ?? e}`));
+    }
   }
 }
