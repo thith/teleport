@@ -403,3 +403,31 @@ test('--expect-base is re-checked right before the PUT (a retarget during the ch
   assert.match(r.text, /vừa đổi nhánh đích/);
   assert.equal(f.calls.some((c) => c[2] === 'PUT'), false);
 });
+
+test('mergeOne: checks still running → re-read for up to 15 s (billing jobs fail ~3 s after a push); then refused; --force never waits', async () => {
+  const running = [{ name: 'gate', status: 'IN_PROGRESS', conclusion: '' }];
+  // finishes on the 2nd read → merged after one 3 s wait
+  const prs = { 7: PR(7, { statusCheckRollup: running }) };
+  const f = fakeGh(prs);
+  let reads = 0;
+  const gh = (a) => {
+    if (a[1] === 'view' && ++reads === 2) prs[7].statusCheckRollup = [{ name: 'gate', status: 'COMPLETED', conclusion: 'SUCCESS' }];
+    return f.gh(a);
+  };
+  const slept = [];
+  let r = await mergeOne(7, ARGS([7]), { gh, sleep: async (ms) => { slept.push(ms); } });
+  assert.equal(r.ok, true, r.text);
+  assert.deepEqual(slept, [3000]);
+  // still running after 15 s → refused, total wait exactly 15 s, no merge call
+  const f2 = fakeGh({ 8: PR(8, { statusCheckRollup: running }) });
+  const slept2 = [];
+  r = await mergeOne(8, ARGS([8]), { gh: f2.gh, sleep: async (ms) => { slept2.push(ms); } });
+  assert.match(r.text, /checks still running: gate/);
+  assert.equal(slept2.reduce((a, b) => a + b, 0), 15000);
+  assert.equal(f2.calls.some((c) => c[2] === 'PUT'), false);
+  // --force: no waiting at all
+  const f3 = fakeGh({ 9: PR(9, { statusCheckRollup: running }) });
+  const slept3 = [];
+  r = await mergeOne(9, ARGS([9], { force: true }), { gh: f3.gh, sleep: async (ms) => { slept3.push(ms); } });
+  assert.deepEqual(slept3, []);
+});

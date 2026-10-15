@@ -213,6 +213,8 @@ export function baseIsMergedHead(base, gh, repo = null) {
   return sameRepo.some((p) => p.headRefOid === tip);
 }
 
+export const PENDING_WAIT_MS = 15_000;
+export const PENDING_POLL_MS = 3_000;
 const PR_FIELDS = 'number,title,url,state,isDraft,mergeable,mergeStateStatus,statusCheckRollup,headRefName,headRefOid,baseRefName,isCrossRepository';
 const ghError = (e) => String(e?.stderr || e?.message || e).trim().split('\n').slice(-3).join(' ');
 
@@ -220,20 +222,31 @@ const ghError = (e) => String(e?.stderr || e?.message || e).trim().split('\n').s
  * Merge one PR. `gh(args)` returns stdout or throws (injectable for tests).
  * Waits (up to `unknownTries` × `unknownWaitMs`) while GitHub still reports
  * mergeable=UNKNOWN — normal right after a previous merge in the same batch.
+ * Also waits (≤ `pendingWaitMs`, re-reading every `pendingPollMs`) while checks
+ * are still running, without --force: a merge-request right after a push sees
+ * jobs GitHub fails ~3 s later for billing ("not started" → treated as no CI).
+ * Still running after that → refused as before (Thi: wait 15 s, then error).
  * Returns { ok, text } | { error, text }.
  */
 export async function mergeOne(target, { method, keepBranch, force, preview = false, skipMerged = false, expectHeads = null, expectBases = null }, {
   gh, sleep = (ms) => new Promise((r) => setTimeout(r, ms)), unknownTries = 5, unknownWaitMs = 2000,
+  pendingWaitMs = PENDING_WAIT_MS, pendingPollMs = PENDING_POLL_MS,
   mergedHeads = [],
 }) {
   const { number, repo = null } = typeof target === 'number' ? { number: target } : target;
   const c = repoCtx(repo);
   let pr;
-  for (let i = 0; ; i++) {
+  for (let i = 0, pendingWaited = 0; ; i++) {
     try { pr = JSON.parse(gh(['pr', 'view', String(number), ...c.R, '--json', PR_FIELDS])); }
     catch (e) { return { error: true, text: `❌ cannot read PR ${c.label}${number}: ${ghError(e)}` }; }
-    if (pr.mergeable !== 'UNKNOWN' || i >= unknownTries) break;
-    await sleep(unknownWaitMs);
+    if (pr.mergeable === 'UNKNOWN' && i < unknownTries) { await sleep(unknownWaitMs); continue; }
+    if (!force && pendingWaited < pendingWaitMs && summarizeChecks(pr.statusCheckRollup).pending.length) {
+      const step = Math.min(pendingPollMs, pendingWaitMs - pendingWaited);
+      await sleep(step);
+      pendingWaited += step;
+      continue;
+    }
+    break;
   }
   // Never act on a different PR than the one asked for (e.g. a CLI fallback).
   if (pr.number !== number) return { error: true, text: `❌ asked for PR ${c.label}${number} but GitHub returned #${pr.number} — refusing.` };
