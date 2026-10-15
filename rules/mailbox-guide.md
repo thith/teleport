@@ -14,6 +14,7 @@ resolve mục tiêu theo **topic đang sống**. Một session **chưa từng g�
 |---|---|
 | `ask` (RFC 10) | **HỎI** một agent có topic — vòng hỏi-đáp, có narration trong topic, có role gate |
 | `handover` (RFC 05) | **GIAO VIỆC** sang một agent/topic khác |
+| Claude **cross-session** (`SendMessage`) | Cả hai là **Claude Code** đang chạy trên máy này: nhắn thẳng, tới ngay lượt kế, **không cần monitor**. Tên đích: `node ../teleport/scripts/session-name.mjs <persona\|#hashtag>` — xem telegram-guide "Cross-session message" |
 | **`mailbox`** | Đích **không có topic** (session vừa mở, agent chạy nhanh trong terminal, subagent, agent do `codex exec` gọi), hoặc người dùng nói thẳng mailbox / thư / file channel |
 
 **Luật chọn kênh, một câu:** đích **có topic** và người dùng muốn hỏi/bàn giao → `ask`/`handover`;
