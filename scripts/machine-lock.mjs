@@ -258,6 +258,16 @@ export function describeHolder(h, now = Date.now()) {
   return `${h.label || `pid ${h.pid}`}${h.cmd ? ` — ${h.cmd}` : ''} — từ ${at} (${mins} phút)`;
 }
 
+/** The worktree (nearest dir holding a `.git` file/dir) containing `cwd`, or null. Shown per ticket; scopes `leave`. */
+export function worktreeOf(cwd = process.cwd(), { exists = fs.existsSync } = {}) {
+  try {
+    for (let d = path.resolve(cwd); ; d = path.dirname(d)) {
+      if (exists(path.join(d, '.git'))) return d;
+      if (path.dirname(d) === d) return null;
+    }
+  } catch { return null; }
+}
+
 /** Best-effort label for whoever runs this: daemon sender, else the agent ("🧛 Ma #c2383556"). */
 export function selfLabel(env = process.env) {
   if (env.TELE_FROM_NAME) return `${env.TELE_FROM_NAME} (daemon)`;
@@ -301,7 +311,7 @@ function armExitHandler() {
 export async function acquireLock(name, {
   waitSec = Infinity, label = selfLabel(), cmd = '', onWait = () => {}, pollMs = 1000, noticeMs = 60000, dir = LOCK_DIR, now = Date.now,
   convoId = selfConvoId(), warn = (m) => console.error(m), stat = procStat, beforeClaim = null,
-  slots = null, exclusive = false, pending = false,
+  slots = null, exclusive = false, pending = false, worktree = worktreeOf(),
 } = {}) {
   let N = slotsFor(name, { slots, dir }); // re-read every poll while waiting: `lock-queue slots 1` applies to queued waiters too
   const nFiles = slotFiles(name);
@@ -348,7 +358,7 @@ export async function acquireLock(name, {
       if (live()) return busyOut();
     } else {
       // Ticket FIRST (before any try); deleted only AFTER the holder file names us.
-      const body = { pid: process.pid, procStart: stat(process.pid)?.start ?? null, label, cmd, convoId: convoId == null ? null : String(convoId), createdAt: now() };
+      const body = { pid: process.pid, procStart: stat(process.pid)?.start ?? null, label, cmd, worktree, convoId: convoId == null ? null : String(convoId), createdAt: now() };
       try {
         fs.mkdirSync(p.queue, { recursive: true, mode: 0o700 });
         const file = path.join(p.queue, `${String(Date.now()).padStart(15, '0')}-${process.pid}-${Math.random().toString(36).slice(2, 8)}.json`);
@@ -410,7 +420,7 @@ export async function acquireLock(name, {
   close(won); // fds of slots we tried but did not win
   const hp = P[slot].holder;
   // `ticket`: which of possibly several tickets of this process (daemon) holds the lock.
-  let me = { pid: process.pid, procStart: stat(process.pid)?.start ?? null, convoId: convoId == null ? null : String(convoId), ticket: ticket ? path.basename(ticket).replace(/\.acq$/, '.json') : null, label, cmd, cwd: process.cwd(), startedAt: now(),
+  let me = { pid: process.pid, procStart: stat(process.pid)?.start ?? null, convoId: convoId == null ? null : String(convoId), ticket: ticket ? path.basename(ticket).replace(/\.acq$/, '.json') : null, label, cmd, worktree, cwd: process.cwd(), startedAt: now(),
     ...(name === 'build' ? { slot, slots: N } : {}), ...(exclusive ? { exclusive: true } : {}), ...(pending ? { pending: true } : {}) };
   try { // atomic, so a waiter never reads half a file
     writeJsonAtomic(hp, me);
