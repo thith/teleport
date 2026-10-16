@@ -43,12 +43,21 @@
 // command leaves running dies with the scope — so `--no-scope` (e.g. booting an
 // emulator that must stay up) and `--no-stop` (keep the Gradle daemon) run
 // without one.
+//
+// RFC 23 — on a machine with ≥ 28 GiB the build lock has 2 slots. Slot k ≥ 1 gets
+// its own Gradle daemon registry and compiles Kotlin in-process (both via
+// GRADLE_OPTS: a dotted env name would be dropped by dash), so the two builds
+// never share a daemon that the other's scope would kill. MemoryMax is 30% when
+// another build may run beside us (45% alone). After taking a slot, a build waits
+// for the builds that got theirs EARLIER (a strict total order → no deadlock):
+// their declared caps + ours must fit in 65% of RAM, none of them may be
+// unbounded, and RAM must hold our cap + 3 GiB — no plateau / cap escape here.
 
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
-import { acquireLock, describeHolder, readHolder, lockPaths } from './machine-lock.mjs';
+import { acquireLock, describeHolder, readHolders, readClaimed, acquireHelperLock, memTotal, LOCK_DIR } from './machine-lock.mjs';
 import { isMainModule } from './is-direct-run.mjs';
 
 export const WAIT_TIMEOUT_EXIT = 75;
@@ -119,6 +128,8 @@ export function memPressurePath({ uid = process.getuid?.() ?? 0, exists = fs.exi
 
 export const SCOPE_SWAP_MAX = 2 * 1024 ** 3;
 export const SCOPE_MEM_FRACTION = 0.45;
+export const SCOPE_MEM_FRACTION_SHARED = 0.30; // RFC 23: another build may run beside us
+export const MEM_BUDGET_FRACTION = 0.65; // RFC 23: sum of the caps of builds running together
 export const DEFAULT_CARGO_JOBS = '4';
 
 /** '8G' / '8192M' / '512K' / '1073741824' → bytes; '0' → 0; junk → null. Pure. */
@@ -130,10 +141,10 @@ export function parseSize(v) {
 }
 
 /** MemoryMax in bytes for the build scope (page-aligned), or 0 = no limit. Pure. */
-export function scopeMemMax(env = process.env, memTotal = os.totalmem()) {
+export function scopeMemMax(env = process.env, total = memTotal(), fraction = SCOPE_MEM_FRACTION) {
   const raw = env.TELEPORT_HEAVY_MEM_MAX;
   const v = raw === undefined || raw === '' ? null : parseSize(raw);
-  const bytes = v ?? Math.floor(memTotal * SCOPE_MEM_FRACTION);
+  const bytes = v ?? Math.floor(total * fraction);
   return bytes > 0 ? Math.max(4096, Math.floor(bytes / 4096) * 4096) : 0;
 }
 
@@ -337,6 +348,67 @@ export async function waitForRam({ minBytes, readMem = null, readState = null, s
   }
 }
 
+// ── RFC 23: two build slots ──
+
+/**
+ * Env additions for a build in slot k ≥ 1 (slot 0: none — exactly as before):
+ * its own Gradle daemon registry + Kotlin in-process, appended LAST to GRADLE_OPTS
+ * so they win over the user's. Pure.
+ */
+export function slotEnv(env, slot, { home = os.homedir(), lockDir = LOCK_DIR } = {}) {
+  if (!(slot > 0)) return {};
+  let reg = path.join(env.GRADLE_USER_HOME || path.join(home, '.gradle'), `daemon-slot${slot}`);
+  if (/\s/.test(reg)) reg = path.join(lockDir, `gradle-daemon-slot${slot}`); // GRADLE_OPTS is split on spaces
+  const add = `-Dorg.gradle.daemon.registry.base=${reg} -Dorg.gradle.project.kotlin.compiler.execution.strategy=in-process`;
+  return { GRADLE_OPTS: env.GRADLE_OPTS ? `${env.GRADLE_OPTS} ${add}` : add };
+}
+
+/** Strict total order of holders: (startedAt, slot). Pure. */
+export const holderBefore = (a, b) => a.startedAt < b.startedAt || (a.startedAt === b.startedAt && (a.slot ?? 0) < (b.slot ?? 0));
+
+/** A holder that has not declared a usable cap counts as unbounded (fail-closed). Pure. */
+export const isUnbounded = (h, total) => !!(h.unbounded || h.pending || h.exclusive || !(h.memMax > 0) || h.memMax > total * MEM_BUDGET_FRACTION);
+
+/**
+ * Why this build must still wait for the builds that took a slot before it
+ * ([] = go). `extra` = slots just claimed whose holder isn't written yet. Pure.
+ */
+export function slotBlockers({ earlier, extra = 0, myMax, unbounded, total, avail, minBytes }) {
+  if (extra) return ['một build vừa lấy chỗ, chưa ghi tên'];
+  if (!earlier.length) return [];
+  const who = (hs) => hs.map((h) => h.label || `pid ${h.pid}`).join(', ');
+  if (unbounded) return [`build không giới hạn RAM phải chờ build trước xong: ${who(earlier)}`];
+  const unb = earlier.filter((h) => isUnbounded(h, total));
+  if (unb.length) return [`build trước chưa khai báo / không giới hạn RAM: ${who(unb)}`];
+  const sum = earlier.reduce((a, h) => a + h.memMax, 0);
+  if (sum + myMax > total * MEM_BUDGET_FRACTION) return [`ngân sách RAM: ${gib(sum)} + ${gib(myMax)} GiB > ${gib(total * MEM_BUDGET_FRACTION)} GiB`];
+  if (minBytes > 0 && avail != null && avail < myMax + minBytes) return [`còn ${gib(avail)} GiB, build thứ 2 cần ${gib(myMax + minBytes)} GiB`];
+  return [];
+}
+
+export const SLOT_LOG_EVERY_MS = 3 * 60_000;
+
+/**
+ * Wait (holding our slot) until slotBlockers() is empty. Re-reads the holders
+ * every poll; no plateau / cap escape. → { waitedMs, alone } (alone: no earlier
+ * build left — the caller then applies the usual RAM wait).
+ */
+export async function waitForSlotTurn({ me, myMax, unbounded, total, minBytes, holders, claimedOnly = () => 0, readState = () => readMemState(), setWaiting = () => {},
+  sleep = (ms) => new Promise((r) => setTimeout(r, ms)), now = Date.now, log = (s) => console.error(s) }) {
+  const start = now();
+  let loggedAt = -Infinity, waiting = false;
+  for (;;) {
+    const earlier = holders().filter((h) => !(h.pid === me.pid && h.startedAt === me.startedAt) && holderBefore(h, me));
+    const extra = claimedOnly();
+    const why = slotBlockers({ earlier, extra, myMax, unbounded, total, avail: earlier.length ? readState().avail : null, minBytes });
+    if (!why.length) { if (waiting) setWaiting(false); return { waitedMs: now() - start, alone: !earlier.length }; }
+    if (!waiting) { setWaiting(true); waiting = true; }
+    const t = now();
+    if (t - loggedAt >= SLOT_LOG_EVERY_MS) { log(`⏳ chờ RAM cho build thứ 2: ${why.join(' · ')}…`); loggedAt = t; }
+    await sleep(RAM_POLL_MS);
+  }
+}
+
 /** True when the command is a Gradle wrapper (called directly — not via `sh -c`). Pure. */
 export const isGradlew = (cmd) => path.basename(cmd[0] || '') === 'gradlew';
 
@@ -366,20 +438,35 @@ export function runForwarded(cmd, { spawnFn = spawn, setpriv = hasSetpriv(), pro
 
 // `--stop` goes through runForwarded too: signals stay handled (and forwarded)
 // until it is over, so it never outlives the lock.
-/** Is the build lock held by the heavy named in `env` (our live ancestor)? */
-export const heldByAncestor = (env, holder = () => readHolder(lockPaths('build').holder)) => {
+/** Is a slot of the build lock (any of them, whatever N is now) held by the heavy named in `env` (our live ancestor)? */
+export const heldByAncestor = (env, holders = () => readHolders('build')) => {
   const pid = Number(env[HELD_ENV]);
   if (!(pid > 0)) return false;
-  const h = holder();
-  return !!h && h.alive && h.pid === pid;
+  return holders().some((h) => h.alive && h.pid === pid);
+};
+
+/** "build đang bận (2/2): A …, B …" / "build đang bận: A …". Pure. */
+export function describeBusy(h, q) {
+  const hs = q?.holders?.length ? q.holders : null;
+  if (!hs || (q.slots ?? 1) < 2) return `build đang bận: ${describeHolder(h)}`;
+  return `build đang bận (${hs.length}/${q.slots}): ${hs.map((x) => describeHolder(x)).join('; ')}`;
+}
+
+const DEFAULT_SCOPE_OPS = {
+  preflight: scopePreflight, stop: stopScope, orphans: orphanScopes, oomKills: appSliceOomKills, jobsConfigured: cargoJobsConfigured, memTotal: memTotal(),
+  holders: () => readHolders('build'),
+  claimedOnly: () => { const named = new Set(readHolders('build').map((h) => h.ticket).filter(Boolean)); return readClaimed('build').filter((c) => !named.has(c.ticket)).length; },
+  sweepLock: () => acquireHelperLock('build.sweep', { waitMs: 60_000 }),
+  slotTurn: waitForSlotTurn,
 };
 
 export async function main(argv, {
   acquire = acquireLock, run = (cmd, o) => runForwarded(cmd, o), stopGradle = (cmd, o) => runForwarded([cmd[0], '--stop'], o),
   log = (s) => console.error(s), env = process.env, nested = heldByAncestor,
   waitRam = waitForRam,
-  scopeOps = { preflight: scopePreflight, stop: stopScope, orphans: orphanScopes, oomKills: appSliceOomKills, jobsConfigured: cargoJobsConfigured, memTotal: os.totalmem() },
+  scopeOps: ops = {},
 } = {}) {
+  const scopeOps = { ...DEFAULT_SCOPE_OPS, ...ops };
   const a = parseHeavyArgs(argv);
   if (a.error) { log(a.error); return 2; }
   const cmdText = a.cmd.join(' ').slice(0, 200);
@@ -395,8 +482,8 @@ export async function main(argv, {
     lock = { release() {}, waitedMs: 0 };
   } else try {
     lock = await acquire('build', {
-      waitSec: a.waitSec, cmd: cmdText,
-      onWait: (h, waited, q) => log(`⏳ build đang bận: ${describeHolder(h)}${q?.position > 1 ? ` — bạn đứng thứ ${q.position}, trước bạn: ${q.ahead.join(', ')}` : q ? ' — bạn đứng đầu hàng' : ''} — ${waited ? `đã chờ ${Math.round(waited / 60000)} phút, ` : ''}chờ tới lượt… (rời hàng: node ../teleport/scripts/lock-queue.mjs leave)`),
+      waitSec: a.waitSec, cmd: cmdText, pending: true,
+      onWait: (h, waited, q) => log(`⏳ ${describeBusy(h, q)}${q?.position > 1 ? ` — bạn đứng thứ ${q.position}, trước bạn: ${q.ahead.join(', ')}` : q ? ' — bạn đứng đầu hàng' : ''} — ${waited ? `đã chờ ${Math.round(waited / 60000)} phút, ` : ''}chờ tới lượt… (rời hàng: node ../teleport/scripts/lock-queue.mjs leave)`),
     });
   } catch (e) {
     // Only a missing flock binary may run unlocked (as before); any other failure stops here.
@@ -407,22 +494,40 @@ export async function main(argv, {
   if (lock.left) { log('⏹ heavy: đã rời hàng đợi build — không chạy.'); return LEFT_QUEUE_EXIT; }
   if (lock.timeout) { log(`❌ heavy: chờ quá ${a.waitSec / 60} phút, build vẫn bận: ${describeHolder(lock.holder)} — không chạy.`); return WAIT_TIMEOUT_EXIT; }
   if (lock.waitedMs > 1000) log(`▶️ tới lượt (đã chờ ${Math.round(lock.waitedMs / 1000)}s): ${cmdText}`);
+  const slot = lock.slot ?? 0;
+  if (!isNested && slot > 0) Object.assign(childEnv, slotEnv(env, slot)); // RFC 23: own Gradle registry, Kotlin in-process
   let scope = null;
   try {
     if (!isNested) {
       // A heavy SIGKILLed earlier lost its lock, but its build may still run: stop it now.
-      for (const u of scopeOps.orphans()) {
-        log(`🧹 heavy: dừng build mồ côi ${u}`);
-        if (!scopeOps.stop(u)) { log(`❌ heavy: không dừng được build mồ côi ${u} — không chạy chồng lên nó. Thử lại sau / systemctl --user kill -s KILL ${u} (rồi systemctl --user reset-failed ${u})`); return WAIT_TIMEOUT_EXIT; }
-      }
-      // Pressure may have changed while we queued: check again, now that we're next.
-      if (a.ramWait) await waitRam({ minBytes: minFreeBytes(env), log });
+      // (RFC 23: under build.sweep.lock, so two heavies starting together don't stop the same unit at once)
+      const unlockSweep = await scopeOps.sweepLock();
+      if (!unlockSweep) { log('❌ heavy: chờ dọn build mồ côi quá 60 s (heavy khác đang dọn?) — không chạy. Thử lại sau.'); return WAIT_TIMEOUT_EXIT; }
+      try {
+        for (const u of scopeOps.orphans()) {
+          log(`🧹 heavy: dừng build mồ côi ${u}`);
+          if (!scopeOps.stop(u)) { log(`❌ heavy: không dừng được build mồ côi ${u} — không chạy chồng lên nó. Thử lại sau / systemctl --user kill -s KILL ${u} (rồi systemctl --user reset-failed ${u})`); return WAIT_TIMEOUT_EXIT; }
+        }
+      } finally { unlockSweep(); }
+      // RFC 23: 30% when another build may run beside us, else 45% (as before).
+      const me = { pid: process.pid, startedAt: lock.startedAt, slot };
+      const others = lock.startedAt ? scopeOps.holders().filter((h) => !(h.pid === me.pid && h.startedAt === me.startedAt)) : [];
+      const fraction = (lock.slots ?? 1) >= 2 || others.length ? SCOPE_MEM_FRACTION_SHARED : SCOPE_MEM_FRACTION;
       if (a.scope && env.TELEPORT_HEAVY_SCOPE !== '0') {
-        const memMax = scopeMemMax(env, scopeOps.memTotal);
+        const memMax = scopeMemMax(env, scopeOps.memTotal, fraction);
         const pf = scopeOps.preflight({ memMax });
         if (pf.ok) scope = { unit: `heavy-${process.pid}-${Math.random().toString(36).slice(2, 8)}.scope`, memMax };
         else log(`⚠️ heavy: không tạo được scope riêng (${pf.why}) — chạy như cũ, không giới hạn RAM.`);
       }
+      if (lock.startedAt) {
+        // Declare our cap (the holder said `pending` until now), then wait for the builds before us.
+        const unbounded = !scope || isUnbounded({ memMax: scope.memMax }, scopeOps.memTotal);
+        lock.update?.({ pending: undefined, ...(unbounded ? { unbounded: true } : { memMax: scope.memMax }) });
+        await scopeOps.slotTurn({ me, myMax: scope?.memMax ?? 0, unbounded, total: scopeOps.memTotal, minBytes: a.ramWait ? minFreeBytes(env) : 0,
+          holders: scopeOps.holders, claimedOnly: scopeOps.claimedOnly, log, setWaiting: (w) => lock.update?.({ waitingRam: w || undefined }) });
+      }
+      // Pressure may have changed while we queued: check again, now that we're next.
+      if (a.ramWait) await waitRam({ minBytes: minFreeBytes(env), log });
     }
     // A Gradle daemon started earlier lives outside our scope (unlimited): stop it first.
     // Ctrl-C / TERM during these pre-steps cancels the build (it must not start anyway).

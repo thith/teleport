@@ -5,7 +5,7 @@
 // below read /proc, df, ps and the user journal (best effort — a missing source
 // just drops that line).
 
-import { formatQueue, LOCK_NAMES } from './lock-queue.mjs';
+import { formatQueue, pruneSkipLines, LOCK_NAMES } from './lock-queue.mjs';
 import fs from 'node:fs';
 import os from 'node:os';
 import { execFileSync, execFile } from 'node:child_process';
@@ -334,7 +334,7 @@ if (isMainModule(import.meta.url)) {
     cores: os.cpus().length, load: os.loadavg(), mem,
     disk: dfOut ? parseDf(dfOut) : null, agents,
     top: psOut ? topMemory(psOut) : null, oomKills: journal ? countOomKills(journal) : 0,
-    locks: (() => { try { return LOCK_NAMES.flatMap((n) => formatQueue(n)); } catch { return null; } })(),
+    locks: (() => { try { return [...LOCK_NAMES.flatMap((n) => formatQueue(n)), ...pruneSkipLines()]; } catch { return null; } })(),
   }) + '\n');
 }
 

@@ -184,14 +184,16 @@ test('ticketStatus: dead (gone / zombie / reused pid) vs stopped vs stalled vs l
 
 test('formatQueue (for /health and ls): holder, order, every status incl. struck; parseArgs', () => {
   const now = 10 * 60_000;
-  const lines = formatQueue('build', { now, holderOf: () => ({ alive: true, pid: 1, label: '🧚 Tiên', cmd: 'cargo test', startedAt: 0 }),
+  const lines = formatQueue('build', { now, holderOf: (f) => (/build\.holder/.test(f) ? { alive: true, pid: 1, label: '🧚 Tiên', cmd: 'cargo test', startedAt: 0 } : null),
     read: () => [{ name: 'b.json', status: 'live', pid: 2, label: '🐭 Chuột', cmd: 'clip', createdAt: 5 * 60_000 }, { name: 'd.json', status: 'stopped', pid: 4, createdAt: 0 }, { name: 'c.json', status: 'stalled', pid: 3, createdAt: 0 }],
     struck: () => [{ name: 'a.left', pid: 5, label: 'X', createdAt: 0 }] });
-  assert.match(lines[0], /build: đang giữ — 🧚 Tiên — cargo test/);
-  assert.match(lines[1], /1\. X — đã gạch \(đang rời\)/);
-  assert.match(lines[2], /2\. 🐭 Chuột — clip — chờ 5 phút/);
-  assert.match(lines[3], /3\. pid 3 — kẹt \(mất nhịp tim\)/);
-  assert.match(lines[4], /4\. pid 4 — bị dừng/);
+  assert.match(lines[0], /^🔒 build: đang chạy 1\/1$/);
+  assert.match(lines[1], /^  ▶ 🧚 Tiên — cargo test/);
+  assert.equal(lines[2], '  Chờ (4):');
+  assert.match(lines[3], /1\. X — đã gạch \(đang rời\)/);
+  assert.match(lines[4], /2\. 🐭 Chuột — clip — chờ 5 phút/);
+  assert.match(lines[5], /3\. pid 3 — kẹt \(mất nhịp tim\)/);
+  assert.match(lines[6], /4\. pid 4 — bị dừng/);
   assert.deepEqual(parseArgs(['leave', '--lock', 'build', '--pid', '42']), { cmd: 'leave', lock: 'build', pid: 42 });
   assert.match(parseArgs(['leave', '--lock', 'nope']).error, /lock phải/);
 });
@@ -222,8 +224,8 @@ test('several tickets in ONE process (the daemon): served in order, each release
 test('formatQueue: "đang nhận lock" names the first LIVE ticket, never a stopped / stalled one', () => {
   const lines = formatQueue('build', { holderOf: () => null, struck: () => [],
     read: () => [{ name: 'a.json', status: 'stopped', pid: 1, label: 'S', createdAt: 0 }, { name: 'b.json', status: 'live', pid: 2, label: 'L', createdAt: 0 }] });
-  assert.match(lines[0], /trống — L đang nhận lock/);
-  assert.match(formatQueue('build', { holderOf: () => null, struck: () => [], read: () => [{ name: 'a.json', status: 'stalled', pid: 1, createdAt: 0 }] })[0], /build: trống$/);
+  assert.match(lines[0], /trống \(0\/1\) — L đang nhận lock/);
+  assert.match(formatQueue('build', { holderOf: () => null, struck: () => [], read: () => [{ name: 'a.json', status: 'stalled', pid: 1, createdAt: 0 }] })[0], /build: trống \(0\/1\)$/);
 });
 
 test('claim lost to a mistaken prune (ticket gone, no .left) → we keep the lock we won', async () => {
