@@ -94,8 +94,9 @@ export async function longBuildWatch(ctx, {
   const stopping = new Set(stopJobs(store).map(([, j]) => j.key));
   for (const [key, a] of Object.entries(st)) { // ended (and not being stopped — the stop job reports itself)
     if (liveKeys.has(key)) continue;
-    if (!stopping.has(key)) {
-      if (a.tok) { try { store.delete(a.tok); } catch {} }
+    // only an alert nobody pressed: a pressed one already says "để chạy tiếp" or carries the stop result
+    if (!stopping.has(key) && a.tok && store.get(a.tok)?.kind === 'longbuild') {
+      try { store.delete(a.tok); } catch {}
       if (a.messageId != null) await ctx.editButtonRows(chatId, a.messageId, `${a.text}\n\n✅ đã xong.`, []);
     }
     delete st[key];
@@ -265,16 +266,16 @@ export async function advanceStop(job, ctx, {
       try { fs.writeFileSync(marker, JSON.stringify({ by: 'owner', at: now, minutes: mins(now - job.startedAt) }), { mode: 0o600 }); } catch {}
       return { ...job, phase: 'waitAck', markerAt: now };
     case 'waitAck': {
-      if (!alive()) return { ...job, phase: 'escalate' }; // heavy gone: make sure nothing of the build survives
       const f = fresh(), h = f._h; delete f._h;
+      if (!alive()) return { ...f, phase: 'escalate' }; // heavy gone: make sure nothing of the build survives
       if (h?.stopAck || h?.stopping) return { ...f, phase: 'waitExit', ackAt: now };
       if (now - (job.markerAt ?? now) < ACK_MS) return f;
       if (alive()) { try { kill(job.pid, 'SIGTERM'); } catch {} } // no ack (old heavy / blocked): the old way
       return { ...f, phase: 'waitExit', termAt: now };
     }
     case 'waitExit': {
-      if (!alive()) return { ...job, phase: 'escalate' };
       const f = fresh(); delete f._h;
+      if (!alive()) return { ...f, phase: 'escalate' };
       return now >= job.deadline ? { ...f, phase: 'escalate' } : f;
     }
     case 'escalate': {
@@ -298,16 +299,21 @@ export async function advanceStop(job, ctx, {
       try { fs.unlinkSync(marker); } catch {}
       return { ...job, phase: 'report', result, tries: 0 };
     }
-    case 'report': { // retried until Telegram + the agent's queue really got it (≤ 30 tries ≈ 1 min)
+    case 'report': { // kept until Telegram + the agent's queue really got it: every tick for a minute, then once a minute
+      if (job.nextTryAt && now < job.nextTryAt) return job;
       const edit = ctx.editButtonRowsStrict || ctx.editButtonRows;
       let edited = !!job.edited, delivered = !!job.delivered || job.convoId == null || !deliver;
-      if (!edited) { try { await edit(job.chatId, job.messageId, `${job.text}\n\n${job.result}`, []); edited = true; } catch (e) { console.error(`[long-build] report edit: ${e?.message ?? e}`); } }
+      if (!edited) {
+        try { await edit(job.chatId, job.messageId, `${job.text}\n\n${job.result}`, []); edited = true; }
+        catch (e) { if (/not found|can't be edited|message_id_invalid/i.test(e?.message || '')) edited = true; else console.error(`[long-build] report edit: ${e?.message ?? e}`); } // (deleted message: nothing to edit)
+      }
       if (!delivered) {
         const wt = job.worktree ? ` (worktree ${path.basename(job.worktree)})` : '';
         try { await deliver({ convoId: job.convoId, text: `${job.cmd}${wt} — ${job.result}` }, { build: buildStopNoticePrompt }); delivered = true; } catch (e) { console.error(`[long-build] notice: ${e?.message ?? e}`); }
       }
-      if ((edited && delivered) || (job.tries ?? 0) >= 30) return null;
-      return { ...job, edited, delivered, tries: (job.tries ?? 0) + 1 };
+      if (edited && delivered) return null;
+      const tries = (job.tries ?? 0) + 1;
+      return { ...job, edited, delivered, tries, ...(tries >= 30 ? { nextTryAt: now + 60_000 } : {}) };
     }
     default: return null;
   }

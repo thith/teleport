@@ -331,3 +331,38 @@ test('heavy: a signal while waiting (before the build) → interrupted, lock rel
   assert.equal(ran, false);
   assert.equal(process.listenerCount('SIGTERM'), listenersBefore, 'no handler left behind');
 });
+
+test('watch: a stopped build’s alert keeps its stop result (no "✅ đã xong" over it)', async () => {
+  const ctx = fakeCtx(), state = memState(), dir = tmpDir();
+  let holders = [H()];
+  const o = (now) => ({ now, dir, holders: () => holders, queue: () => [live(0)], slots: () => 1, state });
+  await longBuildWatch(ctx, o(31 * MIN));
+  const tok = /^bs:([0-9a-f]{16}):s$/.exec(ctx.sent[0].rows[0][0].callback_data)[1];
+  ctx.buttonStore.replace(tok, 'stop:100:0', { kind: 'stop', key: '100:0' });
+  ctx.buttonStore.delete('stop:100:0'); // the stop job finished and reported between two heartbeats
+  holders = [];
+  const before = ctx.edits.length;
+  await longBuildWatch(ctx, o(33 * MIN));
+  assert.equal(ctx.edits.length, before, 'no edit');
+  assert.deepEqual(state.read(), {});
+});
+
+test('advanceStop report: never dropped while failing — backs off to once a minute after 30 tries; a deleted message counts as done', async () => {
+  const ctx = fakeCtx();
+  ctx.editButtonRowsStrict = async () => { throw new Error('network'); };
+  let j = JOB({ phase: 'report', result: 'x', convoId: null });
+  for (let i = 0; i < 31; i++) j = await advanceStop(j, ctx, { now: 1000 });
+  assert.equal(j.phase, 'report');
+  assert.equal(j.nextTryAt, 61_000);
+  assert.equal(await advanceStop(j, ctx, { now: 2000 }), j, 'waits for nextTryAt');
+  ctx.editButtonRowsStrict = async () => { throw new Error('Bad Request: message to edit not found'); };
+  assert.equal(await advanceStop(j, ctx, { now: 61_000 }), null);
+});
+
+test('advanceStop: pgid / unit written just before heavy died are picked up for the cleanup', async () => {
+  const ctx = fakeCtx(), dir = tmpDir();
+  const j = await advanceStop(JOB({ phase: 'waitExit' }), ctx, { now: 1000, dir, same: () => false, holders: () => [H({ pgid: 300, pgidStart: '7', unit: 'heavy-100-abc.scope' })] });
+  assert.equal(j.phase, 'escalate');
+  assert.equal(j.pgid, 300);
+  assert.equal(j.unit, 'heavy-100-abc.scope');
+});

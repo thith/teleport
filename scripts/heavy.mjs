@@ -528,7 +528,7 @@ export async function main(argv, {
   const SIGS = ['SIGINT', 'SIGTERM', 'SIGHUP'];
   const owned = !isNested && !!lock.startedAt;
   const marker = owned ? scopeOps.stopMarker(process.pid, lock.startedAt) : null;
-  let phase = 'pre', stopByOwner = false, cancelled = null, pgid = null, killTimer = null;
+  let phase = 'pre', stopByOwner = false, lateStop = false, cancelled = null, pgid = null, killTimer = null;
   const aborts = new Set();
   const cancelError = () => Object.assign(new Error('heavy cancelled'), { heavyCancel: true });
   const abortWaits = () => { for (const f of [...aborts]) f(); };
@@ -552,7 +552,7 @@ export async function main(argv, {
     if (stopByOwner || !scopeOps.exists(marker)) return;
     if (phase === 'pre') { acceptStop(); abortWaits(); }
     else if (phase === 'run' && pgid) { acceptStop(); killGroup('SIGTERM'); killTimer = setTimeout(() => killGroup('SIGKILL'), STOP_GRACE_MS); }
-    else if (phase === 'post') { lock.update?.({ stopAck: Date.now() }); try { fs.unlinkSync(marker); } catch {} } // already finishing
+    else if (phase === 'post') { lateStop = true; lock.update?.({ stopAck: Date.now() }); try { fs.unlinkSync(marker); } catch {} abortWaits(); } // already finishing: just bound the cleanup
   }, STOP_POLL_MS) : null;
   watch?.unref?.();
   if (owned) for (const s of SIGS) process.on(s, preSig);
@@ -563,6 +563,21 @@ export async function main(argv, {
     return 128 + (os.constants.signals[cancelled] || 2);
   };
   const waitOpts = owned ? { sleep: sleepAbortable } : {};
+  // `gradlew --stop` (before / after the build) as a bounded, interruptible step: on timeout or cancel its process group is
+  // killed and awaited, so nothing of it outlives the lock.
+  const boundedStopGradle = async (ms) => {
+    let gpid = null, timer = null, ab = null;
+    const p = stopGradle(a.cmd, { env: childEnv, onSpawn: (c) => { gpid = c.pid; } }).catch(() => 1);
+    const r = await Promise.race([p, new Promise((res) => { timer = setTimeout(() => res('timeout'), ms); }),
+      new Promise((res) => { ab = () => { aborts.delete(ab); res('cancel'); }; aborts.add(ab); if (cancelled || stopByOwner || lateStop) res('cancel'); })]);
+    clearTimeout(timer); aborts.delete(ab);
+    if (r === 'timeout' || r === 'cancel') {
+      if (gpid && scopeOps.groupAlive(gpid)) { try { process.kill(-gpid, 'SIGKILL'); } catch {} }
+      await Promise.race([p, new Promise((res) => setTimeout(res, 5000))]);
+      return 1;
+    }
+    return r;
+  };
   try {
     if (!isNested) {
       try {
@@ -624,7 +639,7 @@ export async function main(argv, {
       if (scope && a.stop && isGradlew(a.cmd)) {
         log('🧹 gradlew --stop (daemon cũ, trước build)…');
         let rc = 0;
-        try { rc = await stopGradle(a.cmd, { env: childEnv }); } catch { rc = 1; }
+        try { rc = owned ? await boundedStopGradle(120_000) : await stopGradle(a.cmd, { env: childEnv }); } catch { rc = 1; }
         if (rc && !cancelledOld && !preCancelled()) log('⚠️ heavy: gradlew --stop trước build thất bại — daemon cũ (ngoài scope, không giới hạn RAM) có thể bị dùng lại.');
       }
     } finally { for (const sig of SIGS) process.off(sig, onSig); }
@@ -647,13 +662,8 @@ export async function main(argv, {
     // 126/127: gradlew couldn't even start — nothing to stop. Stopped by the owner with a scope: the scope kills the daemon.
     if (a.stop && isGradlew(a.cmd) && code !== 126 && code !== 127 && !(stopByOwner && scope)) {
       log('🧹 gradlew --stop (trả RAM)…');
-      if (stopByOwner) { // after an owner stop (no scope): bounded to 30 s
-        let gpid = null, timer = null;
-        const p = stopGradle(a.cmd, { env: childEnv, onSpawn: (c) => { gpid = c.pid; } }).catch(() => {});
-        await Promise.race([p, new Promise((r) => { timer = setTimeout(r, 30_000); })]);
-        clearTimeout(timer);
-        if (gpid && scopeOps.groupAlive(gpid)) { try { process.kill(-gpid, 'SIGKILL'); } catch {} }
-      } else { try { await stopGradle(a.cmd, { env: childEnv }); } catch {} }
+      if (owned) await boundedStopGradle(stopByOwner || lateStop ? 30_000 : 10 * 60_000); // an owner stop (even late) cuts it at 30 s
+      else { try { await stopGradle(a.cmd, { env: childEnv }); } catch {} }
     }
     const oomAfter = scope ? scopeOps.oomKills() : null;
     // (app.slice counts every agent's OOMs too: only blame the build if it died by a signal)
