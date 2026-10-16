@@ -192,6 +192,7 @@ test('slotEnv: slot 0 changes nothing; slot 1 → own registry + Kotlin in-proce
   assert.ok(Object.keys(e).every((k) => !k.includes('.')), 'dash drops env names with dots');
   assert.match(slotEnv({ GRADLE_USER_HOME: '/g', GRADLE_OPTS: '-Xmx1g' }, 1).GRADLE_OPTS, /^-Xmx1g -Dorg\.gradle\.daemon\.registry\.base=\/g\/daemon-slot1 /);
   assert.match(slotEnv({ GRADLE_USER_HOME: '/my gradle' }, 1, { lockDir: '/locks' }).GRADLE_OPTS, /registry\.base=\/locks\/gradle-daemon-slot1 /);
+  assert.match(slotEnv({ GRADLE_USER_HOME: 'rel/g' }, 1).GRADLE_OPTS, new RegExp(`registry\\.base=${process.cwd().replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/rel/g/daemon-slot1 `), 'relative home made absolute');
 });
 
 // ── heavy: RAM budget ──
@@ -215,7 +216,8 @@ test('slotBlockers: 30%+30% passes, 45%+30% waits, unbounded waits both ways, RA
   assert.deepEqual(slotBlockers({ ...base, earlier: [], myMax: 0, unbounded: true }), [], 'unbounded alone runs');
   assert.match(slotBlockers({ ...base, earlier: [{ memMax: m30 }], myMax: m30, avail: 12 * GiB })[0], /cần/);
   assert.deepEqual(slotBlockers({ ...base, earlier: [{ memMax: m30 }], myMax: m30, avail: 12 * GiB, minBytes: 0 }), [], 'MIN_FREE_MB=0 turns the RAM gate off');
-  assert.match(slotBlockers({ ...base, earlier: [], extra: 1, myMax: m30 })[0], /chưa ghi tên/);
+  assert.deepEqual(slotBlockers({ ...base, earlier: [], extra: 1, myMax: m30 }), [], 'the earliest build never waits, not even on a fresh claim');
+  assert.match(slotBlockers({ ...base, earlier: [{ memMax: m30 }], extra: 1, myMax: m30 })[0], /chưa ghi tên/);
 });
 
 test('waitForSlotTurn: no plateau escape — waits as long as the earlier build blocks, then goes once it is alone', async () => {
@@ -228,6 +230,7 @@ test('waitForSlotTurn: no plateau escape — waits as long as the earlier build 
   assert.equal(polls, 200);
   assert.equal(r.alone, true);
   assert.deepEqual(flags, [true, false]);
+  assert.equal(r.waited, true);
 });
 
 test('waitForSlotTurn: two builds that took slots together never wait on each other — the earlier one goes', async () => {
@@ -250,7 +253,7 @@ test('heldByAncestor sees the outer heavy in slot 1 too', () => {
 
 test('describeBusy: "(2/2): A; B" with two slots, the old one-holder text otherwise', () => {
   const h = (label) => ({ alive: true, label, startedAt: Date.now(), cmd: 'x' });
-  assert.match(describeBusy(h('A'), { holders: [h('A'), h('B')], slots: 2 }), /^build đang bận \(2\/2\): A — x — .*; B — x/);
+  assert.equal(describeBusy(h('A'), { holders: [h('A'), h('B')], slots: 2 }), 'build đang bận (2/2): A — x, B — x');
   assert.match(describeBusy(h('A'), { holders: [h('A')], slots: 1 }), /^build đang bận: A — x/);
   assert.match(describeBusy(null, null), /chưa rõ ai giữ/);
 });
@@ -354,4 +357,98 @@ test('slots 1 / auto / show; prune-skip warning after 5 skips in a row', () => {
   assert.match(pruneSkipLines({ dir })[0], /5 lần/);
   assert.equal(notePruneSkip(dir, false), 0);
   assert.deepEqual(pruneSkipLines({ dir }), []);
+});
+
+// ── round-1 review additions ──
+
+test('a lost claim at slot 1 gives the slot back', async () => {
+  const dir = tmpDir();
+  const h0 = await acquireLock('build', { dir, waitSec: 0, slots: 2, convoId: null });
+  const r = await acquireLock('build', { dir, waitSec: 5, pollMs: 50, slots: 2, convoId: null,
+    beforeClaim: (t) => fs.renameSync(t, t.replace(/\.json$/, '.left')) });
+  assert.equal(r.left, true);
+  assert.equal(probe(dir, 1), 'free');
+  h0.release();
+});
+
+test('position 1 only tries while 1 < N − busy (a claimed ticket without holder counts as busy)', async () => {
+  const dir = tmpDir();
+  const h0 = await acquireLock('build', { dir, waitSec: 0, slots: 2, label: 'H0', convoId: null });
+  const q = lockPaths('build', dir).queue;
+  fs.mkdirSync(q, { recursive: true });
+  // a live waiter ahead of us (our own pid keeps it alive; fresh mtime = live), and a claim with no holder yet
+  const ahead = path.join(q, '000000000000001-' + process.pid + '-aaaaaa.json');
+  fs.writeFileSync(ahead, JSON.stringify({ pid: process.pid, label: 'AHEAD', createdAt: 1 }));
+  const claim = path.join(q, '000000000000002-' + process.pid + '-bbbbbb.acq');
+  fs.writeFileSync(claim, JSON.stringify({ pid: process.pid }));
+  let got = null;
+  const p = acquireLock('build', { dir, waitSec: 5, pollMs: 50, slots: 2, label: 'me', convoId: null }).then((l) => { got = l; return l; });
+  const keep = setInterval(() => { try { const t = new Date(); fs.utimesSync(ahead, t, t); } catch {} }, 100);
+  await sleep(400);
+  assert.equal(got, null, 'position 1 with N − busy = 2 − (1 holder + 1 claim) = 0 → no try, though slot 1 is free');
+  fs.unlinkSync(claim);
+  await sleep(400);
+  assert.equal(got, null, 'busy = 1 holder → position 1 < 2 − 1 is false: the slot is for the waiter ahead');
+  clearInterval(keep);
+  fs.unlinkSync(ahead);
+  const l = await p;
+  assert.equal(l.slot, 1, 'now at position 0 → tries and gets slot 1');
+  l.release(); h0.release();
+});
+
+test('a waiter without `slots` (N from the machine; 1 in a test dir) never takes slot 1, even when it frees', async () => {
+  const dir = tmpDir();
+  const h0 = await acquireLock('build', { dir, waitSec: 0, slots: 2, convoId: null });
+  const h1 = await acquireLock('build', { dir, waitSec: 0, slots: 2, convoId: null });
+  // N defaults to 1 in a test dir: a waiter without `slots` must never take slot 1 even when it frees
+  let got = null;
+  const p = acquireLock('build', { dir, waitSec: 5, pollMs: 50, convoId: null }).then((l) => { got = l; return l; });
+  h1.release();
+  await sleep(400);
+  assert.equal(got, null, 'slot 1 free but N = 1 → not granted');
+  h0.release();
+  const l = await p;
+  assert.equal(l.slot, 0);
+  l.release();
+});
+
+test('with 2 slots a holder that cannot be written means no run (the other build budgets RAM from it)', async () => {
+  const dir = tmpDir();
+  fs.mkdirSync(lockPaths('build', dir).holder); // a directory where the holder file goes → write fails
+  await assert.rejects(acquireLock('build', { dir, waitSec: 0, slots: 2, convoId: null }), /không ghi được holder/);
+  assert.equal(probe(dir, 0), 'free', 'slot given back');
+  const l = await acquireLock('build', { dir, waitSec: 0, slots: 1, convoId: null });
+  assert.ok(l.release, 'N = 1: display only, as before');
+  l.release();
+});
+
+test('heavy main: after waiting for an earlier build it sweeps orphans again; --no-ram-wait keeps the slot gate', async () => {
+  let sweeps = 0, turn = null;
+  const lock = { release() {}, update() {}, waitedMs: 0, slot: 1, slots: 2, startedAt: 7 };
+  const base = { env: {}, nested: () => false, log: () => {}, waitRam: async () => {}, acquire: async () => lock, run: async () => 0 };
+  await heavyMain(['--no-ram-wait', '--', 'cargo', 'b'], { ...base, scopeOps: { ...OPS, sweepLock: async () => { sweeps++; return () => {}; }, slotTurn: async (o) => { turn = o; return { waited: true }; } } });
+  assert.equal(sweeps, 2);
+  assert.equal(turn.minBytes, 3 * GiB);
+  sweeps = 0;
+  await heavyMain(['--', 'cargo', 'b'], { ...base, scopeOps: { ...OPS, sweepLock: async () => { sweeps++; return () => {}; } } });
+  assert.equal(sweeps, 1, 'no wait → no second sweep');
+  const zero = await heavyMain(['--', 'cargo', 'b'], { ...base, env: { TELEPORT_HEAVY_MIN_FREE_MB: '0' }, scopeOps: { ...OPS, slotTurn: async (o) => { turn = o; return {}; } } });
+  assert.equal(zero, 0);
+  assert.equal(turn.minBytes, 0, 'MIN_FREE_MB=0 turns the gate off');
+});
+
+test('heavy main + real acquireLock and waitForSlotTurn: slot 1 waits for slot 0 (45%) to finish', async () => {
+  const dir = tmpDir();
+  const T = 32 * GiB;
+  const a = await acquireLock('build', { dir, waitSec: 0, slots: 2, label: 'A', convoId: null });
+  a.update({ memMax: Math.floor(0.45 * T) });
+  const holders = () => readHolders('build', { dir });
+  const events = [];
+  const turn = (o) => waitForSlotTurn({ ...o, readState: () => ({ avail: 20 * GiB }), sleep: async () => { events.push('wait'); if (events.length === 3) a.release(); await sleep(10); } });
+  const code = await heavyMain(['--', 'cargo', 'b'], { env: {}, nested: () => false, log: () => {}, waitRam: async () => {},
+    acquire: (name, o) => acquireLock(name, { ...o, dir, slots: 2, convoId: null, label: 'B' }),
+    run: async () => { events.push('run'); return 0; },
+    scopeOps: { ...OPS, memTotal: T, holders, claimedOnly: () => 0, slotTurn: turn } });
+  assert.equal(code, 0);
+  assert.deepEqual(events, ['wait', 'wait', 'wait', 'run']);
 });

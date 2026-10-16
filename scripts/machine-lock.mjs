@@ -303,7 +303,7 @@ export async function acquireLock(name, {
   convoId = selfConvoId(), warn = (m) => console.error(m), stat = procStat, beforeClaim = null,
   slots = null, exclusive = false, pending = false,
 } = {}) {
-  const N = slotsFor(name, { slots, dir });
+  let N = slotsFor(name, { slots, dir }); // re-read every poll while waiting: `lock-queue slots 1` applies to queued waiters too
   const nFiles = slotFiles(name);
   const P = Array.from({ length: nFiles }, (_, k) => lockPaths(name, dir, k));
   const p = P[0];
@@ -316,12 +316,13 @@ export async function acquireLock(name, {
   const close = (keep = null) => { for (let k = 0; k < nFiles; k++) if (fds[k] != null && !(keep && keep.has(k))) { try { fs.closeSync(fds[k]); } catch {} fds[k] = null; won.delete(k); } };
   const holders = () => readHolders(name, { dir });
   const first = (hs = holders()) => hs[0] || readHolder(p.holder);
-  // Try slots 0..n−1 in order; → the slot won, or −1. Retries a slot once after 100 ms when its holder is dead
-  // (a try-once caller just gave it back).
-  const trySlots = async (n) => {
+  // Try slots 0..n−1 in order; → the slot won, or −1. Waiters retry a slot once after 100 ms when its holder is
+  // dead (a try-once caller just gave it back) — not while an exclusive holder (cleanup) has every slot.
+  const trySlots = async (n, retry = true) => {
+    const excl = retry && n > 1 && readHolder(P[0].holder);
     for (let k = 0; k < n; k++) {
       let r = await tryFlock(fdOf(k));
-      if (r !== 'acquired' && !readHolder(P[k].holder)?.alive) { await sleep(100); r = await tryFlock(fdOf(k)); }
+      if (retry && r !== 'acquired' && !(excl?.alive && excl.exclusive) && !readHolder(P[k].holder)?.alive) { await sleep(100); r = await tryFlock(fdOf(k)); }
       if (r === 'acquired') { won.add(k); return k; }
     }
     return -1;
@@ -343,7 +344,7 @@ export async function acquireLock(name, {
         // every slot file (not just 0..N−1: a build may still run in a slot N no longer grants)
         for (let k = 0; k < nFiles; k++) { if (await tryFlock(fdOf(k)) !== 'acquired') return busyOut(); won.add(k); }
         slot = 0;
-      } else if ((slot = await trySlots(N)) < 0) return busyOut();
+      } else if ((slot = await trySlots(N, false)) < 0) return busyOut();
       if (live()) return busyOut();
     } else {
       // Ticket FIRST (before any try); deleted only AFTER the holder file names us.
@@ -375,6 +376,7 @@ export async function acquireLock(name, {
         // Position 0 always tries (never gated by holder files, which may be stale). Position i ≥ 1
         // only while i < N − busy, busy = live holders of every slot + claimed (.acq) tickets that have
         // no holder yet. A wrong count costs order, never exclusion (flock decides).
+        if (slots == null && name === 'build') N = slotsFor(name, { dir });
         let mayTry = !ahead.length;
         if (!mayTry && N > 1) {
           const hs = holders();
@@ -410,9 +412,12 @@ export async function acquireLock(name, {
   // `ticket`: which of possibly several tickets of this process (daemon) holds the lock.
   let me = { pid: process.pid, procStart: stat(process.pid)?.start ?? null, convoId: convoId == null ? null : String(convoId), ticket: ticket ? path.basename(ticket).replace(/\.acq$/, '.json') : null, label, cmd, cwd: process.cwd(), startedAt: now(),
     ...(name === 'build' ? { slot, slots: N } : {}), ...(exclusive ? { exclusive: true } : {}), ...(pending ? { pending: true } : {}) };
-  try { // atomic, so a waiter never reads half a file; display only → failure is harmless
+  try { // atomic, so a waiter never reads half a file
     writeJsonAtomic(hp, me);
-  } catch {}
+  } catch (e) {
+    // Display only — except with 2 build slots, where the other build budgets RAM from our holder: no holder, no run.
+    if (name === 'build' && N > 1) { done(); close(); throw new Error(`không ghi được holder ${path.basename(hp)} (${e.message}) — không chạy (build kia cần nó để tính RAM)`); }
+  }
   done(); // holder names us → leave the queue
   let released = false;
   const ours = () => { const h = readHolder(hp); return h?.pid === process.pid && h.startedAt === me.startedAt && h.ticket === me.ticket; };
