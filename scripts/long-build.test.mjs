@@ -366,3 +366,16 @@ test('advanceStop: pgid / unit written just before heavy died are picked up for 
   assert.equal(j.pgid, 300);
   assert.equal(j.unit, 'heavy-100-abc.scope');
 });
+
+test('heavy: after an owner stop without a scope, gradlew --stop still gets to run (not killed at once)', async () => {
+  const { main } = await import('./heavy.mjs');
+  let stopRan = false, marker = false;
+  const lock = { release() {}, update() { return true; }, waitedMs: 0, slot: 0, slots: 1, startedAt: Date.now() };
+  const code = await main(['--', './gradlew', 'build'], { env: {}, nested: () => false, log: () => {}, waitRam: async () => {}, acquire: async () => lock,
+    run: async (c, o) => { o.onSpawn?.({ pid: 999999 }); marker = true; await sleep(2600); return 143; }, // the watcher sees the marker during the build
+    stopGradle: async () => { await sleep(300); stopRan = true; return 0; },
+    scopeOps: { preflight: () => ({ ok: false, why: 't' }), stop: () => true, orphans: () => [], oomKills: () => null, jobsConfigured: () => true, memTotal: 16 * 1024 ** 3,
+      holders: () => [], sweepLock: async () => () => {}, slotTurn: async () => ({}), stopMarker: () => '/nonexistent', exists: () => marker, groupAlive: () => false } });
+  assert.equal(code, STOPPED_EXIT);
+  assert.equal(stopRan, true, 'gradlew --stop completed within its grace period');
+});

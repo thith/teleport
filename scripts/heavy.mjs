@@ -565,12 +565,17 @@ export async function main(argv, {
   const waitOpts = owned ? { sleep: sleepAbortable } : {};
   // `gradlew --stop` (before / after the build) as a bounded, interruptible step: on timeout or cancel its process group is
   // killed and awaited, so nothing of it outlives the lock.
-  const boundedStopGradle = async (ms) => {
-    let gpid = null, timer = null, ab = null;
+  // Before the build a cancel ends it at once; after it (`shortenTo`), a stop only shortens what is left to that many ms —
+  // `gradlew --stop` is what frees the detached Gradle daemon's GBs, so it gets its grace period.
+  const boundedStopGradle = async (ms, { shortenTo = null } = {}) => {
+    let gpid = null, timer = null, ab = null, short = null;
     const p = stopGradle(a.cmd, { env: childEnv, onSpawn: (c) => { gpid = c.pid; } }).catch(() => 1);
     const r = await Promise.race([p, new Promise((res) => { timer = setTimeout(() => res('timeout'), ms); }),
-      new Promise((res) => { ab = () => { aborts.delete(ab); res('cancel'); }; aborts.add(ab); if (cancelled || stopByOwner || lateStop) res('cancel'); })]);
-    clearTimeout(timer); aborts.delete(ab);
+      new Promise((res) => {
+        if (shortenTo != null) { ab = () => { aborts.delete(ab); short = setTimeout(() => res('timeout'), shortenTo); }; aborts.add(ab); return; }
+        ab = () => { aborts.delete(ab); res('cancel'); }; aborts.add(ab); if (cancelled || stopByOwner || lateStop) res('cancel');
+      })]);
+    clearTimeout(timer); clearTimeout(short); aborts.delete(ab);
     if (r === 'timeout' || r === 'cancel') {
       if (gpid && scopeOps.groupAlive(gpid)) { try { process.kill(-gpid, 'SIGKILL'); } catch {} }
       await Promise.race([p, new Promise((res) => setTimeout(res, 5000))]);
@@ -662,7 +667,7 @@ export async function main(argv, {
     // 126/127: gradlew couldn't even start — nothing to stop. Stopped by the owner with a scope: the scope kills the daemon.
     if (a.stop && isGradlew(a.cmd) && code !== 126 && code !== 127 && !(stopByOwner && scope)) {
       log('🧹 gradlew --stop (trả RAM)…');
-      if (owned) await boundedStopGradle(stopByOwner || lateStop ? 30_000 : 10 * 60_000); // an owner stop (even late) cuts it at 30 s
+      if (owned) await boundedStopGradle(stopByOwner || lateStop ? 30_000 : 10 * 60_000, { shortenTo: 30_000 }); // an owner stop (even late) → ≤ 30 s
       else { try { await stopGradle(a.cmd, { env: childEnv }); } catch {} }
     }
     const oomAfter = scope ? scopeOps.oomKills() : null;
