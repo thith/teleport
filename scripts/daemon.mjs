@@ -68,6 +68,7 @@ import {
 } from './merge-inbox.mjs';
 import { peekPersona } from './persona-store.mjs';
 import { machineWatch } from './health.mjs';
+import { longBuildWatch, handleLongBuildButton, stopTick, STOP_BUTTON_RE, STOP_TICK_MS } from './long-build.mjs';
 import { recordFetchOk, startListenWatchdog } from './listen-watch.mjs';
 import { launchCleanup, startCleanupScheduler } from './cleanup-launch.mjs';
 import { processCleanupRequests, processCleanupOffers, handleCleanupButton, CLEANUP_BUTTON_RE } from './cleanup-inbox.mjs';
@@ -290,9 +291,14 @@ async function main() {
     // Several rows of buttons (/type); edit = replace text AND keyboard (rows = [] removes it).
     sendButtonRows: (chatId, text, rows) => tg('sendMessage', { chat_id: chatId, text, reply_markup: { inline_keyboard: rows }, link_preview_options: { is_disabled: true } }),
     editButtonRows: (chatId, messageId, text, rows) => tg('editMessageText', { chat_id: chatId, message_id: messageId, text, reply_markup: { inline_keyboard: rows }, link_preview_options: { is_disabled: true } }).catch(() => {}),
+    // (RFC 24 stop report: failures must be seen, to retry; "message is not modified" counts as done)
+    editButtonRowsStrict: (chatId, messageId, text, rows) => tg('editMessageText', { chat_id: chatId, message_id: messageId, text, reply_markup: { inline_keyboard: rows }, link_preview_options: { is_disabled: true } }).catch((e) => { if (!/not modified/i.test(e?.message || '')) throw e; }),
   };
   // Pending buttons (merge previews, manual cleanups) survive a restart.
   pendingMergeButtons = new PersistentMap();
+  // RFC 24: owner-requested build stops run on their own short timer (not the 60 s heartbeat); jobs survive a restart.
+  const stopCtx = { daemonUserId, buttonStore: pendingMergeButtons, ...linkMergeUi };
+  setInterval(() => { stopTick(stopCtx, { deliver: deliverResult }).catch((e) => console.error(`[daemon] stop tick: ${e?.message ?? e}`)); }, STOP_TICK_MS);
   // The Merge button pins the head commit read here (gh, without our secrets).
   const ghEnv = { ...process.env };
   for (const k of secretEnvKeys) delete ghEnv[k];
@@ -374,8 +380,8 @@ async function main() {
       const presses = updates.filter((u) => u.callback_query && String(u.callback_query.from?.id) === daemonUserId);
       for (const u of presses) {
         const data = String(u.callback_query.data || '');
-        const handler = TYPE_BUTTON_RE.test(data) ? handleTypeButton : CLEANUP_BUTTON_RE.test(data) ? handleCleanupButton : handleMergeButton;
-        handler(u.callback_query, ctx).catch((e) => console.error(`[daemon] button: ${e?.message ?? e}`));
+        const handler = STOP_BUTTON_RE.test(data) ? handleLongBuildButton : TYPE_BUTTON_RE.test(data) ? handleTypeButton : CLEANUP_BUTTON_RE.test(data) ? handleCleanupButton : handleMergeButton;
+        handler(u.callback_query, ctx, handler === handleLongBuildButton ? { kick: () => { stopTick(stopCtx, { deliver: deliverResult }).catch(() => {}); } } : undefined).catch((e) => console.error(`[daemon] button: ${e?.message ?? e}`));
       }
       // Agent merge requests (file inbox) — one pass at a time.
       if (!mergeInboxBusy) {
@@ -400,6 +406,9 @@ async function main() {
         // Machine watch: early low-RAM warning + agents that vanished (OOM-kills).
         try { await machineWatch(watchState, (t) => sendText(daemonUserId, t)); }
         catch (e) { console.error(`[daemon] machine watch: ${e?.message ?? e}`); }
+        // RFC 24: a build holding the lock too long while others wait → owner alert with a stop button.
+        try { await longBuildWatch(ctx); }
+        catch (e) { console.error(`[daemon] long-build watch: ${e?.message ?? e}`); }
       }
     } catch (e) {
       console.error(`[daemon] loop error: ${e instanceof Error ? e.message : e}`);
@@ -475,7 +484,7 @@ export function takeMergeButton(tok, { now = Date.now(), store = pendingMergeBut
   const e = store.get(tok);
   if (e?.kind) return null; // allow-list: merge entries carry no kind (cleanup / type have their own takers)
   store.delete(tok);
-  for (const [k, v] of store) if (now - v.createdAt > ttlMs) store.delete(k); // sweep
+  for (const [k, v] of store) if (v?.kind !== 'stop' && now - v.createdAt > ttlMs) store.delete(k); // sweep (an in-flight build stop — RFC 24 — stays)
   if (!e || now - e.createdAt > ttlMs) return null;
   return e;
 }

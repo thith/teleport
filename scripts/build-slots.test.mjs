@@ -271,7 +271,8 @@ test('heavy main, slot 1 of 2: own Gradle env, 30% cap declared to the holder, b
   assert.equal(code, 0);
   assert.match(runOpts.env.GRADLE_OPTS, /daemon-slot1/);
   assert.equal(pf.memMax, Math.floor(32 * GiB * SCOPE_MEM_FRACTION_SHARED / 4096) * 4096);
-  assert.deepEqual(updates[0], { pending: undefined, memMax: pf.memMax });
+  assert.deepEqual({ ...updates[0], unit: undefined }, { pending: undefined, memMax: pf.memMax, unit: undefined });
+  assert.match(updates[0].unit, /^heavy-\d+-[a-z0-9]+\.scope$/, 'RFC 24: the unit is published with the cap');
   assert.equal(turn.me.slot, 1);
   assert.equal(turn.myMax, pf.memMax);
 });

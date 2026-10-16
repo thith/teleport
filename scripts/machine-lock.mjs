@@ -275,6 +275,12 @@ export function worktreeOf(cwd = process.cwd(), { exists = fs.existsSync } = {})
   } catch { return null; }
 }
 
+// ── RFC 24 part B: owner stop marker ──
+
+/** The file the daemon writes to ask the heavy holding a build slot (pid + startedAt) to stop. */
+export const stopMarkerPath = (pid, startedAt, dir = LOCK_DIR) => path.join(dir, `stop-${pid}-${startedAt}.json`);
+export const STOP_MARKER_RE = /^stop-(\d+)-(\d+)\.json$/;
+
 // ── RFC 24: fair order between owners ──
 
 /** The git common dir of a worktree (its `.git` dir, or what a `.git` file / `commondir` points to), or null. */

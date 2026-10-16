@@ -224,7 +224,7 @@ test('acquire: no flock binary → rejects (heavy runs unlocked, merge refuses) 
 test('heavy: wrapper SIGKILLed → the build dies too (setpriv --pdeathsig); lock free', { skip: spawnSync('setpriv', ['--version']).status !== 0 }, async () => {
   const dir = tmpDir();
   const c = heavy(dir, ['--', 'sleep', '30']);
-  await until(() => fs.existsSync(lockPaths('build', dir).holder));
+  await until(() => readHolder(lockPaths('build', dir).holder)?.running === true); // RFC 24: set once the build is spawned
   await sleep(200);
   const kids = spawnSync('pgrep', ['-P', String(c.pid)], { encoding: 'utf8' }).stdout.trim().split('\n').filter(Boolean).map(Number);
   assert.equal(kids.length, 1);
