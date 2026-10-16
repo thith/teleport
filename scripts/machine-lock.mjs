@@ -314,6 +314,19 @@ export function markServed(name, owner, { dir = LOCK_DIR, now = Date.now() } = {
     const t = new Date(now); fs.utimesSync(f, t, t);
   } catch {}
 }
+/**
+ * Delete a stale ledger file without racing a refresh: move it aside (atomic), look again, and put it back
+ * (link — never over a newer file) if it was refreshed in between.
+ */
+function pruneServedFile(file, now) {
+  const aside = `${file}.prune-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
+  try { fs.renameSync(file, aside); } catch { return; }
+  try {
+    if (now - fs.statSync(aside).mtimeMs <= SERVED_PRUNE_MS) { try { fs.linkSync(aside, file); } catch {} } // refreshed meanwhile: restore (a newer file wins)
+  } catch {}
+  try { fs.unlinkSync(aside); } catch {}
+}
+
 /** owner → last served (ms); entries older than 24 h ignored (deleted after 7 days when `prune`). Unreadable → {}. */
 export function readServed(name, { dir = LOCK_DIR, now = Date.now(), prune = false } = {}) {
   const d = path.join(dir, `${name}.served`);
@@ -321,14 +334,18 @@ export function readServed(name, { dir = LOCK_DIR, now = Date.now(), prune = fal
   let files = [];
   try { files = fs.readdirSync(d); } catch { return out; }
   for (const f of files) {
+    if (f.includes('.prune-')) continue;
     try {
       const file = path.join(d, f), st = fs.statSync(file);
-      if (now - st.mtimeMs > SERVED_MAX_AGE_MS) { if (prune && now - st.mtimeMs > SERVED_PRUNE_MS) fs.unlinkSync(file); continue; }
+      if (now - st.mtimeMs > SERVED_MAX_AGE_MS) { if (prune && now - st.mtimeMs > SERVED_PRUNE_MS) pruneServedFile(file, now); continue; }
       out[fs.readFileSync(file, 'utf8').trim()] = st.mtimeMs;
     } catch {}
   }
   return out;
 }
+
+/** A live ticket written by pre-RFC 24 code (no `owner`): its waiter is FIFO, so the queue must be too. */
+export const hasLegacyWaiter = (tickets) => tickets.some((t) => t.status === 'live' && !t.owner);
 
 /**
  * The queue in service order. Live tickets first: FIFO by name, or for a fair lock
@@ -475,12 +492,11 @@ export async function acquireLock(name, {
             // running builds of each owner (an exclusive cleanup holder is nobody's build)
             running = [...hs.filter((h) => !h.exclusive), ...readClaimed(name, { dir, stat }).filter((c) => !named.has(c.ticket))];
           }
-          // A ticket without `owner` belongs to a waiter on the pre-RFC 24 code, which still waits in FIFO order:
-          // it is ahead of us only if older (otherwise the two would each wait for the other).
-          const tagged = fair ? others.filter((t) => t.owner) : others;
-          const order = queueOrder([...tagged, { name: myName, status: 'live', pid: process.pid, owner: me0 }], { fair, running: running || [], served: fair ? readServed(name, { dir, now: now() }) : {} });
+          // A live ticket without `owner` belongs to a waiter on the pre-RFC 24 code, which waits in FIFO order: while
+          // one exists the whole queue is FIFO (one total order everyone agrees on — mixing the two can form a cycle).
+          const fairNow = fair && !hasLegacyWaiter(others);
+          const order = queueOrder([...others, { name: myName, status: 'live', pid: process.pid, owner: me0 }], { fair: fairNow, running: running || [], served: fairNow ? readServed(name, { dir, now: now() }) : {} });
           ahead = order.slice(0, order.findIndex((t) => t.name === myName)).filter((t) => t.status === 'live');
-          if (fair) ahead.push(...others.filter((t) => !t.owner && t.status === 'live' && t.name < myName));
         }
         // Position 0 always tries (never gated by holder files, which may be stale). Position i ≥ 1
         // only while i < N − busy, busy = live holders of every slot + claimed (.acq) tickets that have

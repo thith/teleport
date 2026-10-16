@@ -107,7 +107,7 @@ test('gitCommonDir is canonical: a symlinked path to the repo gives the same own
   assert.equal(gitCommonDir(path.join(root, 'alias')), gitCommonDir(path.join(root, 'repo')));
 });
 
-test('rollout: a ticket without `owner` (old-code waiter, FIFO) is ahead only if older — no mutual wait', async () => {
+test('rollout: while an old-code ticket (no `owner`) waits, the queue is FIFO for everyone — a newer one never blocks us', async () => {
   const dir = tmpDir();
   const h = await acquireLock('build', { dir, waitSec: 0, label: 'H', convoId: 'H' });
   const q = lockPaths('build', dir).queue;
@@ -124,4 +124,15 @@ test('rollout: a ticket without `owner` (old-code waiter, FIFO) is ahead only if
   clearInterval(keep);
   assert.ok(l.release, 'we got it: the newer old-code ticket did not count as ahead');
   l.release();
+});
+
+test('rollout: 3-way case (N1 owner A, O2 old code, N3 owner B, A running) → FIFO, so N1 goes first, no cycle', () => {
+  const T = (name, owner) => ({ name, owner, status: 'live', pid: 1 });
+  const tickets = [T('1', 'convo:A'), { name: '2', status: 'live', pid: 2, convoId: 'Z' }, T('3', 'convo:B')];
+  const fair = !tickets.some((t) => t.status === 'live' && !t.owner);
+  assert.equal(fair, false);
+  assert.deepEqual(queueOrder(tickets, { fair, running: [{ owner: 'convo:A' }] }).map((t) => t.name), ['1', '2', '3']);
+  const lines = formatQueue('build', { holderOf: () => null, struck: () => [], claimedOf: () => [], servedOf: () => ({}),
+    read: () => tickets.map((t) => ({ ...t, label: `T${t.name}`, createdAt: 0 })) });
+  assert.match(lines.join('\n'), /1\. T1[\s\S]*2\. T2[\s\S]*3\. T3/, 'the display shows the FIFO the waiters use');
 });
