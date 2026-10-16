@@ -6,7 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { acquireLock, readQueue, gitCommonDir, ownerOf, recordOwner, queueOrder, markServed, readServed, SERVED_MAX_AGE_MS } from './machine-lock.mjs';
+import { acquireLock, readQueue, lockPaths, gitCommonDir, ownerOf, recordOwner, queueOrder, markServed, readServed, SERVED_MAX_AGE_MS, SERVED_PRUNE_MS } from './machine-lock.mjs';
 import { formatQueue } from './lock-queue.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -62,8 +62,10 @@ test('served ledger: one file per owner (concurrent winners never overwrite), ol
   markServed('build', 'convo:1', { dir, now: 1_000_000 });
   markServed('build', 'convo:2', { dir, now: 2_000_000 });
   assert.deepEqual(readServed('build', { dir, now: 2_000_000 }), { 'convo:1': 1_000_000, 'convo:2': 2_000_000 });
-  assert.deepEqual(readServed('build', { dir, now: 1_000_000 + SERVED_MAX_AGE_MS + 1, prune: true }), { 'convo:2': 2_000_000 });
-  assert.equal(fs.readdirSync(path.join(dir, 'build.served')).length, 1);
+  assert.deepEqual(readServed('build', { dir, now: 1_000_000 + SERVED_MAX_AGE_MS + 1, prune: true }), { 'convo:2': 2_000_000 }, 'ignored after 24 h');
+  assert.equal(fs.readdirSync(path.join(dir, 'build.served')).length, 2, '…but not deleted yet (a prune must not race a refresh)');
+  readServed('build', { dir, now: 2_000_000 + SERVED_PRUNE_MS + 1, prune: true });
+  assert.equal(fs.readdirSync(path.join(dir, 'build.served')).length, 0, 'deleted after 7 days');
   assert.deepEqual(readServed('build', { dir: path.join(dir, 'nope') }), {});
 });
 
@@ -96,4 +98,30 @@ test('merge stays FIFO', () => {
   const T = (name, convoId) => ({ name, convoId, status: 'live', pid: 1, createdAt: 0, label: name });
   const lines = formatQueue('merge', { holderOf: () => null, struck: () => [], read: () => [T('1', 'A'), T('2', 'A'), T('3', 'B')] });
   assert.match(lines.join('\n'), /1\. 1[\s\S]*2\. 2[\s\S]*3\. 3/);
+});
+
+test('gitCommonDir is canonical: a symlinked path to the repo gives the same owner', () => {
+  const root = tmpDir();
+  fs.mkdirSync(path.join(root, 'repo', '.git'), { recursive: true });
+  fs.symlinkSync(path.join(root, 'repo'), path.join(root, 'alias'));
+  assert.equal(gitCommonDir(path.join(root, 'alias')), gitCommonDir(path.join(root, 'repo')));
+});
+
+test('rollout: a ticket without `owner` (old-code waiter, FIFO) is ahead only if older — no mutual wait', async () => {
+  const dir = tmpDir();
+  const h = await acquireLock('build', { dir, waitSec: 0, label: 'H', convoId: 'H' });
+  const q = lockPaths('build', dir).queue;
+  fs.mkdirSync(q, { recursive: true });
+  // an old-code ticket NEWER than ours (far-future name), owner never served: must not block us
+  const old = path.join(q, `999999999999999-${process.pid}-oldxxx.json`);
+  fs.writeFileSync(old, JSON.stringify({ pid: process.pid, label: 'OLD', convoId: 'Z', createdAt: 0 }));
+  const keep = setInterval(() => { try { const t = new Date(); fs.utimesSync(old, t, t); } catch {} }, 100);
+  markServed('build', 'convo:me', { dir }); // we were just served: a fair order would put OLD (never served) first
+  const p = acquireLock('build', { dir, waitSec: 5, pollMs: 40, label: 'me', convoId: 'me' });
+  await sleep(100);
+  h.release();
+  const l = await p;
+  clearInterval(keep);
+  assert.ok(l.release, 'we got it: the newer old-code ticket did not count as ahead');
+  l.release();
 });

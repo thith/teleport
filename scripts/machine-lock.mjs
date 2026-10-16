@@ -278,13 +278,15 @@ export function worktreeOf(cwd = process.cwd(), { exists = fs.existsSync } = {})
 // ── RFC 24: fair order between owners ──
 
 /** The git common dir of a worktree (its `.git` dir, or what a `.git` file / `commondir` points to), or null. */
-export function gitCommonDir(worktree, { read = (f) => fs.readFileSync(f, 'utf8'), isDir = (f) => { try { return fs.statSync(f).isDirectory(); } catch { return false; } } } = {}) {
+export function gitCommonDir(worktree, { read = (f) => fs.readFileSync(f, 'utf8'), isDir = (f) => { try { return fs.statSync(f).isDirectory(); } catch { return false; } }, realpath = (f) => fs.realpathSync(f) } = {}) {
   if (!worktree) return null;
   try {
     const dotgit = path.join(worktree, '.git');
     let gitdir = dotgit;
     if (!isDir(dotgit)) { const m = /^gitdir:\s*(.+)$/m.exec(read(dotgit)); if (!m) return null; gitdir = path.resolve(worktree, m[1].trim()); }
-    try { return path.resolve(gitdir, read(path.join(gitdir, 'commondir')).trim()); } catch { return gitdir; }
+    let common = gitdir;
+    try { common = path.resolve(gitdir, read(path.join(gitdir, 'commondir')).trim()); } catch {}
+    try { return realpath(common); } catch { return common; } // one owner per repo, whatever symlinked path reached it
   } catch { return null; }
 }
 
@@ -300,7 +302,8 @@ export function ownerOf({ convoId = null, worktree = null, pid = null } = {}, { 
 /** A stored ticket / holder's owner; older records without the field get the fallback chain (no session lookup). */
 export const recordOwner = (t) => t.owner || ownerOf({ convoId: t.convoId, worktree: t.worktree, pid: t.pid }, { stat: () => null });
 
-export const SERVED_MAX_AGE_MS = 24 * 3600_000;
+export const SERVED_MAX_AGE_MS = 24 * 3600_000; // older entries count as "never served"
+export const SERVED_PRUNE_MS = 7 * 24 * 3600_000; // …and are deleted much later, so a prune can't race a fresh refresh
 const servedFile = (dir, name, owner) => path.join(dir, `${name}.served`, crypto.createHash('sha1').update(String(owner)).digest('hex').slice(0, 16));
 /** Record that `owner` was just served on lock `name` (one file per owner: concurrent winners never overwrite each other). Best effort. */
 export function markServed(name, owner, { dir = LOCK_DIR, now = Date.now() } = {}) {
@@ -311,7 +314,7 @@ export function markServed(name, owner, { dir = LOCK_DIR, now = Date.now() } = {
     const t = new Date(now); fs.utimesSync(f, t, t);
   } catch {}
 }
-/** owner → last served (ms); entries older than 24 h dropped (and deleted when `prune`). Unreadable → {}. */
+/** owner → last served (ms); entries older than 24 h ignored (deleted after 7 days when `prune`). Unreadable → {}. */
 export function readServed(name, { dir = LOCK_DIR, now = Date.now(), prune = false } = {}) {
   const d = path.join(dir, `${name}.served`);
   const out = {};
@@ -320,7 +323,7 @@ export function readServed(name, { dir = LOCK_DIR, now = Date.now(), prune = fal
   for (const f of files) {
     try {
       const file = path.join(d, f), st = fs.statSync(file);
-      if (now - st.mtimeMs > SERVED_MAX_AGE_MS) { if (prune) fs.unlinkSync(file); continue; }
+      if (now - st.mtimeMs > SERVED_MAX_AGE_MS) { if (prune && now - st.mtimeMs > SERVED_PRUNE_MS) fs.unlinkSync(file); continue; }
       out[fs.readFileSync(file, 'utf8').trim()] = st.mtimeMs;
     } catch {}
   }
@@ -463,17 +466,21 @@ export async function acquireLock(name, {
         if (ticket) { try { const tt = new Date(); fs.utimesSync(ticket, tt, tt); } catch {} }
         const others = ticket ? queued(ticket) : [];
         // RFC 24: one ordering of the whole live queue (ourselves included) — the same one /health shows.
-        let ahead = [];
+        let ahead = [], running = null;
         if (ticket) {
           const myName = path.basename(ticket);
-          let running = [];
           if (fair) {
             const hs = holders();
             const named = new Set(hs.map((h) => h.ticket).filter(Boolean));
-            running = [...hs, ...readClaimed(name, { dir, stat }).filter((c) => !named.has(c.ticket))];
+            // running builds of each owner (an exclusive cleanup holder is nobody's build)
+            running = [...hs.filter((h) => !h.exclusive), ...readClaimed(name, { dir, stat }).filter((c) => !named.has(c.ticket))];
           }
-          const order = queueOrder([...others, { name: myName, status: 'live', pid: process.pid, owner: me0 }], { fair, running, served: fair ? readServed(name, { dir }) : {} });
+          // A ticket without `owner` belongs to a waiter on the pre-RFC 24 code, which still waits in FIFO order:
+          // it is ahead of us only if older (otherwise the two would each wait for the other).
+          const tagged = fair ? others.filter((t) => t.owner) : others;
+          const order = queueOrder([...tagged, { name: myName, status: 'live', pid: process.pid, owner: me0 }], { fair, running: running || [], served: fair ? readServed(name, { dir, now: now() }) : {} });
           ahead = order.slice(0, order.findIndex((t) => t.name === myName)).filter((t) => t.status === 'live');
+          if (fair) ahead.push(...others.filter((t) => !t.owner && t.status === 'live' && t.name < myName));
         }
         // Position 0 always tries (never gated by holder files, which may be stale). Position i ≥ 1
         // only while i < N − busy, busy = live holders of every slot + claimed (.acq) tickets that have
@@ -481,10 +488,14 @@ export async function acquireLock(name, {
         if (slots == null && name === 'build') N = slotsFor(name, { dir });
         let mayTry = !ahead.length;
         if (!mayTry && N > 1) {
-          const hs = holders();
-          const named = new Set(hs.map((h) => h.ticket).filter(Boolean));
-          const claimedOnly = readClaimed(name, { dir, stat }).filter((c) => !named.has(c.ticket)).length;
-          mayTry = ahead.length < N - (hs.length + claimedOnly);
+          let busy;
+          if (running) busy = running.length + holders().filter((h) => h.exclusive).length;
+          else {
+            const hs = holders();
+            const named = new Set(hs.map((h) => h.ticket).filter(Boolean));
+            busy = hs.length + readClaimed(name, { dir, stat }).filter((c) => !named.has(c.ticket)).length;
+          }
+          mayTry = ahead.length < N - busy;
         }
         if (mayTry && (slot = await trySlots(N)) >= 0) {
           // The atomic hand-off: WE rename our ticket to .acq, or `leave` renamed it to .left —
@@ -499,7 +510,7 @@ export async function acquireLock(name, {
           }
         }
         const t = now(), hs = holders(), holder = first(hs);
-        const key = `${hs.map((h) => `${h.slot}:${h.pid}:${h.startedAt}`).join(',') || (holder ? `${holder.pid}:${holder.startedAt}` : '')}|${ahead.length}`;
+        const key = `${hs.map((h) => `${h.slot}:${h.pid}:${h.startedAt}`).join(',') || (holder ? `${holder.pid}:${holder.startedAt}` : '')}|${ahead.map((x) => x.name).join(',')}`;
         if (key !== lastKey || t - lastNotice >= noticeMs) {
           onWait(holder, t - start, { position: ahead.length + 1, ahead: ahead.map((x) => x.label || `pid ${x.pid}`), holders: hs, slots: N });
           lastNotice = t; lastKey = key;
@@ -521,7 +532,7 @@ export async function acquireLock(name, {
     // build budgets RAM from our holder: no holder, no run.
     if (name === 'build' && (N > 1 || memTotal() >= TWO_SLOT_MIN_RAM)) { done(); close(); throw new Error(`không ghi được holder ${path.basename(hp)} (${e.message}) — không chạy (build kia cần nó để tính RAM)`); }
   }
-  if (fair && !exclusive) { markServed(name, me0, { dir }); readServed(name, { dir, prune: true }); } // RFC 24: last service of this owner
+  if (fair && !exclusive) { markServed(name, me0, { dir, now: now() }); readServed(name, { dir, now: now(), prune: true }); } // RFC 24: last service of this owner
   done(); // holder names us → leave the queue
   let released = false;
   const ours = () => { const h = readHolder(hp); return h?.pid === process.pid && h.startedAt === me.startedAt && h.ticket === me.ticket; };

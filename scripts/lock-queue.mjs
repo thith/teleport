@@ -53,9 +53,9 @@ export function formatQueue(name, { dir = LOCK_DIR, now = Date.now(), max = LIST
   // RFC 24: the order waiters use (fair for build, FIFO otherwise); the non-live come last, unnumbered
   const fair = name === 'build';
   const named = new Set(hs.map((h) => h.ticket).filter(Boolean));
-  const running = fair ? [...hs, ...claimedOf(name, { dir }).filter((c) => !named.has(c.ticket))] : [];
+  const running = fair ? [...hs.filter((h) => !h.exclusive), ...claimedOf(name, { dir }).filter((c) => !named.has(c.ticket))] : [];
   const q = queueOrder([...read(name, { dir, now }).filter((t) => t.status !== 'dead'), ...struck(name, { dir }).map((t) => ({ ...t, status: 'left' }))],
-    { fair, running, served: fair ? servedOf(name, { dir }) : {} });
+    { fair, running, served: fair ? servedOf(name, { dir, now }) : {} });
   const head = q.find((t) => t.status === 'live');
   // an exclusive holder (cleanup) holds every slot; a build in a slot N no longer grants still counts (x may exceed N for a while)
   const busy = hs.some((h) => h.exclusive) ? Math.max(N, hs.length) : hs.length;
