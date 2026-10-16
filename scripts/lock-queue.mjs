@@ -17,7 +17,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { LOCK_DIR, readQueue, readHolder, readHolders, cancelTickets, selfConvoId, describeHolder, readStruck, readClaimed, worktreeOf, slotsFor, slotFiles, memTotal, TWO_SLOT_MIN_RAM } from './machine-lock.mjs';
+import { LOCK_DIR, readQueue, readHolder, readHolders, queueOrder, readServed, cancelTickets, selfConvoId, describeHolder, readStruck, readClaimed, worktreeOf, slotsFor, slotFiles, memTotal, TWO_SLOT_MIN_RAM } from './machine-lock.mjs';
 import { isMainModule } from './is-direct-run.mjs';
 
 export const LOCK_NAMES = ['build', 'merge', 'cleanup'];
@@ -47,11 +47,15 @@ export function shortCmd(cmd, max = CMD_MAX) {
  * One lock's running jobs + queue as text lines (read-only). RFC 23: one layout
  * for 1 or 2 slots — "đang chạy x/N", one ▶ line per running job, "Chờ (k):".
  */
-export function formatQueue(name, { dir = LOCK_DIR, now = Date.now(), max = LIST_MAX, read = readQueue, struck = readStruck, holderOf = readHolder, slots = null } = {}) {
+export function formatQueue(name, { dir = LOCK_DIR, now = Date.now(), max = LIST_MAX, read = readQueue, struck = readStruck, holderOf = readHolder, slots = null, claimedOf = readClaimed, servedOf = readServed } = {}) {
   const N = slotsFor(name, { slots, dir });
   const hs = readHolders(name, { dir, holderOf }).sort((a, b) => a.startedAt - b.startedAt || a.slot - b.slot);
-  const q = [...read(name, { dir, now }).filter((t) => t.status !== 'dead'), ...struck(name, { dir }).map((t) => ({ ...t, status: 'left' }))]
-    .sort((a, b) => (a.name < b.name ? -1 : 1));
+  // RFC 24: the order waiters use (fair for build, FIFO otherwise); the non-live come last, unnumbered
+  const fair = name === 'build';
+  const named = new Set(hs.map((h) => h.ticket).filter(Boolean));
+  const running = fair ? [...hs, ...claimedOf(name, { dir }).filter((c) => !named.has(c.ticket))] : [];
+  const q = queueOrder([...read(name, { dir, now }).filter((t) => t.status !== 'dead'), ...struck(name, { dir }).map((t) => ({ ...t, status: 'left' }))],
+    { fair, running, served: fair ? servedOf(name, { dir }) : {} });
   const head = q.find((t) => t.status === 'live');
   // an exclusive holder (cleanup) holds every slot; a build in a slot N no longer grants still counts (x may exceed N for a while)
   const busy = hs.some((h) => h.exclusive) ? Math.max(N, hs.length) : hs.length;
@@ -62,7 +66,8 @@ export function formatQueue(name, { dir = LOCK_DIR, now = Date.now(), max = LIST
     lines.push(`  ▶ ${describeHolder({ ...h, label: who(h), cmd: shortCmd(h.cmd) }, now)}${h.exclusive ? ` (giữ cả ${slotFiles(name)} chỗ)` : ''}${h.waitingRam ? ' (chờ RAM)' : ''}`);
   }
   if (q.length) lines.push(`  Chờ (${q.length}):`);
-  q.slice(0, max).forEach((t, i) => lines.push(`  ${i + 1}. ${who(t)}${t.cmd ? ` — ${shortCmd(t.cmd)}` : ''} — ${STATUS_TEXT[t.status] || t.status} ${mins(now - t.createdAt)} phút`));
+  let n = 0;
+  q.slice(0, max).forEach((t) => lines.push(`  ${t.status === 'live' ? `${++n}.` : '–'} ${who(t)}${t.cmd ? ` — ${shortCmd(t.cmd)}` : ''} — ${STATUS_TEXT[t.status] || t.status} ${mins(now - t.createdAt)} phút`));
   if (q.length > max) lines.push(`  … và ${q.length - max} vé nữa`);
   return lines;
 }

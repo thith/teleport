@@ -33,7 +33,14 @@
 // are GRANTED; everything that reads or locks "the whole lock" (exclusive,
 // holders, display, leave) covers all MAX_SLOTS, so changing N mid-build is safe.
 // Every other lock always has one slot.
+//
+// RFC 24 — the build queue is FAIR between owners (convo → git-common-dir →
+// session → pid): order = (rank, owner's last service, ticket name), rank =
+// the owner's running builds + its older live tickets; last service is one file
+// per owner in `<LOCK_DIR>/build.served/` (mtime). One queueOrder() serves the
+// waiters and the display. merge / cleanup stay FIFO.
 
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -109,7 +116,7 @@ export function procStat(pid, { read = (f) => fs.readFileSync(f, 'utf8') } = {})
   try {
     const t = read(`/proc/${pid}/stat`);
     const rest = t.slice(t.lastIndexOf(')') + 2).split(' ');
-    return { state: rest[0], start: rest[19] }; // field 3 = state, field 22 = starttime
+    return { state: rest[0], start: rest[19], pgrp: rest[2], session: rest[3] }; // fields 3 state, 5 pgrp, 6 session, 22 starttime
   } catch { return null; }
 }
 
@@ -268,6 +275,77 @@ export function worktreeOf(cwd = process.cwd(), { exists = fs.existsSync } = {})
   } catch { return null; }
 }
 
+// ── RFC 24: fair order between owners ──
+
+/** The git common dir of a worktree (its `.git` dir, or what a `.git` file / `commondir` points to), or null. */
+export function gitCommonDir(worktree, { read = (f) => fs.readFileSync(f, 'utf8'), isDir = (f) => { try { return fs.statSync(f).isDirectory(); } catch { return false; } } } = {}) {
+  if (!worktree) return null;
+  try {
+    const dotgit = path.join(worktree, '.git');
+    let gitdir = dotgit;
+    if (!isDir(dotgit)) { const m = /^gitdir:\s*(.+)$/m.exec(read(dotgit)); if (!m) return null; gitdir = path.resolve(worktree, m[1].trim()); }
+    try { return path.resolve(gitdir, read(path.join(gitdir, 'commondir')).trim()); } catch { return gitdir; }
+  } catch { return null; }
+}
+
+/** Who a ticket / holder belongs to, for fairness: convo → git common dir → session → pid. */
+export function ownerOf({ convoId = null, worktree = null, pid = null } = {}, { commonDir = gitCommonDir, stat = procStat } = {}) {
+  if (convoId != null) return `convo:${convoId}`;
+  const g = commonDir(worktree);
+  if (g) return `git:${g}`;
+  const sid = pid != null ? stat(pid)?.session : null;
+  if (sid && sid !== '0') return `sid:${sid}`;
+  return `pid:${pid}`;
+}
+/** A stored ticket / holder's owner; older records without the field get the fallback chain (no session lookup). */
+export const recordOwner = (t) => t.owner || ownerOf({ convoId: t.convoId, worktree: t.worktree, pid: t.pid }, { stat: () => null });
+
+export const SERVED_MAX_AGE_MS = 24 * 3600_000;
+const servedFile = (dir, name, owner) => path.join(dir, `${name}.served`, crypto.createHash('sha1').update(String(owner)).digest('hex').slice(0, 16));
+/** Record that `owner` was just served on lock `name` (one file per owner: concurrent winners never overwrite each other). Best effort. */
+export function markServed(name, owner, { dir = LOCK_DIR, now = Date.now() } = {}) {
+  try {
+    const f = servedFile(dir, name, owner);
+    fs.mkdirSync(path.dirname(f), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(f, `${owner}\n`, { mode: 0o600 });
+    const t = new Date(now); fs.utimesSync(f, t, t);
+  } catch {}
+}
+/** owner → last served (ms); entries older than 24 h dropped (and deleted when `prune`). Unreadable → {}. */
+export function readServed(name, { dir = LOCK_DIR, now = Date.now(), prune = false } = {}) {
+  const d = path.join(dir, `${name}.served`);
+  const out = {};
+  let files = [];
+  try { files = fs.readdirSync(d); } catch { return out; }
+  for (const f of files) {
+    try {
+      const file = path.join(d, f), st = fs.statSync(file);
+      if (now - st.mtimeMs > SERVED_MAX_AGE_MS) { if (prune) fs.unlinkSync(file); continue; }
+      out[fs.readFileSync(file, 'utf8').trim()] = st.mtimeMs;
+    } catch {}
+  }
+  return out;
+}
+
+/**
+ * The queue in service order. Live tickets first: FIFO by name, or for a fair lock
+ * by (rank, owner's last service, name) with rank = the owner's running builds +
+ * its older live tickets. Then the non-live (stalled / stopped / left) by name.
+ * → [{ ...ticket, owner, rank }]. Pure given its inputs.
+ */
+export function queueOrder(tickets, { fair = false, running = [], served = {} } = {}) {
+  const byName = (a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
+  const withOwner = tickets.map((t) => ({ ...t, owner: recordOwner(t) }));
+  const live = withOwner.filter((t) => t.status === 'live').sort(byName);
+  const rest = withOwner.filter((t) => t.status !== 'live').sort(byName);
+  if (!fair) return [...live, ...rest];
+  const count = {};
+  for (const r of running) { const o = recordOwner(r); count[o] = (count[o] || 0) + 1; }
+  for (const t of live) { t.rank = count[t.owner] || 0; count[t.owner] = t.rank + 1; }
+  live.sort((a, b) => a.rank - b.rank || (served[a.owner] || 0) - (served[b.owner] || 0) || byName(a, b));
+  return [...live, ...rest];
+}
+
 /** Best-effort label for whoever runs this: daemon sender, else the agent ("🧛 Ma #c2383556"). */
 export function selfLabel(env = process.env) {
   if (env.TELE_FROM_NAME) return `${env.TELE_FROM_NAME} (daemon)`;
@@ -311,8 +389,10 @@ function armExitHandler() {
 export async function acquireLock(name, {
   waitSec = Infinity, label = selfLabel(), cmd = '', onWait = () => {}, pollMs = 1000, noticeMs = 60000, dir = LOCK_DIR, now = Date.now,
   convoId = selfConvoId(), warn = (m) => console.error(m), stat = procStat, beforeClaim = null,
-  slots = null, exclusive = false, pending = false, worktree = worktreeOf(),
+  slots = null, exclusive = false, pending = false, worktree = worktreeOf(), owner = null,
 } = {}) {
+  const me0 = owner || ownerOf({ convoId, worktree, pid: process.pid }, { stat });
+  const fair = name === 'build';
   let N = slotsFor(name, { slots, dir }); // re-read every poll while waiting: `lock-queue slots 1` applies to queued waiters too
   const nFiles = slotFiles(name);
   const P = Array.from({ length: nFiles }, (_, k) => lockPaths(name, dir, k));
@@ -358,7 +438,7 @@ export async function acquireLock(name, {
       if (live()) return busyOut();
     } else {
       // Ticket FIRST (before any try); deleted only AFTER the holder file names us.
-      const body = { pid: process.pid, procStart: stat(process.pid)?.start ?? null, label, cmd, worktree, convoId: convoId == null ? null : String(convoId), createdAt: now() };
+      const body = { pid: process.pid, procStart: stat(process.pid)?.start ?? null, label, cmd, worktree, owner: me0, convoId: convoId == null ? null : String(convoId), createdAt: now() };
       try {
         fs.mkdirSync(p.queue, { recursive: true, mode: 0o700 });
         const file = path.join(p.queue, `${String(Date.now()).padStart(15, '0')}-${process.pid}-${Math.random().toString(36).slice(2, 8)}.json`);
@@ -382,7 +462,19 @@ export async function acquireLock(name, {
         if (ms !== 'ok') { done(); close(); return { timeout: true, left: true, holder: readHolder(p.holder) }; } // struck (.left) — a vanished ticket without .left was put back by mineState
         if (ticket) { try { const tt = new Date(); fs.utimesSync(ticket, tt, tt); } catch {} }
         const others = ticket ? queued(ticket) : [];
-        const ahead = ticket ? others.filter((t) => t.name < path.basename(ticket) && t.status === 'live') : [];
+        // RFC 24: one ordering of the whole live queue (ourselves included) — the same one /health shows.
+        let ahead = [];
+        if (ticket) {
+          const myName = path.basename(ticket);
+          let running = [];
+          if (fair) {
+            const hs = holders();
+            const named = new Set(hs.map((h) => h.ticket).filter(Boolean));
+            running = [...hs, ...readClaimed(name, { dir, stat }).filter((c) => !named.has(c.ticket))];
+          }
+          const order = queueOrder([...others, { name: myName, status: 'live', pid: process.pid, owner: me0 }], { fair, running, served: fair ? readServed(name, { dir }) : {} });
+          ahead = order.slice(0, order.findIndex((t) => t.name === myName)).filter((t) => t.status === 'live');
+        }
         // Position 0 always tries (never gated by holder files, which may be stale). Position i ≥ 1
         // only while i < N − busy, busy = live holders of every slot + claimed (.acq) tickets that have
         // no holder yet. A wrong count costs order, never exclusion (flock decides).
@@ -420,7 +512,7 @@ export async function acquireLock(name, {
   close(won); // fds of slots we tried but did not win
   const hp = P[slot].holder;
   // `ticket`: which of possibly several tickets of this process (daemon) holds the lock.
-  let me = { pid: process.pid, procStart: stat(process.pid)?.start ?? null, convoId: convoId == null ? null : String(convoId), ticket: ticket ? path.basename(ticket).replace(/\.acq$/, '.json') : null, label, cmd, worktree, cwd: process.cwd(), startedAt: now(),
+  let me = { pid: process.pid, procStart: stat(process.pid)?.start ?? null, convoId: convoId == null ? null : String(convoId), ticket: ticket ? path.basename(ticket).replace(/\.acq$/, '.json') : null, label, cmd, worktree, owner: me0, cwd: process.cwd(), startedAt: now(),
     ...(name === 'build' ? { slot, slots: N } : {}), ...(exclusive ? { exclusive: true } : {}), ...(pending ? { pending: true } : {}) };
   try { // atomic, so a waiter never reads half a file
     writeJsonAtomic(hp, me);
@@ -429,6 +521,7 @@ export async function acquireLock(name, {
     // build budgets RAM from our holder: no holder, no run.
     if (name === 'build' && (N > 1 || memTotal() >= TWO_SLOT_MIN_RAM)) { done(); close(); throw new Error(`không ghi được holder ${path.basename(hp)} (${e.message}) — không chạy (build kia cần nó để tính RAM)`); }
   }
+  if (fair && !exclusive) { markServed(name, me0, { dir }); readServed(name, { dir, prune: true }); } // RFC 24: last service of this owner
   done(); // holder names us → leave the queue
   let released = false;
   const ours = () => { const h = readHolder(hp); return h?.pid === process.pid && h.startedAt === me.startedAt && h.ticket === me.ticket; };

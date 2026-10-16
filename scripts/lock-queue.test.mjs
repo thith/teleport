@@ -141,7 +141,7 @@ test('onWait fires again when the place in line changes; no exit listeners leak'
   const a = child(dir, 'A', 50);
   await queuedFor(dir, 'A');
   const seen = [];
-  const p = acquireLock('build', { dir, pollMs: 20, noticeMs: 1e9, label: 'me', onWait: (hd, w, q) => seen.push(q.position) });
+  const p = acquireLock('build', { dir, pollMs: 20, noticeMs: 1e9, label: 'me', convoId: null, onWait: (hd, w, q) => seen.push(q.position) }); // same owner as A (fair order = FIFO within an owner)
   await sleep(200);
   cancelTickets('build', (t) => t.label === 'A', { dir });
   await sleep(300);
@@ -190,10 +190,10 @@ test('formatQueue (for /health and ls): holder, order, every status incl. struck
   assert.match(lines[0], /^🔒 build: đang chạy 1\/1$/);
   assert.match(lines[1], /^  ▶ 🧚 Tiên — cargo test/);
   assert.equal(lines[2], '  Chờ (4):');
-  assert.match(lines[3], /1\. X — đã gạch \(đang rời\)/);
-  assert.match(lines[4], /2\. 🐭 Chuột — clip — chờ 5 phút/);
-  assert.match(lines[5], /3\. pid 3 — kẹt \(mất nhịp tim\)/);
-  assert.match(lines[6], /4\. pid 4 — bị dừng/);
+  assert.match(lines[3], /^  1\. 🐭 Chuột — clip — chờ 5 phút/, 'live tickets first, numbered (the order waiters use)');
+  assert.match(lines[4], /^  – X — đã gạch \(đang rời\)/, 'then the non-live, unnumbered, by name');
+  assert.match(lines[5], /^  – pid 3 — kẹt \(mất nhịp tim\)/);
+  assert.match(lines[6], /^  – pid 4 — bị dừng/);
   assert.deepEqual(parseArgs(['leave', '--lock', 'build', '--pid', '42']), { cmd: 'leave', lock: 'build', pid: 42, all: false });
   assert.deepEqual(parseArgs(['leave', '--all']), { cmd: 'leave', lock: null, pid: null, all: true });
   assert.match(parseArgs(['leave', '--all', '--pid', '3']).error, /không dùng chung/);
