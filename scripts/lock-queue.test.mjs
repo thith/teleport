@@ -194,7 +194,9 @@ test('formatQueue (for /health and ls): holder, order, every status incl. struck
   assert.match(lines[4], /2\. 🐭 Chuột — clip — chờ 5 phút/);
   assert.match(lines[5], /3\. pid 3 — kẹt \(mất nhịp tim\)/);
   assert.match(lines[6], /4\. pid 4 — bị dừng/);
-  assert.deepEqual(parseArgs(['leave', '--lock', 'build', '--pid', '42']), { cmd: 'leave', lock: 'build', pid: 42 });
+  assert.deepEqual(parseArgs(['leave', '--lock', 'build', '--pid', '42']), { cmd: 'leave', lock: 'build', pid: 42, all: false });
+  assert.deepEqual(parseArgs(['leave', '--all']), { cmd: 'leave', lock: null, pid: null, all: true });
+  assert.match(parseArgs(['leave', '--all', '--pid', '3']).error, /không dùng chung/);
   assert.match(parseArgs(['leave', '--lock', 'nope']).error, /lock phải/);
 });
 
@@ -234,4 +236,30 @@ test('claim lost to a mistaken prune (ticket gone, no .left) → we keep the loc
   assert.ok(l.release, 'not treated as a leave');
   assert.equal((await acquireLock('build', { dir, waitSec: 0 })).timeout, true, 'and it is really ours');
   l.release();
+});
+
+test('worktree: shown per ticket / holder; leave strikes only this worktree by default, --all the whole convo', async () => {
+  const { worktreeOf } = await import('./machine-lock.mjs');
+  const dir = tmpDir();
+  const root = tmpDir();
+  for (const w of ['wt-a', 'wt-b']) { fs.mkdirSync(path.join(root, w, 'sub'), { recursive: true }); fs.writeFileSync(path.join(root, w, '.git'), 'gitdir: x\n'); }
+  assert.equal(worktreeOf(path.join(root, 'wt-a', 'sub')), path.join(root, 'wt-a'));
+  assert.equal(worktreeOf('/'), null);
+  const h = await acquireLock('build', { dir, waitSec: 0, label: 'H', convoId: null, worktree: path.join(root, 'wt-a') });
+  const q = lockPaths('build', dir).queue;
+  fs.mkdirSync(q, { recursive: true });
+  const mk = (n, wt) => fs.writeFileSync(path.join(q, `00000000000000${n}-${process.pid}-aaaaa${n}.json`), JSON.stringify({ pid: process.pid, label: `T${n}`, convoId: '5', worktree: path.join(root, wt), createdAt: 0 }));
+  mk(1, 'wt-a'); mk(2, 'wt-b');
+  const lines = formatQueue('build', { dir, now: 0 });
+  assert.match(lines[1], /▶ H · wt-a — /);
+  assert.match(lines.join('\n'), /1\. T1 · wt-a/);
+  assert.match(lines.join('\n'), /2\. T2 · wt-b/);
+  const r = leave({ lock: 'build' }, { dir, convoId: '5', worktree: path.join(root, 'wt-b') });
+  assert.equal(r.code, 0);
+  assert.deepEqual(readQueue('build', { dir }).map((t) => t.label), ['T1'], 'only the wt-b ticket left');
+  const none = leave({ lock: 'build' }, { dir, convoId: '5', worktree: path.join(root, 'wt-b') });
+  assert.match(none.lines[0], /còn 1 vé ở worktree khác — rời hết thì thêm --all/);
+  assert.equal(leave({ lock: 'build', all: true }, { dir, convoId: '5', worktree: path.join(root, 'wt-b') }).code, 0);
+  assert.equal(readQueue('build', { dir }).length, 0);
+  h.release();
 });
