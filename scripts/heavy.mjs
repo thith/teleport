@@ -49,15 +49,17 @@
 // GRADLE_OPTS: a dotted env name would be dropped by dash), so the two builds
 // never share a daemon that the other's scope would kill. MemoryMax is 30% when
 // another build may run beside us (45% alone). After taking a slot, a build waits
-// for the builds that got theirs EARLIER (a strict total order → no deadlock):
-// their declared caps + ours must fit in 65% of RAM, none of them may be
-// unbounded, and RAM must hold our cap + 3 GiB — no plateau / cap escape here.
+// for the builds that got theirs EARLIER (a strict total order → no deadlock) and
+// for any build already ADMITTED (whatever its order): their declared caps + ours
+// must fit in 65% of RAM, none of them may be unbounded, and RAM must hold our
+// cap + 3 GiB — no plateau / cap escape here. Check + "admitted" are one step under
+// build.admit.lock, so two builds can never both pass on a stale view.
 
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
-import { acquireLock, describeHolder, readHolders, readClaimed, acquireHelperLock, memTotal, LOCK_DIR, TWO_SLOT_MIN_RAM } from './machine-lock.mjs';
+import { acquireLock, describeHolder, readHolders, acquireHelperLock, memTotal, LOCK_DIR, TWO_SLOT_MIN_RAM } from './machine-lock.mjs';
 import { isMainModule } from './is-direct-run.mjs';
 import { shortCmd } from './lock-queue.mjs';
 
@@ -371,12 +373,11 @@ export const holderBefore = (a, b) => a.startedAt < b.startedAt || (a.startedAt 
 export const isUnbounded = (h, total) => !!(h.unbounded || h.pending || h.exclusive || !(h.memMax > 0) || h.memMax > total * MEM_BUDGET_FRACTION);
 
 /**
- * Why this build must still wait for the builds that took a slot before it
- * ([] = go). `extra` = slots just claimed whose holder isn't written yet. Pure.
+ * Why this build must still wait for `earlier` — the builds that took a slot
+ * before it, plus any already admitted ([] = go). Pure.
  */
-export function slotBlockers({ earlier, extra = 0, myMax, unbounded, total, avail, minBytes }) {
-  if (!earlier.length) return []; // the earliest build never waits (a claim without a holder is always later than us)
-  if (extra) return ['một build vừa lấy chỗ, chưa ghi tên'];
+export function slotBlockers({ earlier, myMax, unbounded, total, avail, minBytes }) {
+  if (!earlier.length) return [];
   const who = (hs) => hs.map((h) => h.label || `pid ${h.pid}`).join(', ');
   if (unbounded) return [`build không giới hạn RAM phải chờ build trước xong: ${who(earlier)}`];
   const unb = earlier.filter((h) => isUnbounded(h, total));
@@ -389,20 +390,34 @@ export function slotBlockers({ earlier, extra = 0, myMax, unbounded, total, avai
 
 export const SLOT_LOG_EVERY_MS = 3 * 60_000;
 
+/** The holders this build must respect: earlier by (startedAt, slot), or already admitted. Pure. */
+export const blockingHolders = (holders, me) => holders.filter((h) => !(h.pid === me.pid && h.startedAt === me.startedAt) && (h.admitted || holderBefore(h, me)));
+
 /**
- * Wait (holding our slot) until slotBlockers() is empty. Re-reads the holders
- * every poll; no plateau / cap escape. → { waitedMs, alone, waited } (alone: no earlier
- * build left — the caller then applies the usual RAM wait).
+ * Wait (holding our slot) until slotBlockers() is empty, then mark us admitted —
+ * the check and admit() run together under `admitLock` (a build that has not yet
+ * published its holder can't be admitted, so it can't slip past us). Re-reads the
+ * holders every poll; no plateau / cap escape. admit() failing → { failed: true }.
+ * → { waitedMs, alone, waited } (alone: nobody to respect — the caller then
+ * applies the usual RAM wait).
  */
-export async function waitForSlotTurn({ me, myMax, unbounded, total, minBytes, holders, claimedOnly = () => 0, readState = () => readMemState(), setWaiting = () => {},
-  sleep = (ms) => new Promise((r) => setTimeout(r, ms)), now = Date.now, log = (s) => console.error(s) }) {
+export async function waitForSlotTurn({ me, myMax, unbounded, total, minBytes, holders, admitLock = async () => () => {}, admit = () => true, readState = () => readMemState(),
+  setWaiting = () => {}, sleep = (ms) => new Promise((r) => setTimeout(r, ms)), now = Date.now, log = (s) => console.error(s) }) {
   const start = now();
   let loggedAt = -Infinity, waiting = false;
   for (;;) {
-    const earlier = holders().filter((h) => !(h.pid === me.pid && h.startedAt === me.startedAt) && holderBefore(h, me));
-    const extra = claimedOnly();
-    const why = slotBlockers({ earlier, extra, myMax, unbounded, total, avail: earlier.length ? readState().avail : null, minBytes });
-    if (!why.length) { if (waiting) setWaiting(false); return { waitedMs: now() - start, alone: !earlier.length, waited: waiting }; }
+    let why = ['đang chờ lượt xét RAM (build.admit.lock)'], blocking = [];
+    const unlock = await admitLock();
+    if (unlock) {
+      try {
+        blocking = blockingHolders(holders(), me);
+        why = slotBlockers({ earlier: blocking, myMax, unbounded, total, avail: blocking.length ? readState().avail : null, minBytes });
+        if (!why.length) {
+          if (!admit()) return { failed: true, waitedMs: now() - start, waited: waiting };
+          return { waitedMs: now() - start, alone: !blocking.length, waited: waiting };
+        }
+      } finally { unlock(); }
+    }
     if (!waiting) { setWaiting(true); waiting = true; }
     const t = now();
     if (t - loggedAt >= SLOT_LOG_EVERY_MS) { log(`⏳ chờ RAM cho build thứ 2: ${why.join(' · ')}…`); loggedAt = t; }
@@ -456,7 +471,7 @@ export function describeBusy(h, q) {
 const DEFAULT_SCOPE_OPS = {
   preflight: scopePreflight, stop: stopScope, orphans: orphanScopes, oomKills: appSliceOomKills, jobsConfigured: cargoJobsConfigured, memTotal: memTotal(),
   holders: () => readHolders('build'),
-  claimedOnly: () => { const named = new Set(readHolders('build').map((h) => h.ticket).filter(Boolean)); return readClaimed('build').filter((c) => !named.has(c.ticket)).length; },
+  admitLock: () => acquireHelperLock('build.admit', { waitMs: 10_000 }),
   sweepLock: () => acquireHelperLock('build.sweep', { waitMs: 60_000 }),
   slotTurn: waitForSlotTurn,
 };
@@ -530,8 +545,11 @@ export async function main(argv, {
         const declared = lock.update?.({ pending: undefined, ...(unbounded ? { unbounded: true } : { memMax: scope.memMax }) });
         if (declared === false && ((lock.slots ?? 1) > 1 || scopeOps.memTotal >= TWO_SLOT_MIN_RAM)) { log('❌ heavy: không ghi được giới hạn RAM vào holder (build kia cần nó để tính RAM) — không chạy.'); return 1; }
         // (--no-ram-wait skips only the usual RAM waits; TELEPORT_HEAVY_MIN_FREE_MB=0 turns this gate off)
-        await scopeOps.slotTurn({ me, myMax: scope?.memMax ?? 0, unbounded, total: scopeOps.memTotal, minBytes: minFreeBytes(env),
-          holders: scopeOps.holders, claimedOnly: scopeOps.claimedOnly, log, setWaiting: (w) => lock.update?.({ waitingRam: w || undefined }) });
+        const capable = (lock.slots ?? 1) > 1 || scopeOps.memTotal >= TWO_SLOT_MIN_RAM;
+        const turn = await scopeOps.slotTurn({ me, myMax: scope?.memMax ?? 0, unbounded, total: scopeOps.memTotal, minBytes: minFreeBytes(env),
+          holders: scopeOps.holders, admitLock: scopeOps.admitLock, log, setWaiting: (w) => lock.update?.({ waitingRam: w || undefined }),
+          admit: () => lock.update?.({ admitted: true, waitingRam: undefined }) !== false || !capable });
+        if (turn?.failed) { log('❌ heavy: không ghi được "admitted" vào holder (build kia cần nó để tính RAM) — không chạy.'); return 1; }
       }
       // Pressure may have changed while we queued: check again, now that we're next.
       if (a.ramWait) await waitRam({ minBytes: minFreeBytes(env), log });

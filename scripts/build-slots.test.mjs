@@ -8,7 +8,7 @@ import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { acquireLock, lockPaths, readHolders, readQueue, readClaimed, resolveBuildSlots, slotsFor, MAX_SLOTS, TWO_SLOT_MIN_RAM, acquireHelperLock } from './machine-lock.mjs';
-import { slotEnv, slotBlockers, holderBefore, isUnbounded, waitForSlotTurn, heldByAncestor, describeBusy, main as heavyMain, SCOPE_MEM_FRACTION, SCOPE_MEM_FRACTION_SHARED } from './heavy.mjs';
+import { blockingHolders, slotEnv, slotBlockers, holderBefore, isUnbounded, waitForSlotTurn, heldByAncestor, describeBusy, main as heavyMain, SCOPE_MEM_FRACTION, SCOPE_MEM_FRACTION_SHARED } from './heavy.mjs';
 import { formatQueue, leave, setSlots, pruneSkipLines, shortCmd, parseArgs } from './lock-queue.mjs';
 import { notePruneSkip } from './cleanup.mjs';
 
@@ -216,8 +216,6 @@ test('slotBlockers: 30%+30% passes, 45%+30% waits, unbounded waits both ways, RA
   assert.deepEqual(slotBlockers({ ...base, earlier: [], myMax: 0, unbounded: true }), [], 'unbounded alone runs');
   assert.match(slotBlockers({ ...base, earlier: [{ memMax: m30 }], myMax: m30, avail: 12 * GiB })[0], /cần/);
   assert.deepEqual(slotBlockers({ ...base, earlier: [{ memMax: m30 }], myMax: m30, avail: 12 * GiB, minBytes: 0 }), [], 'MIN_FREE_MB=0 turns the RAM gate off');
-  assert.deepEqual(slotBlockers({ ...base, earlier: [], extra: 1, myMax: m30 }), [], 'the earliest build never waits, not even on a fresh claim');
-  assert.match(slotBlockers({ ...base, earlier: [{ memMax: m30 }], extra: 1, myMax: m30 })[0], /chưa ghi tên/);
 });
 
 test('waitForSlotTurn: no plateau escape — waits as long as the earlier build blocks, then goes once it is alone', async () => {
@@ -229,7 +227,7 @@ test('waitForSlotTurn: no plateau escape — waits as long as the earlier build 
     sleep: async (ms) => { t += ms; if (++polls === 200) hs = []; } }); // ~33 min of polls
   assert.equal(polls, 200);
   assert.equal(r.alone, true);
-  assert.deepEqual(flags, [true, false]);
+  assert.deepEqual(flags, [true], 'waitingRam is cleared by admit(), together with admitted');
   assert.equal(r.waited, true);
 });
 
@@ -261,7 +259,7 @@ test('describeBusy: "(2/2): A; B" with two slots, the old one-holder text otherw
 // ── heavy main with a slot ──
 
 const OPS = { preflight: () => ({ ok: true }), stop: () => true, orphans: () => [], oomKills: () => null, jobsConfigured: () => true, memTotal: 32 * GiB,
-  holders: () => [], claimedOnly: () => 0, sweepLock: async () => () => {}, slotTurn: async () => ({ alone: true }) };
+  holders: () => [], sweepLock: async () => () => {}, slotTurn: async () => ({ alone: true }) };
 
 test('heavy main, slot 1 of 2: own Gradle env, 30% cap declared to the holder, budget wait called', async () => {
   let runOpts = null, pf = null, turn = null;
@@ -448,7 +446,7 @@ test('heavy main + real acquireLock and waitForSlotTurn: slot 1 waits for slot 0
   const code = await heavyMain(['--', 'cargo', 'b'], { env: {}, nested: () => false, log: () => {}, waitRam: async () => {},
     acquire: (name, o) => acquireLock(name, { ...o, dir, slots: 2, convoId: null, label: 'B' }),
     run: async () => { events.push('run'); return 0; },
-    scopeOps: { ...OPS, memTotal: T, holders, claimedOnly: () => 0, slotTurn: turn } });
+    scopeOps: { ...OPS, memTotal: T, holders, slotTurn: turn } });
   assert.equal(code, 0);
   assert.deepEqual(events, ['wait', 'wait', 'wait', 'run']);
 });
@@ -463,4 +461,54 @@ test('heavy main: a 2-slot build whose cap cannot be written to its holder does 
   const small = await heavyMain(['--', 'cargo', 'b'], { env: {}, nested: () => false, log: () => {}, waitRam: async () => {},
     acquire: async () => ({ ...lock, slot: 0, slots: 1 }), run: async () => 0, scopeOps: { ...OPS, memTotal: 16 * GiB } });
   assert.equal(small, 0, '16 GiB machine, N = 1: the holder stays display-only');
+});
+
+// ── round-3 review: admission is serialized ──
+
+test('blockingHolders: earlier ones, plus any admitted one even if it sorts later', () => {
+  const me = { pid: 1, startedAt: 5, slot: 0 };
+  const hs = [me, { pid: 2, startedAt: 9, slot: 1 }, { pid: 3, startedAt: 9, slot: 1, admitted: true }, { pid: 4, startedAt: 1, slot: 1 }];
+  assert.deepEqual(blockingHolders(hs, me).map((h) => h.pid), [3, 4]);
+});
+
+test('waitForSlotTurn: a build that published late (sorts earlier) still waits for one already admitted', async () => {
+  const T = 32 * GiB;
+  const hs = [{ pid: 2, startedAt: 9, slot: 1, unbounded: true, admitted: true, label: 'B' }]; // B passed while A had no holder yet
+  let polls = 0;
+  const r = await waitForSlotTurn({ me: { pid: 1, startedAt: 5, slot: 0 }, myMax: 0.3 * T, unbounded: false, total: T, minBytes: 0, holders: () => hs,
+    log: () => {}, readState: () => ({ avail: 30 * GiB }), sleep: async () => { if (++polls === 3) hs.pop(); } });
+  assert.equal(polls, 3, 'A waited for the admitted unbounded B although B sorts later');
+  assert.equal(r.alone, true);
+});
+
+test('waitForSlotTurn: check + admit run inside the admit lock; lock busy → wait; admit failure → failed', async () => {
+  const ev = [];
+  const r = await waitForSlotTurn({ me: { pid: 1, startedAt: 5, slot: 0 }, myMax: GiB, unbounded: false, total: 32 * GiB, minBytes: 0, holders: () => { ev.push('read'); return []; },
+    admitLock: async () => { ev.push('lock'); return () => ev.push('unlock'); }, admit: () => { ev.push('admit'); return true; }, log: () => {}, sleep: async () => {} });
+  assert.deepEqual(ev, ['lock', 'read', 'admit', 'unlock']);
+  assert.equal(r.alone, true);
+  let tries = 0;
+  await waitForSlotTurn({ me: { pid: 1, startedAt: 5, slot: 0 }, myMax: GiB, unbounded: false, total: 32 * GiB, minBytes: 0, holders: () => [],
+    admitLock: async () => (++tries < 3 ? null : () => {}), log: () => {}, sleep: async () => {} });
+  assert.equal(tries, 3);
+  const f = await waitForSlotTurn({ me: { pid: 1, startedAt: 5, slot: 0 }, myMax: GiB, unbounded: false, total: 32 * GiB, minBytes: 0, holders: () => [],
+    admit: () => false, log: () => {}, sleep: async () => {} });
+  assert.equal(f.failed, true);
+});
+
+test('heavy main: the build is marked admitted (waitingRam cleared) before it runs; admit failure on a 2-slot machine → no run', async () => {
+  const updates = [];
+  const lock = { release() {}, update: (f) => { updates.push(f); return true; }, waitedMs: 0, slot: 1, slots: 2, startedAt: 7 };
+  const base = { env: {}, nested: () => false, log: () => {}, waitRam: async () => {}, acquire: async () => lock };
+  let ran = false;
+  await heavyMain(['--', 'cargo', 'b'], { ...base, run: async () => { ran = true; assert.ok(updates.some((u) => u.admitted === true)); return 0; },
+    scopeOps: { ...OPS, slotTurn: waitForSlotTurn, holders: () => [] } });
+  assert.equal(ran, true);
+  assert.deepEqual(updates.find((u) => u.admitted), { admitted: true, waitingRam: undefined });
+  ran = false;
+  const failing = { ...lock, update: (f) => !f.admitted };
+  const code = await heavyMain(['--', 'cargo', 'b'], { ...base, acquire: async () => failing, run: async () => { ran = true; return 0; },
+    scopeOps: { ...OPS, slotTurn: waitForSlotTurn, holders: () => [] } });
+  assert.equal(code, 1);
+  assert.equal(ran, false);
 });
