@@ -138,7 +138,7 @@ test('heavy: waiter killed while waiting leaves nothing behind (command never ru
 });
 
 // no real systemd here: scope preflight "fails" → the pre-RFC-20 path
-const NO_SCOPE = { preflight: () => ({ ok: false, why: 'test' }), stop: () => true, orphans: () => [], oomKills: () => null, jobsConfigured: () => true, memTotal: 16 * 1024 ** 3 };
+const NO_SCOPE = { preflight: () => ({ ok: false, why: 'test' }), stop: () => true, orphans: () => [], oomKills: () => null, jobsConfigured: () => true, memTotal: 16 * 1024 ** 3, sweepLock: async () => () => {}, holders: () => [] };
 
 test('heavy args + gradlew --stop policy (after success AND failure, not with --no-stop, not for non-gradle)', async () => {
   assert.match(parseHeavyArgs(['./gradlew']).error, /usage/);
@@ -166,7 +166,7 @@ test('heavy args + gradlew --stop policy (after success AND failure, not with --
   assert.equal(await heavyMain(['--', 'x'], { env: {}, waitRam: async () => {}, nested: () => true, acquire: async () => { acquired = true; }, run: async () => 0, log: () => {} }), 0);
   assert.equal(acquired, false);
   // the env token only counts while it names the live holder of record
-  const H = (h) => () => h;
+  const H = (h) => () => (h ? [h] : []); // the holders of every slot
   assert.equal(heldByAncestor({ TELEPORT_HEAVY_HELD: '42' }, H({ pid: 42, alive: true })), true);
   assert.equal(heldByAncestor({ TELEPORT_HEAVY_HELD: '42' }, H({ pid: 43, alive: true })), false, 'someone else holds it now');
   assert.equal(heldByAncestor({ TELEPORT_HEAVY_HELD: '42' }, H({ pid: 42, alive: false })), false);

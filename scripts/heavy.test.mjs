@@ -110,7 +110,7 @@ test('F: slowly rising RAM is capped at 15 min total', async () => {
   assert.match(f.logs.at(-1), /đã chờ 15 phút \(còn/);
 });
 
-const NO_SCOPE = { preflight: () => ({ ok: false, why: 'test' }), stop: () => true, orphans: () => [], oomKills: () => null, jobsConfigured: () => false, memTotal: 16 * 1024 ** 3 };
+const NO_SCOPE = { preflight: () => ({ ok: false, why: 'test' }), stop: () => true, orphans: () => [], oomKills: () => null, jobsConfigured: () => false, memTotal: 16 * 1024 ** 3, sweepLock: async () => () => {}, holders: () => [] };
 
 test('F: main waits BEFORE acquiring the lock AND again after it; skipped when nested or --no-ram-wait; threshold from env', async () => {
   const go = async (argv, { nested = false, env = {} } = {}) => {
@@ -274,7 +274,7 @@ test('RFC20 main: orphans stopped, scope used, gradle stopped before AND after, 
   let runOpts;
   const ops = {
     preflight: () => ({ ok: true }), stop: (u) => { ev.push(`stop ${u.replace(new RegExp(`-${process.pid}-[a-z0-9]+`), '-P-R')}`); return true; },
-    orphans: () => ['heavy-1-dead.scope'], oomKills: () => 0, jobsConfigured: () => false, memTotal: 16 * GiB,
+    orphans: () => ['heavy-1-dead.scope'], oomKills: () => 0, jobsConfigured: () => false, memTotal: 16 * GiB, sweepLock: async () => () => {}, holders: () => [],
   };
   await heavyMain(['--', './gradlew', 'test'], {
     env: {}, nested: () => false, log: () => {}, scopeOps: ops, waitRam: async () => {},
@@ -297,7 +297,7 @@ test('RFC20 main: orphans stopped, scope used, gradle stopped before AND after, 
 test('RFC20 main: scope stopped and lock released even when the build throws; oom_kill rise is reported', async () => {
   const ev = [], logs = [];
   let n = 0;
-  const ops = { preflight: () => ({ ok: true }), stop: () => { ev.push('stop'); return true; }, orphans: () => [], oomKills: () => n++, jobsConfigured: () => true, memTotal: 16 * GiB };
+  const ops = { preflight: () => ({ ok: true }), stop: () => { ev.push('stop'); return true; }, orphans: () => [], oomKills: () => n++, jobsConfigured: () => true, memTotal: 16 * GiB, sweepLock: async () => () => {}, holders: () => [] };
   const code = await heavyMain(['--', 'cargo', 'test'], { env: {}, nested: () => false, log: (s) => logs.push(s), scopeOps: ops, waitRam: async () => {},
     acquire: async () => ({ release() { ev.push('release'); }, waitedMs: 0 }), run: async () => 137 });
   assert.equal(code, 137);
@@ -326,7 +326,7 @@ test('RFC20 review: --no-scope → no preflight/scope; oom_kill rise with exit 0
   let pf = 0, runOpts;
   const logs = [];
   let n = 0;
-  const ops = { preflight: () => { pf++; return { ok: true }; }, stop: () => false, orphans: () => [], oomKills: () => n++, jobsConfigured: () => true, memTotal: 16 * GiB };
+  const ops = { preflight: () => { pf++; return { ok: true }; }, stop: () => false, orphans: () => [], oomKills: () => n++, jobsConfigured: () => true, memTotal: 16 * GiB, sweepLock: async () => () => {}, holders: () => [] };
   const base = { env: {}, nested: () => false, log: (s) => logs.push(s), waitRam: async () => {}, acquire: async () => ({ release() {}, waitedMs: 0 }), run: async (c, o) => { runOpts = o; return 0; } };
   await heavyMain(['--no-scope', '--', 'emu'], { ...base, scopeOps: ops });
   assert.equal(pf, 0);

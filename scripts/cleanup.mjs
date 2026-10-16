@@ -636,9 +636,11 @@ export async function runCleanup({
   try { cacheDirs = fs.readdirSync(cargoCacheDir, { withFileTypes: true }).filter((d) => d.isDirectory()); } catch {}
   if (cacheDirs.length) {
     let lock;
-    try { lock = await acquireLock('build', { waitSec: 0, dir: lockDir, cmd: 'cleanup: prune cargo cache' }); } catch (e) { res.cacheSkipped = `không lấy được lock build: ${e.message}`; }
+    // exclusive (RFC 23): every slot of the build lock, or none — one slot is not "no build can run"
+    try { lock = await acquireLock('build', { waitSec: 0, exclusive: true, dir: lockDir, cmd: 'cleanup: prune cargo cache' }); } catch (e) { res.cacheSkipped = `không lấy được lock build: ${e.message}`; }
     if (lock?.timeout) res.cacheSkipped = 'đang có build chạy (lock build bận)';
-    else if (lock) {
+    if (!dryRun) notePruneSkip(lockDir, !!res.cacheSkipped);
+    if (lock && !lock.timeout) {
       try {
         for (const d of cacheDirs) {
           const p = path.join(cargoCacheDir, d.name);
@@ -654,6 +656,20 @@ export async function runCleanup({
     }
   }
   return res;
+}
+
+export const PRUNE_SKIPS_FILE = 'cargo-prune-skips';
+/** Count consecutive skipped cargo-cache prunes in <lockDir>/cargo-prune-skips (reset on a prune). Best effort. */
+export function notePruneSkip(lockDir, skipped) {
+  const f = path.join(lockDir, PRUNE_SKIPS_FILE);
+  try {
+    if (!skipped) { fs.rmSync(f, { force: true }); return 0; }
+    let n = 0;
+    try { n = Number(fs.readFileSync(f, 'utf8')) || 0; } catch {}
+    fs.mkdirSync(lockDir, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(f, `${n + 1}\n`, { mode: 0o600 });
+    return n + 1;
+  } catch { return null; }
 }
 
 // ── Report ───────────────────────────────────────────────────────────────────
