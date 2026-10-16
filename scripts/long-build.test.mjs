@@ -154,24 +154,30 @@ test('verifyHolder: pid + start + startedAt + not exclusive + still a heavy + no
 const JOB = (o = {}) => ({ kind: 'stop', key: '100:0', phase: 'marker', pid: 100, procStart: '5', startedAt: 0, slot: 0, unit: null, pgid: null, pgidStart: null,
   convoId: '42', cmd: 'cargo test', worktree: '/w/x', chatId: '9', messageId: 1, text: '⏰ …', createdAt: 0, deadline: STOP_DEADLINE_MS, ...o });
 
-test('advanceStop: marker → ack → heavy exits → verified report + agent notice; marker removed', async () => {
+test('advanceStop: marker → ack → heavy exits → cleanup pass → verified report + agent notice; marker removed', async () => {
   const dir = tmpDir(), ctx = fakeCtx(), kills = [], delivered = [];
   let alive = true;
-  const o = (now, extra = {}) => ({ now, dir, same: () => alive, kill: (p, s) => kills.push([p, s]), holders: () => [H({ stopAck: 1 })], groupAlive: () => false, deliver: async (r) => delivered.push(r), ...extra });
+  const o = (now, extra = {}) => ({ now, dir, same: () => alive, kill: (p, s) => kills.push([p, s]), holders: () => [H({ stopAck: 1, pgid: 300, pgidStart: '7' })],
+    stat: () => null, groupAlive: () => false, deliver: async (r) => delivered.push(r), ...extra });
   let j = await advanceStop(JOB(), ctx, o(1000));
   assert.equal(j.phase, 'waitAck');
   assert.ok(fs.existsSync(stopMarkerPath(100, 0, dir)));
   j = await advanceStop(j, ctx, o(2000));
   assert.equal(j.phase, 'waitExit');
+  assert.equal(j.pgid, 300, 'pgid refreshed from the live holder');
   assert.equal(kills.length, 0, 'acked: no signal from the daemon');
   alive = false;
   j = await advanceStop(j, ctx, o(9000));
+  assert.equal(j.phase, 'escalate', 'heavy gone → make sure nothing survives');
+  j = await advanceStop(j, ctx, o(9000));
   assert.equal(j.phase, 'verify');
-  const done = await advanceStop({ ...j, pgid: 300 }, ctx, o(9000));
-  assert.equal(done, null);
+  assert.deepEqual(kills, [], 'leader start unknown (exited) → no group kill; heavy gone → no kill');
+  j = await advanceStop(j, ctx, o(9000));
+  assert.equal(j.phase, 'report');
+  assert.equal(fs.existsSync(stopMarkerPath(100, 0, dir)), false);
+  assert.equal(await advanceStop(j, ctx, o(9000)), null);
   assert.match(ctx.edits.at(-1).text, /⏹ đã dừng sau 9 s \(không có scope/);
   assert.equal(delivered[0].convoId, '42');
-  assert.equal(fs.existsSync(stopMarkerPath(100, 0, dir)), false);
 });
 
 test('advanceStop: no ack in 30 s → TERM (identity checked); past the deadline → scope stop, verified group KILL, heavy KILL', async () => {
@@ -187,22 +193,51 @@ test('advanceStop: no ack in 30 s → TERM (identity checked); past the deadline
   j = await advanceStop(j, ctx, o(STOP_DEADLINE_MS));
   assert.deepEqual(units, ['heavy-100-abc.scope']);
   assert.deepEqual(kills.slice(1), [[-300, 'SIGKILL'], [100, 'SIGKILL']]);
-  const done = await advanceStop(j, ctx, o(STOP_DEADLINE_MS, { same: () => true }));
-  assert.equal(done, null);
+  j = await advanceStop(j, ctx, o(STOP_DEADLINE_MS));
+  assert.equal(j.phase, 'report');
+  assert.equal(await advanceStop(j, ctx, o(STOP_DEADLINE_MS)), null);
   assert.match(ctx.edits.at(-1).text, /❌ chưa chắc đã dừng/, 'heavy still "alive" → no claim of success');
 });
 
-test('advanceStop: a reused pid is never signalled; a pgid whose leader changed is never killed', async () => {
-  const dir = tmpDir(), ctx = fakeCtx(), kills = [];
+test('advanceStop: heavy died with its scope still populated → one cleanup pass (stopScope) before reporting', async () => {
+  const dir = tmpDir(), ctx = fakeCtx(), units = [];
+  let pop = true;
+  const o = (now) => ({ now, dir, same: () => false, kill: () => {}, holders: () => [], stat: () => null,
+    stopUnit: async (u) => { units.push(u); pop = false; return true; }, populated: async () => pop, groupAlive: () => false });
+  let j = await advanceStop(JOB({ phase: 'waitExit', unit: 'heavy-100-abc.scope' }), ctx, o(5000));
+  assert.equal(j.phase, 'escalate');
+  j = await advanceStop(j, ctx, o(5000));
+  assert.deepEqual(units, ['heavy-100-abc.scope']);
+  j = await advanceStop(j, ctx, o(5000));
+  assert.equal(j.phase, 'report');
+  assert.match(j.result, /⏹ đã dừng/);
+});
+
+test('advanceStop: a reused pid is never signalled; a pgid whose leader changed is never killed; a forged unit is never stopped', async () => {
+  const dir = tmpDir(), ctx = fakeCtx(), kills = [], units = [];
   let j = await advanceStop(JOB({ phase: 'waitAck', markerAt: 0 }), ctx, { now: ACK_MS, dir, same: () => false, kill: (p, s) => kills.push([p, s]), holders: () => [] });
-  assert.equal(j.phase, 'verify');
-  j = await advanceStop(JOB({ phase: 'escalate', pgid: 300, pgidStart: '7' }), ctx, { now: 0, dir, same: () => false, kill: (p, s) => kills.push([p, s]), stat: () => ({ start: '8' }) });
+  assert.equal(j.phase, 'escalate');
+  await advanceStop(JOB({ phase: 'escalate', pgid: 300, pgidStart: '7', unit: 'teleport-daemon.service' }), ctx, { now: 0, dir, same: () => false, kill: (p, s) => kills.push([p, s]),
+    stat: () => ({ start: '8' }), stopUnit: async (u) => units.push(u), populated: async () => true });
   assert.deepEqual(kills, []);
+  assert.deepEqual(units, [], 'stored unit re-validated at use: not heavy-<pid>-*.scope → untouched');
+});
+
+test('advanceStop report: a failed Telegram edit is retried (not dropped)', async () => {
+  const ctx = fakeCtx();
+  let fail = true;
+  ctx.editButtonRowsStrict = async (c, m, text) => { if (fail) throw new Error('network'); ctx.edits.push({ text }); };
+  let j = await advanceStop(JOB({ phase: 'report', result: '⏹ đã dừng sau 3 s.', convoId: null }), ctx, { now: 0 });
+  assert.equal(j.phase, 'report');
+  assert.equal(j.tries, 1);
+  fail = false;
+  assert.equal(await advanceStop(j, ctx, { now: 0 }), null);
+  assert.match(ctx.edits.at(-1).text, /đã dừng sau 3 s/);
 });
 
 test('stopTick: advances persisted jobs, deletes finished ones (restart = just tick again)', async () => {
   const ctx = fakeCtx(), dir = tmpDir();
-  ctx.buttonStore.set('stop:100:0', JOB({ phase: 'verify' }));
+  ctx.buttonStore.set('stop:100:0', JOB({ phase: 'report', result: 'x', convoId: null }));
   ctx.buttonStore.set('tok', { kind: 'longbuild' });
   await stopTick(ctx, { dir, same: () => false, groupAlive: () => false, now: 5000 });
   assert.equal(ctx.buttonStore.has('stop:100:0'), false);
@@ -263,21 +298,36 @@ test('heavy: a TERM-ignoring build is SIGKILLed after the grace period', { timeo
   assert.throws(() => process.kill(-h.pgid, 0), /ESRCH/);
 });
 
-test('heavy: a marker while still waiting (before the build) → message, lock released, exit 77, command never runs', async () => {
+test('heavy: a marker while still waiting (before the build) → the wait is interrupted, message, lock released, exit 77, command never runs', async () => {
   const { main } = await import('./heavy.mjs');
-  let exited = null, released = false, ran = false;
+  let released = false, ran = false;
   const logs = [];
-  let finish;
-  const waiting = new Promise((r) => { finish = r; });
   const lock = { release() { released = true; }, update() { return true; }, waitedMs: 0, slot: 0, slots: 1, startedAt: Date.now() };
-  main(['--', 'cargo', 'b'], { env: {}, nested: () => false, log: (s) => logs.push(s), waitRam: async () => {}, acquire: async () => lock,
+  const code = await main(['--', 'cargo', 'b'], { env: {}, nested: () => false, log: (s) => logs.push(s), waitRam: async () => {}, acquire: async () => lock,
     run: async () => { ran = true; return 0; },
     scopeOps: { preflight: () => ({ ok: false, why: 't' }), stop: () => true, orphans: () => [], oomKills: () => null, jobsConfigured: () => true, memTotal: 16 * 1024 ** 3,
-      holders: () => [], sweepLock: async () => () => {}, slotTurn: () => waiting, // stuck "waiting for RAM"
-      stopMarker: () => '/nonexistent/marker', exists: () => true, exit: (c) => { exited = c; finish({}); } } });
-  await until(() => exited !== null, 8000);
-  assert.equal(exited, STOPPED_EXIT);
+      holders: () => [], sweepLock: async () => () => {},
+      slotTurn: async ({ sleep }) => { for (;;) await sleep(10_000); }, // stuck "waiting for RAM", with heavy's interruptible sleep
+      stopMarker: () => '/nonexistent/marker', exists: () => true } });
+  assert.equal(code, STOPPED_EXIT);
   assert.equal(released, true);
   assert.equal(ran, false);
   assert.ok(logs.some((l) => /Owner đã dừng build này/.test(l)));
+});
+
+test('heavy: a signal while waiting (before the build) → interrupted, lock released through the normal path, no build', async () => {
+  const { main } = await import('./heavy.mjs');
+  let released = false, ran = false;
+  const lock = { release() { released = true; }, update() { return true; }, waitedMs: 0, slot: 0, slots: 1, startedAt: Date.now() };
+  const listenersBefore = process.listenerCount('SIGTERM');
+  const p = main(['--', 'cargo', 'b'], { env: {}, nested: () => false, log: () => {}, waitRam: async () => {}, acquire: async () => lock,
+    run: async () => { ran = true; return 0; },
+    scopeOps: { preflight: () => ({ ok: false, why: 't' }), stop: () => true, orphans: () => [], oomKills: () => null, jobsConfigured: () => true, memTotal: 16 * 1024 ** 3,
+      holders: () => [], sweepLock: async () => () => {}, slotTurn: async ({ sleep }) => { for (;;) await sleep(10_000); }, stopMarker: () => '/nonexistent', exists: () => false } });
+  await sleep(100);
+  process.emit('SIGTERM', 'SIGTERM');
+  assert.equal(await p, 128 + 15);
+  assert.equal(released, true);
+  assert.equal(ran, false);
+  assert.equal(process.listenerCount('SIGTERM'), listenersBefore, 'no handler left behind');
 });

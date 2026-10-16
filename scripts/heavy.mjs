@@ -478,7 +478,7 @@ const DEFAULT_SCOPE_OPS = {
   admitLock: () => acquireHelperLock('build.admit', { waitMs: 10_000 }),
   sweepLock: () => acquireHelperLock('build.sweep', { waitMs: 60_000 }),
   slotTurn: waitForSlotTurn,
-  stopMarker: (pid, startedAt) => stopMarkerPath(pid, startedAt), exists: (f) => fs.existsSync(f), exit: (c) => process.exit(c),
+  stopMarker: (pid, startedAt) => stopMarkerPath(pid, startedAt), exists: (f) => fs.existsSync(f),
   groupAlive: (pgid) => { try { process.kill(-pgid, 0); return true; } catch (e) { return e.code === 'EPERM'; } },
 };
 
@@ -520,105 +520,141 @@ export async function main(argv, {
   if (!isNested && slot > 0) Object.assign(childEnv, slotEnv(env, slot)); // RFC 23: own Gradle registry, Kotlin in-process
   let scope = null;
   // RFC 24: the owner can stop us through the daemon (a marker file we watch all our life), and one signal
-  // policy covers that whole life: before the build a signal cancels cleanly (lock released, no build), during
-  // it runForwarded forwards, after it we ignore signals while cleaning up.
+  // policy covers that whole life. Before the build: a signal or the marker is RECORDED, the long waits
+  // (slot turn, RAM) are interrupted, and we leave through the normal path below (lock released in
+  // `finally`, no build). During it: runForwarded forwards signals; the marker → TERM, then KILL, of the
+  // build's process group. After it: signals are ignored while we clean up; the lock is kept until the
+  // group is gone.
   const SIGS = ['SIGINT', 'SIGTERM', 'SIGHUP'];
   const owned = !isNested && !!lock.startedAt;
   const marker = owned ? scopeOps.stopMarker(process.pid, lock.startedAt) : null;
-  let phase = 'pre', stopByOwner = false, pgid = null, killTimer = null;
+  let phase = 'pre', stopByOwner = false, cancelled = null, pgid = null, killTimer = null;
+  const aborts = new Set();
+  const cancelError = () => Object.assign(new Error('heavy cancelled'), { heavyCancel: true });
+  const abortWaits = () => { for (const f of [...aborts]) f(); };
+  const sleepAbortable = (ms) => new Promise((resolve, reject) => {
+    if (cancelled || stopByOwner) { reject(cancelError()); return; }
+    const ab = () => { clearTimeout(t); aborts.delete(ab); reject(cancelError()); };
+    const t = setTimeout(() => { aborts.delete(ab); resolve(); }, ms);
+    aborts.add(ab);
+  });
   const acceptStop = () => {
     stopByOwner = true;
     log(`⏹ Owner đã dừng build này qua daemon (giữ lock ${Math.round((Date.now() - lock.startedAt) / 60000)} phút) — đừng tự chạy lại; hỏi owner trước.`);
     lock.update?.({ stopAck: Date.now() });
     try { fs.unlinkSync(marker); } catch {}
   };
-  const cancelBeforeBuild = (code) => { clearInterval(watch); for (const s of SIGS) process.off(s, preSig); lock.release(); scopeOps.exit(code); };
-  const preSig = (sig) => { log(`⏹ heavy: bị huỷ (${sig}) trước khi build bắt đầu — không chạy.`); cancelBeforeBuild(128 + (os.constants.signals[sig] || 2)); };
+  const preSig = (sig) => { if (!cancelled) cancelled = sig || 'SIGINT'; abortWaits(); };
   const postIgn = () => {};
+  const groupAlive = () => !!pgid && scopeOps.groupAlive(pgid);
+  const killGroup = (sig) => { if (groupAlive()) { try { process.kill(-pgid, sig); } catch {} } }; // (a live group keeps its id reserved)
   const watch = owned ? setInterval(() => {
     if (stopByOwner || !scopeOps.exists(marker)) return;
-    if (phase === 'pre') { acceptStop(); cancelBeforeBuild(STOPPED_EXIT); }
-    else if (phase === 'run' && pgid) {
-      acceptStop();
-      try { process.kill(-pgid, 'SIGTERM'); } catch {}
-      killTimer = setTimeout(() => { try { process.kill(-pgid, 'SIGKILL'); } catch {} }, STOP_GRACE_MS);
-    }
+    if (phase === 'pre') { acceptStop(); abortWaits(); }
+    else if (phase === 'run' && pgid) { acceptStop(); killGroup('SIGTERM'); killTimer = setTimeout(() => killGroup('SIGKILL'), STOP_GRACE_MS); }
+    else if (phase === 'post') { lock.update?.({ stopAck: Date.now() }); try { fs.unlinkSync(marker); } catch {} } // already finishing
   }, STOP_POLL_MS) : null;
   watch?.unref?.();
   if (owned) for (const s of SIGS) process.on(s, preSig);
+  const preCancelled = () => owned && (stopByOwner || cancelled);
+  const preCancelExit = () => {
+    if (stopByOwner) return STOPPED_EXIT;
+    log(`⏹ heavy: bị huỷ (${cancelled}) trước khi build bắt đầu — không chạy.`);
+    return 128 + (os.constants.signals[cancelled] || 2);
+  };
+  const waitOpts = owned ? { sleep: sleepAbortable } : {};
   try {
     if (!isNested) {
-      // A heavy SIGKILLed earlier lost its lock, but its build may still run: stop it now.
-      // (RFC 23: under build.sweep.lock, so two heavies starting together don't stop the same unit at once)
-      const sweep = async () => {
-        const unlockSweep = await scopeOps.sweepLock();
-        if (!unlockSweep) { log('❌ heavy: chờ dọn build mồ côi quá 60 s (heavy khác đang dọn?) — không chạy. Thử lại sau.'); return false; }
-        try {
-          for (const u of scopeOps.orphans()) {
-            log(`🧹 heavy: dừng build mồ côi ${u}`);
-            if (!scopeOps.stop(u)) { log(`❌ heavy: không dừng được build mồ côi ${u} — không chạy chồng lên nó. Thử lại sau / systemctl --user kill -s KILL ${u} (rồi systemctl --user reset-failed ${u})`); return false; }
-          }
-        } finally { unlockSweep(); }
-        return true;
-      };
-      if (!await sweep()) return WAIT_TIMEOUT_EXIT;
-      // RFC 23: 30% when another build may run beside us, else 45% (as before).
-      const me = { pid: process.pid, startedAt: lock.startedAt, slot };
-      const others = lock.startedAt ? scopeOps.holders().filter((h) => !(h.pid === me.pid && h.startedAt === me.startedAt)) : [];
-      const fraction = (lock.slots ?? 1) >= 2 || others.length ? SCOPE_MEM_FRACTION_SHARED : SCOPE_MEM_FRACTION;
-      if (a.scope && env.TELEPORT_HEAVY_SCOPE !== '0') {
-        const memMax = scopeMemMax(env, scopeOps.memTotal, fraction);
-        const pf = scopeOps.preflight({ memMax });
-        if (pf.ok) scope = { unit: `heavy-${process.pid}-${Math.random().toString(36).slice(2, 8)}.scope`, memMax };
-        else log(`⚠️ heavy: không tạo được scope riêng (${pf.why}) — chạy như cũ, không giới hạn RAM.`);
+      try {
+        // A heavy SIGKILLed earlier lost its lock, but its build may still run: stop it now.
+        // (RFC 23: under build.sweep.lock, so two heavies starting together don't stop the same unit at once)
+        const sweep = async () => {
+          const unlockSweep = await scopeOps.sweepLock();
+          if (!unlockSweep) { log('❌ heavy: chờ dọn build mồ côi quá 60 s (heavy khác đang dọn?) — không chạy. Thử lại sau.'); return false; }
+          try {
+            for (const u of scopeOps.orphans()) {
+              log(`🧹 heavy: dừng build mồ côi ${u}`);
+              if (!scopeOps.stop(u)) { log(`❌ heavy: không dừng được build mồ côi ${u} — không chạy chồng lên nó. Thử lại sau / systemctl --user kill -s KILL ${u} (rồi systemctl --user reset-failed ${u})`); return false; }
+            }
+          } finally { unlockSweep(); }
+          return true;
+        };
+        if (!await sweep()) return WAIT_TIMEOUT_EXIT;
+        if (preCancelled()) return preCancelExit();
+        // RFC 23: 30% when another build may run beside us, else 45% (as before).
+        const me = { pid: process.pid, startedAt: lock.startedAt, slot };
+        const others = lock.startedAt ? scopeOps.holders().filter((h) => !(h.pid === me.pid && h.startedAt === me.startedAt)) : [];
+        const fraction = (lock.slots ?? 1) >= 2 || others.length ? SCOPE_MEM_FRACTION_SHARED : SCOPE_MEM_FRACTION;
+        if (a.scope && env.TELEPORT_HEAVY_SCOPE !== '0') {
+          const memMax = scopeMemMax(env, scopeOps.memTotal, fraction);
+          const pf = scopeOps.preflight({ memMax });
+          if (pf.ok) scope = { unit: `heavy-${process.pid}-${Math.random().toString(36).slice(2, 8)}.scope`, memMax };
+          else log(`⚠️ heavy: không tạo được scope riêng (${pf.why}) — chạy như cũ, không giới hạn RAM.`);
+        }
+        if (lock.startedAt) {
+          // Declare our cap (the holder said `pending` until now), then wait for the builds before us.
+          const unbounded = !scope || isUnbounded({ memMax: scope.memMax }, scopeOps.memTotal);
+          const declared = lock.update?.({ pending: undefined, ...(unbounded ? { unbounded: true } : { memMax: scope.memMax }), ...(scope ? { unit: scope.unit } : {}) });
+          if (declared === false && ((lock.slots ?? 1) > 1 || scopeOps.memTotal >= TWO_SLOT_MIN_RAM)) { log('❌ heavy: không ghi được giới hạn RAM vào holder (build kia cần nó để tính RAM) — không chạy.'); return 1; }
+          // (--no-ram-wait skips only the usual RAM waits; TELEPORT_HEAVY_MIN_FREE_MB=0 turns this gate off)
+          const capable = (lock.slots ?? 1) > 1 || scopeOps.memTotal >= TWO_SLOT_MIN_RAM;
+          const turn = await scopeOps.slotTurn({ me, myMax: scope?.memMax ?? 0, unbounded, total: scopeOps.memTotal, minBytes: minFreeBytes(env),
+            holders: scopeOps.holders, admitLock: scopeOps.admitLock, log, setWaiting: (w) => lock.update?.({ waitingRam: w || undefined }),
+            admit: () => lock.update?.({ admitted: true, waitingRam: undefined }) !== false || !capable, ...waitOpts });
+          if (preCancelled()) return preCancelExit();
+          if (turn?.failed) { log('❌ heavy: không ghi được "admitted" vào holder (build kia cần nó để tính RAM) — không chạy.'); return 1; }
+        }
+        // Pressure may have changed while we queued: check again, now that we're next.
+        if (a.ramWait) await waitRam({ minBytes: minFreeBytes(env), log, ...waitOpts });
+        if (preCancelled()) return preCancelExit();
+        // A build that ended while we prepared / waited may have died hard, leaving its scope running: sweep again, right before we start.
+        if (lock.startedAt && !await sweep()) return WAIT_TIMEOUT_EXIT;
+        if (preCancelled()) return preCancelExit();
+      } catch (e) {
+        if (!e?.heavyCancel) throw e;
+        return preCancelExit(); // a wait was interrupted by a signal / the owner's stop
       }
-      if (lock.startedAt) {
-        // Declare our cap (the holder said `pending` until now), then wait for the builds before us.
-        const unbounded = !scope || isUnbounded({ memMax: scope.memMax }, scopeOps.memTotal);
-        const declared = lock.update?.({ pending: undefined, ...(unbounded ? { unbounded: true } : { memMax: scope.memMax }), ...(scope ? { unit: scope.unit } : {}) });
-        if (declared === false && ((lock.slots ?? 1) > 1 || scopeOps.memTotal >= TWO_SLOT_MIN_RAM)) { log('❌ heavy: không ghi được giới hạn RAM vào holder (build kia cần nó để tính RAM) — không chạy.'); return 1; }
-        // (--no-ram-wait skips only the usual RAM waits; TELEPORT_HEAVY_MIN_FREE_MB=0 turns this gate off)
-        const capable = (lock.slots ?? 1) > 1 || scopeOps.memTotal >= TWO_SLOT_MIN_RAM;
-        const turn = await scopeOps.slotTurn({ me, myMax: scope?.memMax ?? 0, unbounded, total: scopeOps.memTotal, minBytes: minFreeBytes(env),
-          holders: scopeOps.holders, admitLock: scopeOps.admitLock, log, setWaiting: (w) => lock.update?.({ waitingRam: w || undefined }),
-          admit: () => lock.update?.({ admitted: true, waitingRam: undefined }) !== false || !capable });
-        if (turn?.failed) { log('❌ heavy: không ghi được "admitted" vào holder (build kia cần nó để tính RAM) — không chạy.'); return 1; }
-      }
-      // Pressure may have changed while we queued: check again, now that we're next.
-      if (a.ramWait) await waitRam({ minBytes: minFreeBytes(env), log });
-      // A build that ended while we prepared / waited may have died hard, leaving its scope running: sweep again, right before we start.
-      if (lock.startedAt && !await sweep()) return WAIT_TIMEOUT_EXIT;
     }
     // A Gradle daemon started earlier lives outside our scope (unlimited): stop it first.
-    // Ctrl-C / TERM during these pre-steps cancels the build (it must not start anyway).
-    let cancelled = null;
-    const onSig = (sig) => { cancelled = sig || 'SIGINT'; };
-    for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(sig, onSig);
+    // Ctrl-C / TERM during these pre-steps cancels the build (it must not start anyway). (Owned runs: preSig records it.)
+    let cancelledOld = null;
+    const onSig = (sig) => { cancelledOld = sig || 'SIGINT'; };
+    if (!owned) for (const sig of SIGS) process.on(sig, onSig);
     try {
       if (scope && a.stop && isGradlew(a.cmd)) {
         log('🧹 gradlew --stop (daemon cũ, trước build)…');
         let rc = 0;
         try { rc = await stopGradle(a.cmd, { env: childEnv }); } catch { rc = 1; }
-        if (rc && !cancelled) log('⚠️ heavy: gradlew --stop trước build thất bại — daemon cũ (ngoài scope, không giới hạn RAM) có thể bị dùng lại.');
+        if (rc && !cancelledOld && !preCancelled()) log('⚠️ heavy: gradlew --stop trước build thất bại — daemon cũ (ngoài scope, không giới hạn RAM) có thể bị dùng lại.');
       }
-    } finally { for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.off(sig, onSig); }
-    if (cancelled) { log('⏹ heavy: bị huỷ trước khi build bắt đầu — không chạy.'); return 128 + (os.constants.signals[cancelled] || 2); }
+    } finally { for (const sig of SIGS) process.off(sig, onSig); }
+    if (cancelledOld) { log('⏹ heavy: bị huỷ trước khi build bắt đầu — không chạy.'); return 128 + (os.constants.signals[cancelledOld] || 2); }
+    if (preCancelled()) return preCancelExit();
     const oomBefore = scope ? scopeOps.oomKills() : null;
-    if (stopByOwner) return STOPPED_EXIT; // (cancelled before the build — exit() normally never returns)
     if (owned) { for (const s of SIGS) process.off(s, preSig); phase = 'run'; } // runForwarded forwards from here
     const onSpawn = (child) => { pgid = child.pid; lock.update?.({ running: true, runningSince: Date.now(), pgid, pgidStart: procStat(pgid)?.start ?? null }); };
     const code = await run(a.cmd, { env: childEnv, ...(scope ? { scope } : {}), ...(owned ? { onSpawn } : {}) });
     if (owned) {
-      phase = 'post';
+      phase = 'post'; // (the watcher stays on: a late stop is just acknowledged)
       for (const s of SIGS) process.on(s, postIgn); // cleaning up: a signal now would drop the lock mid-cleanup
-      clearInterval(watch); clearTimeout(killTimer);
+      clearTimeout(killTimer);
       lock.update?.({ stopping: true });
-      if (stopByOwner && pgid) { // the group must really be gone before the lock goes (≤ 5 s, then KILL again)
-        for (let i = 0; i < 10 && scopeOps.groupAlive(pgid); i++) { try { process.kill(-pgid, 'SIGKILL'); } catch {} await new Promise((r) => setTimeout(r, 500)); }
+      if (stopByOwner && pgid) { // the group must really be gone before the lock goes: keep it up to 60 s
+        for (let i = 0; i < 120 && groupAlive(); i++) { killGroup('SIGKILL'); await new Promise((r) => setTimeout(r, 500)); }
+        if (groupAlive()) log(`⚠️ heavy: process group ${pgid} vẫn còn sau 60 s (tiến trình kẹt trong kernel?) — nhả lock; daemon sẽ báo "chưa chắc đã dừng".`);
       }
     }
     // 126/127: gradlew couldn't even start — nothing to stop. Stopped by the owner with a scope: the scope kills the daemon.
-    if (a.stop && isGradlew(a.cmd) && code !== 126 && code !== 127 && !(stopByOwner && scope)) { log('🧹 gradlew --stop (trả RAM)…'); try { await stopGradle(a.cmd, { env: childEnv }); } catch {} }
+    if (a.stop && isGradlew(a.cmd) && code !== 126 && code !== 127 && !(stopByOwner && scope)) {
+      log('🧹 gradlew --stop (trả RAM)…');
+      if (stopByOwner) { // after an owner stop (no scope): bounded to 30 s
+        let gpid = null, timer = null;
+        const p = stopGradle(a.cmd, { env: childEnv, onSpawn: (c) => { gpid = c.pid; } }).catch(() => {});
+        await Promise.race([p, new Promise((r) => { timer = setTimeout(r, 30_000); })]);
+        clearTimeout(timer);
+        if (gpid && scopeOps.groupAlive(gpid)) { try { process.kill(-gpid, 'SIGKILL'); } catch {} }
+      } else { try { await stopGradle(a.cmd, { env: childEnv }); } catch {} }
+    }
     const oomAfter = scope ? scopeOps.oomKills() : null;
     // (app.slice counts every agent's OOMs too: only blame the build if it died by a signal)
     if (code >= 128 && oomBefore != null && oomAfter != null && oomAfter > oomBefore) {
@@ -632,10 +668,10 @@ export async function main(argv, {
     if (scope) {
       // Ignore Ctrl-C / TERM while stopping: dying here would drop the lock with the build maybe still alive.
       const ign = () => {};
-      for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(sig, ign);
+      for (const sig of SIGS) process.on(sig, ign);
       let stopped = false;
       try { stopped = scopeOps.stop(scope.unit); } catch {}
-      finally { for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.off(sig, ign); }
+      finally { for (const sig of SIGS) process.off(sig, ign); }
       if (!stopped) log(`⚠️ heavy: KHÔNG xác nhận được scope ${scope.unit} đã trống (systemctl lỗi) — nhả lock để không chặn mọi build; build kế tiếp sẽ thử dọn và không chạy chồng nếu không dọn được.`);
     }
     if (stopByOwner) log('⏹ (exit 77 = owner dừng — không phải lỗi build; đừng tự chạy lại.)');
