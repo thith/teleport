@@ -334,7 +334,10 @@ export function readServed(name, { dir = LOCK_DIR, now = Date.now(), prune = fal
   let files = [];
   try { files = fs.readdirSync(d); } catch { return out; }
   for (const f of files) {
-    if (f.includes('.prune-')) continue;
+    if (f.includes('.prune-')) { // left by a pruner that died mid-way: harmless, cleared after an hour
+      if (prune) { try { const file = path.join(d, f); if (now - fs.statSync(file).mtimeMs > 3600_000) fs.unlinkSync(file); } catch {} }
+      continue;
+    }
     try {
       const file = path.join(d, f), st = fs.statSync(file);
       if (now - st.mtimeMs > SERVED_MAX_AGE_MS) { if (prune && now - st.mtimeMs > SERVED_PRUNE_MS) pruneServedFile(file, now); continue; }

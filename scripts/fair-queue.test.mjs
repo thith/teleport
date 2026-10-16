@@ -6,7 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { acquireLock, readQueue, lockPaths, gitCommonDir, ownerOf, recordOwner, queueOrder, markServed, readServed, SERVED_MAX_AGE_MS, SERVED_PRUNE_MS } from './machine-lock.mjs';
+import { acquireLock, readQueue, lockPaths, hasLegacyWaiter, gitCommonDir, ownerOf, recordOwner, queueOrder, markServed, readServed, SERVED_MAX_AGE_MS, SERVED_PRUNE_MS } from './machine-lock.mjs';
 import { formatQueue } from './lock-queue.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -129,7 +129,7 @@ test('rollout: while an old-code ticket (no `owner`) waits, the queue is FIFO fo
 test('rollout: 3-way case (N1 owner A, O2 old code, N3 owner B, A running) → FIFO, so N1 goes first, no cycle', () => {
   const T = (name, owner) => ({ name, owner, status: 'live', pid: 1 });
   const tickets = [T('1', 'convo:A'), { name: '2', status: 'live', pid: 2, convoId: 'Z' }, T('3', 'convo:B')];
-  const fair = !tickets.some((t) => t.status === 'live' && !t.owner);
+  const fair = !hasLegacyWaiter(tickets);
   assert.equal(fair, false);
   assert.deepEqual(queueOrder(tickets, { fair, running: [{ owner: 'convo:A' }] }).map((t) => t.name), ['1', '2', '3']);
   const lines = formatQueue('build', { holderOf: () => null, struck: () => [], claimedOf: () => [], servedOf: () => ({}),
