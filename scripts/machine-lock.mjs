@@ -415,18 +415,19 @@ export async function acquireLock(name, {
   try { // atomic, so a waiter never reads half a file
     writeJsonAtomic(hp, me);
   } catch (e) {
-    // Display only — except with 2 build slots, where the other build budgets RAM from our holder: no holder, no run.
-    if (name === 'build' && N > 1) { done(); close(); throw new Error(`không ghi được holder ${path.basename(hp)} (${e.message}) — không chạy (build kia cần nó để tính RAM)`); }
+    // Display only — except on a machine that may run 2 builds (now, or after `slots auto`), where the other
+    // build budgets RAM from our holder: no holder, no run.
+    if (name === 'build' && (N > 1 || memTotal() >= TWO_SLOT_MIN_RAM)) { done(); close(); throw new Error(`không ghi được holder ${path.basename(hp)} (${e.message}) — không chạy (build kia cần nó để tính RAM)`); }
   }
   done(); // holder names us → leave the queue
   let released = false;
   const ours = () => { const h = readHolder(hp); return h?.pid === process.pid && h.startedAt === me.startedAt && h.ticket === me.ticket; };
-  // Rewrite our holder (e.g. heavy declaring memMax / unbounded): atomic, best effort, only while we hold it.
+  // Rewrite our holder (e.g. heavy declaring memMax / unbounded): atomic, only while we hold it. → written?
   const update = (fields) => {
-    if (released) return;
+    if (released) return false;
     const next = { ...me, ...fields };
     for (const k of Object.keys(next)) if (next[k] === undefined) delete next[k];
-    try { writeJsonAtomic(hp, next); me = next; } catch {}
+    try { writeJsonAtomic(hp, next); me = next; return true; } catch { return false; }
   };
   const release = () => {
     if (released) return;

@@ -57,7 +57,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
-import { acquireLock, describeHolder, readHolders, readClaimed, acquireHelperLock, memTotal, LOCK_DIR } from './machine-lock.mjs';
+import { acquireLock, describeHolder, readHolders, readClaimed, acquireHelperLock, memTotal, LOCK_DIR, TWO_SLOT_MIN_RAM } from './machine-lock.mjs';
 import { isMainModule } from './is-direct-run.mjs';
 import { shortCmd } from './lock-queue.mjs';
 
@@ -527,15 +527,16 @@ export async function main(argv, {
       if (lock.startedAt) {
         // Declare our cap (the holder said `pending` until now), then wait for the builds before us.
         const unbounded = !scope || isUnbounded({ memMax: scope.memMax }, scopeOps.memTotal);
-        lock.update?.({ pending: undefined, ...(unbounded ? { unbounded: true } : { memMax: scope.memMax }) });
+        const declared = lock.update?.({ pending: undefined, ...(unbounded ? { unbounded: true } : { memMax: scope.memMax }) });
+        if (declared === false && ((lock.slots ?? 1) > 1 || scopeOps.memTotal >= TWO_SLOT_MIN_RAM)) { log('❌ heavy: không ghi được giới hạn RAM vào holder (build kia cần nó để tính RAM) — không chạy.'); return 1; }
         // (--no-ram-wait skips only the usual RAM waits; TELEPORT_HEAVY_MIN_FREE_MB=0 turns this gate off)
-        const turn = await scopeOps.slotTurn({ me, myMax: scope?.memMax ?? 0, unbounded, total: scopeOps.memTotal, minBytes: minFreeBytes(env),
+        await scopeOps.slotTurn({ me, myMax: scope?.memMax ?? 0, unbounded, total: scopeOps.memTotal, minBytes: minFreeBytes(env),
           holders: scopeOps.holders, claimedOnly: scopeOps.claimedOnly, log, setWaiting: (w) => lock.update?.({ waitingRam: w || undefined }) });
-        // An earlier build that went away while we waited may have died hard, leaving its scope running: sweep again.
-        if (turn?.waited && !await sweep()) return WAIT_TIMEOUT_EXIT;
       }
       // Pressure may have changed while we queued: check again, now that we're next.
       if (a.ramWait) await waitRam({ minBytes: minFreeBytes(env), log });
+      // A build that ended while we prepared / waited may have died hard, leaving its scope running: sweep again, right before we start.
+      if (lock.startedAt && !await sweep()) return WAIT_TIMEOUT_EXIT;
     }
     // A Gradle daemon started earlier lives outside our scope (unlimited): stop it first.
     // Ctrl-C / TERM during these pre-steps cancels the build (it must not start anyway).

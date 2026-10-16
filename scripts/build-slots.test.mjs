@@ -422,7 +422,7 @@ test('with 2 slots a holder that cannot be written means no run (the other build
   l.release();
 });
 
-test('heavy main: after waiting for an earlier build it sweeps orphans again; --no-ram-wait keeps the slot gate', async () => {
+test('heavy main: sweeps orphans again right before starting; --no-ram-wait keeps the slot gate', async () => {
   let sweeps = 0, turn = null;
   const lock = { release() {}, update() {}, waitedMs: 0, slot: 1, slots: 2, startedAt: 7 };
   const base = { env: {}, nested: () => false, log: () => {}, waitRam: async () => {}, acquire: async () => lock, run: async () => 0 };
@@ -431,7 +431,7 @@ test('heavy main: after waiting for an earlier build it sweeps orphans again; --
   assert.equal(turn.minBytes, 3 * GiB);
   sweeps = 0;
   await heavyMain(['--', 'cargo', 'b'], { ...base, scopeOps: { ...OPS, sweepLock: async () => { sweeps++; return () => {}; } } });
-  assert.equal(sweeps, 1, 'no wait → no second sweep');
+  assert.equal(sweeps, 2, 'always swept again right before the build starts');
   const zero = await heavyMain(['--', 'cargo', 'b'], { ...base, env: { TELEPORT_HEAVY_MIN_FREE_MB: '0' }, scopeOps: { ...OPS, slotTurn: async (o) => { turn = o; return {}; } } });
   assert.equal(zero, 0);
   assert.equal(turn.minBytes, 0, 'MIN_FREE_MB=0 turns the gate off');
@@ -451,4 +451,16 @@ test('heavy main + real acquireLock and waitForSlotTurn: slot 1 waits for slot 0
     scopeOps: { ...OPS, memTotal: T, holders, claimedOnly: () => 0, slotTurn: turn } });
   assert.equal(code, 0);
   assert.deepEqual(events, ['wait', 'wait', 'wait', 'run']);
+});
+
+test('heavy main: a 2-slot build whose cap cannot be written to its holder does not run', async () => {
+  let ran = false;
+  const lock = { release() {}, update: () => false, waitedMs: 0, slot: 1, slots: 2, startedAt: 7 };
+  const code = await heavyMain(['--', 'cargo', 'b'], { env: {}, nested: () => false, log: () => {}, waitRam: async () => {}, acquire: async () => lock,
+    run: async () => { ran = true; return 0; }, scopeOps: OPS });
+  assert.equal(code, 1);
+  assert.equal(ran, false);
+  const small = await heavyMain(['--', 'cargo', 'b'], { env: {}, nested: () => false, log: () => {}, waitRam: async () => {},
+    acquire: async () => ({ ...lock, slot: 0, slots: 1 }), run: async () => 0, scopeOps: { ...OPS, memTotal: 16 * GiB } });
+  assert.equal(small, 0, '16 GiB machine, N = 1: the holder stays display-only');
 });
