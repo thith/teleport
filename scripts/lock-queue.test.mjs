@@ -263,3 +263,21 @@ test('worktree: shown per ticket / holder; leave strikes only this worktree by d
   assert.equal(readQueue('build', { dir }).length, 0);
   h.release();
 });
+
+test('leave outside any worktree only strikes worktree-less tickets; an old ticket (no field) gets its worktree from its process cwd', async () => {
+  const { ticketWorktree } = await import('./lock-queue.mjs');
+  const dir = tmpDir();
+  const root = tmpDir();
+  fs.mkdirSync(path.join(root, 'wt-a')); fs.writeFileSync(path.join(root, 'wt-a', '.git'), 'gitdir: x\n');
+  assert.equal(ticketWorktree({ pid: 1 }, { cwdOf: () => path.join(root, 'wt-a') }), path.join(root, 'wt-a'));
+  assert.equal(ticketWorktree({ pid: 1 }, { cwdOf: () => { throw new Error('gone'); } }), null);
+  assert.equal(ticketWorktree({ pid: 1, worktree: null }, { cwdOf: () => path.join(root, 'wt-a') }), null, 'a recorded null stays null');
+  const h = await acquireLock('build', { dir, waitSec: 0, label: 'H', convoId: null });
+  const q = lockPaths('build', dir).queue;
+  fs.mkdirSync(q, { recursive: true });
+  fs.writeFileSync(path.join(q, `000000000000001-${process.pid}-aaaaa1.json`), JSON.stringify({ pid: process.pid, label: 'IN', convoId: '5', worktree: path.join(root, 'wt-a'), createdAt: 0 }));
+  fs.writeFileSync(path.join(q, `000000000000002-${process.pid}-aaaaa2.json`), JSON.stringify({ pid: process.pid, label: 'OUT', convoId: '5', worktree: null, createdAt: 0 }));
+  leave({ lock: 'build' }, { dir, convoId: '5', worktree: null });
+  assert.deepEqual(readQueue('build', { dir }).map((t) => t.label), ['IN'], 'the sibling in wt-a is untouched');
+  h.release();
+});

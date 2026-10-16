@@ -27,8 +27,16 @@ const mins = (ms) => Math.max(0, Math.round(ms / 60000));
 const STATUS_TEXT = { live: 'chờ', stalled: 'kẹt (mất nhịp tim)', stopped: 'bị dừng (ctrl-Z)', left: 'đã gạch (đang rời)' };
 
 export const CMD_MAX = 80;
-/** "🧚 Tiên #j8436116 · kytfunds" — who, and in which worktree. Pure. */
-const who = (t) => `${t.label || `pid ${t.pid}`}${t.worktree ? ` · ${path.basename(t.worktree)}` : ''}`;
+/**
+ * A ticket's / holder's worktree: recorded since this field exists; for an older
+ * one, derived from its live process's cwd (/proc/<pid>/cwd). null = none / unknown.
+ */
+export function ticketWorktree(t, { cwdOf = (pid) => fs.readlinkSync(`/proc/${pid}/cwd`) } = {}) {
+  if (t.worktree !== undefined) return t.worktree;
+  try { return worktreeOf(cwdOf(t.pid)); } catch { return null; }
+}
+/** "🧚 Tiên #j8436116 · kytfunds" — who, and in which worktree. */
+const who = (t) => { const w = ticketWorktree(t); return `${t.label || `pid ${t.pid}`}${w ? ` · ${path.basename(w)}` : ''}`; };
 /** A command for display: whitespace folded, cut at ~80 chars with " …". Pure. */
 export function shortCmd(cmd, max = CMD_MAX) {
   const s = String(cmd || '').replace(/\s+/g, ' ').trim();
@@ -81,8 +89,8 @@ export function parseArgs(argv) {
 export function leave({ lock = null, pid = null, all = false }, { dir = LOCK_DIR, convoId = selfConvoId(), worktree = worktreeOf(), cancel = cancelTickets, holderOf = readHolder, claimed = readClaimed, read = readQueue } = {}) {
   if (pid == null && convoId == null) return { code: 1, lines: ['❌ Không xác định được convo của bạn — dùng --pid N (chỉ admin/maintainer).'] };
   const mine = (t) => t.convoId != null && String(t.convoId) === String(convoId);
-  // default: this worktree only (not in a git worktree → the whole convo, as before)
-  const here = all || !worktree ? () => true : (t) => t.worktree === worktree;
+  // default: this worktree only (outside any worktree: only tickets that have none either — never a sibling's)
+  const here = all ? () => true : (t) => ticketWorktree(t) === (worktree ?? null);
   const match = pid != null ? (t) => t.pid === pid : (t) => mine(t) && here(t);
   const lines = [];
   let struck = 0;
@@ -94,9 +102,9 @@ export function leave({ lock = null, pid = null, all = false }, { dir = LOCK_DIR
     if (running) lines.push(`ℹ️ ${name}: việc của bạn đang chạy rồi (${running.cmd || `pid ${running.pid}`}) — không rời được; muốn dừng thì dừng chính tiến trình đó.`);
   }
   if (!lines.length) {
-    const elsewhere = pid == null && !all && worktree ? (lock ? [lock] : LOCK_NAMES).flatMap((n) => read(n, { dir })).filter((t) => t.status !== 'dead' && mine(t)).length : 0;
+    const elsewhere = pid == null && !all ? (lock ? [lock] : LOCK_NAMES).flatMap((n) => read(n, { dir })).filter((t) => t.status !== 'dead' && mine(t)).length : 0;
     lines.push(elsewhere
-      ? `ℹ️ Không có vé nào của bạn đang chờ trong worktree này (${path.basename(worktree)}); convo bạn còn ${elsewhere} vé ở worktree khác — rời hết thì thêm --all.`
+      ? `ℹ️ Không có vé nào của bạn đang chờ trong worktree này (${worktree ? path.basename(worktree) : 'ngoài worktree'}); convo bạn còn ${elsewhere} vé ở worktree khác — rời hết thì thêm --all.`
       : 'ℹ️ Không có vé nào của bạn đang chờ.');
   }
   return { code: struck ? 0 : 1, lines };
