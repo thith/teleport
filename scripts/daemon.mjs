@@ -68,6 +68,7 @@ import {
 } from './merge-inbox.mjs';
 import { peekPersona } from './persona-store.mjs';
 import { machineWatch } from './health.mjs';
+import { longBuildWatch, handleLongBuildButton, stopTick, STOP_BUTTON_RE, STOP_TICK_MS } from './long-build.mjs';
 import { recordFetchOk, startListenWatchdog } from './listen-watch.mjs';
 import { launchCleanup, startCleanupScheduler } from './cleanup-launch.mjs';
 import { processCleanupRequests, processCleanupOffers, handleCleanupButton, CLEANUP_BUTTON_RE } from './cleanup-inbox.mjs';
@@ -293,6 +294,9 @@ async function main() {
   };
   // Pending buttons (merge previews, manual cleanups) survive a restart.
   pendingMergeButtons = new PersistentMap();
+  // RFC 24: owner-requested build stops run on their own short timer (not the 60 s heartbeat); jobs survive a restart.
+  const stopCtx = { daemonUserId, buttonStore: pendingMergeButtons, ...linkMergeUi };
+  setInterval(() => { stopTick(stopCtx, { deliver: deliverResult }).catch((e) => console.error(`[daemon] stop tick: ${e?.message ?? e}`)); }, STOP_TICK_MS);
   // The Merge button pins the head commit read here (gh, without our secrets).
   const ghEnv = { ...process.env };
   for (const k of secretEnvKeys) delete ghEnv[k];
@@ -374,7 +378,7 @@ async function main() {
       const presses = updates.filter((u) => u.callback_query && String(u.callback_query.from?.id) === daemonUserId);
       for (const u of presses) {
         const data = String(u.callback_query.data || '');
-        const handler = TYPE_BUTTON_RE.test(data) ? handleTypeButton : CLEANUP_BUTTON_RE.test(data) ? handleCleanupButton : handleMergeButton;
+        const handler = STOP_BUTTON_RE.test(data) ? handleLongBuildButton : TYPE_BUTTON_RE.test(data) ? handleTypeButton : CLEANUP_BUTTON_RE.test(data) ? handleCleanupButton : handleMergeButton;
         handler(u.callback_query, ctx).catch((e) => console.error(`[daemon] button: ${e?.message ?? e}`));
       }
       // Agent merge requests (file inbox) — one pass at a time.
@@ -400,6 +404,9 @@ async function main() {
         // Machine watch: early low-RAM warning + agents that vanished (OOM-kills).
         try { await machineWatch(watchState, (t) => sendText(daemonUserId, t)); }
         catch (e) { console.error(`[daemon] machine watch: ${e?.message ?? e}`); }
+        // RFC 24: a build holding the lock too long while others wait → owner alert with a stop button.
+        try { await longBuildWatch(ctx); }
+        catch (e) { console.error(`[daemon] long-build watch: ${e?.message ?? e}`); }
       }
     } catch (e) {
       console.error(`[daemon] loop error: ${e instanceof Error ? e.message : e}`);

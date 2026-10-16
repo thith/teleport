@@ -39,11 +39,28 @@ export class PersistentMap extends Map {
 
   set(k, v) {
     super.set(k, v);
-    if (this.size > this.cap) {
-      const oldest = [...this.entries()].sort((a, b) => (a[1].createdAt || 0) - (b[1].createdAt || 0));
+    if (this.size > this.cap) { // (an in-flight stop job — RFC 24 — is never evicted)
+      const oldest = [...this.entries()].filter(([, e]) => e?.kind !== 'stop').sort((a, b) => (a[1].createdAt || 0) - (b[1].createdAt || 0));
       for (const [key] of oldest.slice(0, this.size - this.cap)) super.delete(key);
     }
     try { this.flush(); } catch (e) { console.error(`[button-store] write failed: ${e?.message ?? e}`); } // still works in memory
+    return this;
+  }
+
+  /**
+   * Swap a one-shot button for its follow-up record in ONE flush (RFC 24 stop job). Throws if it can't be
+   * written — memory is then put back, and the caller must not act.
+   */
+  replace(oldKey, newKey, value) {
+    const had = super.has(oldKey), prev = super.get(oldKey), prevNew = super.get(newKey), hadNew = super.has(newKey);
+    super.delete(oldKey);
+    super.set(newKey, value);
+    try { this.flush(); } catch (e) {
+      super.delete(newKey);
+      if (hadNew) super.set(newKey, prevNew);
+      if (had) super.set(oldKey, prev);
+      throw e;
+    }
     return this;
   }
 

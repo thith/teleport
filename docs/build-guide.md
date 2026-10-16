@@ -17,6 +17,7 @@ node ../teleport/scripts/heavy.mjs -- cargo nextest run --workspace
 - **Exit code** là exit code của lệnh.
 - **Lệnh là `gradlew`:** sau khi xong, wrapper tự chạy `gradlew --stop` để trả vài GB RAM của Gradle daemon. Dùng `--no-stop` nếu sắp build tiếp ngay. Gọi `gradlew` **trực tiếp** (`./gradlew -p android …`), không gọi qua `sh -c "cd … && ./gradlew"`, nếu không sẽ không được nhận ra.
 - Build chết (Ctrl-C, timeout, bị kill) thì lock tự nhả, không bao giờ kẹt.
+- **Build giữ lock quá lâu (RFC 24):** chạy ≥ 30 phút trong khi có người chờ ≥ 10 phút (và hết chỗ) → daemon nhắn owner kèm nút [⏹ Dừng]. Owner bấm thì heavy tự dừng build (TERM rồi KILL cả process group, dọn scope), in `⏹ Owner đã dừng build này qua daemon … — đừng tự chạy lại; hỏi owner trước.` và thoát **exit 77**. Thấy exit 77: **đừng chạy lại tự động** — hỏi owner. Agent cũng nhận một prompt báo việc này.
 
 ## `target/` và chờ RAM (RFC 18)
 

@@ -604,6 +604,7 @@ export async function main(argv, {
     } finally { for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.off(sig, onSig); }
     if (cancelled) { log('⏹ heavy: bị huỷ trước khi build bắt đầu — không chạy.'); return 128 + (os.constants.signals[cancelled] || 2); }
     const oomBefore = scope ? scopeOps.oomKills() : null;
+    if (stopByOwner) return STOPPED_EXIT; // (cancelled before the build — exit() normally never returns)
     if (owned) { for (const s of SIGS) process.off(s, preSig); phase = 'run'; } // runForwarded forwards from here
     const onSpawn = (child) => { pgid = child.pid; lock.update?.({ running: true, runningSince: Date.now(), pgid, pgidStart: procStat(pgid)?.start ?? null }); };
     const code = await run(a.cmd, { env: childEnv, ...(scope ? { scope } : {}), ...(owned ? { onSpawn } : {}) });
