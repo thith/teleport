@@ -938,8 +938,8 @@ export async function startType(rest, ctx, { list = listForType, io = defaultIo(
   if (!agents.length) { await sendText(daemonUserId, 'ℹ️ không có agent nào trong screen tele-* để gõ.'); return; }
   const text = `⌨️ /type — chọn agent:\n${agents.map((a) => `• ${a.line}`).join('\n')}`;
   // The label is free text (the pick is bound by callback data + the #hash in the list above): persona + context
-  // use; the #hash only when there is no persona to tell agents apart.
-  const rows = agents.map((a) => [{ text: [personaOf(a.target.hashtag) || `#${a.target.hashtag}`, a.ctx].filter(Boolean).join(' · '), callback_data: `ty:pick:${a.target.hashtag}` }]);
+  // use without the "ctx" word ("👻 Ma · 693k (35%)"); the #hash only when there is no persona to tell agents apart.
+  const rows = agents.map((a) => [{ text: [personaOf(a.target.hashtag) || `#${a.target.hashtag}`, a.ctx?.replace(/^ctx /, '')].filter(Boolean).join(' · '), callback_data: `ty:pick:${a.target.hashtag}` }]);
   await sendButtonRows(daemonUserId, text, rows);
 }
 
