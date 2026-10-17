@@ -23,6 +23,13 @@ import { transcriptState, findTranscript, compactAfter, formatContext, contextWi
 export const TYPE_BUTTON_TTL_MS = 10 * 60 * 1000;
 export const TYPE_GAP_MS = 500;          // text → Enter (paste detection / suggestion box)
 export const TYPE_SETTLE_MS = 4000;      // how long to keep re-reading until the typed text shows (a busy box renders late)
+export const PROBE_CHAR = 'x';           // typed (then ⌫) to tell an empty box from Claude's dim suggestion
+// One clear round: End, kill to line start, kill to line end (on the now-empty line: pulls the next
+// line up), ⌫ (at column 0: joins the previous line). Repeated, it empties a draft of any length,
+// wherever the cursor is (probed on Claude Code 2.1.302: 4 pasted lines, cursor on line 2).
+export const CLEAR_ROUND = '\x05\x15\x0b\x7f';
+export const CLEAR_ROUNDS_PER_SEND = 10;
+export const CLEAR_MAX_SENDS = 10;
 export const COOLDOWN_MS = 5000;         // after Enter the session file still says idle for a moment
 export const ESC_GAP_MS = 3000;          // two quick Escs at idle open the Rewind menu
 export const RC_DIALOG_WAIT_MS = 5000;
@@ -214,8 +221,11 @@ export class TypeRunner {
   async run(op, t, who = 'owner') {
     const audit = (step, extra = {}) => this.io.audit({ who, op: TYPE_OPS[op], pid: t.pid, sessionId: t.sessionId, hashtag: t.hashtag, step, ...extra });
     if (op === 'e') return this.esc(t, audit);
-    if (op === 'i') return this.readInput(t, audit);
     if (this.locks.has(t.pid)) return { text: '⏳ đang gõ lệnh khác vào agent này — thử lại sau.' };
+    if (op === 'i') { // the probe types too: same lock, no cool-down
+      this.locks.add(t.pid);
+      try { return await this.readInput(t, audit); } finally { this.locks.delete(t.pid); }
+    }
     if ((this.cooldown.get(t.pid) || 0) > this.io.now()) return { text: '⏳ vừa gõ lệnh vào agent này — đợi vài giây rồi thử lại.' };
     this.locks.add(t.pid);
     this.cancel.delete(t.pid);
@@ -240,9 +250,13 @@ export class TypeRunner {
     // Never type over something already in the box (a draft, or our own earlier /type whose Enter was withheld).
     const before = parseInputLine(shot);
     if (before == null) { audit('refused', { reason: 'input-unreadable' }); return { text: `❔ không đọc được ô nhập (hộp thoại mở?) — không gõ ${cmd}.` }; }
-    if (before && !isPlaceholder(before)) {
-      audit('refused', { reason: 'input-not-empty', line: before });
-      return { text: `❌ ô nhập đang có chữ ("${before}") — không gõ ${cmd}. Vào screen xoá ô nhập rồi /type lại.` };
+    if (before && !isPlaceholder(before)) { // a draft — or Claude's dim suggestion, which reads the same
+      const p = await this.probeEmpty(t, before, audit, { allowBusy });
+      if (p.text) return { text: `${p.text} — không gõ ${cmd}.` };
+      if (!p.empty) {
+        audit('refused', { reason: 'input-not-empty', line: before });
+        return { text: `❌ ô nhập đang có chữ ("${before}") — không gõ ${cmd}. Bấm 🔍 ô nhập → 🧹 Xoá rồi /type lại.` };
+      }
     }
     const now0 = observe(t, io); // re-checked right before the key (the screen read took a moment)
     if (now0.mismatch || !ok(now0.state)) { audit('refused', { reason: now0.mismatch || now0.state }); return { text: `❌ agent vừa đổi trạng thái (${now0.mismatch || STATE_LABEL[now0.state]}) — không gõ ${cmd}.` }; }
@@ -345,7 +359,36 @@ export class TypeRunner {
     return { text: '❔ đã bật nhưng chưa thấy phiên Remote Control trong 15 giây — kiểm tra tay.' };
   }
 
-  /** What is in the agent's input box (no key sent). → { text, line, canClear }. */
+  /**
+   * Is the box really empty? A hardcopy has no colours, so Claude's dim suggestion (any text — e.g.
+   * a past `! git …` command) reads exactly like a draft. Type PROBE_CHAR and look: an empty box then
+   * shows just that char. It is taken back (⌫) only once seen to land, and only if the agent is
+   * still at the box. → { empty, line } | { text } (refused / unreadable / left in the box).
+   */
+  async probeEmpty(t, before, audit, { allowBusy = true } = {}) {
+    const io = this.io, sid = screenId(t);
+    const atBox = () => { const o = observe(t, io); return o.mismatch || !(o.state === 'idle' || (allowBusy && o.state === 'busy')) ? o : null; };
+    const bad = atBox(); // re-checked right before the key
+    if (bad) { audit('refused', { reason: bad.mismatch || bad.state }); return { text: `❌ agent vừa đổi trạng thái (${bad.mismatch || STATE_LABEL[bad.state]})` }; }
+    if (/ ⏎ /.test(before)) return { empty: false, line: before }; // several lines: never a suggestion
+    io.stuff(sid, PROBE_CHAR);
+    let line = before;
+    for (let waited = 0; waited < TYPE_SETTLE_MS && line === before; waited += TYPE_GAP_MS) {
+      await io.sleep(TYPE_GAP_MS);
+      line = parseInputLine(await io.hardcopy(sid));
+    }
+    audit('probe', { before, line });
+    const left = `đã gõ thử "${PROBE_CHAR}" vào ô nhập và chưa xoá lại — kiểm tay`;
+    if (line == null) return { text: `❔ không đọc lại được ô nhập (hộp thoại mở?) — ${left}` };
+    if (line === before) return { text: `❔ không thấy chữ gõ thử hiện lên — ${left}` }; // never ⌫ a char we did not see land
+    const now = atBox();
+    if (now) { audit('refused', { reason: now.mismatch || now.state }); return { text: `❌ agent vừa đổi trạng thái (${now.mismatch || STATE_LABEL[now.state]}) — ${left}` }; }
+    io.stuff(sid, '\x7f');
+    await io.sleep(TYPE_GAP_MS); // let the ⌫ land before anyone reads or types again
+    return { empty: line === PROBE_CHAR, line };
+  }
+
+  /** What is in the agent's input box. → { text, line, canClear }. Sends at most PROBE_CHAR + ⌫ (only when the box may be a dim suggestion). */
   async readInput(t, audit) {
     const o = observe(t, this.io);
     if (o.mismatch) return { text: `❌ agent đã đổi phiên (${o.mismatch}) — gõ /type lại.` };
@@ -354,32 +397,52 @@ export class TypeRunner {
     audit('read-input', { line });
     if (line == null) return { text: '❔ không đọc được ô nhập trên màn hình.' };
     if (!line || isPlaceholder(line)) return { text: '🔍 ô nhập đang trống.', line: '' };
+    const p = await this.probeEmpty(t, line, audit);
+    if (p.text) return { text: `${p.text} — đọc được: "${line}".` };
+    if (p.empty) return { text: `🔍 ô nhập đang trống (dòng mờ "${line}" chỉ là gợi ý của Claude).`, line: '' };
     return { text: `🔍 ô nhập đang có: "${line}"`, line, canClear: true };
   }
 
-  /** Clear the input box: End, then Ctrl-U (kill to line start); never Enter / Esc. Verified by reading it again. */
+  /**
+   * Clear the input box, whatever is in it and however many lines: CLEAR_ROUND repeated (never
+   * Enter / Esc), then verified — '' / the placeholder, or else the PROBE_CHAR probe (a dim
+   * suggestion comes back once the box is empty).
+   */
   async clearInput(t, audit) {
     const io = this.io, sid = screenId(t);
     const o = observe(t, io);
     if (o.mismatch) { audit('refused', { reason: o.mismatch }); return { text: `❌ agent đã đổi phiên (${o.mismatch}) — gõ /type lại.` }; }
     if (o.state !== 'idle' && o.state !== 'busy') { audit('refused', { reason: o.state }); return { text: `❌ agent ${STATE_LABEL[o.state]} — không xoá ô nhập.` }; }
+    const empty = (l) => l === '' || isPlaceholder(l); // (null = unreadable: never counted as cleared)
     const before = parseInputLine(await io.hardcopy(sid));
     if (before == null) return { text: '❔ không đọc được ô nhập — không gửi phím nào.' };
-    if (!before || isPlaceholder(before)) return { text: '🔍 ô nhập đã trống — không gửi phím nào.' };
-    const now0 = observe(t, io); // re-checked right before the keys
-    if (now0.mismatch || (now0.state !== 'idle' && now0.state !== 'busy')) { audit('refused', { reason: now0.mismatch || now0.state }); return { text: `❌ agent vừa đổi trạng thái (${now0.mismatch || STATE_LABEL[now0.state]}) — không xoá.` }; }
-    io.stuff(sid, '\x05\x15'); // Ctrl-E (end of line), Ctrl-U (delete to line start)
-    audit('clear-input', { before });
-    const empty = (l) => l === '' || isPlaceholder(l); // (null = unreadable: never counted as cleared)
+    if (empty(before)) return { text: '🔍 ô nhập đã trống — không gửi phím nào.' };
+    const first = await this.probeEmpty(t, before, audit);
+    if (first.text) return { text: `${first.text} — không xoá.` };
+    if (first.empty) return { text: `🔍 ô nhập đã trống (dòng mờ "${before}" chỉ là gợi ý của Claude) — không xoá gì.` };
     let line = before;
-    for (let waited = 0; waited < TYPE_SETTLE_MS; waited += TYPE_GAP_MS) {
-      await io.sleep(TYPE_GAP_MS);
-      line = parseInputLine(await io.hardcopy(sid));
-      if (empty(line)) break;
+    const cancelled = () => { if (!this.cancel.get(t.pid)) return null; audit('cancelled'); return { text: '✖ đã huỷ (⎋ Esc) — dừng xoá, ô nhập có thể còn một phần.' }; };
+    for (let send = 1; send <= CLEAR_MAX_SENDS; send++) {
+      const c = cancelled(); if (c) return c;
+      const now = observe(t, io); // re-checked before every batch of keys
+      if (now.mismatch || (now.state !== 'idle' && now.state !== 'busy')) { audit('refused', { reason: now.mismatch || now.state }); return { text: `❌ agent vừa đổi trạng thái (${now.mismatch || STATE_LABEL[now.state]}) — dừng xoá.` }; }
+      io.stuff(sid, CLEAR_ROUND.repeat(CLEAR_ROUNDS_PER_SEND));
+      audit('clear-input', { send, line });
+      const prev = line;
+      for (let waited = 0; waited < TYPE_SETTLE_MS; waited += TYPE_GAP_MS) {
+        await io.sleep(TYPE_GAP_MS);
+        line = parseInputLine(await io.hardcopy(sid));
+        if (line !== prev) break;
+      }
+      if (empty(line)) { audit('result', { result: 'cleared', send }); return { text: '🧹 đã xoá ô nhập (giờ trống).' }; }
+      if (line == null) { audit('result', { result: 'unreadable' }); return { text: '❔ đã gửi phím xoá nhưng không đọc lại được ô nhập — kiểm tay.' }; }
+      const c2 = cancelled(); if (c2) return c2;
+      const p = await this.probeEmpty(t, line, audit);
+      if (p.text) return { text: `${p.text} — dừng xoá.` };
+      if (p.empty) { audit('result', { result: 'cleared', send }); return { text: '🧹 đã xoá ô nhập (giờ trống).' }; }
     }
-    if (empty(line)) { audit('result', { result: 'cleared' }); return { text: '🧹 đã xoá ô nhập (giờ trống).' }; }
     audit('result', { result: 'not-cleared', line });
-    return { text: line == null ? '❔ đã gửi Ctrl-U nhưng không đọc lại được ô nhập — kiểm tay.' : `⚠️ ô nhập vẫn còn: "${line}" (nhiều dòng?) — vào screen xoá tay.` };
+    return { text: `⚠️ đã gửi ${CLEAR_MAX_SENDS * CLEAR_ROUNDS_PER_SEND} vòng phím xoá mà ô nhập vẫn còn: "${line}" — vào screen xoá tay.` };
   }
 
   async esc(t, audit) {
