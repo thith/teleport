@@ -508,3 +508,14 @@ test('runner: 🔍 read takes the per-agent lock (its probe types) — refused w
   assert.equal(runner.locks.has(T.pid), false);
   assert.ok(r.text);
 });
+
+test('runner: 🧹 stops at the next batch once ⎋ cancels it', async () => {
+  const { io, st } = fakeIo({ screens: [hc('draft')] });
+  let n = 0;
+  io.hardcopy = async () => (n++ % 2 ? typedX(hc('draft')) : hc('draft'));
+  const runner = new TypeRunner(io);
+  io.stuff = ((orig) => (sid, d) => { orig(sid, d); if (d === CLEAR) runner.cancel.set(T.pid, true); })(io.stuff);
+  const r = await runner.run('u', T);
+  assert.match(r.text, /đã huỷ/);
+  assert.equal(st.keys.filter((k) => k === CLEAR).length, 1);
+});

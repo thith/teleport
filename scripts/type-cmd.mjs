@@ -421,7 +421,9 @@ export class TypeRunner {
     if (first.text) return { text: `${first.text} — không xoá.` };
     if (first.empty) return { text: `🔍 ô nhập đã trống (dòng mờ "${before}" chỉ là gợi ý của Claude) — không xoá gì.` };
     let line = before;
+    const cancelled = () => { if (!this.cancel.get(t.pid)) return null; audit('cancelled'); return { text: '✖ đã huỷ (⎋ Esc) — dừng xoá, ô nhập có thể còn một phần.' }; };
     for (let send = 1; send <= CLEAR_MAX_SENDS; send++) {
+      const c = cancelled(); if (c) return c;
       const now = observe(t, io); // re-checked before every batch of keys
       if (now.mismatch || (now.state !== 'idle' && now.state !== 'busy')) { audit('refused', { reason: now.mismatch || now.state }); return { text: `❌ agent vừa đổi trạng thái (${now.mismatch || STATE_LABEL[now.state]}) — dừng xoá.` }; }
       io.stuff(sid, CLEAR_ROUND.repeat(CLEAR_ROUNDS_PER_SEND));
@@ -434,6 +436,7 @@ export class TypeRunner {
       }
       if (empty(line)) { audit('result', { result: 'cleared', send }); return { text: '🧹 đã xoá ô nhập (giờ trống).' }; }
       if (line == null) { audit('result', { result: 'unreadable' }); return { text: '❔ đã gửi phím xoá nhưng không đọc lại được ô nhập — kiểm tay.' }; }
+      const c2 = cancelled(); if (c2) return c2;
       const p = await this.probeEmpty(t, line, audit);
       if (p.text) return { text: `${p.text} — dừng xoá.` };
       if (p.empty) { audit('result', { result: 'cleared', send }); return { text: '🧹 đã xoá ô nhập (giờ trống).' }; }
