@@ -198,7 +198,7 @@ export function listForType({ list = () => listClaudeProcs(), personaOf = () => 
     const t = pinTarget(r);
     const o = observe(t, io);
     const ctx = o.mismatch ? null : formatContext(o.usage, contextWindowFor(cfg, { hashtag: t.hashtag, model: o.usage?.model }));
-    return { target: t, obs: o, line: agentLine(t, { persona: personaOf(t.hashtag), state: o.mismatch ? 'unknown' : o.state, ctx, bridge: o.bridge }) };
+    return { target: t, obs: o, ctx, line: agentLine(t, { persona: personaOf(t.hashtag), state: o.mismatch ? 'unknown' : o.state, ctx, bridge: o.bridge }) };
   });
 }
 

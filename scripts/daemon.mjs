@@ -919,13 +919,12 @@ export function typeStep2({ target, obs, persona, cfg = {}, tok }) {
 }
 
 /** `/type` (agent menu) or `/type #hash` (straight to the commands). */
-export async function startType(rest, ctx, { list = listForType, io = defaultIo() } = {}) {
+export async function startType(rest, ctx, { list = listForType, io = defaultIo(), personaOf = personaLookup() } = {}) {
   const { daemonUserId, projectsConfig, sendText, sendButtonRows, buttonStore } = ctx;
   if (!sendButtonRows || !buttonStore) { await sendText(daemonUserId, '❌ /type cần chạy trong daemon.'); return; }
   const toks = tokenizeArgs(rest);
   const want = (toks[0] || '').replace(/^#/, '').toLowerCase();
   if (toks.length > 1 || (want && !/^[0-9a-z]{8}$/.test(want))) { await sendText(daemonUserId, 'usage: /type  ·  /type #<hashtag>   (lệnh chọn bằng nút)'); return; }
-  const personaOf = personaLookup();
   const agents = list({ personaOf, cfg: projectsConfig, io });
   if (want) {
     const a = agents.find((x) => x.target.hashtag === want);
@@ -938,7 +937,9 @@ export async function startType(rest, ctx, { list = listForType, io = defaultIo(
   }
   if (!agents.length) { await sendText(daemonUserId, 'ℹ️ không có agent nào trong screen tele-* để gõ.'); return; }
   const text = `⌨️ /type — chọn agent:\n${agents.map((a) => `• ${a.line}`).join('\n')}`;
-  const rows = agents.map((a) => [{ text: `${personaOf(a.target.hashtag) || ''} #${a.target.hashtag}`.trim(), callback_data: `ty:pick:${a.target.hashtag}` }]);
+  // The label is free text (the pick is bound by callback data + the #hash in the list above): persona + context
+  // use; the #hash only when there is no persona to tell agents apart.
+  const rows = agents.map((a) => [{ text: [personaOf(a.target.hashtag) || `#${a.target.hashtag}`, a.ctx].filter(Boolean).join(' · '), callback_data: `ty:pick:${a.target.hashtag}` }]);
   await sendButtonRows(daemonUserId, text, rows);
 }
 

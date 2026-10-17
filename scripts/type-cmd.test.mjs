@@ -5,7 +5,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   classify, allowedOps, typeTargets, pinTarget, agentLine, messageNamesTarget, parseInputLine, suggestionSelects,
-  rcDialogReady, targetMismatch, TypeRunner, TYPE_BUTTON_RE, COOLDOWN_MS, defaultIo, compactRefusedOnScreen, isPlaceholder,
+  rcDialogReady, targetMismatch, TypeRunner, listForType, TYPE_BUTTON_RE, COOLDOWN_MS, defaultIo, compactRefusedOnScreen, isPlaceholder,
   CLEAR_ROUND, CLEAR_ROUNDS_PER_SEND, CLEAR_MAX_SENDS,
 } from './type-cmd.mjs';
 
@@ -518,4 +518,15 @@ test('runner: 🧹 stops at the next batch once ⎋ cancels it', async () => {
   const r = await runner.run('u', T);
   assert.match(r.text, /đã huỷ/);
   assert.equal(st.keys.filter((k) => k === CLEAR).length, 1);
+});
+
+test('listForType: returns the context use per agent (null when the target no longer matches)', () => {
+  const row = { pid: 10, ppid: 9, screenPid: 9, screen: 'tele-abcd1234', sessionId: 'S', procStart: '100', hashtag: 'abcd1234', cwd: '/w' };
+  const { io } = fakeIo({ status: 'idle' });
+  io.transcript = () => ({ ended: true, usage: { tokens: 693000 } });
+  const [a] = listForType({ list: () => [row], io });
+  assert.equal(a.ctx, 'ctx 693k');
+  assert.match(a.line, /#abcd1234 · PID 10 · rảnh · ctx 693k/);
+  io.session = () => ({ sessionId: 'OTHER', status: 'idle' });
+  assert.equal(listForType({ list: () => [row], io })[0].ctx, null);
 });
