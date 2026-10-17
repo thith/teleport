@@ -15,6 +15,13 @@ const IDLE = hc('idle-ghost'); // the empty box (its dim placeholder reads like 
 const box = (text) => IDLE.replace('Try "fix lint errors"', text); // the live input line showing `text`
 const SUGGEST = box('! git worktree remove --force ~/x'); // an EMPTY box with Claude's dim suggestion (past command)
 const CLEAR = CLEAR_ROUND.repeat(CLEAR_ROUNDS_PER_SEND);
+/** `scr` with the probe char typed at the end of its live input line. */
+const typedX = (scr) => {
+  const lines = scr.split('\n');
+  const i = lines.findLastIndex((l) => /^[^\s]\u00a0/.test(l.replace(/\0/g, '')));
+  lines[i] = lines[i].replace(/[\s\u00a0]*$/, 'x');
+  return lines.join('\n');
+};
 
 test('classify: idle / shell+turn-over = rảnh; shell mid-turn = bận; unknown never counts as idle', () => {
   assert.equal(classify('idle', null), 'idle');
@@ -378,7 +385,7 @@ test('runner: the typed text shows late (busy render) → re-read until it does,
 
 test('runner: text already in the box (e.g. an earlier /compact without Enter) → probed (x ⌫), then refused, no Enter', async () => {
   for (const scr of [hc('compact-typed'), hc('draft')]) {
-    const { io, st } = fakeIo({ screens: [scr] });
+    const { io, st } = fakeIo({ screens: [scr, typedX(scr), scr] });
     const r = await new TypeRunner(io).run('c', T);
     assert.match(r.text, /ô nhập đang có chữ/);
     assert.deepEqual(st.keys, ['x', '\x7f']);
@@ -407,7 +414,7 @@ test('runner: 🔍 read input — empty / placeholder: no key; text: probed (x �
     assert.equal(r.canClear, undefined);
     assert.deepEqual(st.keys, []);
   }
-  const txt = fakeIo({ screens: [hc('compact-typed'), hc('compact-typed').replace('/compact', '/compactx'), hc('compact-typed')] });
+  const txt = fakeIo({ screens: [hc('compact-typed'), typedX(hc('compact-typed')), hc('compact-typed')] });
   const r = await new TypeRunner(txt.io).run('i', T);
   assert.match(r.text, /đang có: "\/compact"/);
   assert.equal(r.canClear, true);
@@ -422,14 +429,14 @@ test('runner: 🔍 read input — empty / placeholder: no key; text: probed (x �
 });
 
 test('runner: 🧹 clear input — rounds of End/Ctrl-U/Ctrl-K/⌫ until empty, whatever the text', async () => {
-  // multi-line draft: first batch leaves a line, the second empties it
+  // multi-line draft: the first batch leaves a line, the second empties it
   const multi = hc('draft').replace('abc draft', 'l1 ⏎ l2');
-  const { io, st } = fakeIo({ screens: [multi, multi.replace('l1 ⏎ l2', 'l1 ⏎ l2x'), multi, box('l1'), box('l1x'), box('l1'), hc('compact-done-empty')] });
+  const { io, st } = fakeIo({ screens: [multi, box('l1'), typedX(box('l1')), box('l1'), hc('compact-done-empty')] });
   const r = await new TypeRunner(io).run('u', T);
-  assert.deepEqual(st.keys, ['x', '\x7f', CLEAR, 'x', '\x7f', CLEAR]);
+  assert.deepEqual(st.keys, [CLEAR, 'x', '\x7f', CLEAR]); // several lines: no probe needed first
   assert.match(r.text, /đã xoá ô nhập/);
   // cleared, but Claude shows a dim suggestion again → the probe says empty
-  const sg = fakeIo({ screens: [hc('draft'), hc('draft').replace('abc draft', 'abc draftx'), hc('draft'), SUGGEST, box('x'), SUGGEST] });
+  const sg = fakeIo({ screens: [hc('draft'), typedX(hc('draft')), hc('draft'), SUGGEST, box('x'), SUGGEST] });
   assert.match((await new TypeRunner(sg.io).run('u', T)).text, /đã xoá ô nhập/);
   assert.deepEqual(sg.st.keys, ['x', '\x7f', CLEAR, 'x', '\x7f']);
   // the box only held a suggestion → nothing deleted
@@ -437,7 +444,10 @@ test('runner: 🧹 clear input — rounds of End/Ctrl-U/Ctrl-K/⌫ until empty, 
   assert.match((await new TypeRunner(only.io).run('u', T)).text, /đã trống \(dòng mờ/);
   assert.deepEqual(only.st.keys, ['x', '\x7f']);
   // never empties → bounded, told
+  // never empties → bounded, told (each read alternates the draft / the draft + our probe char)
   const stuck = fakeIo({ screens: [hc('draft')] });
+  let n = 0;
+  stuck.io.hardcopy = async () => (n++ % 2 ? typedX(hc('draft')) : hc('draft'));
   assert.match((await new TypeRunner(stuck.io).run('u', T)).text, /vẫn còn: "abc draft"/);
   assert.equal(stuck.st.keys.filter((k) => k === CLEAR).length, CLEAR_MAX_SENDS);
   const empty = fakeIo({ screens: [IDLE] });
@@ -460,4 +470,41 @@ test('runner: unreadable box / state change during the read → no key; clear ne
   assert.deepEqual(d.st.keys, []);
   const c = fakeIo({ screens: [hc('compact-typed'), hc('rc-dialog')] });
   assert.match((await new TypeRunner(c.io).run('u', T)).text, /không đọc lại được/);
+});
+
+test('probe: ⌫ only after the probe char is seen landing, with the agent still at the box', async () => {
+  // a dialog opens while probing → no ⌫ into it
+  const d = fakeIo({ screens: [hc('draft'), hc('rc-dialog')] });
+  d.io.hardcopy = async () => { d.st.status = 'waiting'; return hc('rc-dialog'); };
+  const r = await new TypeRunner(d.io).probeEmpty(T, 'abc draft', () => {});
+  assert.match(r.text, /không đọc lại được/);
+  assert.deepEqual(d.st.keys, ['x']);
+  // the box reads "x" before and after: nothing observed → inconclusive, no ⌫, never "empty"
+  const same = fakeIo({ screens: [box('x')] });
+  const r2 = await new TypeRunner(same.io).probeEmpty(T, 'x', () => {});
+  assert.equal(r2.empty, undefined);
+  assert.match(r2.text, /không thấy chữ gõ thử/);
+  assert.deepEqual(same.st.keys, ['x']);
+  // still visible but the agent left the box (status changed) → no ⌫
+  const gone = fakeIo({ screens: [box('x')] });
+  gone.io.hardcopy = async () => { gone.st.status = 'waiting'; return box('x'); };
+  const r3 = await new TypeRunner(gone.io).probeEmpty(T, '! git worktree remove --force ~/x', () => {});
+  assert.match(r3.text, /vừa đổi trạng thái/);
+  assert.deepEqual(gone.st.keys, ['x']);
+  // several lines are never a suggestion → no key at all
+  const ml = fakeIo({ screens: [IDLE] });
+  assert.deepEqual(await new TypeRunner(ml.io).probeEmpty(T, 'l1 ⏎ l2…', () => {}), { empty: false, line: 'l1 ⏎ l2…' });
+  assert.deepEqual(ml.st.keys, []);
+});
+
+test('runner: 🔍 read takes the per-agent lock (its probe types) — refused while another op runs', async () => {
+  const { io, st } = fakeIo({ screens: [hc('draft')] });
+  const runner = new TypeRunner(io);
+  runner.locks.add(T.pid);
+  assert.match((await runner.run('i', T)).text, /đang gõ lệnh khác/);
+  assert.deepEqual(st.keys, []);
+  runner.locks.delete(T.pid);
+  const r = await runner.run('i', T);
+  assert.equal(runner.locks.has(T.pid), false);
+  assert.ok(r.text);
 });

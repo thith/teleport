@@ -221,8 +221,11 @@ export class TypeRunner {
   async run(op, t, who = 'owner') {
     const audit = (step, extra = {}) => this.io.audit({ who, op: TYPE_OPS[op], pid: t.pid, sessionId: t.sessionId, hashtag: t.hashtag, step, ...extra });
     if (op === 'e') return this.esc(t, audit);
-    if (op === 'i') return this.readInput(t, audit);
     if (this.locks.has(t.pid)) return { text: '⏳ đang gõ lệnh khác vào agent này — thử lại sau.' };
+    if (op === 'i') { // the probe types too: same lock, no cool-down
+      this.locks.add(t.pid);
+      try { return await this.readInput(t, audit); } finally { this.locks.delete(t.pid); }
+    }
     if ((this.cooldown.get(t.pid) || 0) > this.io.now()) return { text: '⏳ vừa gõ lệnh vào agent này — đợi vài giây rồi thử lại.' };
     this.locks.add(t.pid);
     this.cancel.delete(t.pid);
@@ -359,25 +362,29 @@ export class TypeRunner {
   /**
    * Is the box really empty? A hardcopy has no colours, so Claude's dim suggestion (any text — e.g.
    * a past `! git …` command) reads exactly like a draft. Type PROBE_CHAR and look: an empty box then
-   * shows just that char. The char is always taken back (⌫). → { empty, line } | { text } (refused).
+   * shows just that char. It is taken back (⌫) only once seen to land, and only if the agent is
+   * still at the box. → { empty, line } | { text } (refused / unreadable / left in the box).
    */
   async probeEmpty(t, before, audit, { allowBusy = true } = {}) {
     const io = this.io, sid = screenId(t);
-    const o = observe(t, io); // re-checked right before the key
-    if (o.mismatch || !(o.state === 'idle' || (allowBusy && o.state === 'busy'))) {
-      audit('refused', { reason: o.mismatch || o.state });
-      return { text: `❌ agent vừa đổi trạng thái (${o.mismatch || STATE_LABEL[o.state]})` };
-    }
+    const atBox = () => { const o = observe(t, io); return o.mismatch || !(o.state === 'idle' || (allowBusy && o.state === 'busy')) ? o : null; };
+    const bad = atBox(); // re-checked right before the key
+    if (bad) { audit('refused', { reason: bad.mismatch || bad.state }); return { text: `❌ agent vừa đổi trạng thái (${bad.mismatch || STATE_LABEL[bad.state]})` }; }
+    if (/ ⏎ /.test(before)) return { empty: false, line: before }; // several lines: never a suggestion
     io.stuff(sid, PROBE_CHAR);
     let line = before;
     for (let waited = 0; waited < TYPE_SETTLE_MS && line === before; waited += TYPE_GAP_MS) {
       await io.sleep(TYPE_GAP_MS);
       line = parseInputLine(await io.hardcopy(sid));
     }
+    audit('probe', { before, line });
+    const left = `đã gõ thử "${PROBE_CHAR}" vào ô nhập và chưa xoá lại — kiểm tay`;
+    if (line == null) return { text: `❔ không đọc lại được ô nhập (hộp thoại mở?) — ${left}` };
+    if (line === before) return { text: `❔ không thấy chữ gõ thử hiện lên — ${left}` }; // never ⌫ a char we did not see land
+    const now = atBox();
+    if (now) { audit('refused', { reason: now.mismatch || now.state }); return { text: `❌ agent vừa đổi trạng thái (${now.mismatch || STATE_LABEL[now.state]}) — ${left}` }; }
     io.stuff(sid, '\x7f');
     await io.sleep(TYPE_GAP_MS); // let the ⌫ land before anyone reads or types again
-    audit('probe', { before, line });
-    if (line == null) return { text: '❔ không đọc lại được ô nhập (hộp thoại mở?) — kiểm tay' };
     return { empty: line === PROBE_CHAR, line };
   }
 
