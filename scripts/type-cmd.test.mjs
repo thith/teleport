@@ -6,11 +6,15 @@ import { fileURLToPath } from 'node:url';
 import {
   classify, allowedOps, typeTargets, pinTarget, agentLine, messageNamesTarget, parseInputLine, suggestionSelects,
   rcDialogReady, targetMismatch, TypeRunner, TYPE_BUTTON_RE, COOLDOWN_MS, defaultIo, compactRefusedOnScreen, isPlaceholder,
+  CLEAR_ROUND, CLEAR_ROUNDS_PER_SEND, CLEAR_MAX_SENDS,
 } from './type-cmd.mjs';
 
 const FIX = path.join(path.dirname(fileURLToPath(import.meta.url)), 'fixtures', 'type-hardcopy');
 const hc = (name) => fs.readFileSync(path.join(FIX, `${name}.txt`)).toString('latin1'); // as the daemon reads them
 const IDLE = hc('idle-ghost'); // the empty box (its dim placeholder reads like text) — what /type sees before typing
+const box = (text) => IDLE.replace('Try "fix lint errors"', text); // the live input line showing `text`
+const SUGGEST = box('! git worktree remove --force ~/x'); // an EMPTY box with Claude's dim suggestion (past command)
+const CLEAR = CLEAR_ROUND.repeat(CLEAR_ROUNDS_PER_SEND);
 
 test('classify: idle / shell+turn-over = rảnh; shell mid-turn = bận; unknown never counts as idle', () => {
   assert.equal(classify('idle', null), 'idle');
@@ -372,14 +376,21 @@ test('runner: the typed text shows late (busy render) → re-read until it does,
   assert.match(r.text, /đã gõ \/compact/);
 });
 
-test('runner: text already in the box (e.g. an earlier /compact without Enter) → refused, NO key sent', async () => {
+test('runner: text already in the box (e.g. an earlier /compact without Enter) → probed (x ⌫), then refused, no Enter', async () => {
   for (const scr of [hc('compact-typed'), hc('draft')]) {
     const { io, st } = fakeIo({ screens: [scr] });
     const r = await new TypeRunner(io).run('c', T);
     assert.match(r.text, /ô nhập đang có chữ/);
-    assert.deepEqual(st.keys, []);
+    assert.deepEqual(st.keys, ['x', '\x7f']);
     assert.equal(st.audits.at(-1).reason, 'input-not-empty');
   }
+});
+
+test('runner: a dim suggestion (reads like text) is probed as empty → /compact goes ahead', async () => {
+  const { io, st } = fakeIo({ screens: [SUGGEST, box('x'), SUGGEST, hc('compact-typed'), hc('compact-typed')], compact: { preTokens: 1000, postTokens: 10 } });
+  const r = await new TypeRunner(io).run('c', T);
+  assert.deepEqual(st.keys, ['x', '\x7f', '/compact', '\r']);
+  assert.match(r.text, /đã gõ \/compact/);
 });
 
 test('isPlaceholder: the dim "Try …" hint is not a draft', () => {
@@ -388,25 +399,47 @@ test('isPlaceholder: the dim "Try …" hint is not a draft', () => {
   assert.equal(isPlaceholder('abc draft'), false);
 });
 
-test('runner: 🔍 read input — empty / placeholder / text (offers clear); never sends a key', async () => {
-  for (const [scr, re, canClear] of [[hc('compact-done-empty'), /đang trống/, undefined], [IDLE, /đang trống/, undefined], [hc('compact-typed'), /đang có: "\/compact"/, true]]) {
+test('runner: 🔍 read input — empty / placeholder: no key; text: probed (x ⌫) and offers clear; suggestion → empty', async () => {
+  for (const [scr, re] of [[hc('compact-done-empty'), /đang trống/], [IDLE, /đang trống/]]) {
     const { io, st } = fakeIo({ screens: [scr] });
     const r = await new TypeRunner(io).run('i', T);
     assert.match(r.text, re);
-    assert.equal(r.canClear, canClear);
+    assert.equal(r.canClear, undefined);
     assert.deepEqual(st.keys, []);
   }
+  const txt = fakeIo({ screens: [hc('compact-typed'), hc('compact-typed').replace('/compact', '/compactx'), hc('compact-typed')] });
+  const r = await new TypeRunner(txt.io).run('i', T);
+  assert.match(r.text, /đang có: "\/compact"/);
+  assert.equal(r.canClear, true);
+  assert.deepEqual(txt.st.keys, ['x', '\x7f']);
+  const sg = fakeIo({ screens: [SUGGEST, box('x'), SUGGEST] });
+  const r2 = await new TypeRunner(sg.io).run('i', T);
+  assert.match(r2.text, /đang trống \(dòng mờ "! git/);
+  assert.equal(r2.canClear, undefined);
   const w = fakeIo({ status: 'waiting', ended: true, screens: [hc('compact-typed')] });
   assert.match((await new TypeRunner(w.io).run('i', T)).text, /không đọc ô nhập/);
+  assert.deepEqual(w.st.keys, []);
 });
 
-test('runner: 🧹 clear input — End + Ctrl-U, verified empty; still text → told; empty / dialog → no key', async () => {
-  const { io, st } = fakeIo({ screens: [hc('compact-typed'), hc('compact-done-empty')] });
+test('runner: 🧹 clear input — rounds of End/Ctrl-U/Ctrl-K/⌫ until empty, whatever the text', async () => {
+  // multi-line draft: first batch leaves a line, the second empties it
+  const multi = hc('draft').replace('abc draft', 'l1 ⏎ l2');
+  const { io, st } = fakeIo({ screens: [multi, multi.replace('l1 ⏎ l2', 'l1 ⏎ l2x'), multi, box('l1'), box('l1x'), box('l1'), hc('compact-done-empty')] });
   const r = await new TypeRunner(io).run('u', T);
-  assert.deepEqual(st.keys, ['\x05\x15']);
+  assert.deepEqual(st.keys, ['x', '\x7f', CLEAR, 'x', '\x7f', CLEAR]);
   assert.match(r.text, /đã xoá ô nhập/);
+  // cleared, but Claude shows a dim suggestion again → the probe says empty
+  const sg = fakeIo({ screens: [hc('draft'), hc('draft').replace('abc draft', 'abc draftx'), hc('draft'), SUGGEST, box('x'), SUGGEST] });
+  assert.match((await new TypeRunner(sg.io).run('u', T)).text, /đã xoá ô nhập/);
+  assert.deepEqual(sg.st.keys, ['x', '\x7f', CLEAR, 'x', '\x7f']);
+  // the box only held a suggestion → nothing deleted
+  const only = fakeIo({ screens: [SUGGEST, box('x'), SUGGEST] });
+  assert.match((await new TypeRunner(only.io).run('u', T)).text, /đã trống \(dòng mờ/);
+  assert.deepEqual(only.st.keys, ['x', '\x7f']);
+  // never empties → bounded, told
   const stuck = fakeIo({ screens: [hc('draft')] });
   assert.match((await new TypeRunner(stuck.io).run('u', T)).text, /vẫn còn: "abc draft"/);
+  assert.equal(stuck.st.keys.filter((k) => k === CLEAR).length, CLEAR_MAX_SENDS);
   const empty = fakeIo({ screens: [IDLE] });
   assert.match((await new TypeRunner(empty.io).run('u', T)).text, /đã trống — không gửi phím nào/);
   assert.deepEqual(empty.st.keys, []);
