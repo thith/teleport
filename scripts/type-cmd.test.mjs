@@ -5,11 +5,12 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   classify, allowedOps, typeTargets, pinTarget, agentLine, messageNamesTarget, parseInputLine, suggestionSelects,
-  rcDialogReady, targetMismatch, TypeRunner, TYPE_BUTTON_RE, COOLDOWN_MS, defaultIo, compactRefusedOnScreen,
+  rcDialogReady, targetMismatch, TypeRunner, TYPE_BUTTON_RE, COOLDOWN_MS, defaultIo, compactRefusedOnScreen, isPlaceholder,
 } from './type-cmd.mjs';
 
 const FIX = path.join(path.dirname(fileURLToPath(import.meta.url)), 'fixtures', 'type-hardcopy');
 const hc = (name) => fs.readFileSync(path.join(FIX, `${name}.txt`)).toString('latin1'); // as the daemon reads them
+const IDLE = hc('idle-ghost'); // the empty box (its dim placeholder reads like text) — what /type sees before typing
 
 test('classify: idle / shell+turn-over = rảnh; shell mid-turn = bận; unknown never counts as idle', () => {
   assert.equal(classify('idle', null), 'idle');
@@ -23,9 +24,9 @@ test('classify: idle / shell+turn-over = rảnh; shell mid-turn = bận; unknown
 });
 
 test('allowedOps: idle → both commands (/remote-control only when not bridged); busy → /compact (queued) + Esc; waiting → Esc only', () => {
-  assert.deepEqual(allowedOps('idle', null), ['c', 'r']);
-  assert.deepEqual(allowedOps('idle', 'session_x'), ['c']);
-  assert.deepEqual(allowedOps('busy', null), ['c', 'e']);
+  assert.deepEqual(allowedOps('idle', null), ['c', 'r', 'i']);
+  assert.deepEqual(allowedOps('idle', 'session_x'), ['c', 'i']);
+  assert.deepEqual(allowedOps('busy', null), ['c', 'e', 'i']);
   assert.deepEqual(allowedOps('waiting', null), ['e']);
   assert.deepEqual(allowedOps('unknown', null), []);
 });
@@ -116,7 +117,7 @@ function fakeIo({ status = 'shell', ended = true, screens = [], bridge = null, o
 }
 
 test('runner /compact: idle (shell + turn over) → text, verify, Enter; result read from the transcript', async () => {
-  const { io, st } = fakeIo({ screens: [hc('compact-typed'), hc('compact-typed')], compact: { preTokens: 763065, postTokens: 8080 } });
+  const { io, st } = fakeIo({ screens: [IDLE, hc('compact-typed'), hc('compact-typed')], compact: { preTokens: 763065, postTokens: 8080 } });
   const r = await new TypeRunner(io).run('c', T);
   assert.deepEqual(st.keys, ['/compact', '\r']);
   assert.match(r.text, /đã gõ \/compact vào #abcd1234/);
@@ -125,7 +126,7 @@ test('runner /compact: idle (shell + turn over) → text, verify, Enter; result 
 });
 
 test('runner /compact: "Not enough messages" is reported', async () => {
-  const { io } = fakeIo({ screens: [hc('compact-typed'), hc('compact-typed'), hc('compact-done-empty')] }); // before: none · after: one
+  const { io } = fakeIo({ screens: [IDLE, hc('compact-typed'), hc('compact-typed'), hc('compact-done-empty')] }); // before: none · after: one
   const r = await new TypeRunner(io).run('c', T);
   assert.match(await r.watch(), /chưa đủ tin nhắn/);
 });
@@ -144,7 +145,7 @@ test('runner /compact: waiting (a dialog) / unknown / drifted target → refused
 });
 
 test('runner: a draft in the input box → typed but NO Enter and no other key (no blind Backspace)', async () => {
-  const { io, st } = fakeIo({ screens: [hc('draft').replace('abc draft', 'abc draft/compact')] });
+  const { io, st } = fakeIo({ screens: [IDLE, hc('draft').replace('abc draft', 'abc draft/compact')] });
   const r = await new TypeRunner(io).run('c', T);
   assert.deepEqual(st.keys, ['/compact']);
   assert.match(r.text, /KHÔNG Enter.*xoá tay/);
@@ -152,14 +153,14 @@ test('runner: a draft in the input box → typed but NO Enter and no other key (
 });
 
 test('runner: state changes between typing and Enter → no Enter', async () => {
-  const { io, st } = fakeIo({ screens: [hc('compact-typed')], onStuff: (s, d) => { if (d === '/compact') s.status = 'waiting'; } });
+  const { io, st } = fakeIo({ screens: [IDLE, hc('compact-typed')], onStuff: (s, d) => { if (d === '/compact') s.status = 'waiting'; } });
   const r = await new TypeRunner(io).run('c', T);
   assert.deepEqual(st.keys, ['/compact']);
   assert.match(r.text, /vừa đổi trạng thái.*KHÔNG Enter/);
 });
 
 test('runner: cool-down after Enter blocks another command; per-agent lock blocks overlap', async () => {
-  const { io, st } = fakeIo({ screens: [hc('compact-typed')] });
+  const { io, st } = fakeIo({ screens: [IDLE, hc('compact-typed')] });
   const runner = new TypeRunner(io);
   await runner.run('c', T);
   assert.match((await runner.run('c', T)).text, /vừa gõ lệnh/);
@@ -170,7 +171,7 @@ test('runner: cool-down after Enter blocks another command; per-agent lock block
 
 test('runner /remote-control: off → type, Enter, wait for the Enable dialog, Enter #2 → URL', async () => {
   const { io, st } = fakeIo({
-    status: 'idle', screens: [hc('rc-typed'), hc('rc-typed'), hc('rc-dialog')],
+    status: 'idle', screens: [IDLE, hc('rc-typed'), hc('rc-typed'), hc('rc-dialog')],
     onStuff: (s, d) => { if (d === '\r' && s.keys.length === 2) s.status = 'waiting'; if (d === '\r' && s.keys.length === 3) { s.status = 'idle'; s.bridge = 'session_ABC'; } },
   });
   const r = await new TypeRunner(io).run('r', T);
@@ -186,14 +187,14 @@ test('runner /remote-control: already on → nothing typed, URL returned', async
 });
 
 test('runner /remote-control: dialog not recognised → no second Enter, no Esc', async () => {
-  const { io, st } = fakeIo({ status: 'idle', screens: [hc('rc-typed'), hc('rc-typed'), hc('rewind')], onStuff: (s, d) => { if (d === '\r') s.status = 'waiting'; } });
+  const { io, st } = fakeIo({ status: 'idle', screens: [IDLE, hc('rc-typed'), hc('rc-typed'), hc('rewind')], onStuff: (s, d) => { if (d === '\r') s.status = 'waiting'; } });
   const r = await new TypeRunner(io).run('r', T);
   assert.deepEqual(st.keys, ['/remote-control', '\r']);
   assert.match(r.text, /không thấy hộp thoại/);
 });
 
 test('runner /remote-control: Esc during the chain cancels it before Enter #2', async () => {
-  const { io, st } = fakeIo({ status: 'idle', screens: [hc('rc-typed'), hc('rc-typed'), hc('rc-dialog')] });
+  const { io, st } = fakeIo({ status: 'idle', screens: [IDLE, hc('rc-typed'), hc('rc-typed'), hc('rc-dialog')] });
   const runner = new TypeRunner(io);
   io.stuff = ((orig) => (sid, d) => { orig(sid, d); if (d === '\r' && st.keys.length === 2) { st.status = 'waiting'; runner.cancel.set(T.pid, true); } })(io.stuff);
   const r = await runner.run('r', T);
@@ -256,7 +257,7 @@ test('Esc: during the cool-down it fires as soon as the agent shows busy (no fix
 });
 
 test('/remote-control: an Esc pressed between typing and the FIRST Enter cancels it (no Enter at all)', async () => {
-  const { io, st } = fakeIo({ status: 'idle', screens: [hc('rc-typed')] });
+  const { io, st } = fakeIo({ status: 'idle', screens: [IDLE, hc('rc-typed')] });
   const runner = new TypeRunner(io);
   const realSleep = io.sleep;
   io.sleep = async (ms) => { if (ms === 500 && st.keys.length === 1) runner.cancel.set(T.pid, true); return realSleep(ms); };
@@ -290,7 +291,7 @@ test('defaultIo: exact screen argv; window count parsing; hardcopy read back as 
 
 test('/compact: an OLD "Not enough messages" still on screen is not this run\'s result (watch the transcript)', async () => {
   const stale = hc('compact-typed') + '\n  x  Not enough messages to compact.';
-  const { io } = fakeIo({ screens: [stale, stale], compact: { preTokens: 900000, postTokens: 9000 } });
+  const { io } = fakeIo({ screens: [IDLE, stale, stale], compact: { preTokens: 900000, postTokens: 9000 } });
   const r = await new TypeRunner(io).run('c', T);
   assert.equal(await r.watch(), '✅ đã compact: 900k → 9k');
 });
@@ -328,7 +329,7 @@ test('compactRefusedOnScreen: only an error BELOW the last submitted /compact co
 
 test('/compact: a NEW refusal is seen even when an old one scrolled off (same count on screen)', async () => {
   const before = hc('compact-typed') + '\n  x  Not enough messages to compact.';
-  const { io } = fakeIo({ screens: [before, before, hc('compact-done-empty')] });
+  const { io } = fakeIo({ screens: [IDLE, before, before, hc('compact-done-empty')] });
   const r = await new TypeRunner(io).run('c', T);
   assert.match(await r.watch(), /chưa đủ tin nhắn/);
 });
@@ -342,7 +343,7 @@ test('Esc after a remote-control chain sent its last key: not reported as a canc
 
 test('runner /compact while BUSY: queued (Claude runs it when the turn ends); refused if something is already queued; /remote-control stays idle-only', async () => {
   const busyScreen = hc('compact-typed').replace('auto mode on', 'auto mode on · esc to interrupt');
-  const { io, st } = fakeIo({ status: 'busy', screens: [busyScreen, hc('compact-typed'), hc('compact-typed')], compact: { preTokens: 733000, postTokens: 9000 } });
+  const { io, st } = fakeIo({ status: 'busy', screens: [IDLE, busyScreen, hc('compact-typed'), hc('compact-typed')], compact: { preTokens: 733000, postTokens: 9000 } });
   const r = await new TypeRunner(io).run('c', T);
   assert.deepEqual(st.keys, ['/compact', '\r']);
   assert.match(r.text, /đã xếp hàng/);
@@ -357,8 +358,73 @@ test('runner /compact while BUSY: queued (Claude runs it when the turn ends); re
 });
 
 test('/compact while busy: a dialog appearing right before Enter (second screen read) → NO Enter', async () => {
-  const { io, st } = fakeIo({ status: 'busy', screens: [hc('compact-typed'), hc('compact-typed'), hc('rc-dialog')] });
+  const { io, st } = fakeIo({ status: 'busy', screens: [IDLE, hc('compact-typed'), hc('rc-dialog')] }); // before · typed · right before Enter
   const r = await new TypeRunner(io).run('c', T);
   assert.deepEqual(st.keys, ['/compact']);
   assert.match(r.text, /màn hình vừa đổi.*KHÔNG Enter/);
+});
+
+test('runner: the typed text shows late (busy render) → re-read until it does, then Enter', async () => {
+  const empty = hc('compact-done-empty');
+  const { io, st } = fakeIo({ screens: [IDLE, empty, empty, hc('compact-typed'), hc('compact-typed')], compact: { preTokens: 1000, postTokens: 10 } });
+  const r = await new TypeRunner(io).run('c', T);
+  assert.deepEqual(st.keys, ['/compact', '\r'], 'no false "chữ khác" for an empty first read');
+  assert.match(r.text, /đã gõ \/compact/);
+});
+
+test('runner: text already in the box (e.g. an earlier /compact without Enter) → refused, NO key sent', async () => {
+  for (const scr of [hc('compact-typed'), hc('draft')]) {
+    const { io, st } = fakeIo({ screens: [scr] });
+    const r = await new TypeRunner(io).run('c', T);
+    assert.match(r.text, /ô nhập đang có chữ/);
+    assert.deepEqual(st.keys, []);
+    assert.equal(st.audits.at(-1).reason, 'input-not-empty');
+  }
+});
+
+test('isPlaceholder: the dim "Try …" hint is not a draft', () => {
+  assert.equal(isPlaceholder('Try "fix lint errors"'), true);
+  assert.equal(isPlaceholder('/compact'), false);
+  assert.equal(isPlaceholder('abc draft'), false);
+});
+
+test('runner: 🔍 read input — empty / placeholder / text (offers clear); never sends a key', async () => {
+  for (const [scr, re, canClear] of [[hc('compact-done-empty'), /đang trống/, undefined], [IDLE, /đang trống/, undefined], [hc('compact-typed'), /đang có: "\/compact"/, true]]) {
+    const { io, st } = fakeIo({ screens: [scr] });
+    const r = await new TypeRunner(io).run('i', T);
+    assert.match(r.text, re);
+    assert.equal(r.canClear, canClear);
+    assert.deepEqual(st.keys, []);
+  }
+  const w = fakeIo({ status: 'waiting', ended: true, screens: [hc('compact-typed')] });
+  assert.match((await new TypeRunner(w.io).run('i', T)).text, /không đọc ô nhập/);
+});
+
+test('runner: 🧹 clear input — End + Ctrl-U, verified empty; still text → told; empty / dialog → no key', async () => {
+  const { io, st } = fakeIo({ screens: [hc('compact-typed'), hc('compact-done-empty')] });
+  const r = await new TypeRunner(io).run('u', T);
+  assert.deepEqual(st.keys, ['\x05\x15']);
+  assert.match(r.text, /đã xoá ô nhập/);
+  const stuck = fakeIo({ screens: [hc('draft')] });
+  assert.match((await new TypeRunner(stuck.io).run('u', T)).text, /vẫn còn: "abc draft"/);
+  const empty = fakeIo({ screens: [IDLE] });
+  assert.match((await new TypeRunner(empty.io).run('u', T)).text, /đã trống — không gửi phím nào/);
+  assert.deepEqual(empty.st.keys, []);
+  const dlg = fakeIo({ status: 'waiting', ended: true, screens: [hc('compact-typed')] });
+  assert.match((await new TypeRunner(dlg.io).run('u', T)).text, /không xoá ô nhập/);
+  assert.deepEqual(dlg.st.keys, []);
+});
+
+test('runner: unreadable box / state change during the read → no key; clear never claims success on an unreadable box', async () => {
+  const u = fakeIo({ screens: [hc('rc-dialog')] }); // no input line on screen
+  assert.match((await new TypeRunner(u.io).run('c', T)).text, /không đọc được ô nhập/);
+  assert.deepEqual(u.st.keys, []);
+  let reads = 0;
+  const d = fakeIo({ screens: [IDLE] });
+  const realSession = d.io.session;
+  d.io.session = (pid) => { reads++; return reads >= 2 ? { ...realSession(pid), status: 'waiting' } : realSession(pid); };
+  assert.match((await new TypeRunner(d.io).run('c', T)).text, /vừa đổi trạng thái/);
+  assert.deepEqual(d.st.keys, []);
+  const c = fakeIo({ screens: [hc('compact-typed'), hc('rc-dialog')] });
+  assert.match((await new TypeRunner(c.io).run('u', T)).text, /không đọc lại được/);
 });
