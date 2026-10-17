@@ -22,6 +22,7 @@ import { transcriptState, findTranscript, compactAfter, formatContext, contextWi
 
 export const TYPE_BUTTON_TTL_MS = 10 * 60 * 1000;
 export const TYPE_GAP_MS = 500;          // text → Enter (paste detection / suggestion box)
+export const TYPE_SETTLE_MS = 4000;      // how long to keep re-reading until the typed text shows (a busy box renders late)
 export const COOLDOWN_MS = 5000;         // after Enter the session file still says idle for a moment
 export const ESC_GAP_MS = 3000;          // two quick Escs at idle open the Rewind menu
 export const RC_DIALOG_WAIT_MS = 5000;
@@ -31,9 +32,9 @@ export const COMPACT_QUEUED_WATCH_MS = 30 * 60 * 1000; // queued behind a runnin
 export const AUDIT_FILE = path.join(process.env.XDG_STATE_HOME || path.join(os.homedir(), '.local', 'state'), 'teleport', 'type-audit.jsonl');
 
 // op letter (callback data) → command. Fixed table: the command never comes from stored data.
-export const TYPE_OPS = { c: '/compact', r: '/remote-control', e: 'esc' };
+export const TYPE_OPS = { c: '/compact', r: '/remote-control', e: 'esc', i: 'read-input', u: 'clear-input' };
 export const COMPACT_OK = '✅ đã compact'; // a watch() result starting with this = a confirmed compaction
-export const TYPE_BUTTON_RE = /^ty:(?:pick:([0-9a-z]{8})|([0-9a-f]{16}):([crex]))$/;
+export const TYPE_BUTTON_RE = /^ty:(?:pick:([0-9a-z]{8})|([0-9a-f]{16}):([crexiu]))$/;
 
 // ── Pure helpers ──────────────────────────────────────────────────────────────
 
@@ -50,10 +51,11 @@ export const STATE_LABEL = { idle: 'rảnh', busy: 'đang bận', waiting: 'đan
 
 /** Which ops a state allows (buttons shown / presses accepted). Pure. */
 export function allowedOps(state, bridgeSessionId) {
-  if (state === 'idle') return bridgeSessionId ? ['c'] : ['c', 'r'];
+  // 'i' = read what is in the input box (a [🧹 clear] follows when it holds text) — idle / busy only.
+  if (state === 'idle') return bridgeSessionId ? ['c', 'i'] : ['c', 'r', 'i'];
   // Busy: /compact is QUEUED by Claude and runs as the command when the turn ends (probed
   // 2.1.300). Waiting (a dialog is open): Enter would answer the dialog → Esc only.
-  if (state === 'busy') return ['c', 'e'];
+  if (state === 'busy') return ['c', 'e', 'i'];
   if (state === 'waiting') return ['e'];
   return [];
 }
@@ -106,6 +108,9 @@ export function parseInputLine(screenText) {
   const next = lines[idx + 1] ?? '';
   return /^\0+\s*$/.test(next) ? text : `${text} ⏎ ${next.replace(/\0/g, '').trim()}…`;
 }
+
+/** The empty box's dim placeholder (`Try "fix lint errors"`) reads like text in a hardcopy: it is not a draft. Pure. */
+export const isPlaceholder = (line) => /^Try "[^"]*"$/.test(String(line ?? ''));
 
 /** The suggestion box selects `cmd` (marker + cmd + description). Pure. */
 export function suggestionSelects(screenText, cmd) {
@@ -209,12 +214,13 @@ export class TypeRunner {
   async run(op, t, who = 'owner') {
     const audit = (step, extra = {}) => this.io.audit({ who, op: TYPE_OPS[op], pid: t.pid, sessionId: t.sessionId, hashtag: t.hashtag, step, ...extra });
     if (op === 'e') return this.esc(t, audit);
+    if (op === 'i') return this.readInput(t, audit);
     if (this.locks.has(t.pid)) return { text: '⏳ đang gõ lệnh khác vào agent này — thử lại sau.' };
     if ((this.cooldown.get(t.pid) || 0) > this.io.now()) return { text: '⏳ vừa gõ lệnh vào agent này — đợi vài giây rồi thử lại.' };
     this.locks.add(t.pid);
     this.cancel.delete(t.pid);
     this.keysDone.delete(t.pid);
-    try { return op === 'c' ? await this.compact(t, audit) : await this.remoteControl(t, audit); }
+    try { return op === 'c' ? await this.compact(t, audit) : op === 'u' ? await this.clearInput(t, audit) : await this.remoteControl(t, audit); }
     finally { this.locks.delete(t.pid); this.keysDone.delete(t.pid); }
   }
 
@@ -226,15 +232,27 @@ export class TypeRunner {
     if (pre.mismatch) { audit('refused', { reason: pre.mismatch }); return { text: `❌ agent đã đổi phiên (${pre.mismatch}) — gõ /type lại.` }; }
     if (!ok(pre.state)) { audit('refused', { reason: pre.state }); return { text: `❌ agent ${STATE_LABEL[pre.state]} — không gõ ${cmd}.${pre.state === 'busy' ? ' Bấm ⎋ Esc trước nếu cần dừng.' : ''}` }; }
     if (needNoBridge && pre.bridge) return { text: `📡 Remote Control đang bật: https://claude.ai/code/${pre.bridge}` };
-    if (pre.state === 'busy' && hasQueuedInput(await io.hardcopy(sid))) { // don't stack onto a queue we can't see
+    const shot = await io.hardcopy(sid); // one look before typing: queued input, and what is in the box
+    if (pre.state === 'busy' && hasQueuedInput(shot)) { // don't stack onto a queue we can't see
       audit('refused', { reason: 'queued' });
       return { text: `❌ agent đang bận và đã có tin xếp hàng — không gõ thêm ${cmd}.` };
     }
+    // Never type over something already in the box (a draft, or our own earlier /type whose Enter was withheld).
+    const before = parseInputLine(shot);
+    if (before && !isPlaceholder(before)) {
+      audit('refused', { reason: 'input-not-empty', line: before });
+      return { text: `❌ ô nhập đang có chữ ("${before}") — không gõ ${cmd}. Vào screen xoá ô nhập rồi /type lại.` };
+    }
     io.stuff(sid, cmd);
     audit('typed', { status: pre.status });
-    await io.sleep(TYPE_GAP_MS);
-    const scr = await io.hardcopy(sid);
-    const line = parseInputLine(scr);
+    // The text can take a moment to show: re-read until it does (≤ TYPE_SETTLE_MS) before calling it a mismatch.
+    let scr = null, line = null;
+    for (let waited = 0; ; waited += TYPE_GAP_MS) {
+      await io.sleep(TYPE_GAP_MS);
+      scr = await io.hardcopy(sid);
+      line = parseInputLine(scr);
+      if ((line === cmd && suggestionSelects(scr, cmd)) || waited + TYPE_GAP_MS >= TYPE_SETTLE_MS) break;
+    }
     if (line !== cmd || !suggestionSelects(scr, cmd)) {
       audit('input-mismatch', { line });
       return { text: `⚠️ ô nhập có chữ khác (đọc được: "${line ?? '?'}") — đã gõ ${cmd} nhưng KHÔNG Enter, không gửi thêm phím nào. Vào xoá tay.` };
@@ -322,6 +340,40 @@ export class TypeRunner {
     }
     audit('result', { result: 'no-bridge' });
     return { text: '❔ đã bật nhưng chưa thấy phiên Remote Control trong 15 giây — kiểm tra tay.' };
+  }
+
+  /** What is in the agent's input box (no key sent). → { text, line, canClear }. */
+  async readInput(t, audit) {
+    const o = observe(t, this.io);
+    if (o.mismatch) return { text: `❌ agent đã đổi phiên (${o.mismatch}) — gõ /type lại.` };
+    if (o.state !== 'idle' && o.state !== 'busy') return { text: `ℹ️ agent ${STATE_LABEL[o.state]} — không đọc ô nhập.` };
+    const line = parseInputLine(await this.io.hardcopy(screenId(t)));
+    audit('read-input', { line });
+    if (line == null) return { text: '❔ không đọc được ô nhập trên màn hình.' };
+    if (!line || isPlaceholder(line)) return { text: '🔍 ô nhập đang trống.', line: '' };
+    return { text: `🔍 ô nhập đang có: "${line}"`, line, canClear: true };
+  }
+
+  /** Clear the input box: End, then Ctrl-U (kill to line start); never Enter / Esc. Verified by reading it again. */
+  async clearInput(t, audit) {
+    const io = this.io, sid = screenId(t);
+    const o = observe(t, io);
+    if (o.mismatch) { audit('refused', { reason: o.mismatch }); return { text: `❌ agent đã đổi phiên (${o.mismatch}) — gõ /type lại.` }; }
+    if (o.state !== 'idle' && o.state !== 'busy') { audit('refused', { reason: o.state }); return { text: `❌ agent ${STATE_LABEL[o.state]} — không xoá ô nhập.` }; }
+    const before = parseInputLine(await io.hardcopy(sid));
+    if (before == null) return { text: '❔ không đọc được ô nhập — không gửi phím nào.' };
+    if (!before || isPlaceholder(before)) return { text: '🔍 ô nhập đã trống — không gửi phím nào.' };
+    io.stuff(sid, '\x05\x15'); // Ctrl-E (end of line), Ctrl-U (delete to line start)
+    audit('clear-input', { before });
+    let line = before;
+    for (let waited = 0; waited < TYPE_SETTLE_MS; waited += TYPE_GAP_MS) {
+      await io.sleep(TYPE_GAP_MS);
+      line = parseInputLine(await io.hardcopy(sid));
+      if (!line || isPlaceholder(line)) break;
+    }
+    if (!line || isPlaceholder(line)) { audit('result', { result: 'cleared' }); return { text: '🧹 đã xoá ô nhập (giờ trống).' }; }
+    audit('result', { result: 'not-cleared', line });
+    return { text: `⚠️ ô nhập vẫn còn: "${line}" (nhiều dòng?) — vào screen xoá tay.` };
   }
 
   async esc(t, audit) {

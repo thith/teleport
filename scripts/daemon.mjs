@@ -895,7 +895,7 @@ if (isDirectRun) {
 // ── /type (RFC 22): type /compact, /remote-control or ⎋ Esc into an agent's screen ──
 
 export const TYPE_COMMAND = 'type';
-const TYPE_OP_LABEL = { c: '/compact', r: '/remote-control', e: '⎋ Esc' };
+const TYPE_OP_LABEL = { c: '/compact', r: '/remote-control', e: '⎋ Esc', i: '🔍 ô nhập', u: '🧹 Xoá ô nhập' };
 let typeRunner = null; // one per daemon: per-agent locks, cool-down, Esc rate limit
 const getTypeRunner = () => (typeRunner ||= new TypeRunner(defaultIo()));
 
@@ -1000,9 +1000,15 @@ export async function handleTypeButton(cq, ctx, { runner = getTypeRunner(), list
   }
   if (op === 'x') { await ctx.answerButton(cq.id, 'Đã huỷ'); await ctx.editButtonRows(chatId, messageId, `${original}\n\n✖ Đã huỷ.`, []); return; }
   const base = original.split('\n')[0];
-  await ctx.answerButton(cq.id, `Đang gõ ${TYPE_OPS[op] === 'esc' ? 'Esc' : TYPE_OPS[op]}…`);
-  await ctx.editButtonRows(chatId, messageId, `${base}\n\n⏳ đang gõ ${TYPE_OP_LABEL[op]}…`, []);
+  await ctx.answerButton(cq.id, op === 'i' ? 'Đang đọc ô nhập…' : op === 'u' ? 'Đang xoá ô nhập…' : `Đang gõ ${TYPE_OPS[op] === 'esc' ? 'Esc' : TYPE_OPS[op]}…`);
+  await ctx.editButtonRows(chatId, messageId, `${base}\n\n⏳ ${op === 'i' ? 'đang đọc' : op === 'u' ? 'đang xoá' : 'đang gõ'} ${TYPE_OP_LABEL[op]}…`, []);
   const r = await runner.run(op, entry.target, String(cq.from?.id ?? 'owner'));
+  if (r.canClear) { // the box holds text: offer [🧹 Xoá] (a fresh one-shot token for the same pinned target)
+    const t2 = crypto.randomBytes(8).toString('hex');
+    ctx.buttonStore.set(t2, { kind: 'type', target: entry.target, chatId, messageId, createdAt: Date.now() });
+    await ctx.editButtonRows(chatId, messageId, `${base}\n\n${r.text}`, [[{ text: TYPE_OP_LABEL.u, callback_data: `ty:${t2}:u` }, { text: '✖ Huỷ', callback_data: `ty:${t2}:x` }]]);
+    return;
+  }
   await ctx.editButtonRows(chatId, messageId, `${base}\n\n${r.text}`, []);
   if (r.watch) {
     const more = await r.watch().catch((e) => `❔ ${e?.message ?? e}`);
