@@ -919,13 +919,12 @@ export function typeStep2({ target, obs, persona, cfg = {}, tok }) {
 }
 
 /** `/type` (agent menu) or `/type #hash` (straight to the commands). */
-export async function startType(rest, ctx, { list = listForType, io = defaultIo() } = {}) {
+export async function startType(rest, ctx, { list = listForType, io = defaultIo(), personaOf = personaLookup() } = {}) {
   const { daemonUserId, projectsConfig, sendText, sendButtonRows, buttonStore } = ctx;
   if (!sendButtonRows || !buttonStore) { await sendText(daemonUserId, '❌ /type cần chạy trong daemon.'); return; }
   const toks = tokenizeArgs(rest);
   const want = (toks[0] || '').replace(/^#/, '').toLowerCase();
   if (toks.length > 1 || (want && !/^[0-9a-z]{8}$/.test(want))) { await sendText(daemonUserId, 'usage: /type  ·  /type #<hashtag>   (lệnh chọn bằng nút)'); return; }
-  const personaOf = personaLookup();
   const agents = list({ personaOf, cfg: projectsConfig, io });
   if (want) {
     const a = agents.find((x) => x.target.hashtag === want);
