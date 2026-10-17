@@ -239,10 +239,13 @@ export class TypeRunner {
     }
     // Never type over something already in the box (a draft, or our own earlier /type whose Enter was withheld).
     const before = parseInputLine(shot);
+    if (before == null) { audit('refused', { reason: 'input-unreadable' }); return { text: `❔ không đọc được ô nhập (hộp thoại mở?) — không gõ ${cmd}.` }; }
     if (before && !isPlaceholder(before)) {
       audit('refused', { reason: 'input-not-empty', line: before });
       return { text: `❌ ô nhập đang có chữ ("${before}") — không gõ ${cmd}. Vào screen xoá ô nhập rồi /type lại.` };
     }
+    const now0 = observe(t, io); // re-checked right before the key (the screen read took a moment)
+    if (now0.mismatch || !ok(now0.state)) { audit('refused', { reason: now0.mismatch || now0.state }); return { text: `❌ agent vừa đổi trạng thái (${now0.mismatch || STATE_LABEL[now0.state]}) — không gõ ${cmd}.` }; }
     io.stuff(sid, cmd);
     audit('typed', { status: pre.status });
     // The text can take a moment to show: re-read until it does (≤ TYPE_SETTLE_MS) before calling it a mismatch.
@@ -363,17 +366,20 @@ export class TypeRunner {
     const before = parseInputLine(await io.hardcopy(sid));
     if (before == null) return { text: '❔ không đọc được ô nhập — không gửi phím nào.' };
     if (!before || isPlaceholder(before)) return { text: '🔍 ô nhập đã trống — không gửi phím nào.' };
+    const now0 = observe(t, io); // re-checked right before the keys
+    if (now0.mismatch || (now0.state !== 'idle' && now0.state !== 'busy')) { audit('refused', { reason: now0.mismatch || now0.state }); return { text: `❌ agent vừa đổi trạng thái (${now0.mismatch || STATE_LABEL[now0.state]}) — không xoá.` }; }
     io.stuff(sid, '\x05\x15'); // Ctrl-E (end of line), Ctrl-U (delete to line start)
     audit('clear-input', { before });
+    const empty = (l) => l === '' || isPlaceholder(l); // (null = unreadable: never counted as cleared)
     let line = before;
     for (let waited = 0; waited < TYPE_SETTLE_MS; waited += TYPE_GAP_MS) {
       await io.sleep(TYPE_GAP_MS);
       line = parseInputLine(await io.hardcopy(sid));
-      if (!line || isPlaceholder(line)) break;
+      if (empty(line)) break;
     }
-    if (!line || isPlaceholder(line)) { audit('result', { result: 'cleared' }); return { text: '🧹 đã xoá ô nhập (giờ trống).' }; }
+    if (empty(line)) { audit('result', { result: 'cleared' }); return { text: '🧹 đã xoá ô nhập (giờ trống).' }; }
     audit('result', { result: 'not-cleared', line });
-    return { text: `⚠️ ô nhập vẫn còn: "${line}" (nhiều dòng?) — vào screen xoá tay.` };
+    return { text: line == null ? '❔ đã gửi Ctrl-U nhưng không đọc lại được ô nhập — kiểm tay.' : `⚠️ ô nhập vẫn còn: "${line}" (nhiều dòng?) — vào screen xoá tay.` };
   }
 
   async esc(t, audit) {

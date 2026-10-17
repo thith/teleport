@@ -414,3 +414,17 @@ test('runner: 🧹 clear input — End + Ctrl-U, verified empty; still text → 
   assert.match((await new TypeRunner(dlg.io).run('u', T)).text, /không xoá ô nhập/);
   assert.deepEqual(dlg.st.keys, []);
 });
+
+test('runner: unreadable box / state change during the read → no key; clear never claims success on an unreadable box', async () => {
+  const u = fakeIo({ screens: [hc('rc-dialog')] }); // no input line on screen
+  assert.match((await new TypeRunner(u.io).run('c', T)).text, /không đọc được ô nhập/);
+  assert.deepEqual(u.st.keys, []);
+  let reads = 0;
+  const d = fakeIo({ screens: [IDLE] });
+  const realSession = d.io.session;
+  d.io.session = (pid) => { reads++; return reads >= 2 ? { ...realSession(pid), status: 'waiting' } : realSession(pid); };
+  assert.match((await new TypeRunner(d.io).run('c', T)).text, /vừa đổi trạng thái/);
+  assert.deepEqual(d.st.keys, []);
+  const c = fakeIo({ screens: [hc('compact-typed'), hc('rc-dialog')] });
+  assert.match((await new TypeRunner(c.io).run('u', T)).text, /không đọc lại được/);
+});
