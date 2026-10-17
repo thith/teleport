@@ -158,5 +158,5 @@ test('/type (no arg): the pick button shows persona (or #hash) + context use, no
   const { ctx, calls } = ui();
   const personaOf = (h) => (h === 'c2383556' ? '👻 Ma' : null);
   await startType('', ctx, { personaOf, list: () => [{ ...agent(T), ctx: 'ctx 693k (35%)' }, { ...agent(T2), ctx: 'ctx 12k (1%)' }, agent({ ...T2, hashtag: 'e0000001' })] });
-  assert.deepEqual(calls[0][2].map((r) => r[0].text), ['👻 Ma · ctx 693k (35%)', '#d8133684 · ctx 12k (1%)', '#e0000001']);
+  assert.deepEqual(calls[0][2].map((r) => r[0].text), ['👻 Ma · 693k (35%)', '#d8133684 · 12k (1%)', '#e0000001']);
 });
