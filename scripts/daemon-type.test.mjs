@@ -40,6 +40,7 @@ test('/type (no arg): one pick button per agent, no stored entry; /type #hash: s
   await startType('', ctx, { list: () => [agent(T), agent(T2)] });
   assert.equal(calls[0][0], 'send');
   assert.deepEqual(calls[0][2].map((r) => r[0].callback_data), ['ty:pick:c2383556', 'ty:pick:d8133684']);
+  assert.match(calls[0][1], /#c2383556 · PID 644406/); // the list keeps the #hash (the pick is checked against it)
   assert.equal(ctx.buttonStore.size, 0);
   await startType('#c2383556', ctx, { list: () => [agent(T), agent(T2)] });
   const [tok, e] = [...ctx.buttonStore][0];
@@ -151,4 +152,13 @@ test('compact notice: only after a CONFIRMED compaction (not on "not enough", ti
     await handleTypeButton(cq(`ty:${'c'.repeat(16)}:${op}`, text), ctx, { runner: { run: async () => res }, deliver: async (r) => { delivered.push(r); } });
     assert.equal(delivered.length, 0, `${op}: ${res.text}`);
   }
+});
+
+test('/type (no arg): the pick button shows persona (or #hash) + context use, not just the hashtag', async () => {
+  const { ctx, calls } = ui();
+  await startType('', ctx, { list: () => [{ ...agent(T), ctx: 'ctx 693k (35%)' }, agent(T2)] });
+  const [a, b] = calls[0][2].map((r) => r[0].text);
+  assert.match(a, / · ctx 693k \(35%\)$/);
+  assert.ok(!/ · /.test(b), 'no context → just the name'); // persona if this machine knows one, else #hash
+  assert.match(b, /\S/);
 });
