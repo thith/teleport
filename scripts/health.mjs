@@ -1,5 +1,5 @@
 // `/health` — a daemon command: one-glance machine status for the owner.
-// CPU load, RAM / swap, disk, the running claude agents (screen vs terminal,
+// CPU load + pressure (PSI), disk IO pressure, RAM / swap, disk, the running claude agents (screen vs terminal,
 // busy/idle), the biggest memory users, and warnings (low RAM / disk, an OOM
 // kill in the last 24h). Read-only. Pure formatting is unit-tested; the probes
 // below read /proc, df, ps and the user journal (best effort — a missing source
@@ -48,14 +48,42 @@ export function countOomKills(journalText) {
   return String(journalText).split('\n').filter((l) => /systemd-oomd killed|killed by the OOM killer/i.test(l)).length;
 }
 
+/**
+ * /proc/pressure/<cpu|io|memory> body → { some: {avg10, avg60, avg300}, full: {…} | null } | null. Pure.
+ * PSI = % of wall time tasks were stalled waiting for that resource.
+ */
+export function parsePressure(text) {
+  const row = (kind) => {
+    const m = String(text ?? '').match(new RegExp(`^${kind}\\s+avg10=([\\d.]+)\\s+avg60=([\\d.]+)\\s+avg300=([\\d.]+)`, 'm'));
+    return m ? { avg10: Number(m[1]), avg60: Number(m[2]), avg300: Number(m[3]) } : null;
+  };
+  const some = row('some');
+  return some ? { some, full: row('full') } : null;
+}
+
+// Linux load counts tasks blocked on disk (D state) too, so load > cores alone
+// doesn't mean the CPU is short — on this box it was the disk (PSI cpu ≈ 0,
+// io full ≈ 67%). With PSI we warn on the resource tasks are actually waiting for.
+export const CPU_PSI_ALERT = 50;  // cpu some avg10 %: tasks waiting for a CPU
+export const IO_PSI_ALERT = 30;   // io full avg10 %: every task stalled on the disk
+
 /** Build the /health message. All inputs passed in → pure. */
-export function formatHealth({ cores, load, mem, disk, agents, top, oomKills, locks = null }) {
+export function formatHealth({ cores, load, mem, disk, agents, top, oomKills, locks = null, psi = null }) {
   const warn = [];
   const lines = ['🩺 Tình trạng máy', ''];
+  const cpuPsi = psi?.cpu?.some ?? null;
+  const ioPsi = psi?.io?.full ?? null;
   if (load) {
     const pct = cores ? Math.round((load[0] / cores) * 100) : null;
-    lines.push(`🖥 CPU: ${cores} nhân · load ${load.map((x) => x.toFixed(2)).join(' / ')}${pct != null ? ` (~${pct}%)` : ''}`);
-    if (cores && load[0] > cores) warn.push(`CPU quá tải (load ${load[0].toFixed(1)} > ${cores} nhân)`);
+    lines.push(`🖥 CPU: ${cores} nhân · load ${load.map((x) => x.toFixed(2)).join(' / ')}${pct != null ? ` (~${pct}%)` : ''}${cpuPsi ? ` · chờ CPU ${Math.round(cpuPsi.avg10)}%` : ''}`);
+    if (cpuPsi ? cpuPsi.avg10 >= CPU_PSI_ALERT : (cores && load[0] > cores)) warn.push(`CPU quá tải (load ${load[0].toFixed(1)} > ${cores} nhân)`);
+  }
+  if (ioPsi) {
+    lines.push(`💽 Disk IO: đứng chờ ổ đĩa ${Math.round(ioPsi.avg10)}% thời gian (TB 1 phút ${Math.round(ioPsi.avg60)}% · 5 phút ${Math.round(ioPsi.avg300)}%)`);
+    if (ioPsi.avg10 >= IO_PSI_ALERT) {
+      const highLoad = load && cores && load[0] > cores && !(cpuPsi && cpuPsi.avg10 >= CPU_PSI_ALERT);
+      warn.push(`Disk IO nghẽn: ${Math.round(ioPsi.avg10)}% thời gian mọi tiến trình đứng chờ ổ đĩa${highLoad ? ' (load cao là do chờ disk, không phải thiếu CPU)' : ''}`);
+    }
   }
   if (mem && mem.total) {
     const used = mem.total - (mem.available ?? 0);
@@ -332,6 +360,7 @@ if (isMainModule(import.meta.url)) {
   try { agents = listClaudeProcs(); } catch {}
   process.stdout.write(formatHealth({
     cores: os.cpus().length, load: os.loadavg(), mem,
+    psi: (() => { const r = (k) => { try { return parsePressure(fs.readFileSync(`/proc/pressure/${k}`, 'utf8')); } catch { return null; } }; return { cpu: r('cpu'), io: r('io') }; })(),
     disk: dfOut ? parseDf(dfOut) : null, agents,
     top: psOut ? topMemory(psOut) : null, oomKills: journal ? countOomKills(journal) : 0,
     locks: (() => { try { return [...LOCK_NAMES.flatMap((n) => formatQueue(n)), ...pruneSkipLines()]; } catch { return null; } })(),
