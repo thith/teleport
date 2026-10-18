@@ -264,9 +264,6 @@ export function formatAgentList({ screens = [], procs = [], personaOf = () => nu
   lines.push('', `🖥 Terminal (${terminal.length})`);
   if (!terminal.length) lines.push('  (không có)');
   for (const [i, r] of terminal.entries()) { if (i) lines.push(SEP); lines.push(`• ${procLine(r)}`); lines.push(sess(r)); status(uuidToConvoInt(r.sessionId)); }
-  lines.push('', '📨 = tên phiên để agent nhắn trực tiếp (Claude cross-session: SendMessage to="<tên>")');
-  lines.push('Dừng (chỉ owner): /kill pid:<PID> · screen: /kill <hashtag>');
-  lines.push('Chạy lại trong screen: /spawn <project> --resume-session <session>');
   return lines.join('\n');
 }
 
