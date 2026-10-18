@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { parseMeminfo, parseDf, topMemory, countOomKills, formatHealth } from './health.mjs';
+import { parseMeminfo, parseDf, topMemory, countOomKills, formatHealth, parsePressure } from './health.mjs';
 
 const GB = 1024 ** 3;
 
@@ -37,6 +37,32 @@ test('formatHealth: all sections + warnings only when thresholds are crossed', (
   for (const w of [/CPU quá tải/, /RAM sắp hết/, /Disk sắp đầy \(còn 4%\)/, /3 lần OOM-kill/]) assert.match(bad, w);
   assert.doesNotMatch(bad, /Không có cảnh báo/);
   assert.match(formatHealth({ cores: 4, load: null, mem: null, disk: null, agents: null, top: null, oomKills: 0 }), /Không có cảnh báo/, 'missing sources just drop lines');
+});
+
+test('PSI: parse /proc/pressure; warn on what tasks actually wait for, not raw load', () => {
+  const io = parsePressure('some avg10=71.77 avg60=71.27 avg300=55.75 total=344279498\nfull avg10=66.88 avg60=67.09 avg300=52.48 total=321719232\n');
+  assert.deepEqual(io, { some: { avg10: 71.77, avg60: 71.27, avg300: 55.75 }, full: { avg10: 66.88, avg60: 67.09, avg300: 52.48 } });
+  const cpuIdle = parsePressure('some avg10=0.00 avg60=0.00 avg300=1.15 total=57760764\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n');
+  assert.equal(parsePressure('garbage'), null);
+  assert.equal(parsePressure(null), null);
+  // The real case: load 17.6 on 12 cores, but nothing waits for CPU — the disk is the jam.
+  const jam = formatHealth({ cores: 12, load: [17.64, 13.26, 7.46], psi: { cpu: cpuIdle, io } });
+  assert.match(jam, /load 17\.64 \/ 13\.26 \/ 7\.46 \(~147%\) · chờ CPU 0%/);
+  assert.match(jam, /💽 Disk IO: đứng chờ ổ đĩa 67% thời gian \(TB 1 phút 67% · 5 phút 52%\)/);
+  assert.match(jam, /⚠️ Disk IO nghẽn: 67% thời gian mọi tiến trình đứng chờ ổ đĩa \(load cao là do chờ disk, không phải thiếu CPU\)/);
+  assert.doesNotMatch(jam, /CPU quá tải/);
+  // Real CPU shortage: PSI cpu high → CPU warning, no disk hint.
+  const busy = formatHealth({ cores: 12, load: [20, 18, 15], psi: { cpu: { some: { avg10: 80, avg60: 70, avg300: 60 }, full: null }, io: { some: io.some, full: { avg10: 5, avg60: 4, avg300: 3 } } } });
+  assert.match(busy, /CPU quá tải \(80% thời gian có tiến trình chờ CPU\)/);
+  // PSI-triggered warning never quotes a load that contradicts it.
+  assert.doesNotMatch(formatHealth({ cores: 12, load: [6, 6, 6], psi: { cpu: { some: { avg10: 60, avg60: 50, avg300: 40 }, full: null }, io: null } }), /load 6\.0 > 12/);
+  assert.doesNotMatch(busy, /Disk IO nghẽn/);
+  // Calm disk: the IO line shows, no warning.
+  assert.match(formatHealth({ cores: 12, load: [2, 2, 2], psi: { cpu: cpuIdle, io: { some: io.some, full: { avg10: 3, avg60: 2, avg300: 1 } } } }), /✅ Không có cảnh báo/);
+  // No PSI (old kernel / not Linux): fall back to load > cores, no IO line.
+  const legacy = formatHealth({ cores: 12, load: [14, 9, 8] });
+  assert.match(legacy, /CPU quá tải/);
+  assert.doesNotMatch(legacy, /Disk IO/);
 });
 
 test('memoryAlert: below threshold and outside the repeat window only', async () => {
