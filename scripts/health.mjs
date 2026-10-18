@@ -76,7 +76,9 @@ export function formatHealth({ cores, load, mem, disk, agents, top, oomKills, lo
   if (load) {
     const pct = cores ? Math.round((load[0] / cores) * 100) : null;
     lines.push(`🖥 CPU: ${cores} nhân · load ${load.map((x) => x.toFixed(2)).join(' / ')}${pct != null ? ` (~${pct}%)` : ''}${cpuPsi ? ` · chờ CPU ${Math.round(cpuPsi.avg10)}%` : ''}`);
-    if (cpuPsi ? cpuPsi.avg10 >= CPU_PSI_ALERT : (cores && load[0] > cores)) warn.push(`CPU quá tải (load ${load[0].toFixed(1)} > ${cores} nhân)`);
+    if (cpuPsi) {
+      if (cpuPsi.avg10 >= CPU_PSI_ALERT) warn.push(`CPU quá tải (${Math.round(cpuPsi.avg10)}% thời gian có tiến trình chờ CPU)`);
+    } else if (cores && load[0] > cores) warn.push(`CPU quá tải (load ${load[0].toFixed(1)} > ${cores} nhân)`);
   }
   if (ioPsi) {
     lines.push(`💽 Disk IO: đứng chờ ổ đĩa ${Math.round(ioPsi.avg10)}% thời gian (TB 1 phút ${Math.round(ioPsi.avg60)}% · 5 phút ${Math.round(ioPsi.avg300)}%)`);

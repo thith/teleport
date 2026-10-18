@@ -53,7 +53,9 @@ test('PSI: parse /proc/pressure; warn on what tasks actually wait for, not raw l
   assert.doesNotMatch(jam, /CPU quá tải/);
   // Real CPU shortage: PSI cpu high → CPU warning, no disk hint.
   const busy = formatHealth({ cores: 12, load: [20, 18, 15], psi: { cpu: { some: { avg10: 80, avg60: 70, avg300: 60 }, full: null }, io: { some: io.some, full: { avg10: 5, avg60: 4, avg300: 3 } } } });
-  assert.match(busy, /CPU quá tải/);
+  assert.match(busy, /CPU quá tải \(80% thời gian có tiến trình chờ CPU\)/);
+  // PSI-triggered warning never quotes a load that contradicts it.
+  assert.doesNotMatch(formatHealth({ cores: 12, load: [6, 6, 6], psi: { cpu: { some: { avg10: 60, avg60: 50, avg300: 40 }, full: null }, io: null } }), /load 6\.0 > 12/);
   assert.doesNotMatch(busy, /Disk IO nghẽn/);
   // Calm disk: the IO line shows, no warning.
   assert.match(formatHealth({ cores: 12, load: [2, 2, 2], psi: { cpu: cpuIdle, io: { some: io.some, full: { avg10: 3, avg60: 2, avg300: 1 } } } }), /✅ Không có cảnh báo/);
