@@ -1,6 +1,6 @@
 # Build nặng: giới hạn số build mỗi lúc (RFC 17, RFC 23)
 
-Máy dev dùng chung cho khoảng 10 agent. Với 16 GB RAM, hai build Android/Rust chạy song song là đủ để systemd-oomd giết agent. Vì vậy mọi build nặng chạy qua `heavy.mjs`, giữ một **lock chung cho cả máy**: mỗi lúc chỉ **N** build, agent khác xếp hàng. N = 1 khi máy < 28 GiB RAM, N = 2 khi ≥ 28 GiB (RFC 23).
+Máy dev dùng chung cho khoảng 10 agent. Trên máy 16 GB RAM, hai build Android/Rust chạy song song là đủ để systemd-oomd giết agent; máy nhiều RAM hơn vẫn cần giới hạn. Vì vậy mọi build nặng chạy qua `heavy.mjs`, giữ một **lock chung cho cả máy**: mỗi lúc chỉ **N** build, agent khác xếp hàng. N = 1 khi máy < 28 GiB RAM, N = 2 khi ≥ 28 GiB (RFC 23).
 
 ## Dùng thế nào
 
@@ -10,7 +10,7 @@ node ../teleport/scripts/heavy.mjs -- scripts/ci/android-check.sh
 node ../teleport/scripts/heavy.mjs -- cargo nextest run --workspace
 ```
 
-- **Build nặng là:** Gradle (build/test/lint), `cargo build/test/clippy/nextest`, các script CI local (`scripts/ci/*-check.sh`), boot emulator. Lệnh nhỏ (`npm test` vài giây, `cargo fmt`) thì không cần.
+- **Build nặng là:** Gradle (build/test/lint), `cargo build/test/clippy/nextest`, các script CI local (`scripts/ci/*-check.sh`), boot emulator, và mọi lệnh khác tốn vài GB RAM (bundle production, build image Docker, deploy có build ở máy local). Lệnh nhỏ (`npm test` vài giây, `cargo fmt`, deploy chỉ upload như `wrangler deploy` một Worker nhỏ) thì không cần — đừng giữ chỗ build trong lúc chỉ chờ mạng.
 - **Đang có build khác — xếp hàng (RFC 21, RFC 24):** hàng build **công bằng giữa các agent**: vé đầu của mỗi agent (theo convo) được phục vụ trước, rồi vé thứ hai… — agent đang có build chạy, hoặc vừa được phục vụ, xếp sau agent chưa có. Agent có nhiều subagent vẫn được chạy đủ, chỉ xen kẽ với agent khác; trong một agent vẫn đến trước lấy trước. (merge / cleanup: đến trước lấy trước.) Wrapper in `⏳ build đang bận: 🧛 Ma #c2383556 — ./gradlew … — từ 12:40 (3 phút) — bạn đứng thứ 2, trước bạn: 🐭 Chuột …` rồi chờ tới lượt. Mặc định chờ vô hạn. `--wait <phút>` để bỏ cuộc (exit 75, lệnh không chạy).
 - **Xem hàng:** `node ../teleport/scripts/lock-queue.mjs ls` (hoặc `/health` trên Telegram): `🔒 build: đang chạy x/N`, mỗi build đang chạy một dòng `▶`, rồi `Chờ (k):` theo thứ tự; mỗi dòng ghi `· <worktree>` để phân biệt hai lệnh giống nhau ở hai worktree. Cùng mẫu cho merge/cleanup.
 - **Rời hàng khi không cần build nữa:** `node ../teleport/scripts/lock-queue.mjs leave` — rời các vé đang chờ của convo bạn **trong worktree hiện tại** (mỗi subagent làm ở worktree riêng nên không rời nhầm vé của subagent khác); `leave --all` rời mọi vé của convo; job đang chờ thoát với **exit 76** ("đã rời hàng"), không chạy. Job đã bắt đầu chạy thì không rời được (dừng chính tiến trình đó). Hoặc dừng thẳng tiến trình heavy đang chờ. `--pid N` chỉ dành cho admin/maintainer (lưu ý: `--pid <pid daemon>` rời **mọi** việc daemon đang chờ lock, và offer dọn hằng ngày bị rời thì bỏ luôn). Lúc đang **chờ RAM** (trước khi vào hàng) thì chưa có vé: muốn huỷ thì dừng tiến trình heavy.
@@ -41,7 +41,7 @@ Bị kill khi **đang chờ** thì vô hại: chưa giữ lock, lệnh không ch
 - **N cho cả máy:** tự động theo RAM. Owner giới hạn về 1 bằng `node ../teleport/scripts/lock-queue.mjs slots 1` (ghi `~/.local/state/teleport/locks/build.slots`), bỏ giới hạn bằng `slots auto`, xem bằng `slots`. N mới áp dụng cho build lấy chỗ từ giờ; build đang chạy chạy nốt. Chỉ lock `build` có 2 chỗ; merge và cleanup luôn 1.
 - **Agent không phải làm gì khác:** vẫn `heavy.mjs -- <lệnh>`. Build ở chỗ thứ hai tự có Gradle daemon riêng (`~/.gradle/daemon-slot1`) và biên dịch Kotlin ngay trong daemon đó (qua `GRADLE_OPTS`), nên hai build không bao giờ dùng chung daemon. Đừng tự đặt `org.gradle.daemon.registry.base` trong lệnh.
 - **RAM:** mỗi build giới hạn 30% RAM khi có thể chạy cùng build khác (45% khi chạy một mình như trước). Build thứ hai, sau khi lấy chỗ, chờ tới khi RAM trống ≥ giới hạn của nó + 3 GiB, và tổng giới hạn các build cùng chạy ≤ 65% RAM (in `⏳ chờ RAM cho build thứ 2: …`; `/health` ghi `(chờ RAM)`). Build không giới hạn RAM (`--no-scope`, `--no-stop`, `TELEPORT_HEAVY_MEM_MAX=0`) chỉ chạy khi không còn build nào lấy chỗ trước nó.
-- **Triển khai:** merge code RFC 23 **trước** khi cắm RAM (cắm RAM = tắt máy → mọi tiến trình cũ chạy lại bằng code mới); không giữ worktree teleport cũ còn chạy được. Nếu RAM vào trước: `lock-queue.mjs slots 1` cho tới khi code mới chạy và `lock-queue.mjs ls` trống.
+- **Triển khai (đã xong 2026-10-18: máy 32 GB, N = 2):** merge code RFC 23 **trước** khi cắm RAM (cắm RAM = tắt máy → mọi tiến trình cũ chạy lại bằng code mới); không giữ worktree teleport cũ còn chạy được. Nếu RAM vào trước: `lock-queue.mjs slots 1` cho tới khi code mới chạy và `lock-queue.mjs ls` trống.
 
 ## Merge
 
