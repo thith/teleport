@@ -163,8 +163,7 @@ test('formatAgentList: screens section first (with the claude inside), then term
   assert.match(term, new RegExp(`• PID 830318 · 📨 🪱 Giun \\(idle\\) · umipay · 2-00:49:26\\n  session ${SID} · #a7611284`));
   assert.doesNotMatch(term, /PID 9 /); // a screen claude is not repeated under Terminal
   assert.doesNotMatch(out, /pts\//);   // no tty column
-  assert.match(out, /\/kill pid:<PID>/);
-  assert.match(out, /--resume-session/);
+  assert.doesNotMatch(out, /\/kill pid:<PID>|--resume-session|SendMessage/);   // no how-to footer (Thi: too wordy)
   const empty = formatAgentList({});
   assert.match(empty, /📺 Screen \(0\)\n  \(không có\)/);
   assert.match(empty, /🖥 Terminal \(0\)\n  \(không có\)/);
