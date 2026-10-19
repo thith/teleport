@@ -39,9 +39,10 @@ export const COMPACT_QUEUED_WATCH_MS = 30 * 60 * 1000; // queued behind a runnin
 export const AUDIT_FILE = path.join(process.env.XDG_STATE_HOME || path.join(os.homedir(), '.local', 'state'), 'teleport', 'type-audit.jsonl');
 
 // op letter (callback data) → command. Fixed table: the command never comes from stored data.
-export const TYPE_OPS = { c: '/compact', r: '/remote-control', e: 'esc', i: 'read-input', u: 'clear-input' };
+// 'k' only asks (a confirm button follows); 'y' is that confirmation: /kill pid:<PID> (SIGTERM), not a keystroke.
+export const TYPE_OPS = { c: '/compact', r: '/remote-control', e: 'esc', i: 'read-input', u: 'clear-input', k: 'kill-ask', y: 'kill' };
 export const COMPACT_OK = '✅ đã compact'; // a watch() result starting with this = a confirmed compaction
-export const TYPE_BUTTON_RE = /^ty:(?:pick:([0-9a-z]{8})|([0-9a-f]{16}):([crexiu]))$/;
+export const TYPE_BUTTON_RE = /^ty:(?:pick:([0-9a-z]{8})|([0-9a-f]{16}):([crexiuky]))$/;
 
 // ── Pure helpers ──────────────────────────────────────────────────────────────
 

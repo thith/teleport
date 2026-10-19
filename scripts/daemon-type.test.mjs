@@ -25,10 +25,11 @@ const cq = (data, text, messageId = 100) => ({ id: 'q', data, from: { id: 42 }, 
 
 test('typeStep2: buttons follow the state (idle → /compact + /remote-control; busy → /compact (queued) + Esc; waiting → Esc; bridged → no /remote-control)', () => {
   const ops = (obs) => typeStep2({ target: T, obs, tok: 'a'.repeat(16) }).rows[0].map((b) => b.callback_data.split(':')[2]);
-  assert.deepEqual(ops(idle), ['c', 'r', 'i', 'x']);
-  assert.deepEqual(ops({ ...idle, state: 'busy' }), ['c', 'e', 'i', 'x']);
-  assert.deepEqual(ops({ ...idle, state: 'waiting' }), ['e', 'x']);
-  assert.deepEqual(ops({ ...idle, bridge: 'session_B' }), ['c', 'i', 'x']);
+  assert.deepEqual(ops(idle), ['c', 'r', 'i', 'k', 'x']);
+  assert.deepEqual(ops({ ...idle, state: 'busy' }), ['c', 'e', 'i', 'k', 'x']);
+  assert.deepEqual(ops({ ...idle, state: 'waiting' }), ['e', 'k', 'x']);
+  assert.deepEqual(ops({ ...idle, state: 'unknown' }), ['k', 'x']); // nothing to type, still killable
+  assert.deepEqual(ops({ ...idle, bridge: 'session_B' }), ['c', 'i', 'k', 'x']);
   assert.deepEqual(ops({ mismatch: 'phiên đã đổi' }), ['x']);
   const s = typeStep2({ target: T, obs: { ...idle, bridge: 'session_B' }, persona: '🧛 Ma', tok: 'a'.repeat(16) });
   assert.match(s.text, /🧛 Ma #c2383556 · PID 644406 · rảnh · ctx 693k · 📡/);
@@ -159,4 +160,39 @@ test('/type (no arg): the pick button shows persona (or #hash) + context use, no
   const personaOf = (h) => (h === 'c2383556' ? '👻 Ma' : null);
   await startType('', ctx, { personaOf, list: () => [{ ...agent(T), ctx: 'ctx 693k (35%)' }, { ...agent(T2), ctx: 'ctx 12k (1%)' }, agent({ ...T2, hashtag: 'e0000001' })] });
   assert.deepEqual(calls[0][2].map((r) => r[0].text), ['👻 Ma · 693k (35%)', '#d8133684 · 12k (1%)', '#e0000001']);
+});
+
+test('step 2 buttons are emoji only except /compact and Huỷ; the text carries the legend', () => {
+  const s = typeStep2({ target: T, obs: { ...idle, state: 'busy' }, tok: 'a'.repeat(16) });
+  assert.deepEqual(s.rows[0].map((b) => b.text), ['/compact', '🛑', '🔍', '💀', '✖ Huỷ']);
+  assert.match(s.text, /🛑 Esc · 🔍 xem ô nhập · 💀 kill/);
+  assert.deepEqual(typeStep2({ target: T, obs: idle, tok: 'a'.repeat(16) }).rows[0].map((b) => b.text), ['/compact', '📡', '🔍', '💀', '✖ Huỷ']);
+});
+
+test('💀 asks first (fresh one-shot ✅ token); ✅ re-checks the pinned process, then runs /kill pid:', async () => {
+  const text = '⌨️ /type — #c2383556 · PID 644406 · rảnh\nChọn lệnh';
+  const runner = { run: async () => { throw new Error('kill must not type'); } };
+  const { ctx, calls } = ui();
+  ctx.buttonStore.set('a'.repeat(16), { kind: 'type', target: T, chatId: 42, messageId: 100, createdAt: Date.now() });
+  const killed = [];
+  const kill = async (pid, from) => { killed.push([pid, from.id]); return '[spawn] ✅ PID 644406 stopped'; };
+  await handleTypeButton(cq(`ty:${'a'.repeat(16)}:k`, text), ctx, { runner, kill });
+  assert.equal(killed.length, 0); // the first tap only asks
+  const ask = calls.at(-1);
+  assert.match(ask[1], /^⌨️ \/type — #c2383556 · PID 644406 · rảnh\n\n💀 Kill/);
+  assert.deepEqual(ask[2][0].map((b) => b.text), ['✅', '✖ Huỷ']);
+  const yes = ask[2][0][0].callback_data;
+  assert.match(yes, /^ty:[0-9a-f]{16}:y$/);
+  const live = { session: () => ({ sessionId: 'S', status: 'idle' }), proc: () => ({ comm: 'claude', start: '5' }), ppid: () => 644405, windows: () => 1, transcript: () => ({ ended: true, usage: null }) };
+  await handleTypeButton(cq(yes, ask[1]), ctx, { runner, kill, io: live });
+  assert.deepEqual(killed, [[644406, 42]]);
+  assert.match(calls.at(-1)[1], /PID 644406 stopped/);
+  await handleTypeButton(cq(yes, ask[1]), ctx, { runner, kill, io: live }); // double tap
+  assert.equal(killed.length, 1);
+  // the pid now belongs to another process → refused, nothing killed
+  const { ctx: c2, calls: k2 } = ui();
+  c2.buttonStore.set('c'.repeat(16), { kind: 'type', target: T, chatId: 42, messageId: 100, createdAt: Date.now() });
+  await handleTypeButton(cq(`ty:${'c'.repeat(16)}:y`, text), c2, { runner, kill, io: { ...live, proc: () => ({ comm: 'claude', start: '9' }) } });
+  assert.equal(killed.length, 1);
+  assert.match(k2.at(-1)[1], /không kill/);
 });
