@@ -896,9 +896,9 @@ if (isDirectRun) {
 
 export const TYPE_COMMAND = 'type';
 const TYPE_OP_LABEL = { c: '/compact', r: '/remote-control', e: '⎋ Esc', i: '🔍 ô nhập', u: '🧹 Xoá ô nhập' };
-// Buttons are emoji only (Thi), except Esc and Huỷ; no legend (the owner knows them).
+// Buttons are emoji only (Thi), except Esc (short already); no legend (the owner knows them).
 const TYPE_BUTTON_LABEL = { c: '🗜️', r: '📡', e: 'Esc', i: '🔍', u: '🧹', k: '💀', y: '✅' };
-const CANCEL_BUTTON = (tok) => ({ text: '✖ Huỷ', callback_data: `ty:${tok}:x` });
+const CANCEL_BUTTON = (tok) => ({ text: '✖', callback_data: `ty:${tok}:x` });
 let typeRunner = null; // one per daemon: per-agent locks, cool-down, Esc rate limit
 const getTypeRunner = () => (typeRunner ||= new TypeRunner(defaultIo()));
 

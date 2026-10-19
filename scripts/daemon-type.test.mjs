@@ -162,10 +162,10 @@ test('/type (no arg): the pick button shows persona (or #hash) + context use, no
   assert.deepEqual(calls[0][2].map((r) => r[0].text), ['👻 Ma · 693k (35%)', '#d8133684 · 12k (1%)', '#e0000001']);
 });
 
-test('step 2 buttons are emoji only except Esc and Huỷ', () => {
+test('step 2 buttons are emoji only except Esc', () => {
   const s = typeStep2({ target: T, obs: { ...idle, state: 'busy' }, tok: 'a'.repeat(16) });
-  assert.deepEqual(s.rows[0].map((b) => b.text), ['🗜️', 'Esc', '🔍', '💀', '✖ Huỷ']);
-  assert.deepEqual(typeStep2({ target: T, obs: idle, tok: 'a'.repeat(16) }).rows[0].map((b) => b.text), ['🗜️', '📡', '🔍', '💀', '✖ Huỷ']);
+  assert.deepEqual(s.rows[0].map((b) => b.text), ['🗜️', 'Esc', '🔍', '💀', '✖']);
+  assert.deepEqual(typeStep2({ target: T, obs: idle, tok: 'a'.repeat(16) }).rows[0].map((b) => b.text), ['🗜️', '📡', '🔍', '💀', '✖']);
 });
 
 test('💀 asks first (fresh one-shot ✅ token); ✅ re-checks the pinned process, then runs /kill pid:', async () => {
@@ -179,7 +179,7 @@ test('💀 asks first (fresh one-shot ✅ token); ✅ re-checks the pinned proce
   assert.equal(killed.length, 0); // the first tap only asks
   const ask = calls.at(-1);
   assert.match(ask[1], /^⌨️ \/type — #c2383556 · PID 644406 · rảnh\n\n💀 Kill/);
-  assert.deepEqual(ask[2][0].map((b) => b.text), ['✅', '✖ Huỷ']);
+  assert.deepEqual(ask[2][0].map((b) => b.text), ['✅', '✖']);
   const yes = ask[2][0][0].callback_data;
   assert.match(yes, /^ty:[0-9a-f]{16}:y$/);
   // identity only: a second screen window (windows 2) does not block the kill
