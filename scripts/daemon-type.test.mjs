@@ -162,10 +162,10 @@ test('/type (no arg): the pick button shows persona (or #hash) + context use, no
   assert.deepEqual(calls[0][2].map((r) => r[0].text), ['👻 Ma · 693k (35%)', '#d8133684 · 12k (1%)', '#e0000001']);
 });
 
-test('step 2 buttons are emoji only except /compact, Esc and Huỷ', () => {
+test('step 2 buttons are emoji only except Esc and Huỷ', () => {
   const s = typeStep2({ target: T, obs: { ...idle, state: 'busy' }, tok: 'a'.repeat(16) });
-  assert.deepEqual(s.rows[0].map((b) => b.text), ['/compact', 'Esc', '🔍', '💀', '✖ Huỷ']);
-  assert.deepEqual(typeStep2({ target: T, obs: idle, tok: 'a'.repeat(16) }).rows[0].map((b) => b.text), ['/compact', '📡', '🔍', '💀', '✖ Huỷ']);
+  assert.deepEqual(s.rows[0].map((b) => b.text), ['🗜️', 'Esc', '🔍', '💀', '✖ Huỷ']);
+  assert.deepEqual(typeStep2({ target: T, obs: idle, tok: 'a'.repeat(16) }).rows[0].map((b) => b.text), ['🗜️', '📡', '🔍', '💀', '✖ Huỷ']);
 });
 
 test('💀 asks first (fresh one-shot ✅ token); ✅ re-checks the pinned process, then runs /kill pid:', async () => {
