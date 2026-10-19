@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { startType, handleTypeButton, takeTypeButton, typeStep2, takeMergeButton, dispatchCommand } from './daemon.mjs';
+import { startType, handleTypeButton, takeTypeButton, typeStep2, takeMergeButton, dispatchCommand, killViaSpawn } from './daemon.mjs';
 
 const T = { pid: 644406, procStart: '5', sessionId: 'S', screenPid: 644405, screen: 'tele-c2383556', hashtag: 'c2383556', cwd: '/w' };
 const T2 = { ...T, pid: 331131, screenPid: 331130, screen: 'tele-d8133684', hashtag: 'd8133684' };
@@ -162,10 +162,9 @@ test('/type (no arg): the pick button shows persona (or #hash) + context use, no
   assert.deepEqual(calls[0][2].map((r) => r[0].text), ['👻 Ma · 693k (35%)', '#d8133684 · 12k (1%)', '#e0000001']);
 });
 
-test('step 2 buttons are emoji only except /compact and Huỷ; the text carries the legend', () => {
+test('step 2 buttons are emoji only except /compact, Esc and Huỷ', () => {
   const s = typeStep2({ target: T, obs: { ...idle, state: 'busy' }, tok: 'a'.repeat(16) });
-  assert.deepEqual(s.rows[0].map((b) => b.text), ['/compact', '🛑', '🔍', '💀', '✖ Huỷ']);
-  assert.match(s.text, /🛑 Esc · 🔍 xem ô nhập · 💀 kill/);
+  assert.deepEqual(s.rows[0].map((b) => b.text), ['/compact', 'Esc', '🔍', '💀', '✖ Huỷ']);
   assert.deepEqual(typeStep2({ target: T, obs: idle, tok: 'a'.repeat(16) }).rows[0].map((b) => b.text), ['/compact', '📡', '🔍', '💀', '✖ Huỷ']);
 });
 
@@ -175,7 +174,7 @@ test('💀 asks first (fresh one-shot ✅ token); ✅ re-checks the pinned proce
   const { ctx, calls } = ui();
   ctx.buttonStore.set('a'.repeat(16), { kind: 'type', target: T, chatId: 42, messageId: 100, createdAt: Date.now() });
   const killed = [];
-  const kill = async (pid, from) => { killed.push([pid, from.id]); return '[spawn] ✅ PID 644406 stopped'; };
+  const kill = async (t, from) => { killed.push([t.pid, from.id]); return '[spawn] ✅ PID 644406 stopped'; };
   await handleTypeButton(cq(`ty:${'a'.repeat(16)}:k`, text), ctx, { runner, kill });
   assert.equal(killed.length, 0); // the first tap only asks
   const ask = calls.at(-1);
@@ -183,7 +182,9 @@ test('💀 asks first (fresh one-shot ✅ token); ✅ re-checks the pinned proce
   assert.deepEqual(ask[2][0].map((b) => b.text), ['✅', '✖ Huỷ']);
   const yes = ask[2][0][0].callback_data;
   assert.match(yes, /^ty:[0-9a-f]{16}:y$/);
-  const live = { session: () => ({ sessionId: 'S', status: 'idle' }), proc: () => ({ comm: 'claude', start: '5' }), ppid: () => 644405, windows: () => 1, transcript: () => ({ ended: true, usage: null }) };
+  // identity only: a second screen window (windows 2) does not block the kill
+  const audits = [];
+  const live = { session: () => ({ sessionId: 'S', status: 'idle' }), proc: () => ({ comm: 'claude', start: '5' }), windows: () => 2, audit: (e) => audits.push(e) };
   await handleTypeButton(cq(yes, ask[1]), ctx, { runner, kill, io: live });
   assert.deepEqual(killed, [[644406, 42]]);
   assert.match(calls.at(-1)[1], /PID 644406 stopped/);
@@ -191,8 +192,34 @@ test('💀 asks first (fresh one-shot ✅ token); ✅ re-checks the pinned proce
   assert.equal(killed.length, 1);
   // the pid now belongs to another process → refused, nothing killed
   const { ctx: c2, calls: k2 } = ui();
-  c2.buttonStore.set('c'.repeat(16), { kind: 'type', target: T, chatId: 42, messageId: 100, createdAt: Date.now() });
+  c2.buttonStore.set('c'.repeat(16), { kind: 'type', target: T, chatId: 42, messageId: 100, createdAt: Date.now(), ops: ['y', 'x'] });
   await handleTypeButton(cq(`ty:${'c'.repeat(16)}:y`, text), c2, { runner, kill, io: { ...live, proc: () => ({ comm: 'claude', start: '9' }) } });
   assert.equal(killed.length, 1);
   assert.match(k2.at(-1)[1], /không kill/);
+  assert.deepEqual(audits.map((a) => [a.step, a.reason]), [['kill', undefined], ['refused', 'PID đã thuộc tiến trình khác']]);
+});
+
+test('a token answers only its own buttons: ✅ from a step-2 or 🧹 token is refused (the confirm cannot be skipped)', async () => {
+  const text = '⌨️ /type — #c2383556 · PID 644406 · rảnh';
+  const kill = async () => { throw new Error('must not kill'); };
+  for (const ops of [['c', 'r', 'i', 'k', 'x'], ['u', 'x'], undefined]) {
+    const { ctx, calls } = ui();
+    ctx.buttonStore.set('d'.repeat(16), { kind: 'type', target: T, chatId: 42, messageId: 100, createdAt: Date.now(), ops });
+    await handleTypeButton(cq(`ty:${'d'.repeat(16)}:y`, text), ctx, { kill });
+    assert.match(calls.at(-1)[1], /Nút không khớp/);
+  }
+  const { ctx, calls } = ui(); // /type #hash stores the ops it showed
+  await startType('#c2383556', ctx, { list: () => [agent(T)] });
+  assert.deepEqual([...ctx.buttonStore.values()][0].ops, ['c', 'r', 'i', 'k', 'x']);
+  assert.ok(calls.length);
+});
+
+test('killViaSpawn: spawn.mjs --kill pid:<PID> --expect-start <start>, sender id in env; error output surfaced', async () => {
+  const seen = [];
+  const ok = async (bin, argv, opts) => { seen.push([argv.slice(1), opts.env.TELE_FROM_ID]); return { stdout: '[spawn] ✅ stopped\n', stderr: '' }; };
+  const ctx = { registry: { kill: { run: 'spawn.mjs', args: ['--kill'], minRole: 'maintainer' } }, projectsConfig: {}, secretEnvKeys: [] };
+  assert.equal(await killViaSpawn(T, { id: 42 }, ctx, { runner: ok, scriptsDir: '/s' }), '[spawn] ✅ stopped');
+  assert.deepEqual(seen[0], [['--kill', 'pid:644406', '--expect-start', '5'], '42']);
+  const fail = async () => { const e = new Error('exit 1'); e.stdout = ''; e.stderr = '[spawn] ❌ pid reused'; throw e; };
+  assert.match(await killViaSpawn(T, { id: 42 }, ctx, { runner: fail }), /pid reused/);
 });
