@@ -116,6 +116,7 @@ Manage sessions (interactive/screen only):
                      never SIGKILL. Only via the daemon, only for its owner
                      (TELE_FROM_ID must equal projects.json _config.daemonUserId);
                      audited to scripts/tmp/kill-pid-audit.jsonl.
+    --expect-start <ticks>  refuse if the PID's start time differs (pid reused) — daemon /type 💀.
     --restart        after it exits, resume the same session in screen tele-<hashtag>
                      in its old cwd (= --resume-session). Needs a session id known
                      from its session file — checked BEFORE killing.
@@ -1241,6 +1242,13 @@ if (isDirectRun) {
       appendKillAudit({ pid: killPid.pid ?? null, name: killPid.name ?? null, fromId, result: 'denied', reason: auth.error });
       console.error(`[spawn] ❌ ${auth.error}`);
       process.exit(1);
+    }
+    // --expect-start <ticks>: the start fingerprint the caller pinned (daemon /type 💀) — a pid
+    // reused since then is refused instead of killed. `name:` pins its own below.
+    const es = argv.indexOf('--expect-start');
+    if (es !== -1 && !killPid.name) {
+      if (!/^\d+$/.test(argv[es + 1] ?? '')) { console.error('[spawn] --expect-start needs the process start time (clock ticks).'); process.exit(1); }
+      killPid.start = argv[es + 1];
     }
     if (killPid.name) {
       // Owner only from here (no process list for anyone else).

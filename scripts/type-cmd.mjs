@@ -39,9 +39,10 @@ export const COMPACT_QUEUED_WATCH_MS = 30 * 60 * 1000; // queued behind a runnin
 export const AUDIT_FILE = path.join(process.env.XDG_STATE_HOME || path.join(os.homedir(), '.local', 'state'), 'teleport', 'type-audit.jsonl');
 
 // op letter (callback data) → command. Fixed table: the command never comes from stored data.
-export const TYPE_OPS = { c: '/compact', r: '/remote-control', e: 'esc', i: 'read-input', u: 'clear-input' };
+// 'k' only asks (a confirm button follows); 'y' is that confirmation: /kill pid:<PID> (SIGTERM), not a keystroke.
+export const TYPE_OPS = { c: '/compact', r: '/remote-control', e: 'esc', i: 'read-input', u: 'clear-input', k: 'kill-ask', y: 'kill' };
 export const COMPACT_OK = '✅ đã compact'; // a watch() result starting with this = a confirmed compaction
-export const TYPE_BUTTON_RE = /^ty:(?:pick:([0-9a-z]{8})|([0-9a-f]{16}):([crexiu]))$/;
+export const TYPE_BUTTON_RE = /^ty:(?:pick:([0-9a-z]{8})|([0-9a-f]{16}):([crexiuky]))$/;
 
 // ── Pure helpers ──────────────────────────────────────────────────────────────
 
@@ -240,7 +241,7 @@ export class TypeRunner {
     const ok = (st) => st === 'idle' || (allowBusy && st === 'busy');
     const pre = observe(t, io);
     if (pre.mismatch) { audit('refused', { reason: pre.mismatch }); return { text: `❌ agent đã đổi phiên (${pre.mismatch}) — gõ /type lại.` }; }
-    if (!ok(pre.state)) { audit('refused', { reason: pre.state }); return { text: `❌ agent ${STATE_LABEL[pre.state]} — không gõ ${cmd}.${pre.state === 'busy' ? ' Bấm ⎋ Esc trước nếu cần dừng.' : ''}` }; }
+    if (!ok(pre.state)) { audit('refused', { reason: pre.state }); return { text: `❌ agent ${STATE_LABEL[pre.state]} — không gõ ${cmd}.${pre.state === 'busy' ? ' Bấm Esc trước nếu cần dừng.' : ''}` }; }
     if (needNoBridge && pre.bridge) return { text: `📡 Remote Control đang bật: https://claude.ai/code/${pre.bridge}` };
     const shot = await io.hardcopy(sid); // one look before typing: queued input, and what is in the box
     if (pre.state === 'busy' && hasQueuedInput(shot)) { // don't stack onto a queue we can't see
@@ -255,7 +256,7 @@ export class TypeRunner {
       if (p.text) return { text: `${p.text} — không gõ ${cmd}.` };
       if (!p.empty) {
         audit('refused', { reason: 'input-not-empty', line: before });
-        return { text: `❌ ô nhập đang có chữ ("${before}") — không gõ ${cmd}. Bấm 🔍 ô nhập → 🧹 Xoá rồi /type lại.` };
+        return { text: `❌ ô nhập đang có chữ ("${before}") — không gõ ${cmd}. Bấm 🔍 → 🧹 rồi /type lại.` };
       }
     }
     const now0 = observe(t, io); // re-checked right before the key (the screen read took a moment)

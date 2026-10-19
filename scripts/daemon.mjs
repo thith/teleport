@@ -896,6 +896,9 @@ if (isDirectRun) {
 
 export const TYPE_COMMAND = 'type';
 const TYPE_OP_LABEL = { c: '/compact', r: '/remote-control', e: '⎋ Esc', i: '🔍 ô nhập', u: '🧹 Xoá ô nhập' };
+// Buttons are emoji only (Thi), except /compact, Esc and Huỷ; no legend (the owner knows them).
+const TYPE_BUTTON_LABEL = { c: '/compact', r: '📡', e: 'Esc', i: '🔍', u: '🧹', k: '💀', y: '✅' };
+const CANCEL_BUTTON = (tok) => ({ text: '✖ Huỷ', callback_data: `ty:${tok}:x` });
 let typeRunner = null; // one per daemon: per-agent locks, cool-down, Esc rate limit
 const getTypeRunner = () => (typeRunner ||= new TypeRunner(defaultIo()));
 
@@ -910,12 +913,14 @@ export function typeStep2({ target, obs, persona, cfg = {}, tok }) {
   const ctx = obs.mismatch ? null : formatContext(obs.usage, contextWindowFor(cfg, { hashtag: target.hashtag, model: obs.usage?.model }));
   const line = agentLine(target, { persona, state: obs.mismatch ? 'unknown' : obs.state, ctx, bridge: obs.bridge });
   const ops = obs.mismatch ? [] : allowedOps(obs.state, obs.bridge);
+  // Kill works in any state (a stuck agent is the usual reason), but not on a target that changed under us.
+  const buttons = obs.mismatch ? [] : [...ops, 'k'];
   const text = `⌨️ /type — ${line}\n`
     + (ops.length ? 'Chọn lệnh (nút hết hạn sau 10 phút):' : `Không có lệnh nào gõ được lúc này (${obs.mismatch || STATE_LABEL[obs.state]}).`)
     + (obs.bridge ? `\n📡 Remote Control đang bật: https://claude.ai/code/${obs.bridge}` : '');
-  const row = ops.map((op) => ({ text: TYPE_OP_LABEL[op], callback_data: `ty:${tok}:${op}` }));
-  row.push({ text: '✖ Huỷ', callback_data: `ty:${tok}:x` });
-  return { text, rows: [row], ops };
+  const row = buttons.map((op) => ({ text: TYPE_BUTTON_LABEL[op], callback_data: `ty:${tok}:${op}` }));
+  row.push(CANCEL_BUTTON(tok));
+  return { text, rows: [row], ops, buttons: [...buttons, 'x'] };
 }
 
 /** `/type` (agent menu) or `/type #hash` (straight to the commands). */
@@ -932,7 +937,7 @@ export async function startType(rest, ctx, { list = listForType, io = defaultIo(
     const tok = crypto.randomBytes(8).toString('hex');
     const step = typeStep2({ target: a.target, obs: a.obs, persona: personaOf(want), cfg: projectsConfig, tok });
     const sent = await sendButtonRows(daemonUserId, step.text, step.rows);
-    buttonStore.set(tok, { kind: 'type', target: a.target, chatId: daemonUserId, messageId: sent?.message_id ?? null, createdAt: Date.now() });
+    buttonStore.set(tok, { kind: 'type', target: a.target, chatId: daemonUserId, messageId: sent?.message_id ?? null, createdAt: Date.now(), ops: step.buttons });
     return;
   }
   if (!agents.length) { await sendText(daemonUserId, 'ℹ️ không có agent nào trong screen tele-* để gõ.'); return; }
@@ -967,7 +972,22 @@ export function buildCompactNoticePrompt({ convoId, chatId, text }) {
   };
 }
 
-export async function handleTypeButton(cq, ctx, { runner = getTypeRunner(), list = listForType, io = defaultIo(), deliver = deliverResult } = {}) {
+/**
+ * `/kill pid:<PID> --expect-start <start>` through the registry's kill command (spawn.mjs: owner gate,
+ * refuses a reused pid, SIGTERM, audit) → output text.
+ */
+export async function killViaSpawn(target, from, ctx, { runner = execFileP, scriptsDir = __dirname, parentDir = PARENT_DIR } = {}) {
+  const spec = resolveCommand('kill', ctx.registry);
+  if (!spec) return '❌ không có lệnh kill trong commands.json.';
+  try {
+    const r = await runner(process.execPath, [path.join(scriptsDir, spec.run), ...spec.args, `pid:${target.pid}`, '--expect-start', String(target.procStart)], {
+      cwd: parentDir, env: childEnv(from, resolveSenderRole(ctx.projectsConfig, from?.id), ctx.secretEnvKeys || []), timeout: COMMAND_TIMEOUT_MS, maxBuffer: COMMAND_MAX_BUFFER,
+    });
+    return ((r.stdout || '') + (r.stderr ? `\n${r.stderr}` : '')).trim() || '✅ đã kill.';
+  } catch (e) { return ((e.stdout || '') + (e.stderr ? `\n${e.stderr}` : '')).trim() || `❌ kill lỗi: ${e.message || e}`; }
+}
+
+export async function handleTypeButton(cq, ctx, { runner = getTypeRunner(), list = listForType, io = defaultIo(), deliver = deliverResult, kill = killViaSpawn } = {}) {
   const m = String(cq.data || '').match(TYPE_BUTTON_RE);
   const chatId = cq.message?.chat?.id, messageId = cq.message?.message_id;
   const original = cq.message?.text || '';
@@ -980,7 +1000,7 @@ export async function handleTypeButton(cq, ctx, { runner = getTypeRunner(), list
     if (!a) { await ctx.answerButton(cq.id, 'Agent không còn.'); await ctx.editButtonRows(chatId, messageId, `${original}\n\n❌ #${h} không còn trong screen — gõ /type lại.`, []); return; }
     const tok = crypto.randomBytes(8).toString('hex');
     const step = typeStep2({ target: a.target, obs: a.obs, persona: personaOf(h), cfg: ctx.projectsConfig, tok });
-    ctx.buttonStore.set(tok, { kind: 'type', target: a.target, chatId, messageId, createdAt: Date.now() });
+    ctx.buttonStore.set(tok, { kind: 'type', target: a.target, chatId, messageId, createdAt: Date.now(), ops: step.buttons });
     await ctx.answerButton(cq.id);
     await ctx.editButtonRows(chatId, messageId, step.text, step.rows);
     return;
@@ -999,15 +1019,51 @@ export async function handleTypeButton(cq, ctx, { runner = getTypeRunner(), list
     await ctx.editButtonRows(chatId, messageId, `${original}\n\n⚠️ Nút không khớp nội dung tin nhắn — không làm gì.`, []);
     return;
   }
+  // A token answers only the buttons it was sent with (✅ only from its own confirm prompt).
+  // Entries without `ops` (stored before this field) keep working, except for ✅.
+  if (entry.ops ? !entry.ops.includes(op) : op === 'y') {
+    await ctx.answerButton(cq.id, 'Nút không khớp — gõ /type lại.');
+    await ctx.editButtonRows(chatId, messageId, `${original}\n\n⚠️ Nút không khớp — không làm gì.`, []);
+    return;
+  }
   if (op === 'x') { await ctx.answerButton(cq.id, 'Đã huỷ'); await ctx.editButtonRows(chatId, messageId, `${original}\n\n✖ Đã huỷ.`, []); return; }
   const base = original.split('\n')[0];
+  if (op === 'k') { // ask first: one stray tap must not kill an agent
+    const t2 = crypto.randomBytes(8).toString('hex');
+    ctx.buttonStore.set(t2, { kind: 'type', target: entry.target, chatId, messageId, createdAt: Date.now(), ops: ['y', 'x'] });
+    await ctx.answerButton(cq.id);
+    await ctx.editButtonRows(chatId, messageId, `${base}\n\n💀 Kill agent này (SIGTERM, phiên dừng hẳn — muốn chạy lại dùng /resume)? Bấm ✅ để xác nhận.`,
+      [[{ text: TYPE_BUTTON_LABEL.y, callback_data: `ty:${t2}:y` }, CANCEL_BUTTON(t2)]]);
+    return;
+  }
+  if (op === 'y') {
+    // Identity only (pid + start + session): the screen checks guard keystrokes, not a SIGTERM —
+    // a second screen window or a hung `screen -Q` must not block killing a stuck agent.
+    const t = entry.target, proc = io.proc(t.pid), sess = io.session(t.pid);
+    const bad = !proc || proc.comm !== 'claude' ? 'tiến trình claude không còn'
+      : String(proc.start) !== String(t.procStart) ? 'PID đã thuộc tiến trình khác'
+        : !sess || sess.sessionId !== t.sessionId ? 'phiên đã đổi' : null;
+    const audit = (step, extra = {}) => io.audit?.({ who: String(cq.from?.id ?? 'owner'), op: TYPE_OPS.y, pid: t.pid, sessionId: t.sessionId, hashtag: t.hashtag, step, ...extra });
+    if (bad) {
+      audit('refused', { reason: bad });
+      await ctx.answerButton(cq.id, 'Agent đã đổi — không kill.');
+      await ctx.editButtonRows(chatId, messageId, `${base}\n\n❌ agent đã đổi (${bad}) — không kill. Gõ /type lại.`, []);
+      return;
+    }
+    audit('kill');
+    await ctx.answerButton(cq.id, 'Đang kill…');
+    await ctx.editButtonRows(chatId, messageId, `${base}\n\n⏳ đang kill PID ${entry.target.pid}…`, []);
+    const out = await kill(entry.target, cq.from, ctx);
+    await ctx.editButtonRows(chatId, messageId, `${base}\n\n${out}`, []);
+    return;
+  }
   await ctx.answerButton(cq.id, op === 'i' ? 'Đang đọc ô nhập…' : op === 'u' ? 'Đang xoá ô nhập…' : `Đang gõ ${TYPE_OPS[op] === 'esc' ? 'Esc' : TYPE_OPS[op]}…`);
   await ctx.editButtonRows(chatId, messageId, `${base}\n\n⏳ ${op === 'i' ? 'đang đọc' : op === 'u' ? 'đang xoá' : 'đang gõ'} ${TYPE_OP_LABEL[op]}…`, []);
   const r = await runner.run(op, entry.target, String(cq.from?.id ?? 'owner'));
   if (r.canClear) { // the box holds text: offer [🧹 Xoá] (a fresh one-shot token for the same pinned target)
     const t2 = crypto.randomBytes(8).toString('hex');
-    ctx.buttonStore.set(t2, { kind: 'type', target: entry.target, chatId, messageId, createdAt: Date.now() });
-    await ctx.editButtonRows(chatId, messageId, `${base}\n\n${r.text}`, [[{ text: TYPE_OP_LABEL.u, callback_data: `ty:${t2}:u` }, { text: '✖ Huỷ', callback_data: `ty:${t2}:x` }]]);
+    ctx.buttonStore.set(t2, { kind: 'type', target: entry.target, chatId, messageId, createdAt: Date.now(), ops: ['u', 'x'] });
+    await ctx.editButtonRows(chatId, messageId, `${base}\n\n${r.text}`, [[{ text: TYPE_BUTTON_LABEL.u, callback_data: `ty:${t2}:u` }, CANCEL_BUTTON(t2)]]);
     return;
   }
   await ctx.editButtonRows(chatId, messageId, `${base}\n\n${r.text}`, []);
