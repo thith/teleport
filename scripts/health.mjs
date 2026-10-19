@@ -68,6 +68,9 @@ export const CPU_PSI_ALERT = 50;  // cpu some avg10 %: tasks waiting for a CPU
 export const IO_PSI_ALERT = 30;   // io full avg10 %: every task stalled on the disk
 
 /** Build the /health message. All inputs passed in → pure. */
+// Tappable next steps (Telegram turns a /command in the text into a link that sends it).
+export const HEALTH_SHORTCUTS = '/cswap   /type   /ls';
+
 export function formatHealth({ cores, load, mem, disk, agents, top, oomKills, locks = null, psi = null }) {
   const warn = [];
   const lines = ['🩺 Tình trạng máy', ''];
@@ -114,6 +117,7 @@ export function formatHealth({ cores, load, mem, disk, agents, top, oomKills, lo
   if (locks && locks.length) lines.push('', 'Hàng đợi lock:', ...locks);
   if (oomKills) warn.push(`${oomKills} lần OOM-kill trong 24 giờ qua (systemd-oomd). Có thể có agent đã bị tắt, xem /ls`);
   lines.push('', warn.length ? `⚠️ ${warn.join('\n⚠️ ')}` : '✅ Không có cảnh báo.');
+  lines.push('', HEALTH_SHORTCUTS);
   return lines.join('\n');
 }
 
