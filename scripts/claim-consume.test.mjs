@@ -54,6 +54,23 @@ test('autoConsumeClaimedPrompt: an ANSWERED claim is deleted', () => {
   fs.rmSync(d, { recursive: true, force: true });
 });
 
+test('autoConsumeClaimedPrompt: a batch deleted WITHOUT proof is echoed in full; with proof it is not', (t) => {
+  // The announce is the agent's only other copy and a host UI may truncate it, so
+  // a batch consumed on no proof must reach the agent through this send's output.
+  const logs = [];
+  t.mock.method(console, 'log', (...a) => logs.push(a.join(' ')));
+  const d = mk();
+  const long = 'Ma báo: ' + 'x'.repeat(2000) + ' — đuôi tin';
+  write(PROC(d), { claimId: 'tok', claimedAt: 5000, text: long });
+  assert.equal(autoConsumeClaimedPrompt(9, d, {}), true);
+  assert.equal(logs.length, 1);
+  assert.ok(logs[0].includes('without --claim-id') && logs[0].endsWith(long));
+  write(PROC(d), { claimId: 'tok2', claimedAt: 5000, text: 'handled' });
+  assert.equal(autoConsumeClaimedPrompt(9, d, { claimId: 'tok2' }), true);
+  assert.equal(logs.length, 1);                                  // proven → silent
+  fs.rmSync(d, { recursive: true, force: true });
+});
+
 test('autoConsumeClaimedPrompt: an UNREAD mid-turn claim is PARKED, never deleted', () => {
   const d = mk();
   write(PROC(d), { claimId: 'B-token', claimedAt: 5000, text: 'B — arrived while the agent was working' });

@@ -79,8 +79,9 @@ const TELE_REPLY_DIR = path.join(__dirname, 'tmp', 'tele-reply');
 // which was already composing this send.
 //
 // Losses are prevented on the delivery side instead: the listener announces the
-// batch's FULL text, so a batch consumed unread has still reached the agent's
-// context and can be re-requested — and an agent that passes `--claim-id` (the
+// batch's FULL text (and a host UI may still cut that short, so a no-proof
+// consume also echoes the text into the send's own output), so a batch consumed
+// unread has still reached the agent's context — and an agent that passes `--claim-id` (the
 // announce prints it, the guide mandates it) is never exposed to this at all.
 // ONE classifier for "does this send answer the batch sitting in the claim slot?".
 //
@@ -209,8 +210,16 @@ export function autoConsumeClaimedPrompt(convoId, tmpDir = TELE_REPLY_DIR, proof
   } catch { return false; }                      // no claim (or a peer took it) → nothing to do
   let claim = null;
   try { claim = JSON.parse(fs.readFileSync(taken, 'utf8')); } catch { claim = null; }
-  if (claimIsAnswered(claim, proof)) {
+  const verdict = sendAnswersClaim(claim, proof);
+  if (verdict !== 'no') {
     try { fs.rmSync(taken, { force: true }); } catch { /* best-effort */ }
+    // Deleted on NO proof: the agent may never have read this batch, and the only
+    // other copy it has is the announce, which a host UI may cut short (Claude
+    // Code's Monitor shows "...(truncated)"). Echo the full text into this send's
+    // own output so a batch is never deleted unseen.
+    if (verdict === 'unknown' && typeof claim?.text === 'string' && claim.text) {
+      console.log(`[send-telegram] ⚠️ consumed a batch without --claim-id — its full text, in case you had not read it:\n${claim.text}`);
+    }
     return true;
   }
   // Not ours: leave it parked. The listener's orphan sweep folds it back into the
