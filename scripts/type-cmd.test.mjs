@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url';
 import {
   classify, allowedOps, typeTargets, pinTarget, agentLine, messageNamesTarget, parseInputLine, suggestionSelects,
   rcDialogReady, targetMismatch, TypeRunner, listForType, TYPE_BUTTON_RE, COOLDOWN_MS, defaultIo, compactRefusedOnScreen, isPlaceholder,
-  CLEAR_ROUND, CLEAR_ROUNDS_PER_SEND, CLEAR_MAX_SENDS, NUDGE_TEXT, findTypeTarget, nudgeRefusal, unquoteTarget, lsLinks } from './type-cmd.mjs';
+  CLEAR_ROUND, CLEAR_ROUNDS_PER_SEND, CLEAR_MAX_SENDS, NUDGE_TEXT, NUDGE_LINES, NUDGE_MAX_LEN, findTypeTarget, nudgeText, unquoteTarget, lsLinks } from './type-cmd.mjs';
 
 const FIX = path.join(path.dirname(fileURLToPath(import.meta.url)), 'fixtures', 'type-hardcopy');
 const hc = (name) => fs.readFileSync(path.join(FIX, `${name}.txt`)).toString('latin1'); // as the daemon reads them
@@ -532,26 +532,65 @@ test('listForType: returns the context use per agent (null when the target no lo
 
 // ── RFC 26: /nudge, findTypeTarget ────────────────────────────────────────────
 
-const nudgeTyped = () => {
+const nudgeTyped = (text = NUDGE_TEXT) => {
   const L = hc('compact-typed').split('\n');
   const i = L.findIndex((l) => /^[^\s]\u00a0\/compact/.test(l.replace(/\0/g, '')));
-  L[i] = L[i].replace('/compact', NUDGE_TEXT);
+  L[i] = L[i].replace('/compact', text);
   return L.filter((l) => !/^\s+\S \//.test(l)).join('\n'); // no slash-suggestion rows for plain text
 };
 
 test('runner nudge: types the fixed line (no slash-suggestion check), verifies, Enter', async () => {
   const { io, st } = fakeIo({ screens: [IDLE, nudgeTyped(), nudgeTyped()] });
-  io.nudgeSignals = () => ({ listener: 'off', mail: 0 });
+  io.nudgeSignals = () => ({ listener: 'off', mail: 1 });
   const r = await new TypeRunner(io).run('n', T);
   assert.deepEqual(st.keys, [NUDGE_TEXT, '\r']);
   assert.match(r.text, /đã nudge #abcd1234/);
 });
 
-test('runner nudge: a healthy agent (listener on, no mail) is refused at RUN time — no key', async () => {
-  const { io, st } = fakeIo({ screens: [IDLE, nudgeTyped()] });
+test('runner nudge: the result names the persona when given', async () => {
+  const { io } = fakeIo({ screens: [IDLE, nudgeTyped(), nudgeTyped()] });
+  io.nudgeSignals = () => ({ listener: 'off', mail: 1 });
+  const r = await new TypeRunner(io).run('n', T, 'owner', { persona: '🐺 Sói' });
+  assert.match(r.text, /đã nudge 🐺 Sói #abcd1234/);
+});
+
+test('runner compact: the typed message names the persona when given', async () => {
+  const { io } = fakeIo({ screens: [IDLE, hc('compact-typed'), hc('compact-typed')] });
+  const r = await new TypeRunner(io).run('c', T, 'owner', { persona: '👻 Ma' });
+  assert.match(r.text, /đã gõ \/compact vào 👻 Ma #abcd1234/);
+});
+
+test('every nudge line fits an 80-column input line and asks for a Telegram status', () => {
+  for (const s of Object.values(NUDGE_LINES)) {
+    assert.ok(s.length <= NUDGE_MAX_LEN, `${s.length} > ${NUDGE_MAX_LEN}: ${s}`);
+    assert.match(s, /post a status in your topic\.$/);
+  }
+});
+
+test('nudgeText: asks only for what is broken; neither or unknown → both (force)', () => {
+  assert.equal(nudgeText({ listener: 'off', mail: 2 }), NUDGE_LINES.both);
+  assert.equal(nudgeText({ listener: 'off', mail: 0 }), NUDGE_LINES.listener);
+  assert.equal(nudgeText({ listener: 'on', mail: 3 }), NUDGE_LINES.mail);
+  assert.equal(nudgeText({ listener: 'on', mail: 0 }), NUDGE_LINES.both, 'healthy → force both');
+  assert.equal(nudgeText({ listener: null, mail: null }), NUDGE_LINES.both, 'unknown → both');
+  assert.equal(nudgeText({ listener: null, mail: 1 }), NUDGE_LINES.mail);
+  assert.equal(nudgeText({ listener: 'off', mail: null }), NUDGE_LINES.listener);
+  assert.equal(nudgeText(), NUDGE_LINES.both);
+});
+
+test('runner nudge: a healthy agent (listener on, no mail) is still nudged — the owner asked (force)', async () => {
+  const { io, st } = fakeIo({ screens: [IDLE, nudgeTyped(), nudgeTyped()] });
   io.nudgeSignals = () => ({ listener: 'on', mail: 0 });
-  assert.match((await new TypeRunner(io).run('n', T)).text, /không nudge/);
-  assert.deepEqual(st.keys, []);
+  assert.match((await new TypeRunner(io).run('n', T)).text, /đã nudge #abcd1234/);
+  assert.deepEqual(st.keys, [NUDGE_LINES.both, '\r']);
+});
+
+test('runner nudge: mail only → types the mailbox line', async () => {
+  const line = NUDGE_LINES.mail;
+  const { io, st } = fakeIo({ screens: [IDLE, nudgeTyped(line), nudgeTyped(line)] });
+  io.nudgeSignals = () => ({ listener: 'on', mail: 1 });
+  await new TypeRunner(io).run('n', T);
+  assert.deepEqual(st.keys, [line, '\r']);
 });
 
 test('runner nudge: the line wrapped / differs on screen → typed but NO Enter', async () => {
@@ -568,11 +607,7 @@ test('runner: an unknown op is an error, never /remote-control', async () => {
   assert.deepEqual(st.keys, []);
 });
 
-test('nudgeRefusal / unquoteTarget', () => {
-  assert.match(nudgeRefusal({ listener: 'on', mail: 0 }), /không nudge/);
-  assert.equal(nudgeRefusal({ listener: 'off', mail: 0 }), null);
-  assert.equal(nudgeRefusal({ listener: 'on', mail: 2 }), null);
-  assert.equal(nudgeRefusal({ listener: null, mail: null }), null, 'unknown → go');
+test('unquoteTarget', () => {
   assert.equal(unquoteTarget('“Cà Rồng”'), 'Cà Rồng');
   assert.equal(unquoteTarget("'Ma'"), 'Ma');
   assert.equal(unquoteTarget('"Ma”'), '"Ma”', 'mismatched pair stays');
