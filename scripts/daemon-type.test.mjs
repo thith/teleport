@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { startType, handleTypeButton, takeTypeButton, typeStep2, takeMergeButton, dispatchCommand, killViaSpawn, runTypeCommand, startTapKill, parseDaemonCommand } from './daemon.mjs';
+import { startType, handleTypeButton, takeTypeButton, typeStep2, takeMergeButton, dispatchCommand, killViaSpawn, runTypeCommand, startTapKill, nudgeAll, parseDaemonCommand } from './daemon.mjs';
 
 const T = { pid: 644406, procStart: '5', sessionId: 'S', screenPid: 644405, screen: 'tele-c2383556', hashtag: 'c2383556', cwd: '/w' };
 const T2 = { ...T, pid: 331131, screenPid: 331130, screen: 'tele-d8133684', hashtag: 'd8133684' };
@@ -249,14 +249,40 @@ test('/compact <name>: runs TypeRunner op c on the found agent; under 100k it st
   await runTypeCommand('c', 'Ma', { id: 42 }, ctx, { list: () => [row({ pid: 644406, hashtag: 'c2383556', sessionId: 'S', name: 'umipay-ae' })], io: liveIo, runner, personaOf: (h) => (h === 'c2383556' ? '👻 Ma' : null), deliver: async (p) => delivered.push(p) });
   assert.deepEqual(ran, [['c', 644406]]);
   assert.match(sent[0], /ctx 42k/);
-  assert.match(sent[1], /#c2383556: ✅ đã compact/);
+  assert.match(sent[1], /^👻 Ma #c2383556: ✅ đã compact/);
 });
 
-test('/nudge: no target → usage; unknown → error; drifted target → no run', async () => {
+test('/compact with no target → usage', async () => {
+  const sent = []; const ctx = { daemonUserId: '42', sendText: async (c, t) => sent.push(t), projectsConfig: {} };
+  await runTypeCommand('c', '', { id: 42 }, ctx, { list: () => [], io: liveIo, runner: { run: async () => { throw new Error('must not run'); } } });
+  assert.match(sent.at(-1), /usage: \/compact/);
+});
+
+test('/nudge with no target: every agent with listener off or mail, never a healthy one, a twin hashtag or a drifted one', async () => {
+  const sent = []; const ran = [];
+  const ctx = { daemonUserId: '42', sendText: async (c, t) => sent.push(t), projectsConfig: {} };
+  const runner = { run: async (op, t, who, o) => { ran.push([op, t.hashtag, o.persona]); return { text: `👋 đã nudge ${o.persona ? `${o.persona} ` : ''}#${t.hashtag}.` }; } };
+  const sig = { aaaa0001: { listener: 'off', mail: 0 }, aaaa0002: { listener: 'on', mail: 2 }, aaaa0003: { listener: 'on', mail: 0 }, aaaa0004: { listener: 'off', mail: 1 }, aaaa0005: { listener: null, mail: null } };
+  const rows = [
+    row({ pid: 101, hashtag: 'aaaa0001', sessionId: 'S' }), row({ pid: 102, hashtag: 'aaaa0002', sessionId: 'S' }),
+    row({ pid: 103, hashtag: 'aaaa0003', sessionId: 'S' }), row({ pid: 104, hashtag: 'aaaa0004', sessionId: 'S' }),
+    { pid: 900, hashtag: 'aaaa0004', sessionId: 'S9', procStart: '5' }, // a terminal twin of aaaa0004
+    row({ pid: 105, hashtag: 'aaaa0005', sessionId: 'S' }),
+  ];
+  const io = { ...liveIo, ppid: (pid) => pid - 1, nudgeSignals: (t) => sig[t.hashtag] };
+  await nudgeAll({ id: 42 }, ctx, { list: () => rows, io, runner, personaOf: (h) => (h === 'aaaa0001' ? '🐺 Sói' : null) });
+  assert.deepEqual(ran, [['n', 'aaaa0001', '🐺 Sói'], ['n', 'aaaa0002', null]]);
+  assert.equal(sent.length, 1);
+  assert.match(sent[0], /đã nudge 🐺 Sói #aaaa0001\.\n👋 đã nudge #aaaa0002\.\n❌ #aaaa0004: hashtag trùng 2 process/);
+  await nudgeAll({ id: 42 }, ctx, { list: () => [rows[2]], io, runner });
+  assert.match(sent.at(-1), /không có agent nào cần nudge/);
+  await runTypeCommand('n', '', { id: 42 }, ctx, { list: () => [rows[0]], io: { ...io, windows: () => 2 }, runner });
+  assert.match(sent.at(-1), /#aaaa0001: .*2 cửa sổ.*bỏ qua/);
+});
+
+test('/nudge: unknown → error; drifted target → no run', async () => {
   const sent = []; const ctx = { daemonUserId: '42', sendText: async (c, t) => sent.push(t), projectsConfig: {} };
   const runner = { run: async () => { throw new Error('must not run'); } };
-  await runTypeCommand('n', '', { id: 42 }, ctx, { list: () => [], io: liveIo, runner });
-  assert.match(sent.at(-1), /usage: \/nudge/);
   await runTypeCommand('n', 'Nobody', { id: 42 }, ctx, { list: () => [], io: liveIo, runner });
   assert.match(sent.at(-1), /không thấy/);
   await runTypeCommand('n', '#c2383556', { id: 42 }, ctx, { list: () => [row({ pid: 644406, hashtag: 'c2383556', sessionId: 'S' })], io: { ...liveIo, windows: () => 2 }, runner });

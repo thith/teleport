@@ -79,7 +79,7 @@ import { shortConvoHash } from './convo-hash.mjs';
 import { personaByHashtag } from './spawn.mjs';
 import {
   TypeRunner, listForType, allowedOps, agentLine, messageNamesTarget, defaultIo, observe, classify,
-  findTypeTarget, pinTarget, nudgeRefusal,
+  findTypeTarget, pinTarget, typeTargets, agentLabel,
   TYPE_BUTTON_RE, TYPE_BUTTON_TTL_MS, TYPE_OPS, STATE_LABEL, COMPACT_OK, COMPACT_MIN_TOKENS,
 } from './type-cmd.mjs';
 import { listClaudeProcs } from './claude-procs.mjs';
@@ -1014,22 +1014,50 @@ export function buildCompactNoticePrompt({ convoId, chatId, text }) {
 export async function runTypeCommand(op, rest, from, ctx, { list = () => listClaudeProcs(), io = defaultIo(), runner = getTypeRunner(), personaOf = personaLookup(), deliver = deliverResult } = {}) {
   const { daemonUserId, sendText, projectsConfig } = ctx;
   const cmd = op === 'c' ? '/compact' : '/nudge';
+  if (op === 'n' && !String(rest || '').trim()) return nudgeAll(from, ctx, { list, io, runner, personaOf });
   if (!String(rest || '').trim()) { await sendText(daemonUserId, `usage: ${cmd} <tên | #hashtag>  (bấm ${cmd}_<hashtag> trong /ls)`); return; }
   const f = findTypeTarget(rest, list(), personaOf);
   if (f.error) { await sendText(daemonUserId, `❌ ${cmd}: ${f.error}`); return; }
   const t = pinTarget(f.row);
+  const persona = personaOf(t.hashtag);
   const obs = observe(t, io);
-  if (obs.mismatch) { await sendText(daemonUserId, `❌ ${cmd} #${t.hashtag}: ${obs.mismatch}.`); return; }
+  if (obs.mismatch) { await sendText(daemonUserId, `❌ ${cmd} ${agentLabel(t, persona)}: ${obs.mismatch}.`); return; }
   const ctxNote = op === 'c' ? formatContext(obs.usage, contextWindowFor(projectsConfig || {}, { hashtag: t.hashtag, model: obs.usage?.model })) : null;
-  const r = await runner.run(op, t, String(from?.id ?? 'owner'));
+  const r = await runner.run(op, t, String(from?.id ?? 'owner'), { persona });
   await sendText(daemonUserId, `${r.text}${ctxNote && obs.usage?.tokens != null && obs.usage.tokens < COMPACT_MIN_TOKENS ? ` (${ctxNote})` : ''}`);
   if (!r.watch) return;
   const more = await r.watch().catch((e) => `❔ ${e?.message ?? e}`);
-  await sendText(daemonUserId, `#${t.hashtag}: ${more}`);
+  await sendText(daemonUserId, `${agentLabel(t, persona)}: ${more}`);
   const convoId = uuidToConvoInt(t.sessionId);
   if (String(more).startsWith(COMPACT_OK) && convoId != null) {
     await deliver({ convoId, text: more }, { build: buildCompactNoticePrompt }).catch((e) => console.error(`[daemon] compact notice: ${e?.message ?? e}`));
   }
+}
+
+/**
+ * `/nudge` with no target (Thi 11261): every typeable agent whose listener is off or has unread mail, one at
+ * a time, each through the same TypeRunner checks. Never a healthy one (the force is for a named target), never
+ * a hashtag shared by two live processes. One summary message, one line per agent.
+ */
+export async function nudgeAll(from, ctx, { list = () => listClaudeProcs(), io = defaultIo(), runner = getTypeRunner(), personaOf = personaLookup() } = {}) {
+  const { daemonUserId, sendText } = ctx;
+  const rows = list();
+  const seen = new Map();
+  for (const r of rows) if (r.hashtag) seen.set(r.hashtag, (seen.get(r.hashtag) || 0) + 1);
+  const out = [];
+  for (const r of typeTargets(rows)) {
+    const t = pinTarget(r);
+    const s = io.nudgeSignals?.(t);
+    if (!(s?.listener === 'off' || s?.mail > 0)) continue;
+    const persona = personaOf(t.hashtag);
+    const name = agentLabel(t, persona);
+    if (seen.get(t.hashtag) > 1) { out.push(`❌ ${name}: hashtag trùng ${seen.get(t.hashtag)} process — bỏ qua (xem /ls).`); continue; }
+    const obs = observe(t, io);
+    if (obs.mismatch) { out.push(`❌ ${name}: ${obs.mismatch} — bỏ qua.`); continue; }
+    const res = await runner.run('n', t, String(from?.id ?? 'owner'), { persona }).catch((e) => ({ text: `❌ ${name}: ${e?.message ?? e}` }));
+    out.push(res.text);
+  }
+  await sendText(daemonUserId, out.length ? out.join('\n') : 'ℹ️ không có agent nào cần nudge (listener đều chạy, không ai có thư chưa đọc).');
 }
 
 /**
@@ -1147,7 +1175,7 @@ export async function handleTypeButton(cq, ctx, { runner = getTypeRunner(), list
   }
   await ctx.answerButton(cq.id, op === 'i' ? 'Đang đọc ô nhập…' : op === 'u' ? 'Đang xoá ô nhập…' : `Đang gõ ${TYPE_OPS[op] === 'esc' ? 'Esc' : TYPE_OPS[op]}…`);
   await ctx.editButtonRows(chatId, messageId, `${base}\n\n⏳ ${op === 'i' ? 'đang đọc' : op === 'u' ? 'đang xoá' : 'đang gõ'} ${TYPE_OP_LABEL[op]}…`, []);
-  const r = await runner.run(op, entry.target, String(cq.from?.id ?? 'owner'));
+  const r = await runner.run(op, entry.target, String(cq.from?.id ?? 'owner'), { persona: personaLookup()(entry.target.hashtag) });
   if (r.canClear) { // the box holds text: offer [🧹 Xoá] (a fresh one-shot token for the same pinned target)
     const t2 = crypto.randomBytes(8).toString('hex');
     ctx.buttonStore.set(t2, { kind: 'type', target: entry.target, chatId, messageId, createdAt: Date.now(), ops: ['u', 'x'] });

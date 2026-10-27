@@ -46,8 +46,15 @@ export const AUDIT_FILE = path.join(process.env.XDG_STATE_HOME || path.join(os.h
 // op letter (callback data) → command. Fixed table: the command never comes from stored data.
 // 'k' only asks (a confirm button follows); 'y' is that confirmation: /kill pid:<PID> (SIGTERM), not a keystroke.
 export const TYPE_OPS = { c: '/compact', r: '/remote-control', e: 'esc', i: 'read-input', u: 'clear-input', k: 'kill-ask', y: 'kill', n: 'nudge' };
-// The ONE line /nudge types (Thi, RFC 26) — fixed, never from input.
-export const NUDGE_TEXT = 'Restart Telegram monitor and check your mailbox.';
+// The lines /nudge types (Thi, RFC 26) — fixed, never from input. They arrive as host input, so each asks
+// for a Telegram status or the owner sees nothing. Keep them ≤ NUDGE_MAX_LEN: an 80-column screen must not wrap one.
+export const NUDGE_LINES = {
+  both: 'Restart Telegram monitor, check mailbox, post a status in your topic.',
+  listener: 'Restart Telegram monitor, then post a status in your topic.',
+  mail: 'Check your mailbox, then post a status in your topic.',
+};
+export const NUDGE_TEXT = NUDGE_LINES.both;
+export const NUDGE_MAX_LEN = 70;
 export const COMPACT_OK = '✅ đã compact'; // a watch() result starting with this = a confirmed compaction
 export const TYPE_BUTTON_RE = /^ty:(?:pick:([0-9a-z]{8})|([0-9a-f]{16}):([crexiukyn]))$/;
 
@@ -152,14 +159,21 @@ export function findTypeTarget(query, rows, personaOf = () => null) {
   return { error: elsewhere.length ? `${label(elsewhere[0])} không ở trong screen tele-* của nó — không gõ được (xem /ls).` : `không thấy agent "${t.value}" đang chạy (xem /ls).` };
 }
 
-/** Is a nudge worth sending? `listener` 'on'|'off'|null, `mail` unread count|null. → null (go) | reason. Pure. */
-export function nudgeRefusal({ listener, mail }) {
-  return listener === 'on' && mail === 0 ? 'listener đang chạy, không có thư — không nudge (nhắn bằng /w nếu cần).' : null;
+/**
+ * Which line to type: ask only for what is broken — listener off, mail waiting. Neither (or unknown) → both:
+ * the owner asked anyway, so it is a force (Thi). `listener` 'on'|'off'|null, `mail` unread count|null. Pure.
+ */
+export function nudgeText({ listener, mail } = {}) {
+  const off = listener === 'off', unread = mail > 0;
+  return off === unread ? NUDGE_LINES.both : off ? NUDGE_LINES.listener : NUDGE_LINES.mail;
 }
 
 /** One agent line — carries `#hash` and `PID n` (a press is checked against them). Pure. */
+/** `🐺 Sói #d7261652`, or `#d7261652` without a persona — how results name an agent (Thi 11247, 11264). Pure. */
+export const agentLabel = (t, persona = null) => `${persona ? `${persona} ` : ''}#${t.hashtag}`;
+
 export function agentLine(t, { persona = null, state = 'unknown', ctx = null, bridge = null } = {}) {
-  return [`${persona ? `${persona} ` : ''}#${t.hashtag}`, `PID ${t.pid}`, STATE_LABEL[state] || state, ctx, bridge ? '📡' : null].filter(Boolean).join(' · ');
+  return [agentLabel(t, persona), `PID ${t.pid}`, STATE_LABEL[state] || state, ctx, bridge ? '📡' : null].filter(Boolean).join(' · ');
 }
 
 /** A press is only honoured if the message the owner saw names the entry's target. Pure. */
@@ -296,7 +310,7 @@ export class TypeRunner {
   }
 
   /** Run `op` ('c'|'r'|'e') against pinned target `t`. → { text, watch? } — `watch()` resolves a later result line. */
-  async run(op, t, who = 'owner') {
+  async run(op, t, who = 'owner', { persona = null } = {}) {
     const audit = (step, extra = {}) => this.io.audit({ who, op: TYPE_OPS[op], pid: t.pid, sessionId: t.sessionId, hashtag: t.hashtag, step, ...extra });
     if (op === 'e') return this.esc(t, audit);
     if (this.locks.has(t.pid)) return { text: '⏳ đang gõ lệnh khác vào agent này — thử lại sau.' };
@@ -309,10 +323,10 @@ export class TypeRunner {
     this.cancel.delete(t.pid);
     this.keysDone.delete(t.pid);
     try {
-      if (op === 'c') return await this.compact(t, audit);
+      if (op === 'c') return await this.compact(t, audit, persona);
       if (op === 'u') return await this.clearInput(t, audit);
       if (op === 'r') return await this.remoteControl(t, audit);
-      if (op === 'n') return await this.nudge(t, audit);
+      if (op === 'n') return await this.nudge(t, audit, persona);
       audit('refused', { reason: `unknown op ${op}` });
       return { text: `❌ lệnh không hợp lệ (${op}).` };
     }
@@ -387,7 +401,7 @@ export class TypeRunner {
     return { ok: true, file, offset, screenBefore: scr, queued: last.state === 'busy' };
   }
 
-  async compact(t, audit) {
+  async compact(t, audit, persona = null) {
     const r = await this.typeAndEnter(t, '/compact', audit, { allowBusy: true });
     if (!r.ok) return r;
     const io = this.io;
@@ -412,16 +426,15 @@ export class TypeRunner {
       audit('result', { result: 'timeout' });
       return `❔ chưa thấy compact xong sau ${r.queued ? 30 : 5} phút — kiểm tra tay.`;
     };
-    return { text: `⌨️ đã gõ /compact vào #${t.hashtag}${r.queued ? ' (đang bận → đã xếp hàng, chạy khi xong lượt)' : ''} — đang chờ kết quả…`, watch };
+    return { text: `⌨️ đã gõ /compact vào ${agentLabel(t, persona)}${r.queued ? ' (đang bận → đã xếp hàng, chạy khi xong lượt)' : ''} — đang chờ kết quả…`, watch };
   }
 
-  async nudge(t, audit) {
-    // Checked HERE (not only when a button was drawn): an old 👋 pressed after the listener came back must not fire.
-    const why = nudgeRefusal(this.io.nudgeSignals ? this.io.nudgeSignals(t) : { listener: null, mail: null });
-    if (why) { audit('refused', { reason: 'healthy' }); return { text: `ℹ️ #${t.hashtag}: ${why}` }; }
-    const r = await this.typeAndEnter(t, NUDGE_TEXT, audit, { allowBusy: true, slash: false });
+  async nudge(t, audit, persona = null) {
+    // Signals read HERE (not when a button was drawn): the line matches the agent as it is now.
+    const line = nudgeText(this.io.nudgeSignals ? this.io.nudgeSignals(t) : {});
+    const r = await this.typeAndEnter(t, line, audit, { allowBusy: true, slash: false });
     if (!r.ok) return r;
-    return { text: `👋 đã nudge #${t.hashtag}${r.queued ? ' (đang bận → đã xếp hàng, chạy khi xong lượt)' : ''}.` };
+    return { text: `👋 đã nudge ${agentLabel(t, persona)}${r.queued ? ' (đang bận → đã xếp hàng, chạy khi xong lượt)' : ''}.` };
   }
 
   async remoteControl(t, audit) {
