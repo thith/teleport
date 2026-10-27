@@ -171,6 +171,28 @@ test('formatAgentList: one block per claude process — title, `<emoji> <name>: 
   assert.equal(empty, '📺 Screen (0)\n\n(không có)\n\n🖥 Terminal (0)\n\n(không có)');
 });
 
+test('formatAgentList full:false — one line per agent (icon, name #hash, state, ctx, 🔇, 📬) + its links', () => {
+  const procs = [
+    { pid: 1, etime: '1:00', cwd: '/w/a', screen: 'tele-a7611284', sessionId: SID, hashtag: 'a7611284', name: 'sess-a', status: 'busy' },
+    { pid: 2, etime: '1:00', cwd: '/w/b', screen: null, sessionId: null, hashtag: null, name: 'term', status: null },
+    { pid: 3, etime: '1:00', cwd: '/w/c', screen: null, sessionId: null, hashtag: null, name: null, status: null },
+  ];
+  const out = formatAgentList({
+    full: false, screens: [{ name: 'tele-empty123' }], procs,
+    personaOf: (h) => (h === 'a7611284' ? '🪱 Giun' : null),
+    ctxOf: (r) => (r.pid === 1 ? 'ctx 150k (15%)' : null),
+    listenerOf: () => 'off', mailOf: () => 2,
+    linksOf: (r) => (r.pid === 1 ? ['/compact_a7611284', '/kill_a7611284', '/nudge_a7611284'] : []),
+  });
+  assert.equal(out, [
+    '📺 tele-empty123 · không thấy claude bên trong',
+    '📺 🪱 Giun #a7611284 · busy · 150k (15%) · 🔇 · 📬2\n/compact_a7611284 /kill_a7611284 /nudge_a7611284',
+    '🖥 term',
+    '🖥 PID 3',
+  ].join('\n\n'));
+  assert.equal(formatAgentList({ full: false }), '(không có agent nào)');
+});
+
 test('formatAgentList: a throwing lookup drops its line, never the list', () => {
   const boom = () => { throw new Error('x'); };
   const out = formatAgentList({ procs: [{ pid: 2, sessionId: SID, hashtag: 'a7611284', cwd: '/w' }], personaOf: boom, ctxOf: boom, linksOf: boom, statusLinesOf: boom, mailOf: boom });

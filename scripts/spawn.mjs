@@ -1295,7 +1295,8 @@ if (isDirectRun) {
       screens, procs,
       personaOf: (h) => (pmap[h] ? formatPersona(pmap[h]) : null),
       statusLinesOf: (c) => statusOf?.lines(c) ?? [], mailOf, convoOfHashtag: (h) => cmap[h] ?? null,
-      showSession: fromId === '',
+      showSession: fromId === '', full: fromId === '' || argv.includes('full') || argv.includes('--full'), // a terminal always gets the UUIDs
+      listenerOf: (c) => statusOf?.listener(c) ?? null,
       ctxOf: (r) => {
         const u = usage(r);
         return formatContext(u, contextWindowFor(cfg, { hashtag: r.hashtag, model: u?.model }));

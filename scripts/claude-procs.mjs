@@ -213,8 +213,10 @@ export function buildProcRows({ psRows, uid, sessions = new Map(), procExtras = 
  *                 when the claude inside carries no session id.
  *   ctxOf(row) → "ctx 172k (17%)" | null; linksOf(row) → ['/kill_x', …] (the caller decides who may tap)
  *   showSession — print the full session UUID (terminal use; hidden on Telegram).
+ *   full     — false (the default `/ls`, Thi): one line per agent — 📺/🖥, name #hashtag, state, context,
+ *              🔇 listener off / 📬 mail — then its links; no section headers. `listenerOf(convo)` → 'on'|'off'|null.
  */
-export function formatAgentList({ screens = [], procs = [], personaOf = () => null, home = os.homedir(), statusLinesOf = () => [], mailOf = () => null, convoOfHashtag = () => null, ctxOf = () => null, linksOf = () => [], showSession = true } = {}) {
+export function formatAgentList({ screens = [], procs = [], personaOf = () => null, home = os.homedir(), statusLinesOf = () => [], mailOf = () => null, convoOfHashtag = () => null, ctxOf = () => null, linksOf = () => [], showSession = true, full = true, listenerOf = () => null } = {}) {
   // Folder name only (Thi: "chỉ hiện tên folder") — the full path is noise on a phone.
   const short = (p) => (p ? (p === home ? '~' : path.basename(p)) : null);
   // Every injected lookup is best-effort: a throw drops that line, never the whole /ls.
@@ -253,6 +255,21 @@ export function formatAgentList({ screens = [], procs = [], personaOf = () => nu
     ].filter(Boolean).join('\n');
   };
 
+  // The short form: everything needed to pick an agent and tap — details are in `/ls full`.
+  const line = (r) => {
+    const tag = r.hashtag || (typeof r.screen === 'string' && r.screen.startsWith('tele-') ? r.screen.slice(5) : null);
+    const convo = convoOf(r);
+    const ctx = safe(() => ctxOf(r), null);
+    const mail = convo != null ? safe(() => mailOf(convo), null) : null;
+    const off = convo != null && safe(() => listenerOf(convo), null) === 'off';
+    const links = safe(() => linksOf(r), []);
+    const head = [
+      `${r.screen ? '📺' : '🖥'} ${[persona(tag) || r.name, tag ? `#${tag}` : null].filter(Boolean).join(' ') || `PID ${r.pid}`}`,
+      r.status, ctx ? String(ctx).replace(/^ctx /, '') : null, off ? '🔇' : null, mail > 0 ? `📬${mail}` : null,
+    ].filter(Boolean).join(' · ');
+    return links.length ? `${head}\n${links.join(' ')}` : head;
+  };
+
   const inScreen = new Map(); // screen name → claude rows inside it
   const terminal = [];
   for (const r of procs) {
@@ -263,10 +280,11 @@ export function formatAgentList({ screens = [], procs = [], personaOf = () => nu
 
   const screenBlocks = screenNames.flatMap((name) => {
     const rows = inScreen.get(name) || [];
-    if (rows.length) return rows.map(block);
+    if (rows.length) return rows.map(full ? block : line);
     const p = name.startsWith('tele-') ? persona(name.slice(5)) : null;
     return [`📺 ${[name, p].filter(Boolean).join(' · ')} · không thấy claude bên trong`];
   });
+  if (!full) return [...screenBlocks, ...terminal.map(line)].join('\n\n') || '(không có agent nào)';
   const section = (head, blocks) => [head, ...(blocks.length ? blocks : ['(không có)'])].join('\n\n');
   return [
     section(`📺 Screen (${screenNames.length})`, screenBlocks),

@@ -99,7 +99,7 @@ another resume of the same session is in progress (per-session lock) — stop th
   `tele-<hashtag>` in its **old cwd**. Everything the restart needs (a session id from the session file — never a
   guess — and its transcript) is checked **before** killing, so a doomed restart kills nothing.
 - **Agent đã chết** (bị OOM, crash…): `/resume <tên persona | #hashtag>` (hoặc bấm `/resume_<hashtag>` — kill in ra sẵn; hai session cùng hashtag → từ chối, resume bằng UUID) — tìm session + folder theo tên, resume trong screen; khỏi gõ UUID. (`/kill … --restart` chỉ dùng cho agent còn sống.)
-- Typical flow: `/ls` → `/kill pid:<PID> --restart` (or tap `/kill_<hash>`, then `/resume_<hash>`). `/ls` on Telegram shows one block per agent with tappable `/compact_ /kill_ /nudge_` (owner, only where they apply) and no session UUID; run `node ../teleport/scripts/spawn.mjs --ls` in a terminal to see the UUIDs.
+- Typical flow: `/ls` → `/kill pid:<PID> --restart` (or tap `/kill_<hash>`, then `/resume_<hash>`). `/ls` on Telegram shows one short line per agent (`/ls full`: one block per agent) with tappable `/compact_ /kill_ /nudge_` (owner, only where they apply) and no session UUID; run `node ../teleport/scripts/spawn.mjs --ls` in a terminal to see the UUIDs.
 - If you are the agent that wakes up from such a restart: follow the seed prompt (mailbox → Monitor → greet).
 
 The helper takes NO task argument (prompt is hard-coded); the user assigns work via Telegram
