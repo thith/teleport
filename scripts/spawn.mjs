@@ -42,7 +42,7 @@ import { formatPersona } from './persona.mjs';
 import { peekPersona } from './persona-store.mjs';
 import {
   listClaudeProcs, findProcForSession, findUnidentifiedProcs, cwdToProjectSlug, PROJECTS_DIR,
-  formatAgentList, parseKillPidArg, killClaudePid, KILL_PID_GRACE_MS, inspectPid, etimeToSeconds,
+  formatAgentList, hashtagForSession, parseKillPidArg, killClaudePid, KILL_PID_GRACE_MS, inspectPid, etimeToSeconds,
 } from './claude-procs.mjs';
 import { readProjectsConfig, resolveDaemonUserId } from './projects-config.mjs';
 import { transcriptState, formatContext, contextWindowFor } from './transcript-state.mjs';
@@ -1367,7 +1367,8 @@ if (isDirectRun) {
         appendKillAudit({ pid: killPid.pid, fromId, result: res.error ? 'restart-failed' : 'restarted', reason: res.error, sessionId: t?.sessionId ?? null, screen: res.plan?.sessionName ?? null });
         if (res.error) {
           console.error(`[spawn] ❌ killed, but restart failed: ${res.error}`);
-          if (t?.sessionId && !t.guessed) console.error(`[spawn] retry: /spawn <project> --resume-session ${t.sessionId}`);
+          const tag = t?.sessionId && !t.guessed ? (t.hashtag || hashtagForSession(t.sessionId)) : null;
+          if (tag) console.error(`[spawn] retry: /resume #${tag}`);
           process.exit(1);
         }
         console.log(`[spawn] 🔁 restarted session ${t.sessionId} in screen "${res.plan.sessionName}" (cwd ${t.cwd}) → topic #${res.plan.sessionName.replace(/^tele-/, '')}. It will check its mailbox, re-arm its listener and greet in its topic.`);
@@ -1375,7 +1376,8 @@ if (isDirectRun) {
         process.exit(0);
       }
       // Only suggest a resume for a session we KNOW (session file), never a guess.
-      if (t?.sessionId && !t.guessed) console.log(`[spawn] resume it in a screen: /spawn <project> --resume-session ${t.sessionId}`);
+      const tag = t?.sessionId && !t.guessed ? (t.hashtag || hashtagForSession(t.sessionId)) : null;
+      if (tag) console.log(`[spawn] resume it: /resume #${tag}`);
       process.exit(0);
     }
     console.error(`[spawn] ⚠️ PID ${killPid.pid} still alive after ${KILL_PID_GRACE_MS / 1000}s (SIGTERM sent, no SIGKILL by design). Check /ls, retry later.`);
@@ -1406,6 +1408,7 @@ if (isDirectRun) {
     console.log(r.method === 'exit'
       ? `[spawn] "${name}" exited gracefully (/exit).`
       : `[spawn] "${name}" didn't exit in ${KILL_GRACE_MS / 1000}s — force-killed.`);
+    console.log(`[spawn] resume it: /resume #${name.replace(/^tele-/, '')}`);
     process.exit(0);
   }
 

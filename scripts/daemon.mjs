@@ -899,6 +899,8 @@ const TYPE_OP_LABEL = { c: '/compact', r: '/remote-control', e: '⎋ Esc', i: '�
 // Buttons are emoji only (Thi), except Esc (short already); no legend (the owner knows them).
 const TYPE_BUTTON_LABEL = { c: '🗜️', r: '📡', e: 'Esc', i: '🔍', u: '🧹', k: '💀', y: '✅' };
 const CANCEL_BUTTON = (tok) => ({ text: '✖', callback_data: `ty:${tok}:x` });
+// Below this context /compact gains little (Thi): no 🗜️ button. Unknown usage keeps it.
+export const COMPACT_MIN_TOKENS = 100_000;
 let typeRunner = null; // one per daemon: per-agent locks, cool-down, Esc rate limit
 const getTypeRunner = () => (typeRunner ||= new TypeRunner(defaultIo()));
 
@@ -912,7 +914,8 @@ const personaLookup = () => {
 export function typeStep2({ target, obs, persona, cfg = {}, tok }) {
   const ctx = obs.mismatch ? null : formatContext(obs.usage, contextWindowFor(cfg, { hashtag: target.hashtag, model: obs.usage?.model }));
   const line = agentLine(target, { persona, state: obs.mismatch ? 'unknown' : obs.state, ctx, bridge: obs.bridge });
-  const ops = obs.mismatch ? [] : allowedOps(obs.state, obs.bridge);
+  const small = obs.usage?.tokens != null && obs.usage.tokens < COMPACT_MIN_TOKENS;
+  const ops = obs.mismatch ? [] : allowedOps(obs.state, obs.bridge).filter((op) => !(op === 'c' && small));
   // Kill works in any state (a stuck agent is the usual reason), but not on a target that changed under us.
   const buttons = obs.mismatch ? [] : [...ops, 'k'];
   const text = `⌨️ /type — ${line}\n`
