@@ -68,4 +68,7 @@ test('findResumeTarget: reports skipped live namesakes; accepts the name: prefix
   assert.match(findResumeTarget('pid:123', C).error, /usage/);
   const twin = [...C, { ...C.find((c) => c.hashtag === 'c2383556'), sessionId: 's9', mtimeMs: 1 }];
   assert.match(findResumeTarget('#c2383556', twin).error, /matches 2 sessions/, 'two sessions behind one hashtag → refuse');
+  assert.match(findResumeTarget('#c2383556', C, { liveRows: [{ pid: 4, hashtag: 'c2383556', sessionId: 'zz' }] }).error, /also belongs to live claude PID 4/);
+  assert.match(findResumeTarget('#c2383556', C, { liveRows: [{ pid: 4, hashtag: 'c2383556', sessionId: 's3', guessed: true }] }).error, /PID 4/, 'a guess is not proof');
+  assert.match(findResumeTarget('#c2383556', C, { aliveSessions: new Set(['s3']), liveRows: [{ pid: 4, hashtag: 'c2383556', sessionId: 's3' }] }).error, /still running/, 'its own live process → the usual refusal');
 });

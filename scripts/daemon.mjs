@@ -107,7 +107,8 @@ export function parseDaemonCommand(text) {
   if (!m) return null;
   const cmd = m[1].toLowerCase(), rest = (m[3] ?? '').trim();
   if (m[2] == null) return { cmd, rest };
-  if (!TAP_COMMANDS.has(cmd) || !HASHTAG_RE.test(m[2])) return null;
+  if (!TAP_COMMANDS.has(cmd)) return null;
+  if (!HASHTAG_RE.test(m[2])) return { cmd, rest: '', tapped: true, tapError: `❌ "${m[2]}" không phải hashtag — xem /ls` };
   const tag = m[2].toLowerCase();
   if (rest) return { cmd, rest: '', tapped: true, tapError: `❌ lệnh bấm không nhận tham số — gõ /${cmd} #${tag} ${rest}` };
   return { cmd, rest: `#${tag}`, tapped: true };

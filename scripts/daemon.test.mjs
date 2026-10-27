@@ -25,7 +25,7 @@ test('parseDaemonCommand: tap form /<cmd>_<hashtag> (RFC 26)', () => {
   assert.deepEqual(parseDaemonCommand('/Resume_A7611284@my_bot'), { cmd: 'resume', rest: '#a7611284', tapped: true });
   assert.deepEqual(parseDaemonCommand('/resume_t1234'), { cmd: 'resume', rest: '#t1234', tapped: true });
   assert.match(parseDaemonCommand('/resume_a7611284 -- --model x').tapError, /không nhận tham số/);
-  assert.equal(parseDaemonCommand('/resume_foo'), null, 'suffix must be a hashtag');
+  assert.match(parseDaemonCommand('/resume_a761128').tapError, /không phải hashtag/, 'a mistyped tap gets a reply');
   assert.equal(parseDaemonCommand('/health_a7611284'), null, 'only tap commands');
   assert.deepEqual(parseDaemonCommand('/resume a7611284'), { cmd: 'resume', rest: 'a7611284' });
 });

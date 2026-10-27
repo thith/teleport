@@ -1171,7 +1171,7 @@ test('performResume wait: another refusal (screen exists) is reported at once, n
   assert.equal(slept.length, 0);
 });
 
-test('resumeHint: /resume #hashtag for a session with a topic, else the UUID form; none for a guess', () => {
+test('resumeHint: /resume_<hashtag> for a session with a topic, else the UUID form; none for a guess', () => {
   const t = { sessionId: '00000000-0000-4000-8000-0000000000bb', hashtag: 'a7611284' };
   assert.equal(resumeHint(t, { topics: () => ({ a7611284: '1' }) }), '/resume_a7611284');
   assert.equal(resumeHint(t, { topics: () => ({}) }), `/spawn <project> --resume-session ${t.sessionId}`);
@@ -1183,13 +1183,19 @@ test('checkScreenKillTarget: the claude inside must be that agent, alone, in a o
   const sid = 'ac22f365-d351-4e54-82a5-303156081507';
   const tag = hashtagForSession(sid);
   const name = `tele-${tag}`;
-  const own = { pid: 7, screen: name, sessionId: sid, hashtag: tag };
-  assert.deepEqual(checkScreenKillTarget(name, [own], 1), { ok: true });
-  assert.deepEqual(checkScreenKillTarget(name, [], 1), { ok: true }, 'empty screen');
-  assert.match(checkScreenKillTarget(name, [own], 2).error, /2 cửa sổ/);
-  assert.match(checkScreenKillTarget(name, [own], null).error, /\? cửa sổ/);
-  assert.match(checkScreenKillTarget(name, [{ ...own, sessionId: '3b6f622a-63a9-491a-b683-b125b54d75fc' }], 1).error, /không phải session/);
-  assert.match(checkScreenKillTarget(name, [{ ...own, guessed: true }], 1).error, /không phải session/);
-  assert.match(checkScreenKillTarget(name, [own, { ...own, pid: 8 }], 1).error, /2 claude/);
-  assert.match(checkScreenKillTarget(name, [own, { pid: 9, screen: null, sessionId: 'x', hashtag: tag }], 1).error, /trùng/);
+  const own = { pid: 7, ppid: 100, screen: name, screenPid: 100, sessionId: sid, hashtag: tag };
+  const ok = (procs, opts = {}) => checkScreenKillTarget(name, procs, { screenPid: 100, windows: 1, ...opts });
+  assert.deepEqual(ok([own]), { ok: true });
+  assert.deepEqual(ok([]), { ok: true }, 'empty screen');
+  assert.deepEqual(ok([own, { ...own, pid: 12, ppid: 7 }]), { ok: true }, 'a claude -p child of the agent is not a 2nd occupant');
+  assert.match(ok([own], { windows: 2 }).error, /2 cửa sổ/);
+  assert.match(ok([own], { windows: null }).error, /\? cửa sổ/);
+  assert.match(ok([own], { screenPid: null }).error, /không xác định/, 'unknown screen pid → refuse');
+  assert.match(ok([{ ...own, sessionId: '3b6f622a-63a9-491a-b683-b125b54d75fc' }]).error, /không phải session/);
+  assert.match(ok([{ ...own, guessed: true }]).error, /không phải session/);
+  assert.match(ok([own, { ...own, pid: 8 }]).error, /2 claude/);
+  assert.match(ok([own, { pid: 9, screen: null, sessionId: 'x', hashtag: tag }]).error, /trùng/);
+  assert.match(ok([own, { pid: 9, ppid: 1, screen: null, sessionId: sid, hashtag: tag }]).error, /trùng/, 'same session in a terminal too');
+  const renamed = { ...own, screen: 'tele-zzzz0000', sessionId: '3b6f622a-63a9-491a-b683-b125b54d75fc', hashtag: 'i9661332' };
+  assert.match(ok([renamed]).error, /không phải session/, 'a renamed screen is found by its pid');
 });
