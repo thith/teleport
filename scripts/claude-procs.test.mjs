@@ -158,7 +158,7 @@ test('formatAgentList: one block per claude process — title, `<emoji> <name>: 
   const iScreen = out.indexOf('📺 Screen (3)');
   const iTerm = out.indexOf('🖥 Terminal (1)');
   assert.ok(iScreen === 0 && iTerm > iScreen, out);
-  assert.match(out, new RegExp(`\n\n🦛 Hà Mã #i0744244\n📺 Screen: tele-i0744244\n🔢 PID: 9\n🆔 Session: ${SID2} \\(đoán\\)\n⏱️ Uptime: 00:01\n\n`));
+  assert.match(out, new RegExp(`\n\n🦛 Hà Mã #i0744244 \\(đoán\\)\n📺 Screen: tele-i0744244\n🔢 PID: 9\n🆔 Session: ${SID2} \\(đoán\\)\n⏱️ Uptime: 00:01\n\n`));
   assert.match(out, /\n\n📺 tele-empty123 · không thấy claude bên trong\n\n/);
   assert.match(out, /\n\nx\n📺 Screen: work\n🔢 PID: 11\n📨 Session: x\n📁 Folder: w\n⏱️ Uptime: 00:02\n\n/); // non-tele screen hosting a claude
   const term = out.slice(iTerm);
@@ -167,7 +167,8 @@ test('formatAgentList: one block per claude process — title, `<emoji> <name>: 
   assert.doesNotMatch(out, /\n\n\n/);  // exactly one empty line between blocks
   const hidden = formatAgentList({ procs, showSession: false });
   assert.doesNotMatch(hidden, /🆔|5ce13594/, 'UUIDs hidden on Telegram');
-  assert.match(formatAgentList({ procs: [{ ...procs[1], name: 'g' }], showSession: false }), /📨 Session: g \(đoán\)/, 'a guess stays visible without the UUID');
+  assert.match(formatAgentList({ procs: [{ ...procs[1], name: 'g' }], showSession: false }), /🦛 Hà Mã #i0744244 \(đoán\)|g #i0744244 \(đoán\)/, 'a guess stays visible without the UUID');
+  assert.match(formatAgentList({ full: false, procs: [procs[1]] }), /^📺 #i0744244 \(đoán\)$/, 'short form too');
   assert.match(formatAgentList({ procs: [{ pid: 5 }] }), /🖥 Terminal \(1\)\n\n🖥 PID 5\n🔢 PID: 5$/);
   const empty = formatAgentList({});
   assert.equal(empty, '📺 Screen (0)\n\n(không có)\n\n🖥 Terminal (0)\n\n(không có)');

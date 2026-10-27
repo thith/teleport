@@ -85,7 +85,7 @@ export function splitAtBlocks(text, limit = 3800) {
     for (const line of block.split('\n')) {
       for (let i = 0; i < Math.max(line.length, 1);) {
         let end = Math.min(i + limit, line.length);
-        if (end < line.length && /[\uD800-\uDBFF]/.test(line[end - 1])) end -= 1; // never split an emoji's surrogate pair
+        if (end < line.length && end - 1 > i && /[\uD800-\uDBFF]/.test(line[end - 1])) end -= 1; // never split an emoji's surrogate pair
         const seg = line.slice(i, end);
         i = end || 1;
         if (cur && cur.length + 1 + seg.length > limit) { pieces.push(cur); cur = ''; }
