@@ -1055,7 +1055,7 @@ export async function nudgeAll(from, ctx, { list = () => listClaudeProcs(), io =
     const obs = observe(t, io);
     if (obs.mismatch) { out.push(`❌ ${name}: ${obs.mismatch} — bỏ qua.`); continue; }
     const res = await runner.run('n', t, String(from?.id ?? 'owner'), { persona }).catch((e) => ({ text: `❌ ${name}: ${e?.message ?? e}` }));
-    out.push(res.text);
+    out.push(String(res.text).includes(`#${t.hashtag}`) ? res.text : `${name}: ${res.text}`); // refusals don't name the agent
   }
   await sendText(daemonUserId, out.length ? out.join('\n') : 'ℹ️ không có agent nào cần nudge (listener đều chạy, không ai có thư chưa đọc).');
 }

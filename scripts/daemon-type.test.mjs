@@ -276,6 +276,8 @@ test('/nudge with no target: every agent with listener off or mail, never a heal
   assert.match(sent[0], /đã nudge 🐺 Sói #aaaa0001\.\n👋 đã nudge #aaaa0002\.\n❌ #aaaa0004: hashtag trùng 2 process/);
   await nudgeAll({ id: 42 }, ctx, { list: () => [rows[2]], io, runner });
   assert.match(sent.at(-1), /không có agent nào cần nudge/);
+  await nudgeAll({ id: 42 }, ctx, { list: () => [rows[1]], io, runner: { run: async () => ({ text: '❌ agent đang chờ hộp thoại — không gõ x.' }) } });
+  assert.match(sent.at(-1), /^#aaaa0002: ❌ agent đang chờ hộp thoại/, 'a refusal is prefixed with the agent');
   await runTypeCommand('n', '', { id: 42 }, ctx, { list: () => [rows[0]], io: { ...io, windows: () => 2 }, runner });
   assert.match(sent.at(-1), /#aaaa0001: .*2 cửa sổ.*bỏ qua/);
 });
