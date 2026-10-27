@@ -585,6 +585,18 @@ test('runner nudge: a healthy agent (listener on, no mail) is still nudged — t
   assert.deepEqual(st.keys, [NUDGE_LINES.both, '\r']);
 });
 
+test('runner nudge: `line` picks a fixed line; anything else falls back to the state line', async () => {
+  const line = NUDGE_LINES.listener;
+  const a = fakeIo({ screens: [IDLE, nudgeTyped(line), nudgeTyped(line)] });
+  a.io.nudgeSignals = () => ({ listener: 'on', mail: 1 });
+  await new TypeRunner(a.io).run('n', T, 'auto', { line });
+  assert.deepEqual(a.st.keys, [line, '\r']);
+  const b = fakeIo({ screens: [IDLE, nudgeTyped(NUDGE_LINES.mail), nudgeTyped(NUDGE_LINES.mail)] });
+  b.io.nudgeSignals = () => ({ listener: 'on', mail: 1 });
+  await new TypeRunner(b.io).run('n', T, 'auto', { line: 'rm -rf /' });
+  assert.deepEqual(b.st.keys, [NUDGE_LINES.mail, '\r'], 'never types a line that is not in NUDGE_LINES');
+});
+
 test('runner nudge: mail only → types the mailbox line', async () => {
   const line = NUDGE_LINES.mail;
   const { io, st } = fakeIo({ screens: [IDLE, nudgeTyped(line), nudgeTyped(line)] });

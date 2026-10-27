@@ -310,7 +310,7 @@ export class TypeRunner {
   }
 
   /** Run `op` ('c'|'r'|'e') against pinned target `t`. → { text, watch? } — `watch()` resolves a later result line. */
-  async run(op, t, who = 'owner', { persona = null } = {}) {
+  async run(op, t, who = 'owner', { persona = null, line = null } = {}) {
     const audit = (step, extra = {}) => this.io.audit({ who, op: TYPE_OPS[op], pid: t.pid, sessionId: t.sessionId, hashtag: t.hashtag, step, ...extra });
     if (op === 'e') return this.esc(t, audit);
     if (this.locks.has(t.pid)) return { text: '⏳ đang gõ lệnh khác vào agent này — thử lại sau.' };
@@ -326,7 +326,7 @@ export class TypeRunner {
       if (op === 'c') return await this.compact(t, audit, persona);
       if (op === 'u') return await this.clearInput(t, audit);
       if (op === 'r') return await this.remoteControl(t, audit);
-      if (op === 'n') return await this.nudge(t, audit, persona);
+      if (op === 'n') return await this.nudge(t, audit, persona, line);
       audit('refused', { reason: `unknown op ${op}` });
       return { text: `❌ lệnh không hợp lệ (${op}).` };
     }
@@ -429,9 +429,10 @@ export class TypeRunner {
     return { text: `⌨️ đã gõ /compact vào ${agentLabel(t, persona)}${r.queued ? ' (đang bận → đã xếp hàng, chạy khi xong lượt)' : ''} — đang chờ kết quả…`, watch };
   }
 
-  async nudge(t, audit, persona = null) {
+  async nudge(t, audit, persona = null, want = null) {
     // Signals read HERE (not when a button was drawn): the line matches the agent as it is now.
-    const line = nudgeText(this.io.nudgeSignals ? this.io.nudgeSignals(t) : {});
+    // `want` (auto-nudge) must be one of the fixed lines — never typed from anywhere else.
+    const line = Object.values(NUDGE_LINES).includes(want) ? want : nudgeText(this.io.nudgeSignals ? this.io.nudgeSignals(t) : {});
     const r = await this.typeAndEnter(t, line, audit, { allowBusy: true, slash: false });
     if (!r.ok) return r;
     return { text: `👋 đã nudge ${agentLabel(t, persona)}${r.queued ? ' (đang bận → đã xếp hàng, chạy khi xong lượt)' : ''}.` };

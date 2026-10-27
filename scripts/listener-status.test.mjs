@@ -189,3 +189,17 @@ test('statusOf.lines: one labelled line per signal (the /ls blocks); same signal
   assert.deepEqual(st.lines(0), []);
   fs.rmSync(dir, { recursive: true, force: true });
 });
+
+test('newestUnreadAt: newest unread topic message (its date) or queued prompt (mtime); nothing → null', () => {
+  const dir = tmp();
+  fs.writeFileSync(path.join(dir, `convo-${CONVO}-offset.txt`), '10');
+  const cacheFile = writeCache(dir, [msg(9, { date: sec(5) }), msg(10, { date: sec(300) }), msg(11, { date: sec(100) }), msg(12, { chat: OTHER_CHAT, date: sec(1) })]);
+  const st = status(dir, { cacheFile });
+  assert.equal(st.newestUnreadAt(CONVO), sec(100) * 1000, 'id 9 is read (below offset), other chat excluded');
+  const p = path.join(dir, `prompt-convo-${CONVO}.json`);
+  fs.writeFileSync(p, '{}');
+  fs.utimesSync(p, new Date(NOW - 20_000), new Date(NOW - 20_000));
+  assert.equal(st.newestUnreadAt(CONVO), NOW - 20_000, 'a queued prompt counts');
+  assert.equal(status(tmp()).newestUnreadAt(CONVO), null);
+  assert.equal(st.newestUnreadAt('garbage'), null);
+});
