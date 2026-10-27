@@ -78,6 +78,15 @@ test('doBroadcast: raw (TELE_RAW_ARGS) wins over argv; --chat still scopes it', 
   const r = await doBroadcast(['x'], { from: {}, config: CFG, store: STORE, writePrompt: (p) => writes.push(p), env: {}, envFile: {}, raw: `line 1\n"line 2"` });
   assert.equal(r.ok, true);
   assert.ok(writes.length > 0 && writes.every((p) => p.text === `line 1\n"line 2"`));
-  const none = await doBroadcast([], { from: {}, config: CFG, store: STORE, writePrompt: () => {}, env: {}, envFile: {}, raw: '--chat -999 hi' });
+  const none = await doBroadcast(['--chat', '-999', 'hi'], { from: {}, config: CFG, store: STORE, writePrompt: () => {}, env: {}, envFile: {}, raw: '--chat -999 hi' });
   assert.match(none.message, /no live topics/);
+});
+
+test('doBroadcast raw: a disguised --chat (quotes inside the flag) is refused — the scope must match argv', async () => {
+  const run = (raw, argv) => doBroadcast(argv, { from: {}, config: CFG, store: STORE, writePrompt: () => { throw new Error('must not send'); }, env: {}, envFile: {}, raw });
+  for (const [raw, argv] of [[`--"chat" -100 hi`, ['--chat', '-100', 'hi']], [`--ch'at'=-100 hi`, ['--chat=-100', 'hi']]]) {
+    const r = await run(raw, argv);
+    assert.equal(r.ok, false, raw);
+    assert.match(r.message, /đứng đầu/);
+  }
 });

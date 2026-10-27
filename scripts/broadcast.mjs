@@ -96,6 +96,11 @@ export async function doBroadcast(argv, {
 } = {}) {
   const args = raw ? parseBroadcastRaw(raw) : parseBroadcastArgs(argv);
   if (args.error) return { ok: false, message: args.error };
+  // The scope must agree with the tokenized argv (which honours quotes like `--"chat"`): raw mode may
+  // keep the text verbatim, never send wider than the old reading would.
+  if (raw && (parseBroadcastArgs(argv).chat ?? null) !== (args.chat ?? null)) {
+    return { ok: false, message: `--chat phải đứng đầu, không trong ngoặc — ${USAGE}` };
+  }
   const chatIds = args.chat ? [String(args.chat)] : groupChatIds(config, { env, envFile });
   const live = listLiveTopics(store, chatIds);
   if (!live.length) return { ok: false, message: '📢 broadcast: no live topics found (nothing sent).' };
