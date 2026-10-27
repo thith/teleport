@@ -175,7 +175,14 @@ export function matchSteerName(value, live) {
  */
 export function resolveSteerTargetRaw(raw, { live, replyText, usage }) {
   const sp = splitRawTarget(raw);
-  const fail = (t, status, cands) => ({ error: `target ${t} ${status === 'ambiguous' ? `is ambiguous${cands?.length ? ` (${cands.map((c) => `#${c.hashtag}`).join(', ')}) — dùng #hashtag` : ''}` : 'not found among live topics'}.` });
+  // Ambiguous: a NAME shared by two topics → list their #hashtags; a shared hashtag → their convoIds.
+  const fail = (t, status, cands) => {
+    if (status !== 'ambiguous') return { error: `target ${t} not found among live topics.` };
+    if (!cands?.length) return { error: `target ${t} is ambiguous.` };
+    const byHash = new Set(cands.map((c) => c.hashtag)).size < cands.length;
+    const list = [...new Set(cands.map((c) => (byHash ? String(c.convoId) : `#${c.hashtag}`)))].join(', ');
+    return { error: `target ${t} is ambiguous (${list}) — dùng ${byHash ? 'convoId' : '#hashtag'}.` };
+  };
   const find = (tok) => {
     const t = normalizeTarget(tok);
     return t.kind === 'name' ? matchSteerName(t.value, live) : matchTarget(t, live);

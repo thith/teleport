@@ -643,6 +643,7 @@ test('checkPidKillAuth: owner only, daemon only, needs a configured owner', () =
 
 test('resolveKillPid: pid:<N>, split "pid: N", bad targets; live-screen hashtag kills untouched', () => {
   assert.deepEqual(resolveKillPid(['--kill', 'pid:830318']), { found: true, pid: 830318 });
+  assert.deepEqual(resolveKillPid(['--kill', '“Cà', 'Rồng”']), { found: true, name: 'Cà Rồng' }, 'phone quotes off');
   assert.deepEqual(resolveKillPid(['--kill', 'pid:', '830318']), { found: true, pid: 830318 });
   assert.deepEqual(resolveKillPid(['--quit', 'PID:42']), { found: true, pid: 42 });
   assert.match(resolveKillPid(['--kill', 'pid:abc']).error, /bad pid target/);

@@ -35,7 +35,7 @@ import { fileURLToPath } from 'node:url';
 import { isMainModule } from './is-direct-run.mjs';
 import { uuidToConvoInt } from './convo-registry.mjs';
 import { shortConvoHash } from './convo-hash.mjs';
-import { normalizeAgentName, parseAgentTarget } from './agent-target.mjs';
+import { normalizeAgentName, parseAgentTarget, unquoteTarget } from './agent-target.mjs';
 import { createListenerStatus } from './listener-status.mjs';
 import { countUnread } from './mailbox.mjs';
 import { typeTargets, lsLinks } from './type-cmd.mjs';
@@ -1013,7 +1013,7 @@ export function resolveKillPid(argv, { isScreen = () => false } = {}) {
   for (let j = i + 2; i !== -1 && j < argv.length && !argv[j].startsWith('--'); j++) words.push(argv[j]);
   const screen = words.length === 1 && (/^tele-/i.test(tok) || isScreen(tok));
   if (i !== -1 && (explicit || (tok && !tok.startsWith('-') && !/^pid:/i.test(tok) && !screen))) {
-    const name = words.join(' ').trim();
+    const name = unquoteTarget(words.join(' ')); // a phone's curly quotes survive the daemon tokenizer
     return name ? { found: true, name } : { found: true, error: 'name: needs a name, e.g. name:"Rắn 3" (see /ls).' };
   }
   if (i === -1 || !/^pid:/i.test(tok)) return { found: false };

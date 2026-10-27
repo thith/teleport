@@ -13,6 +13,14 @@ export function normalizeAgentName(s) {
   return String(s ?? '').normalize('NFC').replace(/[^\p{L}\p{N}\s]/gu, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
 }
 
+/** Outer quotes (ASCII or a phone's curly ones) off a whole-rest target. Pure. */
+export function unquoteTarget(s) {
+  const q = String(s ?? '').trim();
+  const m = q.match(/^(["'“‘])([\s\S]*)(["'”’])$/);
+  const pair = { '"': '"', "'": "'", '“': '”', '‘': '’' };
+  return m && pair[m[1]] === m[3] ? m[2].trim() : q;
+}
+
 /** Raw target → `{ kind: 'pid'|'name'|'hashtag'|'convoId', value }` (bad pid → `{ kind: 'pid', error }`). */
 export function parseAgentTarget(raw) {
   const s = String(raw ?? '').trim();

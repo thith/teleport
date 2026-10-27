@@ -42,6 +42,8 @@ test('resolveSteerTargetRaw: # explicit; reply → ALL text; else quoted / `_` t
   const dup = [...LIVE, row('77777777777777', 'Mèo', { ts: 99 })];
   assert.match(resolveSteerTargetRaw('Mèo hi', { live: dup, usage: 'U' }).error, /ambiguous .*#.*— dùng #hashtag/);
   assert.equal(resolveSteerTargetRaw('', opts()).error, 'U');
+  const twin = [row(A, 'X'), { ...row(B, 'Y'), hashtag: shortConvoHash(A) }];
+  assert.match(resolveSteerTargetRaw(`#${shortConvoHash(A)} hi`, { live: twin, usage: 'U' }).error, new RegExp(`ambiguous \\((${A}|${B}), (${A}|${B})\\) — dùng convoId`), 'a shared hashtag lists convoIds');
 });
 
 test('resolveSteerTarget (argv, manual run): a duplicate persona name is refused too', () => {

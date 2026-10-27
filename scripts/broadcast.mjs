@@ -50,7 +50,8 @@ export function parseBroadcastArgs(argv) {
 /**
  * The daemon's raw text (TELE_RAW_ARGS, RFC 26 §3.8) → { chat, text, error }: an optional LEADING
  * `--chat <id>` / `--chat=<id>`, then the message VERBATIM (quotes, newlines kept). A `--chat`
- * later in the text is just text. Pure.
+ * anywhere else is refused: argv mode took it anywhere, so silently sending to EVERY group would
+ * widen an admin-wide action. Pure.
  */
 export function parseBroadcastRaw(raw) {
   const s = String(raw ?? '').trim();
@@ -58,6 +59,7 @@ export function parseBroadcastRaw(raw) {
   const out = m ? { chat: m[1] || m[2] || null, text: (m[3] || '').trim(), error: null } : { chat: null, text: s, error: null };
   if (m && !out.chat) out.error = USAGE;
   else if (!out.text) out.error = USAGE;
+  else if (/(^|\s)--chat(=|\s|$)/.test(out.text)) out.error = `--chat phải đứng đầu — ${USAGE}`;
   return out;
 }
 
