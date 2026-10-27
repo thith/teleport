@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url';
 process.env.TELE_PERSONA_STORE = path.join(os.tmpdir(), `teleport-persona-store-spawn-${process.pid}.jsonl`);
 // No real systemd-run probe in unit tests (escapeServiceCgroup is tested with injected probes).
 process.env.TELEPORT_NO_SCOPE = '1';
-import { buildSpawnPlan, genSessionSeed, runSpawn, childLaunch, loginSeedEnv, wrapInLoginShell, scrubClaudeEnv, SEED_PATH, hasBinary, screenSessionExists, normalizeSessionName, parseScreenSessions, listSpawnSessions, resolveKillId, resolveAttachId, resolveAttachTarget, formatSessionList, resolveMode, SPAWN_PROMPT, PERMISSION_MODES, DEFAULT_PERMISSION_MODE, USAGE, personaByHashtag, gracefulKill, KILL_GRACE_MS, RESUME_PROMPT, resolveResumeSession, checkResumePreflight, findTranscriptDirs, checkPidKillAuth, resolveKillPid, normalizeAgentName, matchProcsByName, appendKillAudit, acquireResumeLock, acquireResumeFileLock, performResume, checkRestartTarget, checkRestartPreflight, RESUME_LOCK_STALE_MS, resumeLockSecret, inSystemdService, escapeServiceCgroup, SYSTEMD_SCOPE_PREFIX } from './spawn.mjs';
+import { buildSpawnPlan, genSessionSeed, runSpawn, childLaunch, loginSeedEnv, wrapInLoginShell, scrubClaudeEnv, SEED_PATH, hasBinary, screenSessionExists, normalizeSessionName, parseScreenSessions, listSpawnSessions, resolveKillId, resolveAttachId, resolveAttachTarget, formatSessionList, resolveMode, SPAWN_PROMPT, PERMISSION_MODES, DEFAULT_PERMISSION_MODE, USAGE, personaByHashtag, gracefulKill, KILL_GRACE_MS, RESUME_PROMPT, resolveResumeSession, checkResumePreflight, findTranscriptDirs, checkPidKillAuth, resolveKillPid, normalizeAgentName, matchProcsByName, resumeHint, appendKillAudit, acquireResumeLock, acquireResumeFileLock, performResume, checkRestartTarget, checkRestartPreflight, RESUME_LOCK_STALE_MS, resumeLockSecret, inSystemdService, escapeServiceCgroup, SYSTEMD_SCOPE_PREFIX } from './spawn.mjs';
 import fs from 'node:fs';
 import { uuidToConvoInt } from './convo-registry.mjs';
 import { shortConvoHash } from './convo-hash.mjs';
@@ -1168,4 +1168,12 @@ test('performResume wait: another refusal (screen exists) is reported at once, n
   const r = await performResume({ sessionId: GIUN, cwd: '/w/umipay' }, deps);
   assert.match(r.error, /already exists/);
   assert.equal(slept.length, 0);
+});
+
+test('resumeHint: /resume #hashtag for a session with a topic, else the UUID form; none for a guess', () => {
+  const t = { sessionId: '00000000-0000-4000-8000-0000000000bb', hashtag: 'a7611284' };
+  assert.equal(resumeHint(t, { topics: () => ({ a7611284: '1' }) }), '/resume #a7611284');
+  assert.equal(resumeHint(t, { topics: () => ({}) }), `/spawn <project> --resume-session ${t.sessionId}`);
+  assert.equal(resumeHint({ ...t, guessed: true }, { topics: () => ({ a7611284: '1' }) }), null);
+  assert.equal(resumeHint(null), null);
 });

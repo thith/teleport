@@ -362,6 +362,18 @@ export function personaByHashtag(store = readTopicsStore()) {
 }
 
 /**
+ * How to bring a killed session back: `/resume #<hashtag>` when it has a Telegram
+ * topic (/resume only finds those), else the UUID form. null for an unknown session.
+ */
+export function resumeHint(t, { topics = () => convoByHashtag() } = {}) {
+  if (!t?.sessionId || t.guessed) return null;
+  const tag = t.hashtag || hashtagForSession(t.sessionId);
+  let hasTopic = false;
+  try { hasTopic = !!(tag && topics()[tag]); } catch {}
+  return hasTopic ? `/resume #${tag}` : `/spawn <project> --resume-session ${t.sessionId}`;
+}
+
+/**
  * `{ <hashtag>: convoId }` from the topics store — lets `--ls` find a tele-*
  * screen's convo (for its listener status) when the claude inside it has no
  * readable session id. Same key walk as personaByHashtag. `store` injectable.
@@ -1367,8 +1379,8 @@ if (isDirectRun) {
         appendKillAudit({ pid: killPid.pid, fromId, result: res.error ? 'restart-failed' : 'restarted', reason: res.error, sessionId: t?.sessionId ?? null, screen: res.plan?.sessionName ?? null });
         if (res.error) {
           console.error(`[spawn] ❌ killed, but restart failed: ${res.error}`);
-          const tag = t?.sessionId && !t.guessed ? (t.hashtag || hashtagForSession(t.sessionId)) : null;
-          if (tag) console.error(`[spawn] retry: /resume #${tag}`);
+          const hint = resumeHint(t);
+          if (hint) console.error(`[spawn] retry: ${hint}`);
           process.exit(1);
         }
         console.log(`[spawn] 🔁 restarted session ${t.sessionId} in screen "${res.plan.sessionName}" (cwd ${t.cwd}) → topic #${res.plan.sessionName.replace(/^tele-/, '')}. It will check its mailbox, re-arm its listener and greet in its topic.`);
@@ -1376,8 +1388,8 @@ if (isDirectRun) {
         process.exit(0);
       }
       // Only suggest a resume for a session we KNOW (session file), never a guess.
-      const tag = t?.sessionId && !t.guessed ? (t.hashtag || hashtagForSession(t.sessionId)) : null;
-      if (tag) console.log(`[spawn] resume it: /resume #${tag}`);
+      const hint = resumeHint(t);
+      if (hint) console.log(`[spawn] resume it: ${hint}`);
       process.exit(0);
     }
     console.error(`[spawn] ⚠️ PID ${killPid.pid} still alive after ${KILL_PID_GRACE_MS / 1000}s (SIGTERM sent, no SIGKILL by design). Check /ls, retry later.`);
