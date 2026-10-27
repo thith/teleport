@@ -47,6 +47,24 @@ export function parseBroadcastArgs(argv) {
   return out;
 }
 
+/**
+ * The daemon's raw text (TELE_RAW_ARGS, RFC 26 §3.8) → { chat, text, error }: an optional LEADING
+ * `--chat <id>` / `--chat=<id>`, then the message VERBATIM (quotes, newlines kept). A `--chat`
+ * anywhere else is refused: argv mode took it anywhere, so silently sending to EVERY group would
+ * widen an admin-wide action. Pure.
+ */
+export function parseBroadcastRaw(raw) {
+  const s = String(raw ?? '').trim();
+  const m = s.match(/^--chat(?:=(\S*)|\s+(\S+))(?:\s+([\s\S]*))?$/) || s.match(/^--chat()()$/);
+  const out = m ? { chat: m[1] || m[2] || null, text: (m[3] || '').trim(), error: null } : { chat: null, text: s, error: null };
+  if (m && !out.chat) out.error = USAGE;
+  else if (!out.text) out.error = USAGE;
+  // Any other `--chat` (quoted, mid-text…) is refused — argv mode honoured it, so dropping it would
+  // silently widen the scope to every group.
+  else if (/--chat/i.test(out.text)) out.error = `--chat phải đứng đầu (không trong ngoặc) — ${USAGE}`;
+  return out;
+}
+
 // The injected system prompt. `broadcast:true` marks it; non-privileged `fromRole`
 // (the sender's real role is carried for the receiver's sensitive-action gate, but
 // 'broadcast' itself grants nothing). `messageId:null` = injected, not a real message.
@@ -74,9 +92,15 @@ export function buildBroadcastPrompt({ targetConvoId, targetChatId, fromUserId, 
 export async function doBroadcast(argv, {
   from = {}, config = readProjectsConfig(), store = readTopicsStore(),
   tmpDir = DEFAULT_TMP_DIR, writePrompt = durableWrite, env = process.env, envFile = {},
+  raw = process.env.TELE_RAW_ARGS, // the daemon's untokenized text; unset/'' → argv
 } = {}) {
-  const args = parseBroadcastArgs(argv);
+  const args = raw ? parseBroadcastRaw(raw) : parseBroadcastArgs(argv);
   if (args.error) return { ok: false, message: args.error };
+  // The scope must agree with the tokenized argv (which honours quotes like `--"chat"`): raw mode may
+  // keep the text verbatim, never send wider than the old reading would.
+  if (raw && (parseBroadcastArgs(argv).chat ?? null) !== (args.chat ?? null)) {
+    return { ok: false, message: `--chat phải đứng đầu, không trong ngoặc — ${USAGE}` };
+  }
   const chatIds = args.chat ? [String(args.chat)] : groupChatIds(config, { env, envFile });
   const live = listLiveTopics(store, chatIds);
   if (!live.length) return { ok: false, message: '📢 broadcast: no live topics found (nothing sent).' };

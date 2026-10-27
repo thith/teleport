@@ -18,6 +18,7 @@ const C = [
 test('findResumeTarget: by hashtag, by full persona name (newest wins, others listed), never a substring', () => {
   assert.equal(findResumeTarget('#c2383556', C).target.sessionId, 's3');
   assert.equal(findResumeTarget('c2383556', C).target.sessionId, 's3');
+  assert.equal(findResumeTarget('“tiên”', C).target.sessionId, findResumeTarget('tiên', C).target.sessionId, 'phone quotes off (RFC 26 §3.8)');
   const t = findResumeTarget('tiên', C);
   assert.equal(t.target.sessionId, 's1', 'newest');
   assert.deepEqual(t.others.map((o) => o.sessionId), ['s2']);

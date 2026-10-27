@@ -15,7 +15,7 @@ import path from 'node:path';
 import { isMainModule } from './is-direct-run.mjs';
 import { uuidToConvoInt } from './convo-registry.mjs';
 import { shortConvoHash } from './convo-hash.mjs';
-import { normalizeAgentName, parseAgentTarget } from './agent-target.mjs';
+import { normalizeAgentName, parseAgentTarget, unquoteTarget } from './agent-target.mjs';
 import { readTopicsStore } from './topics-store.mjs';
 import { peekPersona } from './persona-store.mjs';
 import { formatPersona } from './persona.mjs';
@@ -34,7 +34,7 @@ export const normalizeName = normalizeAgentName;
  * Returns { target, others } | { error }. Pure.
  */
 export function findResumeTarget(query, candidates, { aliveSessions = new Set(), liveRows = [] } = {}) {
-  const t = parseAgentTarget(query); // `name:` (the /kill form) accepted too
+  const t = parseAgentTarget(unquoteTarget(query)); // `name:` (the /kill form) accepted too; outer quotes off (RFC 26 §3.8)
   const q = String(t.value ?? '');
   if (!q || t.kind === 'pid' || t.kind === 'convoId') return { error: 'usage: /resume <persona name | #hashtag>' };
   // A hashtag is an exact address: no name fallback.

@@ -18,7 +18,8 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { listClaudeProcs, parseSessionFile, inspectPid, SESSIONS_DIR } from './claude-procs.mjs';
-import { parseAgentTarget, normalizeAgentName } from './agent-target.mjs';
+import { parseAgentTarget, normalizeAgentName, unquoteTarget } from './agent-target.mjs';
+export { unquoteTarget };
 import { createListenerStatus } from './listener-status.mjs';
 import { countUnread } from './mailbox.mjs';
 import { uuidToConvoInt } from './convo-registry.mjs';
@@ -113,13 +114,6 @@ export function pinTarget(r) {
 
 export const screenId = (t) => `${t.screenPid}.${t.screen}`;
 
-/** Outer quotes (ASCII or a phone's curly ones) off a whole-rest target. Pure. */
-export function unquoteTarget(s) {
-  const q = String(s ?? '').trim();
-  const m = q.match(/^(["'“‘])([\s\S]*)(["'”’])$/);
-  const pair = { '"': '"', "'": "'", '“': '”', '‘': '’' };
-  return m && pair[m[1]] === m[3] ? m[2].trim() : q;
-}
 
 /**
  * `/compact`, `/nudge` target (RFC 26 §3.2): `query` = the whole rest (spaces allowed). A hashtag must be

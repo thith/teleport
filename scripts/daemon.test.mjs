@@ -120,6 +120,19 @@ test('dispatchCommand: splitBlocks → long output as several plain messages in 
   assert.deepEqual(sent, [out], 'no flag → one send (sendTextToAdmin makes it a file)');
 });
 
+test('dispatchCommand: TELE_RAW_ARGS = the untokenized rest for rawText commands, always "" otherwise', async () => {
+  const reg = { whisper: { run: 'whisper.mjs', minRole: 'admin', rawText: true }, ls: { run: 'spawn.mjs', minRole: 'member' } };
+  const grab = async (cmd, rest) => { let env; await dispatchCommand({ cmd, rest }, { id: '7' }, {
+    daemonUserId: '1', projectsConfig: { _default: { roles: { '7': { role: 'admin' } } } }, registry: reg, scriptsDir: '/s',
+    sendText: async () => {}, runner: async (_b, _a, o) => { env = o.env; return { stdout: '', stderr: '' }; },
+  }); return env; };
+  assert.equal((await grab('whisper', `"Cà Rồng" it's\nok`)).TELE_RAW_ARGS, `"Cà Rồng" it's\nok`);
+  const prev = process.env.TELE_RAW_ARGS;
+  process.env.TELE_RAW_ARGS = 'inherited';
+  try { assert.equal((await grab('ls', '')).TELE_RAW_ARGS, '', 'a stray daemon env value never reaches a child'); }
+  finally { if (prev === undefined) delete process.env.TELE_RAW_ARGS; else process.env.TELE_RAW_ARGS = prev; }
+});
+
 // RFC 07: the replied-to DM text reaches /whisper (capped) but NOT other commands.
 test('dispatchCommand: TELE_REPLY_TEXT goes to /whisper (capped), absent for /run, /ls', async () => {
   const cap = 'x'.repeat(400); // > 256 → must be truncated

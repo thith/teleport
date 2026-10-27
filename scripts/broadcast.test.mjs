@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { parseBroadcastArgs, buildBroadcastPrompt, groupChatIds, doBroadcast } from './broadcast.mjs';
+import { parseBroadcastArgs, parseBroadcastRaw, buildBroadcastPrompt, groupChatIds, doBroadcast } from './broadcast.mjs';
 
 test('parseBroadcastArgs: text join; --chat (space/=) extracted; empty → usage error', () => {
   assert.deepEqual(parseBroadcastArgs(['reload', 'guide', 'now']), { chat: null, text: 'reload guide now', error: null });
@@ -57,4 +57,36 @@ test('doBroadcast: empty text → usage error', async () => {
   const r = await doBroadcast([], { config: CFG, store: STORE, writePrompt: () => {} });
   assert.equal(r.ok, false);
   assert.match(r.message, /usage/);
+});
+
+test('parseBroadcastRaw: a LEADING --chat (space or =) is split off; the message is verbatim', () => {
+  assert.deepEqual(parseBroadcastRaw(`reload "guide"\nit's new`), { chat: null, text: `reload "guide"\nit's new`, error: null });
+  assert.deepEqual(parseBroadcastRaw('--chat -100 hi\nthere'), { chat: '-100', text: 'hi\nthere', error: null });
+  assert.deepEqual(parseBroadcastRaw('--chat=-100   hi'), { chat: '-100', text: 'hi', error: null });
+  assert.match(parseBroadcastRaw('hi --chat -100').error, /--chat phải đứng đầu/, 'a later --chat is refused, never a broadcast to every group');
+  assert.match(parseBroadcastRaw('--chat -100 a --chat=-200').error, /đứng đầu/);
+  assert.match(parseBroadcastRaw('"--chat" -100 hi').error, /đứng đầu/, 'a quoted --chat never widens to every group');
+  assert.match(parseBroadcastRaw('“--chat=-100” hi').error, /đứng đầu/);
+  assert.ok(parseBroadcastRaw('--chat -100').error);
+  assert.ok(parseBroadcastRaw('--chat').error);
+  assert.ok(parseBroadcastRaw('--chat=').error);
+  assert.ok(parseBroadcastRaw('   ').error);
+});
+
+test('doBroadcast: raw (TELE_RAW_ARGS) wins over argv; --chat still scopes it', async () => {
+  const writes = [];
+  const r = await doBroadcast(['x'], { from: {}, config: CFG, store: STORE, writePrompt: (p) => writes.push(p), env: {}, envFile: {}, raw: `line 1\n"line 2"` });
+  assert.equal(r.ok, true);
+  assert.ok(writes.length > 0 && writes.every((p) => p.text === `line 1\n"line 2"`));
+  const none = await doBroadcast(['--chat', '-999', 'hi'], { from: {}, config: CFG, store: STORE, writePrompt: () => {}, env: {}, envFile: {}, raw: '--chat -999 hi' });
+  assert.match(none.message, /no live topics/);
+});
+
+test('doBroadcast raw: a disguised --chat (quotes inside the flag) is refused — the scope must match argv', async () => {
+  const run = (raw, argv) => doBroadcast(argv, { from: {}, config: CFG, store: STORE, writePrompt: () => { throw new Error('must not send'); }, env: {}, envFile: {}, raw });
+  for (const [raw, argv] of [[`--"chat" -100 hi`, ['--chat', '-100', 'hi']], [`--ch'at'=-100 hi`, ['--chat=-100', 'hi']]]) {
+    const r = await run(raw, argv);
+    assert.equal(r.ok, false, raw);
+    assert.match(r.message, /đứng đầu/);
+  }
 });
