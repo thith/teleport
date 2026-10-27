@@ -72,6 +72,9 @@ import { machineWatch } from './health.mjs';
 import { longBuildWatch, handleLongBuildButton, stopTick, STOP_BUTTON_RE, STOP_TICK_MS } from './long-build.mjs';
 import { recordFetchOk, startListenWatchdog } from './listen-watch.mjs';
 import { launchCleanup, startCleanupScheduler } from './cleanup-launch.mjs';
+import { autoNudgeTick } from './auto-nudge.mjs';
+import { peekMail } from './mailbox.mjs';
+import { createListenerStatus } from './listener-status.mjs';
 import { processCleanupRequests, processCleanupOffers, handleCleanupButton, CLEANUP_BUTTON_RE } from './cleanup-inbox.mjs';
 import { PersistentMap } from './button-store.mjs';
 import { formatPersona } from './persona.mjs';
@@ -423,6 +426,8 @@ async function main() {
         // RFC 24: a build holding the lock too long while others wait → owner alert with a stop button.
         try { await longBuildWatch(ctx); }
         catch (e) { console.error(`[daemon] long-build watch: ${e?.message ?? e}`); }
+        // RFC 26 §3.11: nudge agents about NEW unread mail / Telegram. Not awaited (typing takes seconds), never overlapping.
+        runAutoNudge();
       }
     } catch (e) {
       console.error(`[daemon] loop error: ${e instanceof Error ? e.message : e}`);
@@ -1032,6 +1037,29 @@ export async function runTypeCommand(op, rest, from, ctx, { list = () => listCla
   if (String(more).startsWith(COMPACT_OK) && convoId != null) {
     await deliver({ convoId, text: more }, { build: buildCompactNoticePrompt }).catch((e) => console.error(`[daemon] compact notice: ${e?.message ?? e}`));
   }
+}
+
+// RFC 26 §3.11 auto-nudge: what was already reminded (convo → { mail, tg }), in RAM only; one pass at a time.
+const autoNudgeSeen = new Map();
+let autoNudgeBusy = false;
+export function runAutoNudge({ tick = autoNudgeTick, list = () => listClaudeProcs(), io = defaultIo(), runner = getTypeRunner() } = {}) {
+  if (autoNudgeBusy) return null;
+  autoNudgeBusy = true;
+  const status = (() => { try { return createListenerStatus(); } catch { return null; } })();
+  const newestMail = (convo) => {
+    const at = peekMail(String(convo)).map((m) => Number(m?.sentAt)).filter(Number.isFinite);
+    return at.length ? Math.max(...at) : null;
+  };
+  return Promise.resolve()
+    .then(() => tick({
+      list, io, runner, seen: autoNudgeSeen, personaOf: personaLookup(),
+      mailAt: (c) => { try { return newestMail(c); } catch { return null; } },
+      tgAt: (c) => { try { return status?.newestUnreadAt(c) ?? null; } catch { return null; } },
+      listener: (c) => { try { return status?.listener(c) ?? null; } catch { return null; } },
+      log: (s) => console.log(s),
+    }))
+    .catch((e) => console.error(`[daemon] auto-nudge: ${e?.message ?? e}`))
+    .finally(() => { autoNudgeBusy = false; });
 }
 
 /**

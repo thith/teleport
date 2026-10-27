@@ -176,6 +176,33 @@ export function createListenerStatus({
     if (!Number.isSafeInteger(convo) || convo <= 0) return null;
     try { const on = listenerOn(convo); return on == null ? null : on ? 'on' : 'off'; } catch { return null; }
   };
+  // Newest unread Telegram item for the convo, epoch ms: a topic message past its offset (its `date`) or a
+  // queued prompt (ask / whisper / daemon delivery — the file's mtime). null = nothing / unknown. (auto-nudge)
+  statusOf.newestUnreadAt = (convoId) => {
+    const convo = Number(convoId);
+    if (!Number.isSafeInteger(convo) || convo <= 0) return null;
+    const at = [];
+    try {
+      if (Array.isArray(updates) && store && typeof store === 'object') {
+        const offset = readOffset(path.join(tmpDir, `convo-${convo}-offset.txt`));
+        const threadByChat = new Map();
+        for (const chatId of Object.keys(store)) {
+          const tid = getThreadId(store, chatId, String(convo));
+          if (tid != null) threadByChat.set(String(chatId), tid);
+        }
+        if (offset > 0 && threadByChat.size) {
+          const msgs = collectMessagesToProcess(updates.filter((u) => u.update_id >= offset), [...threadByChat.keys()], null, 'convo', threadByChat);
+          for (const m of msgs) { // an edit is new too: its edit_date, not the original date
+            const d = Math.max(Number(m.msg?.date) || 0, Number(m.msg?.edit_date) || 0);
+            if (d > 0) at.push(d * 1000);
+          }
+        }
+      }
+    } catch { /* unknown */ }
+    const pm = mtimeMs(path.join(tmpDir, `prompt-convo-${convo}.json`));
+    if (pm != null) at.push(pm);
+    return at.length ? Math.max(...at) : null;
+  };
   // The same status as separate labelled lines (the /ls blocks) → string[].
   statusOf.lines = (convoId) => render(convoId, 'lines');
   return statusOf;
