@@ -70,7 +70,9 @@ When the user asks to **spawn / start / launch** a Claude agent — e.g. "spawn 
   normalized then **gracefully** torn down: the helper types the agent's own `/exit`
   (clean CLI quit, flushes session — softer than a SIGHUP), waits up to **10s**, and only
   force-`quit`s if it's still "bướng" (e.g. busy mid-loop so `/exit` never reached an idle
-  prompt). Verifies the session is gone. Headless agents need no teardown. **Lưu ý timing:**
+  prompt). Verifies the session is gone. **Refused** (→ use `/kill pid:<PID>`) unless the claude inside the screen is that
+  agent: one claude, its known session hashes to the hashtag, no other live session with that hashtag, and the screen
+  has ONE window (RFC 26). Headless agents need no teardown. **Lưu ý timing:**
   `/exit` chỉ ăn khi claude đang ở REPL idle — muốn chắc graceful, bảo agent *"chào và đóng
   topic"* trước (nó stop listeners → về prompt), rồi mới `--kill`.
 
@@ -94,7 +96,7 @@ another resume of the same session is in progress (per-session lock) — stop th
 - **`/kill pid:<PID> --restart`** = both in one: SIGTERM, wait for exit, then resume that session in screen
   `tele-<hashtag>` in its **old cwd**. Everything the restart needs (a session id from the session file — never a
   guess — and its transcript) is checked **before** killing, so a doomed restart kills nothing.
-- **Agent đã chết** (bị OOM, crash…): `/resume <tên persona | #hashtag>` — tìm session + folder theo tên, resume trong screen; khỏi gõ UUID. (`/kill … --restart` chỉ dùng cho agent còn sống.)
+- **Agent đã chết** (bị OOM, crash…): `/resume <tên persona | #hashtag>` (hoặc bấm `/resume_<hashtag>` — kill in ra sẵn; hai session cùng hashtag → từ chối, resume bằng UUID) — tìm session + folder theo tên, resume trong screen; khỏi gõ UUID. (`/kill … --restart` chỉ dùng cho agent còn sống.)
 - Typical flow: `/ls` → `/kill pid:<PID> --restart` (or `/kill pid:<PID>` then `/spawn <project> --resume-session <uuid>`).
 - If you are the agent that wakes up from such a restart: follow the seed prompt (mailbox → Monitor → greet).
 

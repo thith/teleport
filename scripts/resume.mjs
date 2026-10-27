@@ -42,6 +42,10 @@ export function findResumeTarget(query, candidates, { aliveSessions = new Set() 
     ? candidates.filter((c) => c.hashtag === q)
     : candidates.filter((c) => c.persona && normalizeName(c.persona) === normalizeName(q));
   if (!hits.length) return { error: `no agent "${q}" with a Telegram topic in the last ${RECENT_DAYS} days.` };
+  // A hashtag is an exact address: two different sessions behind it → refuse, never pick the newest (RFC 26 §3.9).
+  if (t.kind === 'hashtag' && new Set(hits.map((h) => h.sessionId)).size > 1) {
+    return { error: `#${q} matches ${hits.length} sessions (${hits.map((h) => `${h.persona || '?'} ${h.sessionId}`).join(', ')}) — resume by UUID: /spawn <project> --resume-session <uuid>.` };
+  }
   hits.sort((a, b) => b.mtimeMs - a.mtimeMs);
   // Only DEAD sessions can be resumed: skip ones a live claude still holds.
   const dead = hits.filter((h) => !aliveSessions.has(h.sessionId));

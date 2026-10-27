@@ -1,3 +1,4 @@
+import { hashtagForSession } from './claude-procs.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import os from 'node:os';
@@ -9,7 +10,7 @@ import { fileURLToPath } from 'node:url';
 process.env.TELE_PERSONA_STORE = path.join(os.tmpdir(), `teleport-persona-store-spawn-${process.pid}.jsonl`);
 // No real systemd-run probe in unit tests (escapeServiceCgroup is tested with injected probes).
 process.env.TELEPORT_NO_SCOPE = '1';
-import { buildSpawnPlan, genSessionSeed, runSpawn, childLaunch, loginSeedEnv, wrapInLoginShell, scrubClaudeEnv, SEED_PATH, hasBinary, screenSessionExists, normalizeSessionName, parseScreenSessions, listSpawnSessions, resolveKillId, resolveAttachId, resolveAttachTarget, formatSessionList, resolveMode, SPAWN_PROMPT, PERMISSION_MODES, DEFAULT_PERMISSION_MODE, USAGE, personaByHashtag, gracefulKill, KILL_GRACE_MS, RESUME_PROMPT, resolveResumeSession, checkResumePreflight, findTranscriptDirs, checkPidKillAuth, resolveKillPid, normalizeAgentName, matchProcsByName, resumeHint, appendKillAudit, acquireResumeLock, acquireResumeFileLock, performResume, checkRestartTarget, checkRestartPreflight, RESUME_LOCK_STALE_MS, resumeLockSecret, inSystemdService, escapeServiceCgroup, SYSTEMD_SCOPE_PREFIX } from './spawn.mjs';
+import { buildSpawnPlan, genSessionSeed, runSpawn, childLaunch, loginSeedEnv, wrapInLoginShell, scrubClaudeEnv, SEED_PATH, hasBinary, screenSessionExists, normalizeSessionName, parseScreenSessions, listSpawnSessions, resolveKillId, resolveAttachId, resolveAttachTarget, formatSessionList, resolveMode, SPAWN_PROMPT, PERMISSION_MODES, DEFAULT_PERMISSION_MODE, USAGE, personaByHashtag, gracefulKill, KILL_GRACE_MS, RESUME_PROMPT, resolveResumeSession, checkResumePreflight, findTranscriptDirs, checkPidKillAuth, resolveKillPid, normalizeAgentName, matchProcsByName, resumeHint, checkScreenKillTarget, appendKillAudit, acquireResumeLock, acquireResumeFileLock, performResume, checkRestartTarget, checkRestartPreflight, RESUME_LOCK_STALE_MS, resumeLockSecret, inSystemdService, escapeServiceCgroup, SYSTEMD_SCOPE_PREFIX } from './spawn.mjs';
 import fs from 'node:fs';
 import { uuidToConvoInt } from './convo-registry.mjs';
 import { shortConvoHash } from './convo-hash.mjs';
@@ -1172,8 +1173,23 @@ test('performResume wait: another refusal (screen exists) is reported at once, n
 
 test('resumeHint: /resume #hashtag for a session with a topic, else the UUID form; none for a guess', () => {
   const t = { sessionId: '00000000-0000-4000-8000-0000000000bb', hashtag: 'a7611284' };
-  assert.equal(resumeHint(t, { topics: () => ({ a7611284: '1' }) }), '/resume #a7611284');
+  assert.equal(resumeHint(t, { topics: () => ({ a7611284: '1' }) }), '/resume_a7611284');
   assert.equal(resumeHint(t, { topics: () => ({}) }), `/spawn <project> --resume-session ${t.sessionId}`);
   assert.equal(resumeHint({ ...t, guessed: true }, { topics: () => ({ a7611284: '1' }) }), null);
   assert.equal(resumeHint(null), null);
+});
+
+test('checkScreenKillTarget: the claude inside must be that agent, alone, in a one-window screen', () => {
+  const sid = 'ac22f365-d351-4e54-82a5-303156081507';
+  const tag = hashtagForSession(sid);
+  const name = `tele-${tag}`;
+  const own = { pid: 7, screen: name, sessionId: sid, hashtag: tag };
+  assert.deepEqual(checkScreenKillTarget(name, [own], 1), { ok: true });
+  assert.deepEqual(checkScreenKillTarget(name, [], 1), { ok: true }, 'empty screen');
+  assert.match(checkScreenKillTarget(name, [own], 2).error, /2 cửa sổ/);
+  assert.match(checkScreenKillTarget(name, [own], null).error, /\? cửa sổ/);
+  assert.match(checkScreenKillTarget(name, [{ ...own, sessionId: '3b6f622a-63a9-491a-b683-b125b54d75fc' }], 1).error, /không phải session/);
+  assert.match(checkScreenKillTarget(name, [{ ...own, guessed: true }], 1).error, /không phải session/);
+  assert.match(checkScreenKillTarget(name, [own, { ...own, pid: 8 }], 1).error, /2 claude/);
+  assert.match(checkScreenKillTarget(name, [own, { pid: 9, screen: null, sessionId: 'x', hashtag: tag }], 1).error, /trùng/);
 });

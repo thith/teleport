@@ -66,4 +66,6 @@ test('findResumeTarget: reports skipped live namesakes; accepts the name: prefix
   assert.equal(findResumeTarget('name: #c2383556', C).target.sessionId, 's3');
   assert.match(findResumeTarget('#c9999999', C).error, /no agent/, 'an unmatched hashtag never falls back to names');
   assert.match(findResumeTarget('pid:123', C).error, /usage/);
+  const twin = [...C, { ...C.find((c) => c.hashtag === 'c2383556'), sessionId: 's9', mtimeMs: 1 }];
+  assert.match(findResumeTarget('#c2383556', twin).error, /matches 2 sessions/, 'two sessions behind one hashtag → refuse');
 });

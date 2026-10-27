@@ -362,7 +362,7 @@ export function personaByHashtag(store = readTopicsStore()) {
 }
 
 /**
- * How to bring a killed session back: `/resume #<hashtag>` when it has a Telegram
+ * How to bring a killed session back: `/resume_<hashtag>` when it has a Telegram
  * topic (/resume only finds those), else the UUID form. null for an unknown session.
  */
 export function resumeHint(t, { topics = () => convoByHashtag() } = {}) {
@@ -370,7 +370,7 @@ export function resumeHint(t, { topics = () => convoByHashtag() } = {}) {
   const tag = t.hashtag || hashtagForSession(t.sessionId);
   let hasTopic = false;
   try { hasTopic = !!(tag && topics()[tag]); } catch {}
-  return hasTopic ? `/resume #${tag}` : `/spawn <project> --resume-session ${t.sessionId}`;
+  return hasTopic ? `/resume_${tag}` : `/spawn <project> --resume-session ${t.sessionId}`; // tappable in Telegram (RFC 26)
 }
 
 /**
@@ -439,6 +439,29 @@ export async function gracefulKill(name, {
     if (!sessionExists(name)) return { method: 'quit', killed: true };
   }
   return { method: 'quit', killed: false };
+}
+
+/**
+ * May the screen kill (`/exit`, then quit the whole screen) hit `tele-<tag>`? Only if the
+ * claude inside is that agent: one claude, its known session hashes to `tag`, no other live
+ * session with the same hashtag, and ONE window (an un-targeted `/exit` / quit would hit any
+ * other window too). An empty screen holds no agent → ok. `windows` null = unknown → refuse.
+ * Pure → { ok } | { error } (RFC 26 §3.7).
+ */
+export function checkScreenKillTarget(name, procs, windows) {
+  const tag = String(name).replace(/^tele-/, '').toLowerCase();
+  const inside = procs.filter((r) => r.screen === name);
+  const pidHint = (rows) => rows.map((r) => `/kill pid:${r.pid}`).join(' · ');
+  if (windows !== 1) return { error: `screen "${name}" có ${windows ?? '?'} cửa sổ — không gõ /exit mù. Dùng ${pidHint(inside) || '/kill pid:<PID>'}.` };
+  if (!inside.length) return { ok: true };
+  if (inside.length > 1) return { error: `screen "${name}" có ${inside.length} claude — dùng ${pidHint(inside)}.` };
+  const r = inside[0];
+  if (r.guessed || !r.sessionId || hashtagForSession(r.sessionId) !== tag) {
+    return { error: `claude trong "${name}" không phải session #${tag}${r.sessionId ? ` (${r.guessed ? 'đoán ' : ''}${r.sessionId})` : ''} — dùng /kill pid:${r.pid}.` };
+  }
+  const twins = procs.filter((p) => p.pid !== r.pid && p.hashtag === tag && p.sessionId !== r.sessionId);
+  if (twins.length) return { error: `#${tag} trùng với ${twins.map((p) => `PID ${p.pid}`).join(', ')} — dùng /kill pid:${r.pid}.` };
+  return { ok: true };
 }
 
 /**
@@ -1408,6 +1431,13 @@ if (isDirectRun) {
       console.error(`[spawn] no screen session "${name}" (try: spawn.mjs --list). NB: --kill needs the FULL hashtag — the 3-char tail / no-id shortcuts are --attach only (destructive, so kill stays explicit).`);
       process.exit(1);
     }
+    // The screen's NAME is not proof of who is inside it: check the occupant first.
+    let procs;
+    try { procs = listClaudeProcs({ strict: true }); } catch (e) { console.error(`[spawn] ❌ cannot list claude processes (${e.message}) — nothing killed.`); process.exit(1); }
+    let windows = null;
+    try { windows = (String(execFileSync('screen', ['-S', name, '-Q', 'windows'], { encoding: 'utf8', timeout: 5000 })).match(/(?:^|\s{2})\d+\S*(?:\s|$)/g) || []).length; } catch {}
+    const sk = checkScreenKillTarget(name, procs, windows);
+    if (sk.error) { appendKillAudit({ screen: name, result: 'refused', reason: sk.error, fromId: process.env.TELE_FROM_ID || '' }); console.error(`[spawn] ❌ ${sk.error}`); process.exit(1); }
     // Graceful: try claude's own /exit first, wait up to 10s, force-quit if stubborn.
     console.log(`[spawn] sending /exit to "${name}", waiting up to ${KILL_GRACE_MS / 1000}s…`);
     const r = await gracefulKill(name);
@@ -1420,7 +1450,9 @@ if (isDirectRun) {
     console.log(r.method === 'exit'
       ? `[spawn] "${name}" exited gracefully (/exit).`
       : `[spawn] "${name}" didn't exit in ${KILL_GRACE_MS / 1000}s — force-killed.`);
-    console.log(`[spawn] resume it: /resume #${name.replace(/^tele-/, '')}`);
+    const inside = procs.find((r) => r.screen === name);
+    const hint = inside ? resumeHint(inside) : null;
+    if (hint) console.log(`[spawn] resume it: ${hint}`);
     process.exit(0);
   }
 
