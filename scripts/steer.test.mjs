@@ -37,6 +37,7 @@ test('resolveSteerTargetRaw: # explicit; reply → ALL text; else quoted / `_` t
   assert.deepEqual(resolveSteerTargetRaw('“Cà Rồng” xin "chào"', opts()), { match: LIVE[0], text: 'xin "chào"' });
   assert.deepEqual(resolveSteerTargetRaw('Cà_Rồng hi', opts()), { match: LIVE[0], text: 'hi' });
   assert.match(resolveSteerTargetRaw('"Cà Rồng hi', opts()).error, /thiếu dấu đóng/);
+  assert.deepEqual(resolveSteerTargetRaw('“please continue', opts(`ack #${shortConvoHash(C)}`)), { match: LIVE[2], text: '“please continue' }, 'reply mode: an unclosed quote is just text');
   assert.match(resolveSteerTargetRaw('Cà Rồng hi', opts()).error, /Cà not found/, 'unquoted: the first word only');
   const dup = [...LIVE, row('77777777777777', 'Mèo', { ts: 99 })];
   assert.match(resolveSteerTargetRaw('Mèo hi', { live: dup, usage: 'U' }).error, /ambiguous .*#.*— dùng #hashtag/);

@@ -175,19 +175,19 @@ export function matchSteerName(value, live) {
  */
 export function resolveSteerTargetRaw(raw, { live, replyText, usage }) {
   const sp = splitRawTarget(raw);
-  if (sp.error) return { error: sp.error };
   const fail = (t, status, cands) => ({ error: `target ${t} ${status === 'ambiguous' ? `is ambiguous${cands?.length ? ` (${cands.map((c) => `#${c.hashtag}`).join(', ')}) — dùng #hashtag` : ''}` : 'not found among live topics'}.` });
   const find = (tok) => {
     const t = normalizeTarget(tok);
     return t.kind === 'name' ? matchSteerName(t.value, live) : matchTarget(t, live);
   };
-  if (!sp.quoted && sp.token.startsWith('#')) {
+  if (!sp.error && !sp.quoted && sp.token.startsWith('#')) {
     const m = find(sp.token);
     return m.status === 'found' ? { match: m.match, text: sp.text } : fail(sp.token, m.status, m.candidates);
   }
   const replyMatch = targetFromReply(replyText, live);
   if (replyMatch?.ambiguous) return fail(replyMatch.ambiguous, 'ambiguous');
   if (replyMatch) return { match: replyMatch, text: String(raw).trim() };
+  if (sp.error) return { error: sp.error }; // an unclosed quote only matters when it names the target
   if (sp.token) {
     const m = find(sp.token);
     return m.status === 'found' ? { match: m.match, text: sp.text } : fail(sp.quoted ? `"${sp.token}"` : sp.token, m.status, m.candidates);
