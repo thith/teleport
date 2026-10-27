@@ -152,7 +152,7 @@ test('formatAge', () => {
   assert.equal(formatAge(-1), '0 giây');
 });
 
-test('formatAgentList: status line under agents with a convo only; throwing statusOf → omitted', () => {
+test('formatAgentList: status + mailbox lines in the block of agents with a convo only; a throw → omitted', () => {
   const SID = '848e5ded-a905-4b49-8448-12ed50f4a7dc';
   const SID_T = '971e709e-2629-4d22-9943-40a52ee04a6b';
   const cScreen = uuidToConvoInt(SID);
@@ -161,19 +161,31 @@ test('formatAgentList: status line under agents with a convo only; throwing stat
     { pid: 1, etime: '1:00', cwd: '/w/a', screen: `tele-${shortConvoHash(cScreen)}`, sessionId: SID, hashtag: shortConvoHash(cScreen) },
     { pid: 2, etime: '1:00', cwd: '/w/b', screen: null, sessionId: SID_T, hashtag: shortConvoHash(cTerm) },
     { pid: 3, etime: '1:00', cwd: '/w/c', screen: null, sessionId: null },
+    { pid: 4, etime: '1:00', cwd: '/w/d', screen: 'tele-e5424020', sessionId: null },
   ];
   const seen = [];
   const out = formatAgentList({
-    screens: [{ name: 'tele-e5424020' }], procs, home: '/h',
-    statusOf: (c) => { seen.push(c); return c === 4242 ? null : `S${c}`; },
+    procs, home: '/h', showSession: false,
+    statusLinesOf: (c) => { seen.push(c); return [`🎧 S${c}`]; },
+    mailOf: (c) => (c === cTerm ? 2 : 0),
     convoOfHashtag: (h) => (h === 'e5424020' ? 4242 : null),
   });
-  assert.match(out, new RegExp(`• tele-${shortConvoHash(cScreen)}\\n  PID 1 · a · 1:00\\n  session ${SID} · #\\w+\\n  S${cScreen}\\n`));
-  assert.match(out, new RegExp(`• PID 2 · b · 1:00\\n  session ${SID_T} · #\\w+\\n  S${cTerm}\\n`));
-  assert.match(out, /• PID 3 · c · 1:00\n  session \?\n\n/); // no convo → nothing extra
-  assert.match(out, /• tele-e5424020 · \(không thấy claude bên trong\)\n  ─+\n•/); // status null → no line (next is the separator)
+  assert.match(out, new RegExp(`⏱️ Uptime: 1:00\\n🎧 S${cScreen}\\n\\n`));
+  assert.match(out, new RegExp(`📁 Folder: b\\n⏱️ Uptime: 1:00\\n🎧 S${cTerm}\\n📬 Mailbox: 2 thư chưa đọc`));
+  assert.match(out, /🖥 PID 3\n🔢 PID: 3\n📁 Folder: c\n⏱️ Uptime: 1:00(\n\n|$)/); // no convo → nothing extra
+  assert.match(out, /🎧 S4242/, 'a tele-* screen without a session falls back to the topics store');
   assert.deepEqual(seen.sort(), [4242, cScreen, cTerm].sort());
-  const safe = formatAgentList({ procs, statusOf: () => { throw new Error('x'); }, convoOfHashtag: () => { throw new Error('y'); } });
-  assert.doesNotMatch(safe, /S\d/);
-  assert.match(safe, /PID 2/);
+});
+
+test('statusOf.lines: one labelled line per signal (the /ls blocks); same signals as statusOf', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ls-lines-'));
+  fs.writeFileSync(path.join(dir, 'prompt-convo-7.json'), JSON.stringify({ messages: [{ text: 'a' }] }));
+  fs.writeFileSync(path.join(dir, 'prompt-convo-7.processing.json'), '{}');
+  const st = createListenerStatus({ tmpDir: dir, registryFile: path.join(dir, 'none.jsonl'), cacheFile: null, topics: {}, isLive: () => false });
+  const lines = st.lines(7);
+  assert.equal(lines[0], '🔇 Listener: tắt');
+  assert.match(lines.join('\n'), /🔇 Listener: tắt\n📥 Hàng đợi: .*chờ agent nhận \(\d+ giây\)\n⏳ Đang xử lý: \d+ giây/);
+  assert.match(st(7), /^🔇 listener tắt · 📥 .*chờ agent nhận .* · ⏳ đang xử lý /);
+  assert.deepEqual(st.lines(0), []);
+  fs.rmSync(dir, { recursive: true, force: true });
 });

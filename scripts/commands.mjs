@@ -66,8 +66,40 @@ export function resolveCommand(name, registry) {
     // Only commands that opt in receive the replied-to DM text (TELE_REPLY_TEXT).
     // Default false so arbitrary reply content never leaks to e.g. /run children.
     wantsReplyText: c.wantsReplyText === true,
+    // Long output goes out as several plain messages cut between blocks (an empty line), not one
+    // .md file — the /ls links must stay tappable (RFC 26 §3.10).
+    splitBlocks: c.splitBlocks === true,
     desc: typeof c.desc === 'string' ? c.desc : '',
   };
+}
+
+/**
+ * Cut `text` into messages of ≤ `limit` chars at block boundaries (an empty line); a block too long
+ * for one message is cut between lines, a line too long is cut hard. Pure.
+ */
+export function splitAtBlocks(text, limit = 3800) {
+  const pieces = [];
+  for (const block of String(text).split(/\n\n+/)) {
+    if (block.length <= limit) { pieces.push(block); continue; }
+    let cur = '';
+    for (const line of block.split('\n')) {
+      for (let i = 0; i < Math.max(line.length, 1);) {
+        let end = Math.min(i + limit, line.length);
+        if (end < line.length && end - 1 > i && /[\uD800-\uDBFF]/.test(line[end - 1])) end -= 1; // never split an emoji's surrogate pair
+        const seg = line.slice(i, end);
+        i = end || 1;
+        if (cur && cur.length + 1 + seg.length > limit) { pieces.push(cur); cur = ''; }
+        cur = cur ? `${cur}\n${seg}` : seg;
+      }
+    }
+    if (cur) pieces.push(cur);
+  }
+  const out = [];
+  for (const p of pieces) {
+    if (out.length && out[out.length - 1].length + 2 + p.length <= limit) out[out.length - 1] += `\n\n${p}`;
+    else out.push(p);
+  }
+  return out.filter((m) => m.trim());
 }
 
 // Split a command's argument string into tokens, honouring single/double quotes

@@ -143,30 +143,68 @@ test('guessSessionFromTranscripts: newest unclaimed, written since start; ignore
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
-test('formatAgentList: screens section first (with the claude inside), then terminal; full session ids', () => {
+test('formatAgentList: one block per claude process — title, `<emoji> <name>: <value>` lines, links last', () => {
   const procs = [
-    { pid: 830318, tty: 'pts/7', etime: '2-00:49:26', cwd: '/home/u/Projects/umipay', screen: null, sessionId: SID, guessed: false, hashtag: 'a7611284', name: '🪱 Giun', status: 'idle' },
+    { pid: 830318, tty: 'pts/7', etime: '2-00:49:26', cwd: '/home/u/Projects/umipay', screen: null, sessionId: SID, guessed: false, hashtag: 'a7611284', name: '🪱 Giun', status: 'idle', bridgeSessionId: 'b1' },
     { pid: 9, tty: 'pts/8', etime: '00:01', cwd: null, screen: 'tele-i0744244', sessionId: SID2, guessed: true, hashtag: 'i0744244', name: null, status: null },
     { pid: 11, tty: null, etime: '00:02', cwd: '/w', screen: 'work', sessionId: null, guessed: false, hashtag: null, name: 'x', status: null },
   ];
   const out = formatAgentList({
     screens: [{ pid: '1', name: 'tele-i0744244' }, { pid: '2', name: 'tele-empty123' }], procs,
     personaOf: (h) => (h === 'i0744244' ? '🦛 Hà Mã' : null), home: '/home/u',
+    ctxOf: (r) => (r.pid === 830318 ? 'ctx 172k (17%)' : null),
+    linksOf: (r) => (r.pid === 830318 ? ['/compact_a7611284', '/kill_a7611284'] : []),
   });
   const iScreen = out.indexOf('📺 Screen (3)');
   const iTerm = out.indexOf('🖥 Terminal (1)');
   assert.ok(iScreen === 0 && iTerm > iScreen, out);
-  assert.match(out, /• tele-i0744244 · 🦛 Hà Mã\n  PID 9 · \? · 00:01\n  session 5ce13594-1e43-4d2d-afd3-ac16ccfece93 \(đoán\) · #i0744244/);
-  assert.match(out, /• tele-empty123 · \(không thấy claude bên trong\)/);
-  assert.match(out, /• work\n  PID 11 · 📨 x · w · 00:02\n  session \?/); // non-tele screen hosting a claude
+  assert.match(out, new RegExp(`\n\n🦛 Hà Mã #i0744244 \\(đoán\\)\n📺 Screen: tele-i0744244\n🔢 PID: 9\n🆔 Session: ${SID2} \\(đoán\\)\n⏱️ Uptime: 00:01\n\n`));
+  assert.match(out, /\n\n📺 tele-empty123 · không thấy claude bên trong\n\n/);
+  assert.match(out, /\n\nx\n📺 Screen: work\n🔢 PID: 11\n📨 Session: x\n📁 Folder: w\n⏱️ Uptime: 00:02\n\n/); // non-tele screen hosting a claude
   const term = out.slice(iTerm);
-  assert.match(term, new RegExp(`• PID 830318 · 📨 🪱 Giun \\(idle\\) · umipay · 2-00:49:26\\n  session ${SID} · #a7611284`));
-  assert.doesNotMatch(term, /PID 9 /); // a screen claude is not repeated under Terminal
-  assert.doesNotMatch(out, /pts\//);   // no tty column
-  assert.doesNotMatch(out, /\/kill pid:<PID>|--resume-session|SendMessage/);   // no how-to footer (Thi: too wordy)
+  assert.equal(term, `🖥 Terminal (1)\n\n🪱 Giun #a7611284\n🔢 PID: 830318\n📨 Session: 🪱 Giun\n🆔 Session: ${SID}\n⚙️ Trạng thái: idle\n📁 Folder: umipay\n⏱️ Uptime: 2-00:49:26\n🧠 Context: 172k\n📡 Remote Control: bật\n/compact_a7611284 /kill_a7611284`);
+  assert.doesNotMatch(out, /pts\//);   // no tty line
+  assert.doesNotMatch(out, /\n\n\n/);  // exactly one empty line between blocks
+  const hidden = formatAgentList({ procs, showSession: false });
+  assert.doesNotMatch(hidden, /🆔|5ce13594/, 'UUIDs hidden on Telegram');
+  assert.match(formatAgentList({ procs: [{ ...procs[1], name: 'g' }], showSession: false }), /🦛 Hà Mã #i0744244 \(đoán\)|g #i0744244 \(đoán\)/, 'a guess stays visible without the UUID');
+  assert.match(formatAgentList({ full: false, procs: [procs[1]] }), /^📺 #i0744244 \(đoán\)$/, 'short form too');
+  assert.match(formatAgentList({ procs: [{ pid: 5 }] }), /🖥 Terminal \(1\)\n\n🖥 PID 5\n🔢 PID: 5$/);
   const empty = formatAgentList({});
-  assert.match(empty, /📺 Screen \(0\)\n  \(không có\)/);
-  assert.match(empty, /🖥 Terminal \(0\)\n  \(không có\)/);
+  assert.equal(empty, '📺 Screen (0)\n\n(không có)\n\n🖥 Terminal (0)\n\n(không có)');
+});
+
+test('formatAgentList full:false — one line per agent (icon, name #hash, state, ctx, 🔇, 📬) + its links', () => {
+  const procs = [
+    { pid: 1, etime: '1:00', cwd: '/w/a', screen: 'tele-a7611284', sessionId: SID, hashtag: 'a7611284', name: 'sess-a', status: 'busy' },
+    { pid: 2, etime: '1:00', cwd: '/w/b', screen: null, sessionId: null, hashtag: null, name: 'term', status: null },
+    { pid: 3, etime: '1:00', cwd: '/w/c', screen: null, sessionId: null, hashtag: null, name: null, status: null },
+  ];
+  const out = formatAgentList({
+    full: false, screens: [{ name: 'tele-empty123' }], procs,
+    personaOf: (h) => (h === 'a7611284' ? '🪱 Giun' : null),
+    ctxOf: (r) => (r.pid === 1 ? 'ctx 150k (15%)' : null),
+    listenerOf: () => 'off', mailOf: () => 2,
+    linksOf: (r) => (r.pid === 1 ? ['/compact_a7611284', '/kill_a7611284', '/nudge_a7611284'] : []),
+  });
+  assert.equal(out, [
+    '📺 tele-empty123 · không thấy claude bên trong',
+    '📺 🪱 Giun #a7611284 · busy · 150k · 🔇 · 📬2\n/compact_a7611284 /kill_a7611284 /nudge_a7611284',
+    '🖥 term',
+    '🖥 PID 3',
+  ].join('\n\n'));
+  assert.equal(formatAgentList({ full: false }), '(không có agent nào)');
+  const hl = (n) => formatAgentList({ full: false, procs: [procs[0]], ctxOf: () => 'ctx Xk (9%)', tokensOf: () => n });
+  assert.match(hl(300_000), /busy · Xk$/);
+  assert.match(hl(300_001), /busy · 🟡 Xk$/);
+  assert.match(hl(700_001), /busy · 🔴 Xk$/);
+  assert.match(formatAgentList({ procs: [procs[0]], ctxOf: () => 'ctx 800k', tokensOf: () => 800_000 }), /🧠 Context: 🔴 800k/, 'full form too');
+});
+
+test('formatAgentList: a throwing lookup drops its line, never the list', () => {
+  const boom = () => { throw new Error('x'); };
+  const out = formatAgentList({ procs: [{ pid: 2, sessionId: SID, hashtag: 'a7611284', cwd: '/w' }], personaOf: boom, ctxOf: boom, linksOf: boom, statusLinesOf: boom, mailOf: boom });
+  assert.match(out, /#a7611284\n🔢 PID: 2\n🆔 Session: \S+\n📁 Folder: w$/);
 });
 
 test('findUnidentifiedProcs: no session file (or guessed) AND cwd unknown/same', () => {
@@ -368,12 +406,3 @@ test('killClaudePid: expectStart (caller snapshot) mismatch → refused, no sign
   assert.equal(sent.length, 0);
 });
 
-test('formatAgentList: a separator between entries, never before the first or after the last', async () => {
-  const { formatAgentList } = await import('./claude-procs.mjs');
-  const out = formatAgentList({ screens: [{ name: 'tele-a' }, { name: 'tele-b' }], procs: [{ pid: 2, sessionId: null }, { pid: 3, sessionId: null }] }).split('\n');
-  const seps = out.map((l, i) => [l, i]).filter(([l]) => l.trim().startsWith('───')).map(([, i]) => i);
-  assert.equal(seps.length, 2, 'one between the 2 screens, one between the 2 terminal procs');
-  for (const i of seps) { assert.match(out[i - 1], /\S/); assert.match(out[i + 1], /^• /); }
-  const one = formatAgentList({ screens: [{ name: 'tele-a' }], procs: [] });
-  assert.doesNotMatch(one, /───/);
-});

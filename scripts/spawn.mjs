@@ -37,6 +37,8 @@ import { uuidToConvoInt } from './convo-registry.mjs';
 import { shortConvoHash } from './convo-hash.mjs';
 import { normalizeAgentName, parseAgentTarget } from './agent-target.mjs';
 import { createListenerStatus } from './listener-status.mjs';
+import { countUnread } from './mailbox.mjs';
+import { typeTargets, lsLinks } from './type-cmd.mjs';
 import { readTopicsStore } from './topics-store.mjs';
 import { formatPersona } from './persona.mjs';
 import { peekPersona } from './persona-store.mjs';
@@ -1271,17 +1273,42 @@ if (isDirectRun) {
     let cfg = {};
     try { cfg = readProjectsConfig(path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'projects.json')); } catch {}
     // Listener alive / unread / busy per convo — best-effort, never blocks /ls.
-    let statusOf = () => null;
+    let statusOf = null;
     let cmap = {};
     try { statusOf = createListenerStatus(); cmap = convoByHashtag(); } catch { /* omit statuses */ }
+    // Over Telegram (the daemon sets TELE_FROM_ID): no session UUIDs; tappable commands only for the
+    // owner (the taps are owner-only too). From a terminal: UUIDs, no links.
+    const fromId = process.env.TELE_FROM_ID || '';
+    let ownerId = null;
+    try { ownerId = resolveDaemonUserId(cfg, { env: {} }); } catch {}
+    const owner = fromId !== '' && ownerId != null && String(ownerId) === fromId;
+    const procs = listClaudeProcs();
+    const reachable = new Set(typeTargets(procs));
+    const tagCount = new Map();
+    for (const r of procs) if (r.hashtag) tagCount.set(r.hashtag, (tagCount.get(r.hashtag) || 0) + 1);
+    const usageOf = new Map(); // one transcript read per row (context line + /compact_x gate)
+    const usage = (r) => {
+      if (!r.sessionId || r.guessed) return null;
+      if (!usageOf.has(r)) { let u = null; try { u = transcriptState(r.sessionId, r.cwd).usage; } catch {} usageOf.set(r, u); }
+      return usageOf.get(r);
+    };
+    const mailOf = (c) => countUnread(c);
     console.log(formatAgentList({
-      screens, procs: listClaudeProcs(),
+      screens, procs,
       personaOf: (h) => (pmap[h] ? formatPersona(pmap[h]) : null),
-      statusOf, convoOfHashtag: (h) => cmap[h] ?? null,
+      statusLinesOf: (c) => statusOf?.lines(c) ?? [], mailOf, convoOfHashtag: (h) => cmap[h] ?? null,
+      showSession: fromId === '', full: fromId === '' || argv.includes('full') || argv.includes('--full'), // a terminal always gets the UUIDs
+      listenerOf: (c) => statusOf?.listener(c) ?? null,
+      tokensOf: (r) => usage(r)?.tokens ?? null,
       ctxOf: (r) => {
-        if (!r.sessionId || r.guessed) return null;
-        const u = transcriptState(r.sessionId, r.cwd).usage;
+        const u = usage(r);
         return formatContext(u, contextWindowFor(cfg, { hashtag: r.hashtag, model: u?.model }));
+      },
+      linksOf: (r) => {
+        if (!owner) return [];
+        const convo = r.sessionId ? uuidToConvoInt(r.sessionId) : null;
+        const sig = (f) => { try { return convo == null ? null : f(convo); } catch { return null; } };
+        return lsLinks(r, { reachable: reachable.has(r), unique: tagCount.get(r.hashtag) === 1, tokens: usage(r)?.tokens ?? null, listener: sig((c) => statusOf?.listener(c) ?? null), mail: sig(mailOf) });
       },
     }));
     if (wiped.length) console.log(`\n🧹 đã dọn ${wiped.length} screen chết: ${wiped.join(', ')}`);
