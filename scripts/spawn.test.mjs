@@ -1187,6 +1187,7 @@ test('checkScreenKillTarget: the claude inside must be that agent, alone, in a o
   const ok = (procs, opts = {}) => checkScreenKillTarget(name, procs, { screenPid: 100, windows: 1, ...opts });
   assert.deepEqual(ok([own]), { ok: true });
   assert.deepEqual(ok([]), { ok: true }, 'empty screen');
+  assert.match(ok([], { descendantClaudes: [33] }).error, /không nhận diện được/, 'a claude under the screen that no row matched → refuse');
   assert.deepEqual(ok([own, { ...own, pid: 12, ppid: 7 }]), { ok: true }, 'a claude -p child of the agent is not a 2nd occupant');
   assert.match(ok([own], { windows: 2 }).error, /2 cửa sổ/);
   assert.match(ok([own], { windows: null }).error, /\? cửa sổ/);
@@ -1194,6 +1195,8 @@ test('checkScreenKillTarget: the claude inside must be that agent, alone, in a o
   assert.match(ok([{ ...own, sessionId: '3b6f622a-63a9-491a-b683-b125b54d75fc' }]).error, /không phải session/);
   assert.match(ok([{ ...own, guessed: true }]).error, /không phải session/);
   assert.match(ok([own, { ...own, pid: 8 }]).error, /2 claude/);
+  const shelled = { ...own, ppid: 50 };
+  assert.deepEqual(ok([shelled, { ...own, pid: 12, ppid: 7 }]), { ok: true }, 'claude under a shell + its claude -p child');
   assert.match(ok([own, { pid: 9, screen: null, sessionId: 'x', hashtag: tag }]).error, /trùng/);
   assert.match(ok([own, { pid: 9, ppid: 1, screen: null, sessionId: sid, hashtag: tag }]).error, /trùng/, 'same session in a terminal too');
   const renamed = { ...own, screen: 'tele-zzzz0000', sessionId: '3b6f622a-63a9-491a-b683-b125b54d75fc', hashtag: 'i9661332' };

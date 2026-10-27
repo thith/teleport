@@ -450,17 +450,18 @@ export async function gracefulKill(name, {
  * occupant = empty screen → ok. `windows` = direct children of the screen process (one per
  * window); null = unknown → refuse. Pure → { ok } | { error } (RFC 26 §3.7).
  */
-export function checkScreenKillTarget(name, procs, { screenPid = null, windows = null } = {}) {
+export function checkScreenKillTarget(name, procs, { screenPid = null, windows = null, descendantClaudes = [] } = {}) {
   const tag = String(name).replace(/^tele-/, '').toLowerCase();
   if (!screenPid) return { error: `không xác định được tiến trình của screen "${name}" — dùng /kill pid:<PID>.` };
   const all = procs.filter((r) => r.screen === name || r.screenPid === screenPid);
   // The window's own claude is the SCREEN's direct child; a `claude -p` the agent runs inherits STY
   // but is its descendant — not a second occupant. No direct child (claude under a shell) → all rows.
   const direct = all.filter((r) => r.ppid === screenPid);
-  const inside = direct.length ? direct : all;
+  const inside = direct.length ? direct : all.filter((r) => !all.some((o) => o.pid === r.ppid));
   const pidHint = (rows) => rows.map((r) => `/kill pid:${r.pid}`).join(' · ');
   if (windows !== 1) return { error: `screen "${name}" có ${windows ?? '?'} cửa sổ — không gõ /exit mù. Dùng ${pidHint(inside) || '/kill pid:<PID>'}.` };
-  if (!inside.length) return { ok: true };
+  // "Empty" only if no claude process at all descends from the screen (rows can miss one: no STY, renamed screen).
+  if (!inside.length) return descendantClaudes.length ? { error: `screen "${name}" có claude không nhận diện được (PID ${descendantClaudes.join(', ')}) — dùng /kill pid:<PID>.` } : { ok: true };
   if (inside.length > 1) return { error: `screen "${name}" có ${inside.length} claude — dùng ${pidHint(inside)}.` };
   const r = inside[0];
   if (r.guessed || !r.sessionId || hashtagForSession(r.sessionId) !== tag) {
@@ -1443,10 +1444,16 @@ if (isDirectRun) {
     let procs;
     try { procs = listClaudeProcs({ strict: true }); } catch (e) { console.error(`[spawn] ❌ cannot list claude processes (${e.message}) — nothing killed.`); process.exit(1); }
     // One window = one direct child of the SCREEN process (window titles can't fool a count of processes).
-    const screenPid = Number(listSpawnSessions().find((s) => s.name === name)?.pid) || null;
+    const screenPid = Number(listSpawnSessions().find((s) => s.name.toLowerCase() === name.toLowerCase())?.pid) || null;
     const ps = screenPid ? readPs() : null;
     const windows = ps ? ps.filter((p) => p.ppid === screenPid).length : null;
-    const sk = checkScreenKillTarget(name, procs, { screenPid, windows });
+    const descendantClaudes = [];
+    if (ps) {
+      const byPpid = new Map();
+      for (const p of ps) (byPpid.get(p.ppid) || byPpid.set(p.ppid, []).get(p.ppid)).push(p);
+      for (let q = [...(byPpid.get(screenPid) || [])]; q.length;) { const p = q.pop(); if (p.comm === 'claude') descendantClaudes.push(p.pid); q.push(...(byPpid.get(p.pid) || [])); }
+    }
+    const sk = checkScreenKillTarget(name, procs, { screenPid, windows, descendantClaudes });
     if (sk.error) { appendKillAudit({ screen: name, result: 'refused', reason: sk.error, fromId: process.env.TELE_FROM_ID || '' }); console.error(`[spawn] ❌ ${sk.error}`); process.exit(1); }
     // Graceful: try claude's own /exit first, wait up to 10s, force-quit if stubborn.
     console.log(`[spawn] sending /exit to "${name}", waiting up to ${KILL_GRACE_MS / 1000}s…`);

@@ -128,7 +128,8 @@ if (isMainModule(import.meta.url)) {
     extraArgs = px.args;
   }
   const { listClaudeProcs } = await import('./claude-procs.mjs');
-  const liveRows = listClaudeProcs();
+  let liveRows;
+  try { liveRows = listClaudeProcs({ strict: true }); } catch (e) { console.log(`❌ cannot list live claude processes (${e.message}) — not resuming blind.`); process.exit(1); }
   const alive = new Set(liveRows.map((r) => r.sessionId).filter(Boolean));
   const pick = findResumeTarget(query, listCandidates(), { aliveSessions: alive, liveRows });
   if (pick.error) { console.log(`❌ ${pick.error}`); process.exit(1); }
