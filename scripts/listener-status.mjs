@@ -192,7 +192,10 @@ export function createListenerStatus({
         }
         if (offset > 0 && threadByChat.size) {
           const msgs = collectMessagesToProcess(updates.filter((u) => u.update_id >= offset), [...threadByChat.keys()], null, 'convo', threadByChat);
-          for (const m of msgs) if (Number.isFinite(m.msg?.date)) at.push(m.msg.date * 1000);
+          for (const m of msgs) { // an edit is new too: its edit_date, not the original date
+            const d = Math.max(Number(m.msg?.date) || 0, Number(m.msg?.edit_date) || 0);
+            if (d > 0) at.push(d * 1000);
+          }
         }
       }
     } catch { /* unknown */ }

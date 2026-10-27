@@ -6,13 +6,15 @@
 //   - both → the combined line.
 // A listener that is off with nothing waiting is left alone (turning it off can be intentional — fewer pings).
 // WINDOW_MS > the heartbeat, so every item is seen at least once; `seen` (in RAM, convo → newest stamps
-// already reminded) keeps two ticks from nudging twice for the same item. Nothing is posted to Telegram:
+// already reminded, set once the line was typed) keeps two ticks from nudging twice for the same item;
+// a refused nudge is retried on the next tick while the item is still inside the window. Nothing is posted to Telegram:
 // the TypeRunner audits, and the agent posts its own status.
 
 import { typeTargets, pinTarget, observe, NUDGE_LINES } from './type-cmd.mjs';
 import { uuidToConvoInt } from './convo-registry.mjs';
 
 export const AUTO_NUDGE_WINDOW_MS = 80_000;
+const NUDGED = '👋 đã nudge'; // TypeRunner.nudge success text
 
 /**
  * What to remind `convo` of now. `mailAt` / `tgAt` = newest unread stamps (ms | null), `listener` 'on'|'off'|null,
@@ -41,10 +43,11 @@ export async function autoNudgeTick({ list, io, runner, mailAt, tgAt, listener, 
     if (convo == null) continue;
     const need = autoNudgeNeed({ mailAt: mailAt(convo), tgAt: tgAt(convo), listener: listener(convo), prev: seen.get(convo), now });
     if (!need) continue;
-    seen.set(convo, need.mark); // marked BEFORE typing: a refused one is not retried (the owner has /nudge)
     const t = pinTarget(r);
     if (observe(t, io).mismatch) continue;
     const res = await runner.run('n', t, 'auto', { persona: personaOf(t.hashtag), line: need.line }).catch((e) => ({ text: `❌ ${e?.message ?? e}` }));
+    // Marked only once typed: a refusal (lock, cool-down, dialog) is retried next tick while still in the window.
+    if (String(res.text).startsWith(NUDGED)) seen.set(convo, need.mark);
     log(`[auto-nudge] #${t.hashtag}: ${res.text}`);
     out.push({ hashtag: t.hashtag, line: need.line, text: res.text });
   }

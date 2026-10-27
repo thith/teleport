@@ -28,7 +28,7 @@ const io = { session: () => ({ sessionId: SID, status: 'idle' }), proc: () => ({
 
 test('autoNudgeTick: nudges once per new item with the fixed line; twins, drifted and unknown convos skipped', async () => {
   const ran = [];
-  const runner = { run: async (op, t, who, o) => { ran.push([op, t.hashtag, who, o.line, o.persona]); return { text: 'ok' }; } };
+  const runner = { run: async (op, t, who, o) => { ran.push([op, t.hashtag, who, o.line, o.persona]); return { text: '👋 đã nudge #aaaa0001.' }; } };
   const seen = new Map();
   const deps = { io, runner, seen, mailAt: (c) => (c === CONVO ? NOW - 5_000 : null), tgAt: () => null, listener: () => 'on', personaOf: () => '🐺 Sói', now: NOW };
   await autoNudgeTick({ ...deps, list: () => [row({})] });
@@ -41,6 +41,18 @@ test('autoNudgeTick: nudges once per new item with the fixed line; twins, drifte
   assert.equal(ran.length, 1, 'drifted target → skipped');
   await autoNudgeTick({ ...deps, seen: new Map(), list: () => [row({ screen: 'other' })] });
   assert.equal(ran.length, 1, 'not in its tele-* screen → skipped');
+});
+
+test('autoNudgeTick: a refused nudge (lock / cool-down / dialog) is retried on the next tick, then marked', async () => {
+  const texts = ['⏳ vừa gõ lệnh vào agent này — đợi vài giây rồi thử lại.', '👋 đã nudge #aaaa0001.'];
+  let calls = 0;
+  const runner = { run: async () => ({ text: texts[calls++] }) };
+  const seen = new Map();
+  const deps = { list: () => [row({})], io, runner, seen, mailAt: () => NOW - 5_000, tgAt: () => null, listener: () => 'on' };
+  await autoNudgeTick({ ...deps, now: NOW });
+  await autoNudgeTick({ ...deps, now: NOW + 60_000 });
+  await autoNudgeTick({ ...deps, now: NOW + 70_000 });
+  assert.equal(calls, 2, 'refused → retried once → typed → not again');
 });
 
 test('autoNudgeTick: a throwing runner is logged, never thrown', async () => {

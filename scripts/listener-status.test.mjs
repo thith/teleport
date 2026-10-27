@@ -200,6 +200,10 @@ test('newestUnreadAt: newest unread topic message (its date) or queued prompt (m
   fs.writeFileSync(p, '{}');
   fs.utimesSync(p, new Date(NOW - 20_000), new Date(NOW - 20_000));
   assert.equal(st.newestUnreadAt(CONVO), NOW - 20_000, 'a queued prompt counts');
+  const dir2 = tmp();
+  fs.writeFileSync(path.join(dir2, `convo-${CONVO}-offset.txt`), '10');
+  const edited = { update_id: 10, edited_message: { ...msg(10, { date: sec(900) }).message, edit_date: sec(30) } };
+  assert.equal(status(dir2, { cacheFile: writeCache(dir2, [edited]) }).newestUnreadAt(CONVO), sec(30) * 1000, 'an edit counts at its edit_date');
   assert.equal(status(tmp()).newestUnreadAt(CONVO), null);
   assert.equal(st.newestUnreadAt('garbage'), null);
 });
