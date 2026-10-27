@@ -31,6 +31,9 @@ test('typeStep2: buttons follow the state (idle → /compact + /remote-control; 
   assert.deepEqual(ops({ ...idle, state: 'unknown' }), ['k', 'x']); // nothing to type, still killable
   assert.deepEqual(ops({ ...idle, bridge: 'session_B' }), ['c', 'i', 'k', 'x']);
   assert.deepEqual(ops({ mismatch: 'phiên đã đổi' }), ['x']);
+  assert.deepEqual(ops({ ...idle, usage: { tokens: 99_999 } }), ['r', 'i', 'k', 'x'], 'under 100k: no /compact');
+  assert.deepEqual(ops({ ...idle, usage: { tokens: 100_000 } }), ['c', 'r', 'i', 'k', 'x']);
+  assert.deepEqual(ops({ ...idle, usage: null }), ['c', 'r', 'i', 'k', 'x'], 'unknown usage keeps it');
   const s = typeStep2({ target: T, obs: { ...idle, bridge: 'session_B' }, persona: '🧛 Ma', tok: 'a'.repeat(16) });
   assert.match(s.text, /🧛 Ma #c2383556 · PID 644406 · rảnh · ctx 693k · 📡/);
   assert.match(s.text, /claude\.ai\/code\/session_B/);
