@@ -53,6 +53,7 @@ import { resolveConvoIdFromEnv, uuidToConvoInt, CONVO_ID_RE } from './convo-regi
 import { personaForConvo, formatPersona } from './persona.mjs';
 import { peekPersona } from './persona-store.mjs';
 import { shortConvoHash } from './convo-hash.mjs';
+import { parseAgentTarget } from './agent-target.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -276,15 +277,16 @@ export function resolveRecipient(target, agents, { self = null } = {}) {
   const raw = String(target ?? '').trim();
   if (!raw) return { error: 'no recipient: pass --to <persona|#hashtag|convoId>' };
 
-  if (CONVO_ID_RE.test(raw)) {
-    const known = agents.find((a) => String(a.convoId) === raw);
+  const t = parseAgentTarget(raw); // the shared reading (agent-target.mjs); `name:<convoId>` is still a convoId
+  if (t.kind === 'convoId' && CONVO_ID_RE.test(t.value)) {
+    const known = agents.find((a) => String(a.convoId) === t.value);
     // An unknown convoId is still deliverable — the inbox is keyed by id, so mail
     // simply waits for a session that has not shown itself yet.
-    return { convoId: raw, agent: known ?? null, unregistered: !known };
+    return { convoId: t.value, agent: known ?? null, unregistered: !known };
   }
 
-  const isHashtag = raw.startsWith('#') || /^[a-j]\d{7}$/i.test(raw) || /^t\d+$/i.test(raw);
-  const want = (raw.startsWith('#') ? raw.slice(1) : raw).toLowerCase();
+  const isHashtag = t.kind === 'hashtag';
+  const want = String(t.kind === 'pid' ? raw : t.value).toLowerCase();
   // A display name is `<emoji> <name>` ("🪱 Giun"); humans type the name alone, so
   // compare against both forms rather than depending on the `persona` object being
   // present on every row (registry rows carry it, transcript rows may not).

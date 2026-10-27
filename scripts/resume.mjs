@@ -15,6 +15,7 @@ import path from 'node:path';
 import { isMainModule } from './is-direct-run.mjs';
 import { uuidToConvoInt } from './convo-registry.mjs';
 import { shortConvoHash } from './convo-hash.mjs';
+import { normalizeAgentName, parseAgentTarget } from './agent-target.mjs';
 import { readTopicsStore } from './topics-store.mjs';
 import { peekPersona } from './persona-store.mjs';
 import { formatPersona } from './persona.mjs';
@@ -24,10 +25,8 @@ export const PROJECTS_DIR = path.join(os.homedir(), '.claude', 'projects');
 export const RECENT_DAYS = 30;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-/** Name → comparable form (same rule as /kill name:). Pure. */
-export function normalizeName(s) {
-  return String(s ?? '').normalize('NFC').replace(/[^\p{L}\p{N}\s]/gu, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
-}
+/** Name → comparable form (the shared rule, agent-target.mjs). Pure. */
+export const normalizeName = normalizeAgentName;
 
 /**
  * Pick the session to resume. `candidates` = [{ sessionId, hashtag, persona, mtimeMs, cwd }].
@@ -35,14 +34,13 @@ export function normalizeName(s) {
  * Returns { target, others } | { error }. Pure.
  */
 export function findResumeTarget(query, candidates, { aliveSessions = new Set() } = {}) {
-  const q = String(query ?? '').trim().replace(/^name:\s*/i, ''); // accept the /kill name: form too
-  if (!q) return { error: 'usage: /resume <persona name | #hashtag>' };
-  const tag = q.replace(/^#/, '').toLowerCase();
-  let hits = /^[a-j]\d{7}$|^t\d+$/.test(tag) ? candidates.filter((c) => c.hashtag === tag) : [];
-  if (!hits.length) {
-    const n = normalizeName(q);
-    hits = candidates.filter((c) => c.persona && normalizeName(c.persona) === n);
-  }
+  const t = parseAgentTarget(query); // `name:` (the /kill form) accepted too
+  const q = String(t.value ?? '');
+  if (!q || t.kind === 'pid' || t.kind === 'convoId') return { error: 'usage: /resume <persona name | #hashtag>' };
+  // A hashtag is an exact address: no name fallback.
+  const hits = t.kind === 'hashtag'
+    ? candidates.filter((c) => c.hashtag === q)
+    : candidates.filter((c) => c.persona && normalizeName(c.persona) === normalizeName(q));
   if (!hits.length) return { error: `no agent "${q}" with a Telegram topic in the last ${RECENT_DAYS} days.` };
   hits.sort((a, b) => b.mtimeMs - a.mtimeMs);
   // Only DEAD sessions can be resumed: skip ones a live claude still holds.

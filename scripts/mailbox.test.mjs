@@ -111,6 +111,7 @@ test('addressing edge cases: self in a 2-way tie, unknown convoId, unknown name'
     { convoId: B, name: '🪱 Giun', persona: { emoji: '🪱', name: 'Giun' }, hashtag: 'i4452948', lastActive: 1000 },
   ];
   assert.equal(resolveRecipient('Giun', agents, { self }).convoId, B, 'nobody mails themselves by name');
+  assert.equal(resolveRecipient('name:999999999999', agents).convoId, '999999999999', 'name:<convoId> is still the exact address');
   const unknown = resolveRecipient('999999999999', agents);
   assert.equal(unknown.convoId, '999999999999');
   assert.equal(unknown.unregistered, true, 'mail waits for a session that has not shown up');

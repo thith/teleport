@@ -64,4 +64,6 @@ test('findResumeTarget: reports skipped live namesakes; accepts the name: prefix
   assert.deepEqual(r.skippedLive.map((x) => x.sessionId), ['s1']);
   assert.equal(findResumeTarget('name:Ma', C).target.sessionId, 's3');
   assert.equal(findResumeTarget('name: #c2383556', C).target.sessionId, 's3');
+  assert.match(findResumeTarget('#c9999999', C).error, /no agent/, 'an unmatched hashtag never falls back to names');
+  assert.match(findResumeTarget('pid:123', C).error, /usage/);
 });

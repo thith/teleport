@@ -27,10 +27,11 @@ test('#hashtag, convoId, or the session name itself', () => {
   assert.deepEqual(names('x-1'), ['x-1']);
 });
 
-test('a bare 8-char word may be a hashtag OR a name; "#…" is a hashtag only', () => {
+test('a hashtag shape (bare or "#…") is a hashtag only; any other word is a name', () => {
   assert.deepEqual(names('c2383556'), ['umipay-ae']);
   assert.deepEqual(names('elephant'), ['elephant']);
   assert.deepEqual(names('#elephant'), []);
+  assert.deepEqual(names('c9999999'), [], 'an unmatched hashtag never falls back to names');
 });
 
 test('no match / sessions without a name are never returned', () => {
