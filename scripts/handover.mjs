@@ -41,6 +41,7 @@ function isWatchableConvoId(s) {
 }
 import { buildCombinedPromptData, resyncPromptSegments, DEFAULT_TMP_DIR, mergeOrSpoolPrompt } from './tele-listen.mjs';
 import { loadEnvFromFile, parseAdminChatIds, extractBotId } from './send-telegram.mjs';
+import { parseAgentTarget } from './agent-target.mjs';
 import { buildSpawnPlan, runSpawn, genSessionSeed, listSpawnSessions, hasBinary } from './spawn.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -128,11 +129,8 @@ export function parseArgs(argv) {
  * - name:    anything else (persona name, case-insensitive)
  */
 export function normalizeTarget(raw) {
-  const s = String(raw).trim();
-  if (s.startsWith('#')) return { kind: 'hashtag', value: s.slice(1).toLowerCase() };
-  if (/^[a-j]\d{7}$/i.test(s) || /^t\d+$/i.test(s)) return { kind: 'hashtag', value: s.toLowerCase() };
-  if (/^\d+$/.test(s)) return { kind: 'convoId', value: s };
-  return { kind: 'name', value: s };
+  const t = parseAgentTarget(raw); // the shared reading (agent-target.mjs); a pid is not a topic
+  return t.kind === 'pid' ? { kind: 'name', value: String(raw).trim() } : t;
 }
 
 /**

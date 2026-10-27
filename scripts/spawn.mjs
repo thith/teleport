@@ -35,6 +35,7 @@ import { fileURLToPath } from 'node:url';
 import { isMainModule } from './is-direct-run.mjs';
 import { uuidToConvoInt } from './convo-registry.mjs';
 import { shortConvoHash } from './convo-hash.mjs';
+import { normalizeAgentName, parseAgentTarget } from './agent-target.mjs';
 import { createListenerStatus } from './listener-status.mjs';
 import { readTopicsStore } from './topics-store.mjs';
 import { formatPersona } from './persona.mjs';
@@ -975,10 +976,7 @@ export function resolveKillPid(argv, { isScreen = () => false } = {}) {
   return pid ? { found: true, pid } : { found: true, error: `bad pid target ${JSON.stringify(raw)} — use pid:<PID> (see /ls).` };
 }
 
-/** Name → comparable form: drop emoji/symbols, collapse spaces, lowercase. Pure. */
-export function normalizeAgentName(s) {
-  return String(s ?? '').normalize('NFC').replace(/[^\p{L}\p{N}\s]/gu, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
-}
+export { normalizeAgentName }; // re-exported: session-name and older imports read it from here
 
 /**
  * Resolve `name:` to exactly one live claude process: a FULL-name match (case,
@@ -988,8 +986,9 @@ export function normalizeAgentName(s) {
 export function matchProcsByName(name, rows, personaOf = () => null) {
   // A hashtag (`#a7611284` or `a7611284`, as copied from an agent's messages)
   // picks the process whose session has that hashtag.
-  const tag = String(name ?? '').trim().replace(/^#/, '').toLowerCase();
-  if (/^[a-j]\d{7}$|^t\d+$/.test(tag)) {
+  const t = parseAgentTarget(name);
+  if (t.kind === 'hashtag') {
+    const tag = t.value;
     const byTag = rows.filter((r) => r.hashtag === tag);
     if (byTag.length === 1) return { pid: byTag[0].pid, start: byTag[0].procStart ?? null };
     if (byTag.length > 1) return { error: `#${tag} matches ${byTag.length} processes: ${byTag.map((r) => `PID ${r.pid}`).join(', ')} — use /kill pid:<PID>.` };
