@@ -59,7 +59,9 @@ export function parseBroadcastRaw(raw) {
   const out = m ? { chat: m[1] || m[2] || null, text: (m[3] || '').trim(), error: null } : { chat: null, text: s, error: null };
   if (m && !out.chat) out.error = USAGE;
   else if (!out.text) out.error = USAGE;
-  else if (/(^|\s)--chat(=|\s|$)/.test(out.text)) out.error = `--chat phải đứng đầu — ${USAGE}`;
+  // Any other `--chat` (quoted, mid-text…) is refused — argv mode honoured it, so dropping it would
+  // silently widen the scope to every group.
+  else if (/--chat/i.test(out.text)) out.error = `--chat phải đứng đầu (không trong ngoặc) — ${USAGE}`;
   return out;
 }
 
