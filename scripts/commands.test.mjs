@@ -38,6 +38,8 @@ test('resolveCommand: normalises defaults (args/needsProject/minRole)', () => {
   assert.equal(resolveCommand('w', { w: { alias: 'whisper' }, whisper: { run: 'whisper.mjs', rawText: true } }).rawText, true, 'rawText through an alias');
   assert.equal(resolveCommand('ls', { ls: { run: 'spawn.mjs', splitBlocks: true } }).splitBlocks, true);
   assert.equal(resolveCommand('l', { l: { alias: 'ls' }, ls: { run: 'spawn.mjs', splitBlocks: true } }).splitBlocks, true, 'through an alias');
+  const real = JSON.parse(fs.readFileSync(new URL('../commands.json', import.meta.url), 'utf8'));
+  for (const c of ['ls', 'lsf', 'help']) assert.equal(real[c].splitBlocks, true, `${c}: long output comes as several plain messages, never a file`);
   // opt-in capability surfaces on the normalised spec
   assert.equal(resolveCommand('w', { w: { run: 'whisper.mjs', wantsReplyText: true } }).wantsReplyText, true);
 });
