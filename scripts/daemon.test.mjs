@@ -107,6 +107,19 @@ test('dispatchCommand: needsProject → folder is the positional first token, dr
   fs.rmSync(parent, { recursive: true, force: true });
 });
 
+test('dispatchCommand: splitBlocks → long output as several plain messages in order; others unchanged', async () => {
+  const out = Array.from({ length: 30 }, (_, i) => `#${i}\n${'y'.repeat(300)}`).join('\n\n');
+  const reg = { ls: { run: 'spawn.mjs', args: ['--list'], minRole: 'member', splitBlocks: true }, other: { run: 'x.mjs', minRole: 'member' } };
+  const sent = [];
+  const base = { daemonUserId: '1', projectsConfig: { _default: { roles: { '7': { role: 'admin' } } } }, registry: reg, parentDir: '/p', scriptsDir: '/s', sendText: async (_c, t) => sent.push(t), runner: async () => ({ stdout: out, stderr: '' }) };
+  await dispatchCommand({ cmd: 'ls', rest: '' }, { id: '7' }, base);
+  assert.ok(sent.length > 1 && sent.every((t) => t.length <= 3800));
+  assert.equal(sent.join('\n\n'), out);
+  sent.length = 0;
+  await dispatchCommand({ cmd: 'other', rest: '' }, { id: '7' }, base);
+  assert.deepEqual(sent, [out], 'no flag → one send (sendTextToAdmin makes it a file)');
+});
+
 // RFC 07: the replied-to DM text reaches /whisper (capped) but NOT other commands.
 test('dispatchCommand: TELE_REPLY_TEXT goes to /whisper (capped), absent for /run, /ls', async () => {
   const cap = 'x'.repeat(400); // > 256 → must be truncated

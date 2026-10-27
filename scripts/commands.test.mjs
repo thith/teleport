@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { readCommandsFile, loadCommands, resolveCommand, roleMeets, tokenizeArgs } from './commands.mjs';
+import { readCommandsFile, loadCommands, resolveCommand, roleMeets, tokenizeArgs, splitAtBlocks } from './commands.mjs';
 
 function tmpJson(obj) {
   const f = path.join(os.tmpdir(), `commands-${process.pid}-${Math.abs(JSON.stringify(obj).length)}-${obj.__n || ''}.json`);
@@ -32,9 +32,11 @@ test('loadCommands: merges base file with projects.json._commands (custom wins)'
 
 test('resolveCommand: normalises defaults (args/needsProject/minRole)', () => {
   const c = resolveCommand('x', { x: { run: 'run.mjs' } });
-  assert.deepEqual(c, { run: 'run.mjs', args: [], needsProject: false, minRole: 'public', wantsReplyText: false, desc: '' });
+  assert.deepEqual(c, { run: 'run.mjs', args: [], needsProject: false, minRole: 'public', wantsReplyText: false, splitBlocks: false, desc: '' });
   const d = resolveCommand('y', { y: { run: 'spawn.mjs', args: ['--list'], needsProject: true, minRole: 'admin', desc: 'hi' } });
-  assert.deepEqual(d, { run: 'spawn.mjs', args: ['--list'], needsProject: true, minRole: 'admin', wantsReplyText: false, desc: 'hi' });
+  assert.deepEqual(d, { run: 'spawn.mjs', args: ['--list'], needsProject: true, minRole: 'admin', wantsReplyText: false, splitBlocks: false, desc: 'hi' });
+  assert.equal(resolveCommand('ls', { ls: { run: 'spawn.mjs', splitBlocks: true } }).splitBlocks, true);
+  assert.equal(resolveCommand('l', { l: { alias: 'ls' }, ls: { run: 'spawn.mjs', splitBlocks: true } }).splitBlocks, true, 'through an alias');
   // opt-in capability surfaces on the normalised spec
   assert.equal(resolveCommand('w', { w: { run: 'whisper.mjs', wantsReplyText: true } }).wantsReplyText, true);
 });
@@ -132,4 +134,16 @@ test('roleMeets: rank gate, public/unset always passes, unknown roles lose', () 
   assert.equal(roleMeets('member', undefined), true);   // unset → no gate
   assert.equal(roleMeets('member', 'member'), true);
   assert.equal(roleMeets('bogus', 'member'), false);    // unknown role → -1, below member
+});
+
+test('splitAtBlocks: packs whole blocks ≤ limit, cuts at empty lines; an oversized block by lines; a huge line hard', () => {
+  assert.deepEqual(splitAtBlocks('a\n\nb', 100), ['a\n\nb']);
+  assert.deepEqual(splitAtBlocks('aaaa\n\nbbbb\n\ncc', 10), ['aaaa\n\nbbbb', 'cc']);
+  assert.deepEqual(splitAtBlocks('x\n\n' + '1234\n5678\n90', 9), ['x', '1234\n5678', '90']);
+  assert.deepEqual(splitAtBlocks('abcdefghij', 4), ['abcd', 'efgh', 'ij']);
+  assert.deepEqual(splitAtBlocks('a\n\n\n\nb', 1), ['a', 'b'], 'runs of empty lines collapse');
+  const big = Array.from({ length: 40 }, (_, i) => `🪼 #${i}\n${'x'.repeat(200)}`).join('\n\n');
+  const parts = splitAtBlocks(big);
+  assert.ok(parts.length > 1 && parts.every((p) => p.length <= 3800));
+  assert.equal(parts.join('\n\n'), big, 'nothing lost, block order kept');
 });

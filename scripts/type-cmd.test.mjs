@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url';
 import {
   classify, allowedOps, typeTargets, pinTarget, agentLine, messageNamesTarget, parseInputLine, suggestionSelects,
   rcDialogReady, targetMismatch, TypeRunner, listForType, TYPE_BUTTON_RE, COOLDOWN_MS, defaultIo, compactRefusedOnScreen, isPlaceholder,
-  CLEAR_ROUND, CLEAR_ROUNDS_PER_SEND, CLEAR_MAX_SENDS, NUDGE_TEXT, findTypeTarget, nudgeRefusal, unquoteTarget } from './type-cmd.mjs';
+  CLEAR_ROUND, CLEAR_ROUNDS_PER_SEND, CLEAR_MAX_SENDS, NUDGE_TEXT, findTypeTarget, nudgeRefusal, unquoteTarget, lsLinks } from './type-cmd.mjs';
 
 const FIX = path.join(path.dirname(fileURLToPath(import.meta.url)), 'fixtures', 'type-hardcopy');
 const hc = (name) => fs.readFileSync(path.join(FIX, `${name}.txt`)).toString('latin1'); // as the daemon reads them
@@ -603,4 +603,17 @@ test('findTypeTarget: hashtag twins across ALL rows refused; names by literal ti
   const shadow = [{ pid: 6, hashtag: 'e5555555', sessionId: 's6', screen: null, procStart: '1', name: 'my_agent' }, rows[2]];
   assert.equal(findTypeTarget('my_agent', shadow, persona).row.pid, 3, 'a terminal namesake does not shadow the screen agent');
   assert.match(findTypeTarget('term', rows, persona).error, /không ở trong screen/);
+});
+
+test('lsLinks: the same gates as the taps — kill needs a known session + start; compact/nudge need a typeable row', () => {
+  const r = { hashtag: 'a1111111', sessionId: 's1', procStart: '9', guessed: false };
+  assert.deepEqual(lsLinks(r, { reachable: true, tokens: 150_000, listener: 'on', mail: 0 }), ['/compact_a1111111', '/kill_a1111111']);
+  assert.deepEqual(lsLinks(r, { reachable: true, tokens: 42_000, listener: 'off', mail: 0 }), ['/kill_a1111111', '/nudge_a1111111'], 'no /compact_ under 100k');
+  assert.deepEqual(lsLinks(r, { reachable: true, tokens: null, listener: 'on', mail: 2 }), ['/compact_a1111111', '/kill_a1111111', '/nudge_a1111111'], 'unknown context keeps /compact_; mail → /nudge_');
+  assert.deepEqual(lsLinks(r, { reachable: true, tokens: null, listener: null, mail: null }), ['/compact_a1111111', '/kill_a1111111'], 'unknown signals → no nudge');
+  assert.deepEqual(lsLinks(r, { reachable: false, tokens: 150_000, listener: 'off', mail: 3 }), ['/kill_a1111111'], 'not typeable → kill only');
+  assert.deepEqual(lsLinks({ ...r, guessed: true }, { reachable: true }), [], 'guessed → nothing');
+  assert.deepEqual(lsLinks({ ...r, procStart: null }, { reachable: true }), []);
+  assert.deepEqual(lsLinks({ ...r, sessionId: null }, { reachable: true }), []);
+  assert.deepEqual(lsLinks({ ...r, hashtag: null }, { reachable: true }), []);
 });

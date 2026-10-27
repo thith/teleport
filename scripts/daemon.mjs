@@ -56,7 +56,7 @@ import {
 } from './tele-listen.mjs';
 export { prLinksOnly, PR_LINK_RE };
 import { HASHTAG_RE } from './agent-target.mjs';
-import { loadCommands, resolveCommand, roleMeets, tokenizeArgs, COMMANDS_FILE } from './commands.mjs';
+import { loadCommands, resolveCommand, roleMeets, tokenizeArgs, splitAtBlocks, COMMANDS_FILE } from './commands.mjs';
 import { canonicalPrUrl } from './merge.mjs';
 // Workspace paths live in workspace.mjs (merge.mjs needs them too — importing
 // daemon.mjs from there made a circular import that deadlocked merge.mjs).
@@ -80,7 +80,7 @@ import { personaByHashtag } from './spawn.mjs';
 import {
   TypeRunner, listForType, allowedOps, agentLine, messageNamesTarget, defaultIo, observe, classify,
   findTypeTarget, pinTarget, nudgeRefusal,
-  TYPE_BUTTON_RE, TYPE_BUTTON_TTL_MS, TYPE_OPS, STATE_LABEL, COMPACT_OK,
+  TYPE_BUTTON_RE, TYPE_BUTTON_TTL_MS, TYPE_OPS, STATE_LABEL, COMPACT_OK, COMPACT_MIN_TOKENS,
 } from './type-cmd.mjs';
 import { listClaudeProcs } from './claude-procs.mjs';
 import { uuidToConvoInt } from './convo-registry.mjs';
@@ -883,11 +883,13 @@ export async function dispatchCommand(parsed, from, {
       cwd, env, timeout: COMMAND_TIMEOUT_MS, maxBuffer: COMMAND_MAX_BUFFER,
     });
     const out = ((stdout || '') + (stderr ? `\n[stderr]\n${stderr}` : '')).trim();
+    if (spec.splitBlocks && out) { for (const part of splitAtBlocks(out)) await sendText(daemonUserId, part); return; } // one at a time, in order
     await sendText(daemonUserId, out || '✅ (no output)');
   } catch (e) {
     // execFile rejects on non-zero exit / timeout / ENOENT — surface the child's
     // own output (scripts print their own ❌ messages) before falling back.
     const body = ((e.stdout || '') + (e.stderr ? `\n[stderr]\n${e.stderr}` : '') + (e.killed ? '\n[killed: timeout]' : '')).trim();
+    if (spec.splitBlocks && body) { for (const part of splitAtBlocks(body)) await sendText(daemonUserId, part); return; }
     await sendText(daemonUserId, body || `❌ /${parsed.cmd} failed: ${e.message || e}`);
   }
 }
@@ -924,8 +926,7 @@ const TYPE_OP_LABEL = { c: '/compact', r: '/remote-control', e: '⎋ Esc', i: '�
 // Buttons are emoji only (Thi), except Esc (short already); no legend (the owner knows them).
 const TYPE_BUTTON_LABEL = { c: '🗜️', r: '📡', e: 'Esc', i: '🔍', u: '🧹', k: '💀', y: '✅', n: '👋' };
 const CANCEL_BUTTON = (tok) => ({ text: '✖', callback_data: `ty:${tok}:x` });
-// Below this context /compact gains little (Thi): no 🗜️ button. Unknown usage keeps it.
-export const COMPACT_MIN_TOKENS = 100_000;
+export { COMPACT_MIN_TOKENS }; // type-cmd.mjs (shared with the /ls links)
 let typeRunner = null; // one per daemon: per-agent locks, cool-down, Esc rate limit
 const getTypeRunner = () => (typeRunner ||= new TypeRunner(defaultIo()));
 

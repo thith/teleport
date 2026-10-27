@@ -95,17 +95,17 @@ export function createListenerStatus({
   } catch { updates = null; }
   try { store = topics ?? readTopicsStore(); } catch { store = null; }
 
-  function listenerPart(convo) {
+  // Each signal once, structured: null = unknown / nothing to show. The two renderers below share them.
+  function listenerOn(convo) {
     if (!Array.isArray(registry)) return null;
     const rows = registry.filter((e) => e && Number(e.convoId) === convo);
-    let alive = false;
     for (const e of rows) {
-      try { if (isLive(e)) { alive = true; break; } } catch { /* treat as dead */ }
+      try { if (isLive(e)) return true; } catch { /* treat as dead */ }
     }
-    return alive ? '🎧 đang nghe' : '🔇 listener tắt';
+    return false;
   }
 
-  function unreadPart(convo) {
+  function unreadInfo(convo) {
     if (!Array.isArray(updates) || !store || typeof store !== 'object') return null;
     const offsetFile = path.join(tmpDir, `convo-${convo}-offset.txt`);
     const offset = readOffset(offsetFile); // 0 when missing = never listened → no baseline
@@ -120,41 +120,63 @@ export function createListenerStatus({
     const msgs = collectMessagesToProcess(fresh, [...threadByChat.keys()], null, 'convo', threadByChat);
     if (!msgs.length) return null;
     const dates = msgs.map((m) => m.msg?.date).filter((d) => Number.isFinite(d));
-    const age = dates.length ? ` (cũ nhất ${formatAge(now - Math.min(...dates) * 1000)})` : '';
-    return `📨 ${msgs.length} tin chưa đọc${age}`;
+    return { n: msgs.length, age: dates.length ? formatAge(now - Math.min(...dates) * 1000) : null };
   }
 
-  function promptPart(convo) {
+  function promptInfo(convo) {
     const file = path.join(tmpDir, `prompt-convo-${convo}.json`);
     const m = mtimeMs(file);
     if (m == null) return null;
     let n = null;
     try { n = promptSegments(JSON.parse(fs.readFileSync(file, 'utf8'))).length; } catch { /* count unknown */ }
-    return `📥 ${n ? `${n} tin ` : ''}chờ agent nhận (${formatAge(now - m)})`;
+    return { n, age: formatAge(now - m) };
   }
 
-  function processingPart(convo) {
+  function processingAge(convo) {
     const m = mtimeMs(path.join(tmpDir, `prompt-convo-${convo}.processing.json`));
-    return m == null ? null : `⏳ đang xử lý ${formatAge(now - m)}`;
+    return m == null ? null : formatAge(now - m);
   }
+
+  // [listener, unread, prompt, processing] → one renderer each; a failing signal is omitted.
+  const RENDER = {
+    inline: [
+      (on) => (on ? '🎧 đang nghe' : '🔇 listener tắt'),
+      (u) => `📨 ${u.n} tin chưa đọc${u.age ? ` (cũ nhất ${u.age})` : ''}`,
+      (p) => `📥 ${p.n ? `${p.n} tin ` : ''}chờ agent nhận (${p.age})`,
+      (age) => `⏳ đang xử lý ${age}`,
+    ],
+    // One `<emoji> <name>: <value>` line each, for the /ls blocks (RFC 26 §3.10).
+    lines: [
+      (on) => (on ? '🎧 Listener: đang nghe' : '🔇 Listener: tắt'),
+      (u) => `📨 Telegram: ${u.n} tin chưa đọc${u.age ? ` (cũ nhất ${u.age})` : ''}`,
+      (p) => `📥 Hàng đợi: ${p.n ? `${p.n} tin ` : ''}chờ agent nhận (${p.age})`,
+      (age) => `⏳ Đang xử lý: ${age}`,
+    ],
+  };
+  const render = (convoId, kind) => {
+    const convo = Number(convoId);
+    if (!Number.isSafeInteger(convo) || convo <= 0) return [];
+    const out = [];
+    for (const [i, sig] of [listenerOn, unreadInfo, promptInfo, processingAge].entries()) {
+      try {
+        const v = sig(convo);
+        if (v != null) out.push(RENDER[kind][i](v));
+      } catch { /* omit this part */ }
+    }
+    return out;
+  };
 
   // Structured listener signal for callers that decide on it (RFC 26 /nudge): 'on' | 'off' | null (unknown).
   statusOf.listener = (convoId) => {
     const convo = Number(convoId);
     if (!Number.isSafeInteger(convo) || convo <= 0) return null;
-    try { const p = listenerPart(convo); return p == null ? null : p.startsWith('🎧') ? 'on' : 'off'; } catch { return null; }
+    try { const on = listenerOn(convo); return on == null ? null : on ? 'on' : 'off'; } catch { return null; }
   };
+  // The same status as separate labelled lines (the /ls blocks) → string[].
+  statusOf.lines = (convoId) => render(convoId, 'lines');
   return statusOf;
   function statusOf(convoId) {
-    const convo = Number(convoId);
-    if (!Number.isSafeInteger(convo) || convo <= 0) return null;
-    const parts = [];
-    for (const part of [listenerPart, unreadPart, promptPart, processingPart]) {
-      try {
-        const p = part(convo);
-        if (p) parts.push(p);
-      } catch { /* omit this part */ }
-    }
+    const parts = render(convoId, 'inline');
     return parts.length ? parts.join(' · ') : null;
   }
 }

@@ -196,50 +196,62 @@ export function buildProcRows({ psRows, uid, sessions = new Map(), procExtras = 
 }
 
 /**
- * Render `/ls` for Telegram (plain text; cwd shown as its folder name), in two sections:
+ * Render `/ls` (plain text; cwd shown as its folder name), in two sections:
  *   📺 Screen   — every `tele-*` screen (spawned agents) plus any other screen that
- *                 hosts a claude, each with the claude PID inside (if found);
+ *                 hosts a claude;
  *   🖥 Terminal — claude processes opened by hand (no screen).
- * Every claude line carries the FULL session id (copy-paste into
- * --resume-session) and its #hashtag. Pure.
+ * One block per claude PROCESS (RFC 26 §3.10): a title line (persona #hashtag), then one
+ * `<emoji> <name>: <value>` line per known attribute, then the tappable commands. A screen
+ * with no claude inside is a one-line block. Blocks are separated by ONE empty line (the
+ * daemon splits a long /ls there). Pure.
  *   screens  — parseScreenSessions() rows `{ pid, name }` (tele-* only)
  *   procs    — buildProcRows() rows
- *   personaOf(hashtag) → label | null — topic persona for a tele-* screen
- *   statusOf(convoId) → string | null — listener / unread status line (see
- *                 listener-status.mjs); printed under each agent that has a convo.
+ *   personaOf(hashtag) → label | null — topic persona
+ *   statusLinesOf(convoId) → string[] — listener / unread lines (listener-status.mjs statusOf.lines)
+ *   mailOf(convoId) → unread mailbox count | null
  *   convoOfHashtag(hashtag) → convoId | null — recovers a tele-* screen's convo
- *                 when no claude inside carries a session id with that hashtag.
+ *                 when the claude inside carries no session id.
+ *   ctxOf(row) → "ctx 172k (17%)" | null; linksOf(row) → ['/kill_x', …] (the caller decides who may tap)
+ *   showSession — print the full session UUID (terminal use; hidden on Telegram).
  */
-export function formatAgentList({ screens = [], procs = [], personaOf = () => null, home = os.homedir(), statusOf = () => null, convoOfHashtag = () => null, ctxOf = () => null } = {}) {
+export function formatAgentList({ screens = [], procs = [], personaOf = () => null, home = os.homedir(), statusLinesOf = () => [], mailOf = () => null, convoOfHashtag = () => null, ctxOf = () => null, linksOf = () => [], showSession = true } = {}) {
   // Folder name only (Thi: "chỉ hiện tên folder") — the full path is noise on a phone.
   const short = (p) => (p ? (p === home ? '~' : path.basename(p)) : null);
-  const sess = (r) => (r.sessionId
-    ? `  session ${r.sessionId}${r.guessed ? ' (đoán)' : ''}${r.hashtag ? ` · #${r.hashtag}` : ''}`
-    : '  session ?');
-  // Status line for a convo — never throws, nothing for agents without a convo.
-  const status = (convo) => {
-    if (convo == null) return;
-    let st = null;
-    try { st = statusOf(convo); } catch { st = null; }
-    if (st) lines.push(`  ${st}`);
+  // Every injected lookup is best-effort: a throw drops that line, never the whole /ls.
+  const safe = (f, fallback) => { try { return f() ?? fallback; } catch { return fallback; } };
+  const persona = (h) => (h ? safe(() => personaOf(h), null) : null);
+  // A claude's convo: its own session; a tele-<hash> screen without one falls back to the topics store.
+  const convoOf = (r) => {
+    const c = r.sessionId ? uuidToConvoInt(r.sessionId) : null;
+    if (c != null) return c;
+    return typeof r.screen === 'string' && r.screen.startsWith('tele-') ? safe(() => convoOfHashtag(r.screen.slice(5)), null) : null;
   };
-  const sessConvo = (rows) => rows.map((r) => uuidToConvoInt(r.sessionId)).filter((c) => c != null);
-  // A tele-<hash> screen's convo: the claude inside whose session hashes to the
-  // screen name, else the topics-store lookup. Other screens: their claude's convo.
-  const convoOfScreen = (name, rows) => {
-    if (!name.startsWith('tele-')) return sessConvo(rows)[0] ?? null;
-    const h = name.slice(5);
-    const own = sessConvo(rows).find((c) => shortConvoHash(c) === h);
-    if (own != null) return own;
-    try { return convoOfHashtag(h) ?? null; } catch { return null; }
+  // No tty line (Thi: only useful at the keyboard). r.tty stays in the row/audit.
+  const block = (r) => {
+    const tag = r.hashtag || (typeof r.screen === 'string' && r.screen.startsWith('tele-') ? r.screen.slice(5) : null);
+    const title = [persona(tag), tag ? `#${tag}` : null].filter(Boolean).join(' ') || `PID ${r.pid}`;
+    const convo = convoOf(r);
+    const ctx = safe(() => ctxOf(r), null);
+    const mail = convo != null ? safe(() => mailOf(convo), null) : null;
+    const status = convo != null ? safe(() => statusLinesOf(convo), []) : [];
+    const links = safe(() => linksOf(r), []);
+    return [
+      title,
+      r.screen ? `📺 Screen: ${r.screen}` : null,
+      `🔢 PID: ${r.pid}`,
+      // 📨 = the session's name — the address for Claude's cross-session messages (SendMessage to=<name>)
+      r.name ? `📨 Session: ${r.name}` : null,
+      showSession && r.sessionId ? `🆔 Session: ${r.sessionId}${r.guessed ? ' (đoán)' : ''}` : null,
+      r.status ? `⚙️ Trạng thái: ${r.status}` : null,
+      short(r.cwd) ? `📁 Folder: ${short(r.cwd)}` : null,
+      r.etime ? `⏱️ Uptime: ${r.etime}` : null,
+      ctx ? `🧠 Context: ${String(ctx).replace(/^ctx /, '')}` : null,
+      r.bridgeSessionId ? '📡 Remote Control: bật' : null,
+      ...status,
+      mail > 0 ? `📬 Mailbox: ${mail} thư chưa đọc` : null,
+      links.length ? links.join(' ') : null,
+    ].filter(Boolean).join('\n');
   };
-  // No tty column (Thi: only useful at the keyboard). r.tty stays in the row/audit.
-  const ctxSafe = (r) => { try { return ctxOf(r); } catch { return null; } }; // context fill (RFC 22) — never breaks /ls
-  const procLine = (r) => [
-    // 📨 = the session's name — the address for Claude's cross-session messages (SendMessage to=<name>)
-    `PID ${r.pid}`, r.name ? `📨 ${r.name}${r.status ? ` (${r.status})` : ''}` : (r.status ? `(${r.status})` : null),
-    short(r.cwd) ?? '?', r.etime, ctxSafe(r), r.bridgeSessionId ? '📡' : null,
-  ].filter(Boolean).join(' · ');
 
   const inScreen = new Map(); // screen name → claude rows inside it
   const terminal = [];
@@ -249,22 +261,17 @@ export function formatAgentList({ screens = [], procs = [], personaOf = () => nu
   }
   const screenNames = [...new Set([...screens.map((s) => s.name), ...inScreen.keys()])];
 
-  // A thin rule between entries (Thi: easier to tell agents apart on a phone).
-  const SEP = '  ──────────';
-  const lines = [`📺 Screen (${screenNames.length})`];
-  if (!screenNames.length) lines.push('  (không có)');
-  for (const [i, name] of screenNames.entries()) {
-    if (i) lines.push(SEP);
-    const persona = name.startsWith('tele-') ? personaOf(name.slice(5)) : null;
+  const screenBlocks = screenNames.flatMap((name) => {
     const rows = inScreen.get(name) || [];
-    lines.push(`• ${[name, persona].filter(Boolean).join(' · ')}${rows.length ? '' : ' · (không thấy claude bên trong)'}`);
-    for (const r of rows) { lines.push(`  ${procLine(r)}`); lines.push(sess(r)); }
-    status(convoOfScreen(name, rows));
-  }
-  lines.push('', `🖥 Terminal (${terminal.length})`);
-  if (!terminal.length) lines.push('  (không có)');
-  for (const [i, r] of terminal.entries()) { if (i) lines.push(SEP); lines.push(`• ${procLine(r)}`); lines.push(sess(r)); status(uuidToConvoInt(r.sessionId)); }
-  return lines.join('\n');
+    if (rows.length) return rows.map(block);
+    const p = name.startsWith('tele-') ? persona(name.slice(5)) : null;
+    return [`📺 ${[name, p].filter(Boolean).join(' · ')} · không thấy claude bên trong`];
+  });
+  const section = (head, blocks) => [head, ...(blocks.length ? blocks : ['(không có)'])].join('\n\n');
+  return [
+    section(`📺 Screen (${screenNames.length})`, screenBlocks),
+    section(`🖥 Terminal (${terminal.length})`, terminal.map(block)),
+  ].join('\n\n');
 }
 
 /** `pid:<N>` (whitespace tolerated after the colon) → N, else null. */
