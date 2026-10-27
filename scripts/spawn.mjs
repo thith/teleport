@@ -959,12 +959,13 @@ export function resolveKillPid(argv, { isScreen = () => false } = {}) {
   const i = argv.findIndex((a) => a === '--kill' || a === '--quit');
   const tok = argv[i + 1] ?? '';
   const explicit = /^name:/i.test(tok);
-  const screen = /^tele-/i.test(tok) || isScreen(tok);
   // The name = the words up to the next --flag (so both `name:"Rắn 3"` and
-  // unquoted `Rắn 3` work).
+  // unquoted `Rắn 3` work). Only a ONE-word id can be a screen: `a7611284 x`
+  // is a name, never the a7611284 screen.
+  const words = [explicit ? tok.slice(5) : tok];
+  for (let j = i + 2; i !== -1 && j < argv.length && !argv[j].startsWith('--'); j++) words.push(argv[j]);
+  const screen = words.length === 1 && (/^tele-/i.test(tok) || isScreen(tok));
   if (i !== -1 && (explicit || (tok && !tok.startsWith('-') && !/^pid:/i.test(tok) && !screen))) {
-    const words = [explicit ? tok.slice(5) : tok];
-    for (let j = i + 2; j < argv.length && !argv[j].startsWith('--'); j++) words.push(argv[j]);
     const name = words.join(' ').trim();
     return name ? { found: true, name } : { found: true, error: 'name: needs a name, e.g. name:"Rắn 3" (see /ls).' };
   }
@@ -992,6 +993,8 @@ export function matchProcsByName(name, rows, personaOf = () => null) {
     const byTag = rows.filter((r) => r.hashtag === tag);
     if (byTag.length === 1) return { pid: byTag[0].pid, start: byTag[0].procStart ?? null };
     if (byTag.length > 1) return { error: `#${tag} matches ${byTag.length} processes: ${byTag.map((r) => `PID ${r.pid}`).join(', ')} — use /kill pid:<PID>.` };
+    // No name fallback: a hashtag must never pick a process whose NAME merely looks like it.
+    return { error: `no live claude process with #${tag} (see /ls).` };
   }
   const q = normalizeAgentName(name);
   if (!q) return { error: 'empty name.' };

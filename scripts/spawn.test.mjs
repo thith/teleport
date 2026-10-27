@@ -1052,6 +1052,7 @@ test('resolveKillPid: name: is optional — a bare name/#hashtag is a name unles
   assert.deepEqual(resolveKillPid(['--kill', '#a7611284'], { isScreen }), { found: false }, 'live screen → screen kill');
   assert.deepEqual(resolveKillPid(['--kill', 'tele-b1234567']), { found: false }, 'tele- is always the screen kill');
   assert.deepEqual(resolveKillPid(['--kill', 'name:#a7611284'], { isScreen }), { found: true, name: '#a7611284' }, 'explicit name: wins');
+  assert.deepEqual(resolveKillPid(['--kill', 'a7611284', 'helper', '--restart'], { isScreen }), { found: true, name: 'a7611284 helper' }, 'several words are never a screen');
   assert.deepEqual(resolveKillPid(['--kill']), { found: false });
   assert.deepEqual(resolveKillPid(['--kill', '--restart']), { found: false });
 });
@@ -1070,6 +1071,8 @@ test('matchProcsByName: full name via session name or persona; emoji/case ignore
   assert.match(matchProcsByName('Hà Mã', rows, persona).error, /matches 2 processes: PID 4 \(digesty-a7\), PID 5/);
   assert.match(matchProcsByName('Cú', rows, persona).error, /no claude process named/);
   assert.equal(normalizeAgentName(' 🐍  Rắn   3 '), 'rắn 3');
+  const look = [{ pid: 9, name: 'a1234567', hashtag: 'b7654321', procStart: '1' }];
+  assert.match(matchProcsByName('#a1234567', look).error, /no live claude process with #a1234567/, 'a hashtag never falls back to names');
 });
 
 test('acquireResumeLock: one lock per session (different uuids don\'t block each other); cooldown counts from the failure', async () => {
@@ -1119,7 +1122,7 @@ test('matchProcsByName: a hashtag (with or without #) picks the process by sessi
   const rows = [{ pid: 7, name: '🪱 Giun', hashtag: 'a7611284', procStart: '9' }, { pid: 8, name: 'x', hashtag: 'b1234567' }];
   assert.deepEqual(matchProcsByName('#a7611284', rows), { pid: 7, start: '9' });
   assert.deepEqual(matchProcsByName('a7611284', rows), { pid: 7, start: '9' });
-  assert.match(matchProcsByName('#c0000000', rows).error, /no claude process named/);
+  assert.match(matchProcsByName('#c0000000', rows).error, /no live claude process with #c0000000/);
   assert.match(matchProcsByName('#a7611284', [...rows, { pid: 9, hashtag: 'a7611284' }]).error, /matches 2 processes/);
 });
 
