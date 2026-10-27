@@ -162,7 +162,7 @@ test('formatAgentList: one block per claude process — title, `<emoji> <name>: 
   assert.match(out, /\n\n📺 tele-empty123 · không thấy claude bên trong\n\n/);
   assert.match(out, /\n\nPID 11\n📺 Screen: work\n🔢 PID: 11\n📨 Session: x\n📁 Folder: w\n⏱️ Uptime: 00:02\n\n/); // non-tele screen hosting a claude
   const term = out.slice(iTerm);
-  assert.equal(term, `🖥 Terminal (1)\n\n#a7611284\n🔢 PID: 830318\n📨 Session: 🪱 Giun\n🆔 Session: ${SID}\n⚙️ Trạng thái: idle\n📁 Folder: umipay\n⏱️ Uptime: 2-00:49:26\n🧠 Context: 172k (17%)\n📡 Remote Control: bật\n/compact_a7611284 /kill_a7611284`);
+  assert.equal(term, `🖥 Terminal (1)\n\n#a7611284\n🔢 PID: 830318\n📨 Session: 🪱 Giun\n🆔 Session: ${SID}\n⚙️ Trạng thái: idle\n📁 Folder: umipay\n⏱️ Uptime: 2-00:49:26\n🧠 Context: 172k\n📡 Remote Control: bật\n/compact_a7611284 /kill_a7611284`);
   assert.doesNotMatch(out, /pts\//);   // no tty line
   assert.doesNotMatch(out, /\n\n\n/);  // exactly one empty line between blocks
   const hidden = formatAgentList({ procs, showSession: false });
@@ -186,7 +186,7 @@ test('formatAgentList full:false — one line per agent (icon, name #hash, state
   });
   assert.equal(out, [
     '📺 tele-empty123 · không thấy claude bên trong',
-    '📺 🪱 Giun #a7611284 · busy · 150k (15%) · 🔇 · 📬2\n/compact_a7611284 /kill_a7611284 /nudge_a7611284',
+    '📺 🪱 Giun #a7611284 · busy · 150k · 🔇 · 📬2\n/compact_a7611284 /kill_a7611284 /nudge_a7611284',
     '🖥 term',
     '🖥 PID 3',
   ].join('\n\n'));

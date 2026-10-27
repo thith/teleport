@@ -228,6 +228,8 @@ export function formatAgentList({ screens = [], procs = [], personaOf = () => nu
     if (c != null) return c;
     return typeof r.screen === 'string' && r.screen.startsWith('tele-') ? safe(() => convoOfHashtag(r.screen.slice(5)), null) : null;
   };
+  // "ctx 172k (17%)" → "172k" — no % in /ls (Thi 11231).
+  const ctxText = (c) => String(c).replace(/^ctx /, '').replace(/ \(\d+%\)$/, '');
   // No tty line (Thi: only useful at the keyboard). r.tty stays in the row/audit.
   const block = (r) => {
     const tag = r.hashtag || (typeof r.screen === 'string' && r.screen.startsWith('tele-') ? r.screen.slice(5) : null);
@@ -247,7 +249,7 @@ export function formatAgentList({ screens = [], procs = [], personaOf = () => nu
       r.status ? `⚙️ Trạng thái: ${r.status}` : null,
       short(r.cwd) ? `📁 Folder: ${short(r.cwd)}` : null,
       r.etime ? `⏱️ Uptime: ${r.etime}` : null,
-      ctx ? `🧠 Context: ${String(ctx).replace(/^ctx /, '')}` : null,
+      ctx ? `🧠 Context: ${ctxText(ctx)}` : null,
       r.bridgeSessionId ? '📡 Remote Control: bật' : null,
       ...status,
       mail > 0 ? `📬 Mailbox: ${mail} thư chưa đọc` : null,
@@ -265,7 +267,7 @@ export function formatAgentList({ screens = [], procs = [], personaOf = () => nu
     const links = safe(() => linksOf(r), []);
     const head = [
       `${r.screen ? '📺' : '🖥'} ${[persona(tag) || r.name, tag ? `#${tag}` : null].filter(Boolean).join(' ') || `PID ${r.pid}`}`,
-      r.status, ctx ? String(ctx).replace(/^ctx /, '') : null, off ? '🔇' : null, mail > 0 ? `📬${mail}` : null,
+      r.status, ctx ? ctxText(ctx) : null, off ? '🔇' : null, mail > 0 ? `📬${mail}` : null,
     ].filter(Boolean).join(' · ');
     return links.length ? `${head}\n${links.join(' ')}` : head;
   };
