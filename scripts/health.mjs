@@ -140,7 +140,7 @@ export function memoryAlert({ mem, top = [], now, lastAlertAt = 0, thresholdPct 
   const tops = top.slice(0, 4).map((t) => `${t.name}${t.count > 1 ? ` ×${t.count}` : ''} ${t.mb >= 1024 ? `${(t.mb / 1024).toFixed(1)} GB` : `${t.mb} MB`}`).join(', ');
   return {
     alert: true,
-    text: `⚠️ RAM sắp hết: còn ${fmtGB(mem.available)} / ${fmtGB(mem.total)} (${Math.round(pct)}%)${swap}.\nHệ thống có thể sắp giết agent (systemd-oomd).${tops ? `\nĂn RAM nhiều nhất: ${tops}.` : ''}\nXem /health · /ls, tắt bớt phiên không dùng: /kill name:"…"`,
+    text: `⚠️ RAM sắp hết: còn ${fmtGB(mem.available)} / ${fmtGB(mem.total)} (${Math.round(pct)}%)${swap}.\nHệ thống có thể sắp giết agent (systemd-oomd).${tops ? `\nĂn RAM nhiều nhất: ${tops}.` : ''}\nXem /health · /ls, tắt bớt phiên không dùng: /kill <tên>`,
   };
 }
 

@@ -47,7 +47,7 @@ export function findResumeTarget(query, candidates, { aliveSessions = new Set() 
   hits.sort((a, b) => b.mtimeMs - a.mtimeMs);
   // Only DEAD sessions can be resumed: skip ones a live claude still holds.
   const dead = hits.filter((h) => !aliveSessions.has(h.sessionId));
-  if (!dead.length) return { error: `${hits[0].persona || q} #${hits[0].hashtag} is still running — nothing to resume (use /kill name:"…" --restart to restart it).` };
+  if (!dead.length) return { error: `${hits[0].persona || q} #${hits[0].hashtag} is still running — nothing to resume (use /kill <name> --restart to restart it).` };
   return { target: dead[0], others: dead.slice(1), skippedLive: hits.filter((h) => aliveSessions.has(h.sessionId)) };
 }
 

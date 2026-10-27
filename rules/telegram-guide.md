@@ -90,7 +90,7 @@ another resume of the same session is in progress (per-session lock) — stop th
   run this themselves (the owner gate is TELE_FROM_ID from the daemon; forging it is out of contract).
   The owner id comes from `projects.json` `_config.daemonUserId` only (the deprecated `.env DAEMON_CHAT_ID` is not
   read here → "no daemon owner configured").
-- **`/kill name:"<persona or session name>"`** (or `name:#<hashtag>`, copied from the agent's messages) picks the process by name/hashtag instead of PID (full name, emoji/case ignored; must match exactly one — else it lists the PIDs). Works with `--restart`.
+- **`/kill <persona or session name | #hashtag>`** (like `/resume`; the old `name:` prefix still works) picks the process by name/hashtag instead of PID — a hashtag whose `tele-*` screen is live keeps the screen kill above (full name, emoji/case ignored; must match exactly one — else it lists the PIDs). Works with `--restart`.
 - **`/kill pid:<PID> --restart`** = both in one: SIGTERM, wait for exit, then resume that session in screen
   `tele-<hashtag>` in its **old cwd**. Everything the restart needs (a session id from the session file — never a
   guess — and its transcript) is checked **before** killing, so a doomed restart kills nothing.

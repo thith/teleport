@@ -640,13 +640,13 @@ test('checkPidKillAuth: owner only, daemon only, needs a configured owner', () =
   assert.match(checkPidKillAuth({ fromId: '144', daemonUserId: null }).error, /no daemon owner/);
 });
 
-test('resolveKillPid: pid:<N>, split "pid: N", bad targets; hashtag kills untouched', () => {
+test('resolveKillPid: pid:<N>, split "pid: N", bad targets; live-screen hashtag kills untouched', () => {
   assert.deepEqual(resolveKillPid(['--kill', 'pid:830318']), { found: true, pid: 830318 });
   assert.deepEqual(resolveKillPid(['--kill', 'pid:', '830318']), { found: true, pid: 830318 });
   assert.deepEqual(resolveKillPid(['--quit', 'PID:42']), { found: true, pid: 42 });
   assert.match(resolveKillPid(['--kill', 'pid:abc']).error, /bad pid target/);
   assert.match(resolveKillPid(['--kill', 'pid:']).error, /bad pid target/);
-  assert.deepEqual(resolveKillPid(['--kill', 'a7611284']), { found: false });
+  assert.deepEqual(resolveKillPid(['--kill', 'a7611284'], { isScreen: () => true }), { found: false });
   assert.deepEqual(resolveKillPid(['--list']), { found: false });
 });
 
@@ -1043,6 +1043,17 @@ test('resolveKillPid: name: — quoted (one token) or unquoted (words up to the 
   assert.deepEqual(resolveKillPid(['--kill', 'name:Rắn', '3', '--restart']), { found: true, name: 'Rắn 3' });
   assert.deepEqual(resolveKillPid(['--kill', 'name:', 'Giun']), { found: true, name: 'Giun' });
   assert.match(resolveKillPid(['--kill', 'name:']).error, /needs a name/);
+});
+
+test('resolveKillPid: name: is optional — a bare name/#hashtag is a name unless it is a live tele-* screen', () => {
+  assert.deepEqual(resolveKillPid(['--kill', 'Rắn', '3', '--restart']), { found: true, name: 'Rắn 3' });
+  assert.deepEqual(resolveKillPid(['--kill', '#a7611284']), { found: true, name: '#a7611284' });
+  const isScreen = (id) => id.replace(/^#/, '') === 'a7611284';
+  assert.deepEqual(resolveKillPid(['--kill', '#a7611284'], { isScreen }), { found: false }, 'live screen → screen kill');
+  assert.deepEqual(resolveKillPid(['--kill', 'tele-b1234567']), { found: false }, 'tele- is always the screen kill');
+  assert.deepEqual(resolveKillPid(['--kill', 'name:#a7611284'], { isScreen }), { found: true, name: '#a7611284' }, 'explicit name: wins');
+  assert.deepEqual(resolveKillPid(['--kill']), { found: false });
+  assert.deepEqual(resolveKillPid(['--kill', '--restart']), { found: false });
 });
 
 test('matchProcsByName: full name via session name or persona; emoji/case ignored; ambiguity refused', () => {
