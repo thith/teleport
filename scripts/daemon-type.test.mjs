@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { startType, handleTypeButton, takeTypeButton, typeStep2, takeMergeButton, dispatchCommand, killViaSpawn } from './daemon.mjs';
+import { startType, handleTypeButton, takeTypeButton, typeStep2, takeMergeButton, dispatchCommand, killViaSpawn, runTypeCommand, startTapKill, parseDaemonCommand } from './daemon.mjs';
 
 const T = { pid: 644406, procStart: '5', sessionId: 'S', screenPid: 644405, screen: 'tele-c2383556', hashtag: 'c2383556', cwd: '/w' };
 const T2 = { ...T, pid: 331131, screenPid: 331130, screen: 'tele-d8133684', hashtag: 'd8133684' };
@@ -225,4 +225,74 @@ test('killViaSpawn: spawn.mjs --kill pid:<PID> --expect-start <start>, sender id
   assert.deepEqual(seen[0], [['--kill', 'pid:644406', '--expect-start', '5'], '42']);
   const fail = async () => { const e = new Error('exit 1'); e.stdout = ''; e.stderr = '[spawn] ❌ pid reused'; throw e; };
   assert.match(await killViaSpawn(T, { id: 42 }, ctx, { runner: fail }), /pid reused/);
+});
+
+// ── RFC 26: 👋, /compact, /nudge, /kill_<hash> ───────────────────────────────
+
+test('typeStep2: 👋 only when the listener is off or mail waits, and only idle/busy', () => {
+  const ops = (obs, signals) => typeStep2({ target: T, obs, tok: 'a'.repeat(16), signals }).rows[0].map((b) => b.callback_data.split(':')[2]);
+  assert.deepEqual(ops(idle, { listener: 'on', mail: 0 }), ['c', 'r', 'i', 'k', 'x']);
+  assert.deepEqual(ops(idle, { listener: 'off', mail: 0 }), ['c', 'r', 'i', 'n', 'k', 'x']);
+  assert.deepEqual(ops({ ...idle, state: 'busy' }, { listener: 'on', mail: 2 }), ['c', 'e', 'i', 'n', 'k', 'x']);
+  assert.deepEqual(ops({ ...idle, state: 'waiting' }, { listener: 'off', mail: 1 }), ['e', 'k', 'x']);
+  assert.deepEqual(ops(idle, null), ['c', 'r', 'i', 'k', 'x'], 'unknown signals → no 👋');
+  assert.match(typeStep2({ target: T, obs: idle, tok: 'a'.repeat(16), signals: { listener: 'off', mail: 3 } }).text, /🔇 listener tắt · 📬 3 thư chưa đọc/);
+});
+
+const row = (o) => ({ screen: `tele-${o.hashtag}`, screenPid: o.pid - 1, ppid: o.pid - 1, guessed: false, procStart: '5', cwd: '/w', ...o });
+const liveIo = { session: () => ({ sessionId: 'S', status: 'idle' }), proc: () => ({ comm: 'claude', start: '5' }), ppid: () => 644405, windows: () => 1, transcript: () => ({ ended: true, usage: { tokens: 42000 } }) };
+
+test('/compact <name>: runs TypeRunner op c on the found agent; under 100k it still runs, with a note; result sent after', async () => {
+  const sent = []; const ran = []; const delivered = [];
+  const ctx = { daemonUserId: '42', sendText: async (c, t) => sent.push(t), projectsConfig: {} };
+  const runner = { run: async (op, t) => { ran.push([op, t.pid]); return { text: '⌨️ đã gõ /compact vào #c2383556 — đang chờ kết quả…', watch: async () => '✅ đã compact: 42k → 8k' }; } };
+  await runTypeCommand('c', 'Ma', { id: 42 }, ctx, { list: () => [row({ pid: 644406, hashtag: 'c2383556', sessionId: 'S', name: 'umipay-ae' })], io: liveIo, runner, personaOf: (h) => (h === 'c2383556' ? '👻 Ma' : null), deliver: async (p) => delivered.push(p) });
+  assert.deepEqual(ran, [['c', 644406]]);
+  assert.match(sent[0], /ctx 42k/);
+  assert.match(sent[1], /#c2383556: ✅ đã compact/);
+});
+
+test('/nudge: no target → usage; unknown → error; drifted target → no run', async () => {
+  const sent = []; const ctx = { daemonUserId: '42', sendText: async (c, t) => sent.push(t), projectsConfig: {} };
+  const runner = { run: async () => { throw new Error('must not run'); } };
+  await runTypeCommand('n', '', { id: 42 }, ctx, { list: () => [], io: liveIo, runner });
+  assert.match(sent.at(-1), /usage: \/nudge/);
+  await runTypeCommand('n', 'Nobody', { id: 42 }, ctx, { list: () => [], io: liveIo, runner });
+  assert.match(sent.at(-1), /không thấy/);
+  await runTypeCommand('n', '#c2383556', { id: 42 }, ctx, { list: () => [row({ pid: 644406, hashtag: 'c2383556', sessionId: 'S' })], io: { ...liveIo, windows: () => 2 }, runner });
+  assert.match(sent.at(-1), /2 cửa sổ/);
+});
+
+test('/kill_<hash>: asks ✅ with the /type layout; guessed / twin / absent refused; ✅ goes through the 💀 branch', async () => {
+  const { ctx, calls } = ui();
+  const sent = []; ctx.sendText = async (c, t) => sent.push(t);
+  const r = row({ pid: 644406, hashtag: 'c2383556', sessionId: 'S' });
+  await startTapKill('#c2383556', ctx, { list: () => [], io: liveIo });
+  assert.match(sent.at(-1), /không chạy — \/resume_c2383556/);
+  await startTapKill('#c2383556', ctx, { list: () => [{ ...r, guessed: true }], io: liveIo });
+  assert.match(sent.at(-1), /không xác định chắc/);
+  await startTapKill('#c2383556', ctx, { list: () => [r, { ...r, pid: 7, sessionId: 'S2' }], io: liveIo });
+  assert.match(sent.at(-1), /khớp 2 process/);
+  await startTapKill('#c2383556', ctx, { list: () => [r, { ...r, pid: 8 }], io: liveIo });
+  assert.match(sent.at(-1), /khớp 2 process/, 'two pids on ONE session too');
+  await startTapKill('#c2383556', ctx, { list: () => [r], io: { ...liveIo, proc: () => ({ comm: 'claude', start: '9' }) } });
+  assert.match(sent.at(-1), /vừa đổi/, 'identity re-checked before the prompt');
+  await startTapKill('#c2383556', ctx, { list: () => [{ ...r, screen: null, screenPid: null, ppid: 1 }], io: liveIo, personaOf: () => '👻 Ma' });
+  const ask = calls.at(-1);
+  assert.match(ask[1], /^💀 👻 Ma #c2383556 · PID 644406 · rảnh · ctx 42k\n\nKill agent này/);
+  const yes = ask[2][0][0].callback_data;
+  const killed = [];
+  await handleTypeButton(cq(yes, ask[1]), ctx, { kill: async (t) => { killed.push(t.pid); return 'ok'; }, io: { ...liveIo, audit: () => {} } });
+  assert.deepEqual(killed, [644406], 'terminal agent killed through the same ✅ branch');
+});
+
+test('dispatch: /compact, /nudge, a tapped /kill are owner-only; typed /kill still goes to the registry', async () => {
+  const sent = [];
+  const base = { daemonUserId: '42', projectsConfig: {}, registry: {}, sendText: async (c, t) => sent.push(t) };
+  for (const text of ['/compact Ma', '/nudge_c2383556', '/kill_c2383556']) {
+    await dispatchCommand(parseDaemonCommand(text), { id: 7 }, base);
+    assert.match(sent.at(-1), /chỉ owner/);
+  }
+  assert.deepEqual(parseDaemonCommand('/kill_c2383556'), { cmd: 'kill', rest: '#c2383556', tapped: true });
+  assert.deepEqual(parseDaemonCommand('/kill c2383556'), { cmd: 'kill', rest: 'c2383556' });
 });

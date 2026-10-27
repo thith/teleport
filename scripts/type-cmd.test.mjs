@@ -6,8 +6,7 @@ import { fileURLToPath } from 'node:url';
 import {
   classify, allowedOps, typeTargets, pinTarget, agentLine, messageNamesTarget, parseInputLine, suggestionSelects,
   rcDialogReady, targetMismatch, TypeRunner, listForType, TYPE_BUTTON_RE, COOLDOWN_MS, defaultIo, compactRefusedOnScreen, isPlaceholder,
-  CLEAR_ROUND, CLEAR_ROUNDS_PER_SEND, CLEAR_MAX_SENDS,
-} from './type-cmd.mjs';
+  CLEAR_ROUND, CLEAR_ROUNDS_PER_SEND, CLEAR_MAX_SENDS, NUDGE_TEXT, findTypeTarget, nudgeRefusal, unquoteTarget } from './type-cmd.mjs';
 
 const FIX = path.join(path.dirname(fileURLToPath(import.meta.url)), 'fixtures', 'type-hardcopy');
 const hc = (name) => fs.readFileSync(path.join(FIX, `${name}.txt`)).toString('latin1'); // as the daemon reads them
@@ -529,4 +528,79 @@ test('listForType: returns the context use per agent (null when the target no lo
   assert.match(a.line, /#abcd1234 · PID 10 · rảnh · ctx 693k/);
   io.session = () => ({ sessionId: 'OTHER', status: 'idle' });
   assert.equal(listForType({ list: () => [row], io })[0].ctx, null);
+});
+
+// ── RFC 26: /nudge, findTypeTarget ────────────────────────────────────────────
+
+const nudgeTyped = () => {
+  const L = hc('compact-typed').split('\n');
+  const i = L.findIndex((l) => /^[^\s]\u00a0\/compact/.test(l.replace(/\0/g, '')));
+  L[i] = L[i].replace('/compact', NUDGE_TEXT);
+  return L.filter((l) => !/^\s+\S \//.test(l)).join('\n'); // no slash-suggestion rows for plain text
+};
+
+test('runner nudge: types the fixed line (no slash-suggestion check), verifies, Enter', async () => {
+  const { io, st } = fakeIo({ screens: [IDLE, nudgeTyped(), nudgeTyped()] });
+  io.nudgeSignals = () => ({ listener: 'off', mail: 0 });
+  const r = await new TypeRunner(io).run('n', T);
+  assert.deepEqual(st.keys, [NUDGE_TEXT, '\r']);
+  assert.match(r.text, /đã nudge #abcd1234/);
+});
+
+test('runner nudge: a healthy agent (listener on, no mail) is refused at RUN time — no key', async () => {
+  const { io, st } = fakeIo({ screens: [IDLE, nudgeTyped()] });
+  io.nudgeSignals = () => ({ listener: 'on', mail: 0 });
+  assert.match((await new TypeRunner(io).run('n', T)).text, /không nudge/);
+  assert.deepEqual(st.keys, []);
+});
+
+test('runner nudge: the line wrapped / differs on screen → typed but NO Enter', async () => {
+  const { io, st } = fakeIo({ screens: [IDLE, hc('compact-typed')] });
+  io.nudgeSignals = () => ({ listener: null, mail: null });
+  const r = await new TypeRunner(io).run('n', T);
+  assert.deepEqual(st.keys, [NUDGE_TEXT]);
+  assert.match(r.text, /KHÔNG Enter/);
+});
+
+test('runner: an unknown op is an error, never /remote-control', async () => {
+  const { io, st } = fakeIo({ screens: [IDLE] });
+  assert.match((await new TypeRunner(io).run('z', T)).text, /không hợp lệ/);
+  assert.deepEqual(st.keys, []);
+});
+
+test('nudgeRefusal / unquoteTarget', () => {
+  assert.match(nudgeRefusal({ listener: 'on', mail: 0 }), /không nudge/);
+  assert.equal(nudgeRefusal({ listener: 'off', mail: 0 }), null);
+  assert.equal(nudgeRefusal({ listener: 'on', mail: 2 }), null);
+  assert.equal(nudgeRefusal({ listener: null, mail: null }), null, 'unknown → go');
+  assert.equal(unquoteTarget('“Cà Rồng”'), 'Cà Rồng');
+  assert.equal(unquoteTarget("'Ma'"), 'Ma');
+  assert.equal(unquoteTarget('"Ma”'), '"Ma”', 'mismatched pair stays');
+});
+
+test('findTypeTarget: hashtag twins across ALL rows refused; names by literal tier, then _ → space', () => {
+  const scr = (o) => ({ screen: `tele-${o.hashtag}`, screenPid: o.pid + 1000, ppid: o.pid + 1000, guessed: false, procStart: '1', ...o });
+  const rows = [
+    scr({ pid: 1, hashtag: 'a1111111', sessionId: 's1', name: 'my_agent' }),
+    scr({ pid: 2, hashtag: 'b2222222', sessionId: 's2', name: 'x' }),
+    scr({ pid: 3, hashtag: 'c3333333', sessionId: 's3', name: 'my agent' }),
+    { pid: 4, hashtag: 'd4444444', sessionId: 's4', screen: null, procStart: '1', name: 'term' },
+  ];
+  const persona = (h) => ({ b2222222: '🐉 Cà Rồng' })[h] || null;
+  assert.equal(findTypeTarget('#a1111111', rows, persona).row.pid, 1);
+  assert.equal(findTypeTarget('my_agent', rows, persona).row.pid, 1, 'literal tier first');
+  assert.equal(findTypeTarget('my agent', rows, persona).row.pid, 3);
+  assert.equal(findTypeTarget('Cà_Rồng', rows, persona).row.pid, 2, '_ → space tier');
+  assert.equal(findTypeTarget('“Cà Rồng”', rows, persona).row.pid, 2, 'curly quotes');
+  assert.equal(findTypeTarget('cà rồng', rows, persona).row.pid, 2);
+  assert.match(findTypeTarget('#d4444444', rows, persona).error, /không ở trong screen/);
+  const twin = [...rows, { pid: 5, hashtag: 'a1111111', sessionId: 's9', screen: null, procStart: '1' }];
+  assert.match(findTypeTarget('#a1111111', twin, persona).error, /2 process/, 'a terminal twin blocks the screen one');
+  assert.match(findTypeTarget('#a1111111', [...rows, { ...rows[0], pid: 7, screen: null }], persona).error, /2 process/, 'two pids on one session');
+  assert.match(findTypeTarget('Cà Rồng', [...rows, { pid: 8, hashtag: 'b2222222', sessionId: 's8', screen: null, procStart: '1' }], persona).error, /2 process/, 'a name hit still refuses a hashtag twin');
+  assert.match(findTypeTarget('nobody', rows, persona).error, /không thấy/);
+  assert.match(findTypeTarget('pid:3', rows, persona).error, /cần/);
+  const shadow = [{ pid: 6, hashtag: 'e5555555', sessionId: 's6', screen: null, procStart: '1', name: 'my_agent' }, rows[2]];
+  assert.equal(findTypeTarget('my_agent', shadow, persona).row.pid, 3, 'a terminal namesake does not shadow the screen agent');
+  assert.match(findTypeTarget('term', rows, persona).error, /không ở trong screen/);
 });
