@@ -166,6 +166,8 @@ It's driven by **one owner user** (`_config.daemonUserId`) and is a thin, **regi
 | `/run <project> <script> [args]` | maintainer | run a `package.json` script — auto-detects npm/pnpm/yarn, validates the script, runs `<pm> run <script> -- <args>` (remote exec) |
 | `/whisper #<hash> <text>` | admin | discreet steer into a topic (also accepts a persona name or convoId as the target) — alias `/w` |
 | `/instruct #<hash> <text>` | admin | official *private* instruction to a topic — nothing hits the group; the agent replies to you via DM (reply to continue) — alias `/i` |
+
+> `/w`, `/i` targets (RFC 26): `#hash`, a convoId, or a persona name — a multi-word name in quotes (`"Cà Rồng"`, phone quotes `“…”` too) or with `_` (`Cà_Rồng`). Two live topics with the same persona → refused (use `#hash`). The text after the target is kept verbatim (quotes, newlines). When replying to a message with a `#hash`, everything you type is text. `/broadcast` also keeps its text verbatim (`--chat <id>` only as the first word).
 | `/health` | member | machine status: CPU load + CPU / disk-IO pressure (PSI), RAM / swap, disk, running claude agents (screen vs terminal, busy), top memory users, warnings (CPU short / disk IO jammed — from PSI, since load also counts tasks waiting on the disk; low RAM / disk; OOM kills in the last 24h) |
 | `/pending` | member | convos waiting on an admin reply |
 | `/start` | public | onboarding help |
