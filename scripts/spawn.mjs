@@ -42,7 +42,7 @@ import { formatPersona } from './persona.mjs';
 import { peekPersona } from './persona-store.mjs';
 import {
   listClaudeProcs, findProcForSession, findUnidentifiedProcs, cwdToProjectSlug, PROJECTS_DIR,
-  formatAgentList, hashtagForSession, parseKillPidArg, killClaudePid, KILL_PID_GRACE_MS, inspectPid, etimeToSeconds,
+  formatAgentList, hashtagForSession, readPs, parseKillPidArg, killClaudePid, KILL_PID_GRACE_MS, inspectPid, etimeToSeconds,
 } from './claude-procs.mjs';
 import { readProjectsConfig, resolveDaemonUserId } from './projects-config.mjs';
 import { transcriptState, formatContext, contextWindowFor } from './transcript-state.mjs';
@@ -362,7 +362,7 @@ export function personaByHashtag(store = readTopicsStore()) {
 }
 
 /**
- * How to bring a killed session back: `/resume #<hashtag>` when it has a Telegram
+ * How to bring a killed session back: `/resume_<hashtag>` when it has a Telegram
  * topic (/resume only finds those), else the UUID form. null for an unknown session.
  */
 export function resumeHint(t, { topics = () => convoByHashtag() } = {}) {
@@ -370,7 +370,7 @@ export function resumeHint(t, { topics = () => convoByHashtag() } = {}) {
   const tag = t.hashtag || hashtagForSession(t.sessionId);
   let hasTopic = false;
   try { hasTopic = !!(tag && topics()[tag]); } catch {}
-  return hasTopic ? `/resume #${tag}` : `/spawn <project> --resume-session ${t.sessionId}`;
+  return hasTopic ? `/resume_${tag}` : `/spawn <project> --resume-session ${t.sessionId}`; // tappable in Telegram (RFC 26)
 }
 
 /**
@@ -439,6 +439,38 @@ export async function gracefulKill(name, {
     if (!sessionExists(name)) return { method: 'quit', killed: true };
   }
   return { method: 'quit', killed: false };
+}
+
+/**
+ * May the screen kill (`/exit`, then quit the whole screen) hit `tele-<tag>`? Only if the
+ * claude inside is that agent: one claude, its known session hashes to `tag`, no other live
+ * session with the same hashtag, and ONE window (an un-targeted `/exit` / quit would hit any
+ * other window too). Occupants are found by screen NAME and by the screen's PID (a claude's STY
+ * keeps the pid across a screen rename), so an unknown `screenPid` refuses; with it, no
+ * occupant = empty screen → ok. `windows` = direct children of the screen process (one per
+ * window); null = unknown → refuse. Pure → { ok } | { error } (RFC 26 §3.7).
+ */
+export function checkScreenKillTarget(name, procs, { screenPid = null, windows = null, descendantClaudes = [] } = {}) {
+  const tag = String(name).replace(/^tele-/, '').toLowerCase();
+  if (!screenPid) return { error: `không xác định được tiến trình của screen "${name}" — dùng /kill pid:<PID>.` };
+  const all = procs.filter((r) => r.screen === name || r.screenPid === screenPid);
+  // The window's own claude is the SCREEN's direct child; a `claude -p` the agent runs inherits STY
+  // but is its descendant — not a second occupant. No direct child (claude under a shell) → all rows.
+  const direct = all.filter((r) => r.ppid === screenPid);
+  const inside = direct.length ? direct : all.filter((r) => !all.some((o) => o.pid === r.ppid));
+  const pidHint = (rows) => rows.map((r) => `/kill pid:${r.pid}`).join(' · ');
+  if (windows !== 1) return { error: `screen "${name}" có ${windows ?? '?'} cửa sổ — không gõ /exit mù. Dùng ${pidHint(inside) || '/kill pid:<PID>'}.` };
+  // "Empty" only if no claude process at all descends from the screen (rows can miss one: no STY, renamed screen).
+  if (!inside.length) return descendantClaudes.length ? { error: `screen "${name}" có claude không nhận diện được (PID ${descendantClaudes.join(', ')}) — dùng /kill pid:<PID>.` } : { ok: true };
+  if (inside.length > 1) return { error: `screen "${name}" có ${inside.length} claude — dùng ${pidHint(inside)}.` };
+  const r = inside[0];
+  if (r.guessed || !r.sessionId || hashtagForSession(r.sessionId) !== tag) {
+    return { error: `claude trong "${name}" không phải session #${tag}${r.sessionId ? ` (${r.guessed ? 'đoán ' : ''}${r.sessionId})` : ''} — dùng /kill pid:${r.pid}.` };
+  }
+  // Any OTHER live claude with this hashtag — even one holding the same session — except the occupant's own children.
+  const twins = procs.filter((p) => p.pid !== r.pid && p.ppid !== r.pid && p.hashtag === tag);
+  if (twins.length) return { error: `#${tag} trùng với ${twins.map((p) => `PID ${p.pid}`).join(', ')} — dùng /kill pid:${r.pid}.` };
+  return { ok: true };
 }
 
 /**
@@ -1408,6 +1440,25 @@ if (isDirectRun) {
       console.error(`[spawn] no screen session "${name}" (try: spawn.mjs --list). NB: --kill needs the FULL hashtag — the 3-char tail / no-id shortcuts are --attach only (destructive, so kill stays explicit).`);
       process.exit(1);
     }
+    // The screen's NAME is not proof of who is inside it: check the occupant first.
+    let procs;
+    try { procs = listClaudeProcs({ strict: true }); } catch (e) { console.error(`[spawn] ❌ cannot list claude processes (${e.message}) — nothing killed.`); process.exit(1); }
+    // One window = one direct child of the SCREEN process (window titles can't fool a count of processes).
+    // ONE screen identity for both the check and the kill (names differing only in case → refuse).
+    const sameName = listSpawnSessions().filter((s) => s.name.toLowerCase() === name.toLowerCase());
+    if (sameName.length > 1) { console.error(`[spawn] ❌ ${sameName.length} screens named like "${name}" (${sameName.map((s) => `${s.pid}.${s.name}`).join(', ')}) — use /kill pid:<PID>.`); process.exit(1); }
+    if (sameName.length === 1) name = sameName[0].name;
+    const screenPid = Number(sameName[0]?.pid) || null;
+    const ps = screenPid ? readPs() : null;
+    const windows = ps ? ps.filter((p) => p.ppid === screenPid).length : null;
+    const descendantClaudes = [];
+    if (ps) {
+      const byPpid = new Map();
+      for (const p of ps) (byPpid.get(p.ppid) || byPpid.set(p.ppid, []).get(p.ppid)).push(p);
+      for (let q = [...(byPpid.get(screenPid) || [])]; q.length;) { const p = q.pop(); if (p.comm === 'claude') descendantClaudes.push(p.pid); q.push(...(byPpid.get(p.pid) || [])); }
+    }
+    const sk = checkScreenKillTarget(name, procs, { screenPid, windows, descendantClaudes });
+    if (sk.error) { appendKillAudit({ screen: name, result: 'refused', reason: sk.error, fromId: process.env.TELE_FROM_ID || '' }); console.error(`[spawn] ❌ ${sk.error}`); process.exit(1); }
     // Graceful: try claude's own /exit first, wait up to 10s, force-quit if stubborn.
     console.log(`[spawn] sending /exit to "${name}", waiting up to ${KILL_GRACE_MS / 1000}s…`);
     const r = await gracefulKill(name);
@@ -1420,7 +1471,9 @@ if (isDirectRun) {
     console.log(r.method === 'exit'
       ? `[spawn] "${name}" exited gracefully (/exit).`
       : `[spawn] "${name}" didn't exit in ${KILL_GRACE_MS / 1000}s — force-killed.`);
-    console.log(`[spawn] resume it: /resume #${name.replace(/^tele-/, '')}`);
+    const inside = procs.find((r) => r.screen === name);
+    const hint = inside ? resumeHint(inside) : null;
+    if (hint) console.log(`[spawn] resume it: ${hint}`);
     process.exit(0);
   }
 

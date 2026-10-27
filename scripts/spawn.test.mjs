@@ -1,3 +1,4 @@
+import { hashtagForSession } from './claude-procs.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import os from 'node:os';
@@ -9,7 +10,7 @@ import { fileURLToPath } from 'node:url';
 process.env.TELE_PERSONA_STORE = path.join(os.tmpdir(), `teleport-persona-store-spawn-${process.pid}.jsonl`);
 // No real systemd-run probe in unit tests (escapeServiceCgroup is tested with injected probes).
 process.env.TELEPORT_NO_SCOPE = '1';
-import { buildSpawnPlan, genSessionSeed, runSpawn, childLaunch, loginSeedEnv, wrapInLoginShell, scrubClaudeEnv, SEED_PATH, hasBinary, screenSessionExists, normalizeSessionName, parseScreenSessions, listSpawnSessions, resolveKillId, resolveAttachId, resolveAttachTarget, formatSessionList, resolveMode, SPAWN_PROMPT, PERMISSION_MODES, DEFAULT_PERMISSION_MODE, USAGE, personaByHashtag, gracefulKill, KILL_GRACE_MS, RESUME_PROMPT, resolveResumeSession, checkResumePreflight, findTranscriptDirs, checkPidKillAuth, resolveKillPid, normalizeAgentName, matchProcsByName, resumeHint, appendKillAudit, acquireResumeLock, acquireResumeFileLock, performResume, checkRestartTarget, checkRestartPreflight, RESUME_LOCK_STALE_MS, resumeLockSecret, inSystemdService, escapeServiceCgroup, SYSTEMD_SCOPE_PREFIX } from './spawn.mjs';
+import { buildSpawnPlan, genSessionSeed, runSpawn, childLaunch, loginSeedEnv, wrapInLoginShell, scrubClaudeEnv, SEED_PATH, hasBinary, screenSessionExists, normalizeSessionName, parseScreenSessions, listSpawnSessions, resolveKillId, resolveAttachId, resolveAttachTarget, formatSessionList, resolveMode, SPAWN_PROMPT, PERMISSION_MODES, DEFAULT_PERMISSION_MODE, USAGE, personaByHashtag, gracefulKill, KILL_GRACE_MS, RESUME_PROMPT, resolveResumeSession, checkResumePreflight, findTranscriptDirs, checkPidKillAuth, resolveKillPid, normalizeAgentName, matchProcsByName, resumeHint, checkScreenKillTarget, appendKillAudit, acquireResumeLock, acquireResumeFileLock, performResume, checkRestartTarget, checkRestartPreflight, RESUME_LOCK_STALE_MS, resumeLockSecret, inSystemdService, escapeServiceCgroup, SYSTEMD_SCOPE_PREFIX } from './spawn.mjs';
 import fs from 'node:fs';
 import { uuidToConvoInt } from './convo-registry.mjs';
 import { shortConvoHash } from './convo-hash.mjs';
@@ -1170,10 +1171,34 @@ test('performResume wait: another refusal (screen exists) is reported at once, n
   assert.equal(slept.length, 0);
 });
 
-test('resumeHint: /resume #hashtag for a session with a topic, else the UUID form; none for a guess', () => {
+test('resumeHint: /resume_<hashtag> for a session with a topic, else the UUID form; none for a guess', () => {
   const t = { sessionId: '00000000-0000-4000-8000-0000000000bb', hashtag: 'a7611284' };
-  assert.equal(resumeHint(t, { topics: () => ({ a7611284: '1' }) }), '/resume #a7611284');
+  assert.equal(resumeHint(t, { topics: () => ({ a7611284: '1' }) }), '/resume_a7611284');
   assert.equal(resumeHint(t, { topics: () => ({}) }), `/spawn <project> --resume-session ${t.sessionId}`);
   assert.equal(resumeHint({ ...t, guessed: true }, { topics: () => ({ a7611284: '1' }) }), null);
   assert.equal(resumeHint(null), null);
+});
+
+test('checkScreenKillTarget: the claude inside must be that agent, alone, in a one-window screen', () => {
+  const sid = 'ac22f365-d351-4e54-82a5-303156081507';
+  const tag = hashtagForSession(sid);
+  const name = `tele-${tag}`;
+  const own = { pid: 7, ppid: 100, screen: name, screenPid: 100, sessionId: sid, hashtag: tag };
+  const ok = (procs, opts = {}) => checkScreenKillTarget(name, procs, { screenPid: 100, windows: 1, ...opts });
+  assert.deepEqual(ok([own]), { ok: true });
+  assert.deepEqual(ok([]), { ok: true }, 'empty screen');
+  assert.match(ok([], { descendantClaudes: [33] }).error, /không nhận diện được/, 'a claude under the screen that no row matched → refuse');
+  assert.deepEqual(ok([own, { ...own, pid: 12, ppid: 7 }]), { ok: true }, 'a claude -p child of the agent is not a 2nd occupant');
+  assert.match(ok([own], { windows: 2 }).error, /2 cửa sổ/);
+  assert.match(ok([own], { windows: null }).error, /\? cửa sổ/);
+  assert.match(ok([own], { screenPid: null }).error, /không xác định/, 'unknown screen pid → refuse');
+  assert.match(ok([{ ...own, sessionId: '3b6f622a-63a9-491a-b683-b125b54d75fc' }]).error, /không phải session/);
+  assert.match(ok([{ ...own, guessed: true }]).error, /không phải session/);
+  assert.match(ok([own, { ...own, pid: 8 }]).error, /2 claude/);
+  const shelled = { ...own, ppid: 50 };
+  assert.deepEqual(ok([shelled, { ...own, pid: 12, ppid: 7 }]), { ok: true }, 'claude under a shell + its claude -p child');
+  assert.match(ok([own, { pid: 9, screen: null, sessionId: 'x', hashtag: tag }]).error, /trùng/);
+  assert.match(ok([own, { pid: 9, ppid: 1, screen: null, sessionId: sid, hashtag: tag }]).error, /trùng/, 'same session in a terminal too');
+  const renamed = { ...own, screen: 'tele-zzzz0000', sessionId: '3b6f622a-63a9-491a-b683-b125b54d75fc', hashtag: 'i9661332' };
+  assert.match(ok([renamed]).error, /không phải session/, 'a renamed screen is found by its pid');
 });

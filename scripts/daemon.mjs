@@ -55,6 +55,7 @@ import {
   isDmControlMessage, stripDmControlPrefix, prLinksOnly, PR_LINK_RE,
 } from './tele-listen.mjs';
 export { prLinksOnly, PR_LINK_RE };
+import { HASHTAG_RE } from './agent-target.mjs';
 import { loadCommands, resolveCommand, roleMeets, tokenizeArgs, COMMANDS_FILE } from './commands.mjs';
 import { canonicalPrUrl } from './merge.mjs';
 // Workspace paths live in workspace.mjs (merge.mjs needs them too — importing
@@ -93,13 +94,24 @@ const PID_FILE = path.join(DEFAULT_TMP_DIR, 'daemon.pid');
 
 // ── Pure helpers (unit-tested) ────────────────────────────────────────────────
 
+// Commands Telegram can link as `/<cmd>_<hashtag>` (RFC 26): a tap = `/<cmd> #<hashtag>`.
+export const TAP_COMMANDS = new Set(['resume']);
+
 // Parse the leading `/command` of a message. Returns { cmd, rest } or null.
-// `cmd` is lower-cased, sans the leading slash and any @botname suffix.
+// `cmd` is lower-cased, sans the leading slash and any @botname suffix. A tap form
+// `/resume_a7611284` → { cmd, rest: '#a7611284', tapped: true }; with trailing args
+// it carries `tapError` instead (a tap takes none — never drop e.g. a --flag silently).
 export function parseDaemonCommand(text) {
   if (typeof text !== 'string') return null;
-  const m = text.trim().match(/^\/([a-zA-Z]+)(?:@[a-zA-Z0-9_]+)?(?:\s+([\s\S]*))?$/);
+  const m = text.trim().match(/^\/([a-zA-Z]+)(?:_([0-9a-zA-Z]+))?(?:@[a-zA-Z0-9_]+)?(?:\s+([\s\S]*))?$/);
   if (!m) return null;
-  return { cmd: m[1].toLowerCase(), rest: (m[2] ?? '').trim() };
+  const cmd = m[1].toLowerCase(), rest = (m[3] ?? '').trim();
+  if (m[2] == null) return { cmd, rest };
+  if (!TAP_COMMANDS.has(cmd)) return null;
+  if (!HASHTAG_RE.test(m[2])) return { cmd, rest: '', tapped: true, tapError: `❌ "${m[2]}" không phải hashtag — xem /ls` };
+  const tag = m[2].toLowerCase();
+  if (rest) return { cmd, rest: '', tapped: true, tapError: `❌ lệnh bấm không nhận tham số — gõ /${cmd} #${tag} ${rest}` };
+  return { cmd, rest: `#${tag}`, tapped: true };
 }
 
 // Hard bound on a dispatched command (remote code execution); output beyond the
@@ -785,6 +797,7 @@ export async function dispatchCommand(parsed, from, {
   runner = execFileP, scriptsDir = __dirname, parentDir = PARENT_DIR, reload = null,
   automergeStateFile = AUTOMERGE_STATE_FILE, ...extra
 }, replyText = null, messageId = null) {
+  if (parsed.tapError) { await sendText(daemonUserId, parsed.tapError); return; }
   // Built-in: handled in-process, never via the registry (a `_commands` entry
   // named `reload` can't shadow it). Admin-only.
   if (parsed.cmd === AUTOMERGE_COMMAND) {

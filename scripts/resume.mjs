@@ -33,7 +33,7 @@ export const normalizeName = normalizeAgentName;
  * Query `#a7611284` / `a7611284` → hashtag; otherwise a full persona name.
  * Returns { target, others } | { error }. Pure.
  */
-export function findResumeTarget(query, candidates, { aliveSessions = new Set() } = {}) {
+export function findResumeTarget(query, candidates, { aliveSessions = new Set(), liveRows = [] } = {}) {
   const t = parseAgentTarget(query); // `name:` (the /kill form) accepted too
   const q = String(t.value ?? '');
   if (!q || t.kind === 'pid' || t.kind === 'convoId') return { error: 'usage: /resume <persona name | #hashtag>' };
@@ -42,6 +42,17 @@ export function findResumeTarget(query, candidates, { aliveSessions = new Set() 
     ? candidates.filter((c) => c.hashtag === q)
     : candidates.filter((c) => c.persona && normalizeName(c.persona) === normalizeName(q));
   if (!hits.length) return { error: `no agent "${q}" with a Telegram topic in the last ${RECENT_DAYS} days.` };
+  // A hashtag is an exact address: two different sessions behind it → refuse, never pick the newest (RFC 26 §3.9).
+  if (t.kind === 'hashtag' && new Set(hits.map((h) => h.sessionId)).size > 1) {
+    return { error: `#${q} matches ${hits.length} sessions (${hits.map((h) => `${h.persona || '?'} ${h.sessionId}`).join(', ')}) — resume by UUID: /spawn <project> --resume-session <uuid>.` };
+  }
+  // …including a LIVE claude behind the same hashtag that is not a candidate (no topic, too old,
+  // or no known session): the tap may have meant that one, so never resume the other.
+  if (t.kind === 'hashtag') {
+    const known = new Set(hits.map((h) => h.sessionId));
+    const other = liveRows.filter((r) => r.hashtag === q && !(r.sessionId && !r.guessed && known.has(r.sessionId)));
+    if (other.length) return { error: `#${q} also belongs to live claude ${other.map((r) => `PID ${r.pid}`).join(', ')} — check /ls; resume by UUID if you mean the dead one.` };
+  }
   hits.sort((a, b) => b.mtimeMs - a.mtimeMs);
   // Only DEAD sessions can be resumed: skip ones a live claude still holds.
   const dead = hits.filter((h) => !aliveSessions.has(h.sessionId));
@@ -117,15 +128,17 @@ if (isMainModule(import.meta.url)) {
     extraArgs = px.args;
   }
   const { listClaudeProcs } = await import('./claude-procs.mjs');
-  const alive = new Set(listClaudeProcs().map((r) => r.sessionId).filter(Boolean));
-  const pick = findResumeTarget(query, listCandidates(), { aliveSessions: alive });
+  let liveRows;
+  try { liveRows = listClaudeProcs({ strict: true }); } catch (e) { console.log(`❌ cannot list live claude processes (${e.message}) — not resuming blind.`); process.exit(1); }
+  const alive = new Set(liveRows.map((r) => r.sessionId).filter(Boolean));
+  const pick = findResumeTarget(query, listCandidates(), { aliveSessions: alive, liveRows });
   if (pick.error) { console.log(`❌ ${pick.error}`); process.exit(1); }
   const t = pick.target;
   const c = checkCwd(transcriptCwd(t.file));
   if (c.error) { console.log(`❌ ${t.persona || ''} #${t.hashtag}: ${c.error}`); process.exit(1); }
   const { performResume } = await import('./spawn.mjs');
   const res = await performResume({ sessionId: t.sessionId, cwd: c.cwd, extraArgs, setBy: callerIsOwner ? 'owner' : 'agent' });
-  const also = (pick.others.length ? `\n(also matched, older: ${pick.others.slice(0, 5).map((o) => `#${o.hashtag}`).join(', ')} — use /resume #<hashtag> for one of those)` : '')
+  const also = (pick.others.length ? `\n(also matched, older: ${pick.others.slice(0, 5).map((o) => `/resume_${o.hashtag}`).join(', ')} — tap one of those)` : '')
     + (pick.skippedLive?.length ? `\n(skipped — still running: ${pick.skippedLive.map((o) => `#${o.hashtag}`).join(', ')})` : '');
   if (res.error) { console.log(`❌ ${t.persona || ''} #${t.hashtag}: ${res.error}${also}`); process.exit(1); }
   console.log(`🔁 resumed ${t.persona || ''} #${t.hashtag} (session ${t.sessionId}) in screen "${res.plan.sessionName}", folder ${path.basename(c.cwd)}. It will check its mailbox, re-arm its listener and greet in its topic.${res.plan.extraArgs?.length ? `\nclaude flags: ${res.plan.extraArgs.join(' ')}` : ''}${res.plan.extraNote ? `\n${res.plan.extraNote}` : ''}${also}`);
