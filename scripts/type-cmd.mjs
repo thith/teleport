@@ -113,10 +113,10 @@ export function findTypeTarget(query, rows, personaOf = () => null) {
   const t = parseAgentTarget(unquoteTarget(query));
   if (t.kind === 'pid' || t.kind === 'convoId' || !String(t.value ?? '').trim()) return { error: 'cần <tên | #hashtag> (xem /ls).' };
   const label = (r) => `${personaOf(r.hashtag) || r.name || '?'} #${r.hashtag} · PID ${r.pid}`;
-  const sessions = (hits) => new Set(hits.map((r) => r.sessionId || `pid:${r.pid}`)).size;
+  const sessions = (hits) => hits.length; // processes, not sessions: two PIDs on one session are ambiguous too
   const reachable = typeTargets(rows);
   const pick = (hits) => {
-    if (sessions(hits) > 1) return { error: `"${t.value}" khớp ${sessions(hits)} phiên: ${hits.map(label).join(', ')} — dùng #hashtag.` };
+    if (sessions(hits) > 1) return { error: `"${t.value}" khớp ${sessions(hits)} process: ${hits.map(label).join(', ')} — dùng #hashtag.` };
     const ok = hits.filter((r) => reachable.includes(r));
     if (!ok.length) return { error: `${label(hits[0])} không ở trong screen tele-* của nó — không gõ được (xem /ls).` };
     return { row: ok[0] };
@@ -125,15 +125,18 @@ export function findTypeTarget(query, rows, personaOf = () => null) {
     const hits = rows.filter((r) => r.hashtag === t.value);
     return hits.length ? pick(hits) : { error: `không thấy agent #${t.value} đang chạy (xem /ls).` };
   }
+  // Names: over the agents we can type into (a terminal namesake must not shadow a screen one).
   const names = (r) => [r.name, personaOf(r.hashtag)].filter(Boolean);
   const strip = (s) => String(s).trim().replace(/^[^\p{L}\p{N}]+\s*/u, '').toLowerCase();
-  const lit = strip(t.value);
-  let hits = rows.filter((r) => names(r).some((n) => strip(n) === lit));
-  if (!hits.length) {
-    const norm = normalizeAgentName(String(t.value).replace(/_+/g, ' '));
-    hits = rows.filter((r) => names(r).some((n) => normalizeAgentName(n) === norm));
-  }
-  return hits.length ? pick(hits) : { error: `không thấy agent "${t.value}" đang chạy (xem /ls).` };
+  const lit = strip(t.value), norm = normalizeAgentName(String(t.value).replace(/_+/g, ' '));
+  const byName = (pool) => {
+    const a = pool.filter((r) => names(r).some((n) => strip(n) === lit));
+    return a.length ? a : pool.filter((r) => names(r).some((n) => normalizeAgentName(n) === norm));
+  };
+  const hits = byName(reachable);
+  if (hits.length) return pick(hits);
+  const elsewhere = byName(rows);
+  return { error: elsewhere.length ? `${label(elsewhere[0])} không ở trong screen tele-* của nó — không gõ được (xem /ls).` : `không thấy agent "${t.value}" đang chạy (xem /ls).` };
 }
 
 /** Is a nudge worth sending? `listener` 'on'|'off'|null, `mail` unread count|null. → null (go) | reason. Pure. */

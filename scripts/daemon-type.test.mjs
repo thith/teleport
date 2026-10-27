@@ -273,6 +273,10 @@ test('/kill_<hash>: asks ✅ with the /type layout; guessed / twin / absent refu
   assert.match(sent.at(-1), /không xác định chắc/);
   await startTapKill('#c2383556', ctx, { list: () => [r, { ...r, pid: 7, sessionId: 'S2' }], io: liveIo });
   assert.match(sent.at(-1), /khớp 2 process/);
+  await startTapKill('#c2383556', ctx, { list: () => [r, { ...r, pid: 8 }], io: liveIo });
+  assert.match(sent.at(-1), /khớp 2 process/, 'two pids on ONE session too');
+  await startTapKill('#c2383556', ctx, { list: () => [r], io: { ...liveIo, proc: () => ({ comm: 'claude', start: '9' }) } });
+  assert.match(sent.at(-1), /vừa đổi/, 'identity re-checked before the prompt');
   await startTapKill('#c2383556', ctx, { list: () => [{ ...r, screen: null, screenPid: null, ppid: 1 }], io: liveIo, personaOf: () => '👻 Ma' });
   const ask = calls.at(-1);
   assert.match(ask[1], /^💀 👻 Ma #c2383556 · PID 644406 · rảnh · ctx 42k\n\nKill agent này/);

@@ -1038,12 +1038,16 @@ export async function startTapKill(rest, ctx, { list = () => listClaudeProcs(), 
   const tag = String(rest).replace(/^#/, '').toLowerCase();
   const rows = list().filter((r) => r.hashtag === tag);
   if (!rows.length) { await sendText(daemonUserId, `ℹ️ #${tag} không chạy — /resume_${tag}`); return; }
-  if (new Set(rows.map((r) => r.sessionId || `pid:${r.pid}`)).size > 1) { await sendText(daemonUserId, `❌ #${tag} khớp ${rows.length} process: ${rows.map((r) => `PID ${r.pid}`).join(', ')} — dùng /kill pid:<PID>.`); return; }
+  // Two processes — even on ONE session — never pick one.
+  if (rows.length > 1) { await sendText(daemonUserId, `❌ #${tag} khớp ${rows.length} process: ${rows.map((r) => `PID ${r.pid}`).join(', ')} — dùng /kill pid:<PID>.`); return; }
   const r = rows.find((x) => !x.guessed && x.sessionId && x.procStart);
   if (!r) { await sendText(daemonUserId, `❌ #${tag}: không xác định chắc process (${rows.map((x) => `PID ${x.pid}`).join(', ')}) — dùng /kill pid:<PID>.`); return; }
   const t = pinTarget(r);
   // State without observe(): a terminal agent is not a screen child, and a kill needs no screen.
-  const sess = io.session(t.pid), tr = io.transcript(t.sessionId, t.cwd);
+  const sess = io.session(t.pid), proc = io.proc(t.pid);
+  // Same identity check as ✅, before the prompt shows a state that may belong to a replaced process.
+  if (!proc || proc.comm !== 'claude' || String(proc.start) !== String(t.procStart) || sess?.sessionId !== t.sessionId) { await sendText(daemonUserId, `❌ #${tag}: process vừa đổi — gõ lại /kill_${tag}.`); return; }
+  const tr = io.transcript(t.sessionId, t.cwd);
   const ctxStr = formatContext(tr?.usage, contextWindowFor(projectsConfig || {}, { hashtag: tag, model: tr?.usage?.model }));
   const line = agentLine(t, { persona: personaOf(tag), state: classify(sess?.status, tr?.ended), ctx: ctxStr });
   const tok = crypto.randomBytes(8).toString('hex');

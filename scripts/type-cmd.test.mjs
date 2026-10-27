@@ -595,7 +595,11 @@ test('findTypeTarget: hashtag twins across ALL rows refused; names by literal ti
   assert.equal(findTypeTarget('cà rồng', rows, persona).row.pid, 2);
   assert.match(findTypeTarget('#d4444444', rows, persona).error, /không ở trong screen/);
   const twin = [...rows, { pid: 5, hashtag: 'a1111111', sessionId: 's9', screen: null, procStart: '1' }];
-  assert.match(findTypeTarget('#a1111111', twin, persona).error, /2 phiên/, 'a terminal twin blocks the screen one');
+  assert.match(findTypeTarget('#a1111111', twin, persona).error, /2 process/, 'a terminal twin blocks the screen one');
+  assert.match(findTypeTarget('#a1111111', [...rows, { ...rows[0], pid: 7, screen: null }], persona).error, /2 process/, 'two pids on one session');
   assert.match(findTypeTarget('nobody', rows, persona).error, /không thấy/);
   assert.match(findTypeTarget('pid:3', rows, persona).error, /cần/);
+  const shadow = [{ pid: 6, hashtag: 'e5555555', sessionId: 's6', screen: null, procStart: '1', name: 'my_agent' }, rows[2]];
+  assert.equal(findTypeTarget('my_agent', shadow, persona).row.pid, 3, 'a terminal namesake does not shadow the screen agent');
+  assert.match(findTypeTarget('term', rows, persona).error, /không ở trong screen/);
 });
