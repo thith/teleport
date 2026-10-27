@@ -134,7 +134,8 @@ export function findTypeTarget(query, rows, personaOf = () => null) {
     return a.length ? a : pool.filter((r) => names(r).some((n) => normalizeAgentName(n) === norm));
   };
   const hits = byName(reachable);
-  if (hits.length) return pick(hits);
+  // A name hit still answers to its hashtag: a live twin anywhere (e.g. a terminal copy) → refuse.
+  if (hits.length) return pick(rows.filter((r) => hits.some((h) => h.hashtag && h.hashtag === r.hashtag) || hits.includes(r)));
   const elsewhere = byName(rows);
   return { error: elsewhere.length ? `${label(elsewhere[0])} không ở trong screen tele-* của nó — không gõ được (xem /ls).` : `không thấy agent "${t.value}" đang chạy (xem /ls).` };
 }

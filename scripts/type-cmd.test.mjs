@@ -597,6 +597,7 @@ test('findTypeTarget: hashtag twins across ALL rows refused; names by literal ti
   const twin = [...rows, { pid: 5, hashtag: 'a1111111', sessionId: 's9', screen: null, procStart: '1' }];
   assert.match(findTypeTarget('#a1111111', twin, persona).error, /2 process/, 'a terminal twin blocks the screen one');
   assert.match(findTypeTarget('#a1111111', [...rows, { ...rows[0], pid: 7, screen: null }], persona).error, /2 process/, 'two pids on one session');
+  assert.match(findTypeTarget('Cà Rồng', [...rows, { pid: 8, hashtag: 'b2222222', sessionId: 's8', screen: null, procStart: '1' }], persona).error, /2 process/, 'a name hit still refuses a hashtag twin');
   assert.match(findTypeTarget('nobody', rows, persona).error, /không thấy/);
   assert.match(findTypeTarget('pid:3', rows, persona).error, /cần/);
   const shadow = [{ pid: 6, hashtag: 'e5555555', sessionId: 's6', screen: null, procStart: '1', name: 'my_agent' }, rows[2]];
