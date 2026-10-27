@@ -212,11 +212,12 @@ export function buildProcRows({ psRows, uid, sessions = new Map(), procExtras = 
  *   convoOfHashtag(hashtag) → convoId | null — recovers a tele-* screen's convo
  *                 when the claude inside carries no session id.
  *   ctxOf(row) → "ctx 172k (17%)" | null; linksOf(row) → ['/kill_x', …] (the caller decides who may tap)
+ *   tokensOf(row) → context tokens | null — 🟡/🔴 highlight on a big context.
  *   showSession — print the full session UUID (terminal use; hidden on Telegram).
  *   full     — false (the default `/ls`, Thi): one line per agent — 📺/🖥, name #hashtag, state, context,
  *              🔇 listener off / 📬 mail — then its links; no section headers. `listenerOf(convo)` → 'on'|'off'|null.
  */
-export function formatAgentList({ screens = [], procs = [], personaOf = () => null, home = os.homedir(), statusLinesOf = () => [], mailOf = () => null, convoOfHashtag = () => null, ctxOf = () => null, linksOf = () => [], showSession = true, full = true, listenerOf = () => null } = {}) {
+export function formatAgentList({ screens = [], procs = [], personaOf = () => null, home = os.homedir(), statusLinesOf = () => [], mailOf = () => null, convoOfHashtag = () => null, ctxOf = () => null, linksOf = () => [], showSession = true, full = true, listenerOf = () => null, tokensOf = () => null } = {}) {
   // Folder name only (Thi: "chỉ hiện tên folder") — the full path is noise on a phone.
   const short = (p) => (p ? (p === home ? '~' : path.basename(p)) : null);
   // Every injected lookup is best-effort: a throw drops that line, never the whole /ls.
@@ -229,11 +230,16 @@ export function formatAgentList({ screens = [], procs = [], personaOf = () => nu
     return typeof r.screen === 'string' && r.screen.startsWith('tele-') ? safe(() => convoOfHashtag(r.screen.slice(5)), null) : null;
   };
   // "ctx 172k (17%)" → "172k" — no % in /ls (Thi 11231).
-  const ctxText = (c) => String(c).replace(/^ctx /, '').replace(/ \(\d+%\)$/, '');
+  // A big context is highlighted (Thi 11234): 🟡 > 300k, 🔴 > 700k tokens.
+  const ctxText = (c, r) => {
+    const n = safe(() => tokensOf(r), null);
+    const mark = n > 700_000 ? '🔴 ' : n > 300_000 ? '🟡 ' : '';
+    return mark + String(c).replace(/^ctx /, '').replace(/ \(\d+%\)$/, '');
+  };
   // No tty line (Thi: only useful at the keyboard). r.tty stays in the row/audit.
   const block = (r) => {
     const tag = r.hashtag || (typeof r.screen === 'string' && r.screen.startsWith('tele-') ? r.screen.slice(5) : null);
-    const title = [persona(tag), tag ? `#${tag}` : null].filter(Boolean).join(' ') || `PID ${r.pid}`;
+    const title = [persona(tag) || r.name, tag ? `#${tag}` : null].filter(Boolean).join(' ') || `${r.screen ? '📺' : '🖥'} PID ${r.pid}`;
     const convo = convoOf(r);
     const ctx = safe(() => ctxOf(r), null);
     const mail = convo != null ? safe(() => mailOf(convo), null) : null;
@@ -244,12 +250,12 @@ export function formatAgentList({ screens = [], procs = [], personaOf = () => nu
       r.screen ? `📺 Screen: ${r.screen}` : null,
       `🔢 PID: ${r.pid}`,
       // 📨 = the session's name — the address for Claude's cross-session messages (SendMessage to=<name>)
-      r.name ? `📨 Session: ${r.name}` : null,
+      r.name ? `📨 Session: ${r.name}${r.guessed && !showSession ? ' (đoán)' : ''}` : null,
       showSession && r.sessionId ? `🆔 Session: ${r.sessionId}${r.guessed ? ' (đoán)' : ''}` : null,
       r.status ? `⚙️ Trạng thái: ${r.status}` : null,
       short(r.cwd) ? `📁 Folder: ${short(r.cwd)}` : null,
       r.etime ? `⏱️ Uptime: ${r.etime}` : null,
-      ctx ? `🧠 Context: ${ctxText(ctx)}` : null,
+      ctx ? `🧠 Context: ${ctxText(ctx, r)}` : null,
       r.bridgeSessionId ? '📡 Remote Control: bật' : null,
       ...status,
       mail > 0 ? `📬 Mailbox: ${mail} thư chưa đọc` : null,
@@ -267,7 +273,7 @@ export function formatAgentList({ screens = [], procs = [], personaOf = () => nu
     const links = safe(() => linksOf(r), []);
     const head = [
       `${r.screen ? '📺' : '🖥'} ${[persona(tag) || r.name, tag ? `#${tag}` : null].filter(Boolean).join(' ') || `PID ${r.pid}`}`,
-      r.status, ctx ? ctxText(ctx) : null, off ? '🔇' : null, mail > 0 ? `📬${mail}` : null,
+      r.status, ctx ? ctxText(ctx, r) : null, off ? '🔇' : null, mail > 0 ? `📬${mail}` : null,
     ].filter(Boolean).join(' · ');
     return links.length ? `${head}\n${links.join(' ')}` : head;
   };

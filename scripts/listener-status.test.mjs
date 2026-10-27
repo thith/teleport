@@ -172,7 +172,7 @@ test('formatAgentList: status + mailbox lines in the block of agents with a conv
   });
   assert.match(out, new RegExp(`⏱️ Uptime: 1:00\\n🎧 S${cScreen}\\n\\n`));
   assert.match(out, new RegExp(`📁 Folder: b\\n⏱️ Uptime: 1:00\\n🎧 S${cTerm}\\n📬 Mailbox: 2 thư chưa đọc`));
-  assert.match(out, /PID 3\n🔢 PID: 3\n📁 Folder: c\n⏱️ Uptime: 1:00(\n\n|$)/); // no convo → nothing extra
+  assert.match(out, /🖥 PID 3\n🔢 PID: 3\n📁 Folder: c\n⏱️ Uptime: 1:00(\n\n|$)/); // no convo → nothing extra
   assert.match(out, /🎧 S4242/, 'a tele-* screen without a session falls back to the topics store');
   assert.deepEqual(seen.sort(), [4242, cScreen, cTerm].sort());
 });
@@ -184,7 +184,7 @@ test('statusOf.lines: one labelled line per signal (the /ls blocks); same signal
   const st = createListenerStatus({ tmpDir: dir, registryFile: path.join(dir, 'none.jsonl'), cacheFile: null, topics: {}, isLive: () => false });
   const lines = st.lines(7);
   assert.equal(lines[0], '🔇 Listener: tắt');
-  assert.match(lines.join('\n'), /📥 Hàng đợi: .*chờ agent nhận \(\d+ giây\)\n⏳ Đang xử lý: \d+ giây/);
+  assert.match(lines.join('\n'), /🔇 Listener: tắt\n📥 Hàng đợi: .*chờ agent nhận \(\d+ giây\)\n⏳ Đang xử lý: \d+ giây/);
   assert.match(st(7), /^🔇 listener tắt · 📥 .*chờ agent nhận .* · ⏳ đang xử lý /);
   assert.deepEqual(st.lines(0), []);
   fs.rmSync(dir, { recursive: true, force: true });

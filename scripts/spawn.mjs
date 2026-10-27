@@ -1284,6 +1284,8 @@ if (isDirectRun) {
     const owner = fromId !== '' && ownerId != null && String(ownerId) === fromId;
     const procs = listClaudeProcs();
     const reachable = new Set(typeTargets(procs));
+    const tagCount = new Map();
+    for (const r of procs) if (r.hashtag) tagCount.set(r.hashtag, (tagCount.get(r.hashtag) || 0) + 1);
     const usageOf = new Map(); // one transcript read per row (context line + /compact_x gate)
     const usage = (r) => {
       if (!r.sessionId || r.guessed) return null;
@@ -1297,6 +1299,7 @@ if (isDirectRun) {
       statusLinesOf: (c) => statusOf?.lines(c) ?? [], mailOf, convoOfHashtag: (h) => cmap[h] ?? null,
       showSession: fromId === '', full: fromId === '' || argv.includes('full') || argv.includes('--full'), // a terminal always gets the UUIDs
       listenerOf: (c) => statusOf?.listener(c) ?? null,
+      tokensOf: (r) => usage(r)?.tokens ?? null,
       ctxOf: (r) => {
         const u = usage(r);
         return formatContext(u, contextWindowFor(cfg, { hashtag: r.hashtag, model: u?.model }));
@@ -1305,7 +1308,7 @@ if (isDirectRun) {
         if (!owner) return [];
         const convo = r.sessionId ? uuidToConvoInt(r.sessionId) : null;
         const sig = (f) => { try { return convo == null ? null : f(convo); } catch { return null; } };
-        return lsLinks(r, { reachable: reachable.has(r), tokens: usage(r)?.tokens ?? null, listener: sig((c) => statusOf?.listener(c) ?? null), mail: sig(mailOf) });
+        return lsLinks(r, { reachable: reachable.has(r), unique: tagCount.get(r.hashtag) === 1, tokens: usage(r)?.tokens ?? null, listener: sig((c) => statusOf?.listener(c) ?? null), mail: sig(mailOf) });
       },
     }));
     if (wiped.length) console.log(`\n🧹 đã dọn ${wiped.length} screen chết: ${wiped.join(', ')}`);

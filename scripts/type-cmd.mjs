@@ -96,8 +96,9 @@ export const COMPACT_MIN_TOKENS = 100_000;
  * /kill_x: a known (not guessed) session + start; /compact_x: typeable and context ≥ 100k (known — Thi 11229);
  * /nudge_x: typeable and (listener off or mail waiting). `reachable` = typeTargets(rows) includes it. Pure.
  */
-export function lsLinks(r, { reachable = false, tokens = null, listener = null, mail = null } = {}) {
-  if (!r.hashtag || r.guessed || !r.sessionId || !r.procStart) return [];
+export function lsLinks(r, { reachable = false, tokens = null, listener = null, mail = null, unique = true } = {}) {
+  // `unique` = no other live claude row shares the hashtag (every tap refuses then).
+  if (!r.hashtag || !unique || r.guessed || !r.sessionId || !r.procStart) return [];
   const out = [];
   if (reachable && tokens != null && tokens >= COMPACT_MIN_TOKENS) out.push(`/compact_${r.hashtag}`);
   out.push(`/kill_${r.hashtag}`);

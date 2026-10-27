@@ -142,6 +142,7 @@ test('splitAtBlocks: packs whole blocks ≤ limit, cuts at empty lines; an overs
   assert.deepEqual(splitAtBlocks('x\n\n' + '1234\n5678\n90', 9), ['x', '1234\n5678', '90']);
   assert.deepEqual(splitAtBlocks('abcdefghij', 4), ['abcd', 'efgh', 'ij']);
   assert.deepEqual(splitAtBlocks('a\n\n\n\nb', 1), ['a', 'b'], 'runs of empty lines collapse');
+  assert.deepEqual(splitAtBlocks('ab🪼cd', 3), ['ab', '🪼c', 'd'], 'a surrogate pair is never cut');
   const big = Array.from({ length: 40 }, (_, i) => `🪼 #${i}\n${'x'.repeat(200)}`).join('\n\n');
   const parts = splitAtBlocks(big);
   assert.ok(parts.length > 1 && parts.every((p) => p.length <= 3800));

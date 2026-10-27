@@ -613,6 +613,7 @@ test('lsLinks: the same gates as the taps — kill needs a known session + start
   assert.deepEqual(lsLinks(r, { reachable: true, tokens: 100_000, listener: null, mail: null }), ['/compact_a1111111', '/kill_a1111111'], 'unknown signals → no nudge');
   assert.deepEqual(lsLinks(r, { reachable: false, tokens: 150_000, listener: 'off', mail: 3 }), ['/kill_a1111111'], 'not typeable → kill only');
   assert.deepEqual(lsLinks({ ...r, guessed: true }, { reachable: true }), [], 'guessed → nothing');
+  assert.deepEqual(lsLinks(r, { reachable: true, tokens: 150_000, listener: 'off', unique: false }), [], 'hashtag shared by 2 processes → every tap refuses → no links');
   assert.deepEqual(lsLinks({ ...r, procStart: null }, { reachable: true }), []);
   assert.deepEqual(lsLinks({ ...r, sessionId: null }, { reachable: true }), []);
   assert.deepEqual(lsLinks({ ...r, hashtag: null }, { reachable: true }), []);

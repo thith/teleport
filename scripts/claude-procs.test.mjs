@@ -160,13 +160,15 @@ test('formatAgentList: one block per claude process — title, `<emoji> <name>: 
   assert.ok(iScreen === 0 && iTerm > iScreen, out);
   assert.match(out, new RegExp(`\n\n🦛 Hà Mã #i0744244\n📺 Screen: tele-i0744244\n🔢 PID: 9\n🆔 Session: ${SID2} \\(đoán\\)\n⏱️ Uptime: 00:01\n\n`));
   assert.match(out, /\n\n📺 tele-empty123 · không thấy claude bên trong\n\n/);
-  assert.match(out, /\n\nPID 11\n📺 Screen: work\n🔢 PID: 11\n📨 Session: x\n📁 Folder: w\n⏱️ Uptime: 00:02\n\n/); // non-tele screen hosting a claude
+  assert.match(out, /\n\nx\n📺 Screen: work\n🔢 PID: 11\n📨 Session: x\n📁 Folder: w\n⏱️ Uptime: 00:02\n\n/); // non-tele screen hosting a claude
   const term = out.slice(iTerm);
-  assert.equal(term, `🖥 Terminal (1)\n\n#a7611284\n🔢 PID: 830318\n📨 Session: 🪱 Giun\n🆔 Session: ${SID}\n⚙️ Trạng thái: idle\n📁 Folder: umipay\n⏱️ Uptime: 2-00:49:26\n🧠 Context: 172k\n📡 Remote Control: bật\n/compact_a7611284 /kill_a7611284`);
+  assert.equal(term, `🖥 Terminal (1)\n\n🪱 Giun #a7611284\n🔢 PID: 830318\n📨 Session: 🪱 Giun\n🆔 Session: ${SID}\n⚙️ Trạng thái: idle\n📁 Folder: umipay\n⏱️ Uptime: 2-00:49:26\n🧠 Context: 172k\n📡 Remote Control: bật\n/compact_a7611284 /kill_a7611284`);
   assert.doesNotMatch(out, /pts\//);   // no tty line
   assert.doesNotMatch(out, /\n\n\n/);  // exactly one empty line between blocks
   const hidden = formatAgentList({ procs, showSession: false });
   assert.doesNotMatch(hidden, /🆔|5ce13594/, 'UUIDs hidden on Telegram');
+  assert.match(formatAgentList({ procs: [{ ...procs[1], name: 'g' }], showSession: false }), /📨 Session: g \(đoán\)/, 'a guess stays visible without the UUID');
+  assert.match(formatAgentList({ procs: [{ pid: 5 }] }), /🖥 Terminal \(1\)\n\n🖥 PID 5\n🔢 PID: 5$/);
   const empty = formatAgentList({});
   assert.equal(empty, '📺 Screen (0)\n\n(không có)\n\n🖥 Terminal (0)\n\n(không có)');
 });
@@ -191,6 +193,11 @@ test('formatAgentList full:false — one line per agent (icon, name #hash, state
     '🖥 PID 3',
   ].join('\n\n'));
   assert.equal(formatAgentList({ full: false }), '(không có agent nào)');
+  const hl = (n) => formatAgentList({ full: false, procs: [procs[0]], ctxOf: () => 'ctx Xk (9%)', tokensOf: () => n });
+  assert.match(hl(300_000), /busy · Xk$/);
+  assert.match(hl(300_001), /busy · 🟡 Xk$/);
+  assert.match(hl(700_001), /busy · 🔴 Xk$/);
+  assert.match(formatAgentList({ procs: [procs[0]], ctxOf: () => 'ctx 800k', tokensOf: () => 800_000 }), /🧠 Context: 🔴 800k/, 'full form too');
 });
 
 test('formatAgentList: a throwing lookup drops its line, never the list', () => {

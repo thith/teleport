@@ -157,7 +157,11 @@ export function createListenerStatus({
     const convo = Number(convoId);
     if (!Number.isSafeInteger(convo) || convo <= 0) return [];
     const out = [];
-    for (const [i, sig] of [listenerOn, unreadInfo, promptInfo, processingAge].entries()) {
+    // /ls blocks put the queue before unread Telegram (RFC 26 §3.10 sample); the inline order stays.
+    const order = kind === 'lines' ? [0, 2, 1, 3] : [0, 1, 2, 3];
+    const sigs = [listenerOn, unreadInfo, promptInfo, processingAge];
+    for (const i of order) {
+      const sig = sigs[i];
       try {
         const v = sig(convo);
         if (v != null) out.push(RENDER[kind][i](v));
