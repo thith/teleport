@@ -80,7 +80,7 @@ Usage:
   node spawn.mjs --list | --ls                        list running agent sessions
   node spawn.mjs --attach|--resume [<id>]             re-attach your terminal to a session
   node spawn.mjs --kill|--quit <id>                   gracefully tear a session down
-  node spawn.mjs --kill pid:<PID>|name:<name> [--restart]
+  node spawn.mjs --kill pid:<PID>|<name> [--restart]
                                                       SIGTERM one claude process (daemon owner only);
                                                       --restart then resumes its session in a screen
   node spawn.mjs --help | -h                          show this help
@@ -113,8 +113,10 @@ Manage sessions (interactive/screen only):
     (--resume)       Omit <id> when exactly one session is live. Detach: Ctrl-A D.
   --kill <id>        send /exit, wait up to ${KILL_GRACE_MS / 1000}s, then force-quit.
     (--quit)         Needs the FULL hashtag (no shortcuts — it's destructive).
-  --kill name:<name> same, picking the process by its session name or Telegram persona
-                     (full name, emoji/case ignored; must match exactly one — see --list).
+  --kill <name>      SIGTERM as pid: below, picking the process by its session name,
+                     Telegram persona or #hashtag (full name, emoji/case ignored; must
+                     match exactly one — see --list). \`name:\` prefix optional; a
+                     hashtag of a live tele-* screen uses the /exit kill above.
   --kill pid:<PID>   SIGTERM a \`claude\` process of this user, wait up to ${KILL_PID_GRACE_MS / 1000}s,
                      never SIGKILL. Only via the daemon, only for its owner
                      (TELE_FROM_ID must equal projects.json _config.daemonUserId);
@@ -943,22 +945,31 @@ export function findTranscriptDirs(sessionId, projectsDir = PROJECTS_DIR) {
 export function checkPidKillAuth({ fromId, daemonUserId }) {
   if (!daemonUserId) return { error: 'no daemon owner configured (projects.json `_config.daemonUserId`) — pid kills disabled.' };
   if (!fromId) return { error: '`--kill pid:` is daemon-only: send `/kill pid:<PID>` to the daemon (owner only).' };
-  if (String(fromId) !== String(daemonUserId)) return { error: '`/kill pid:` is owner-only.' };
+  if (String(fromId) !== String(daemonUserId)) return { error: '`/kill pid:` / `/kill <name>` is owner-only (others: /kill <#hashtag> of a tele-* screen).' };
   return { ok: true };
 }
 
-/** The `pid:<N>` target after --kill/--quit, tolerating `pid: N` split into two tokens. */
-export function resolveKillPid(argv) {
+/**
+ * The process target after --kill/--quit: `pid:<N>` (also split as `pid: N`), or a
+ * name. `name:` is optional — any other id is a name (persona, session name or
+ * #hashtag, like /resume), EXCEPT a `tele-` id or a hashtag whose tele-* screen is
+ * live (`isScreen`): those stay the screen kill (`{ found: false }`). Pure.
+ */
+export function resolveKillPid(argv, { isScreen = () => false } = {}) {
   const i = argv.findIndex((a) => a === '--kill' || a === '--quit');
-  // `name:<persona or session name>` — the words after `name:` up to the next
-  // --flag (so both `name:"Rắn 3"` and unquoted `name:Rắn 3` work).
-  if (i !== -1 && /^name:/i.test(argv[i + 1] ?? '')) {
-    const words = [argv[i + 1].slice(5)];
-    for (let j = i + 2; j < argv.length && !argv[j].startsWith('--'); j++) words.push(argv[j]);
+  const tok = argv[i + 1] ?? '';
+  const explicit = /^name:/i.test(tok);
+  // The name = the words up to the next --flag (so both `name:"Rắn 3"` and
+  // unquoted `Rắn 3` work). Only a ONE-word id can be a screen: `a7611284 x`
+  // is a name, never the a7611284 screen.
+  const words = [explicit ? tok.slice(5) : tok];
+  for (let j = i + 2; i !== -1 && j < argv.length && !argv[j].startsWith('--'); j++) words.push(argv[j]);
+  const screen = words.length === 1 && (/^tele-/i.test(tok) || isScreen(tok));
+  if (i !== -1 && (explicit || (tok && !tok.startsWith('-') && !/^pid:/i.test(tok) && !screen))) {
     const name = words.join(' ').trim();
     return name ? { found: true, name } : { found: true, error: 'name: needs a name, e.g. name:"Rắn 3" (see /ls).' };
   }
-  if (i === -1 || !/^pid:/i.test(argv[i + 1] ?? '')) return { found: false };
+  if (i === -1 || !/^pid:/i.test(tok)) return { found: false };
   const raw = argv[i + 1] === 'pid:' || /^pid:$/i.test(argv[i + 1]) ? `pid:${argv[i + 2] ?? ''}` : argv[i + 1];
   const pid = parseKillPidArg(raw);
   return pid ? { found: true, pid } : { found: true, error: `bad pid target ${JSON.stringify(raw)} — use pid:<PID> (see /ls).` };
@@ -982,6 +993,8 @@ export function matchProcsByName(name, rows, personaOf = () => null) {
     const byTag = rows.filter((r) => r.hashtag === tag);
     if (byTag.length === 1) return { pid: byTag[0].pid, start: byTag[0].procStart ?? null };
     if (byTag.length > 1) return { error: `#${tag} matches ${byTag.length} processes: ${byTag.map((r) => `PID ${r.pid}`).join(', ')} — use /kill pid:<PID>.` };
+    // No name fallback: a hashtag must never pick a process whose NAME merely looks like it.
+    return { error: `no live claude process with #${tag} (see /ls).` };
   }
   const q = normalizeAgentName(name);
   if (!q) return { error: 'empty name.' };
@@ -1234,7 +1247,9 @@ if (isDirectRun) {
   }
 
   // --kill pid:<PID>: owner-only SIGTERM of one claude process (via the daemon).
-  const killPid = resolveKillPid(argv);
+  const killPid = resolveKillPid(argv, { isScreen: (id) => {
+    try { return hasBinary('screen') && screenSessionExists(normalizeSessionName(id)); } catch { return false; }
+  } });
   if (killPid.found) {
     if (killPid.error) { console.error(`[spawn] ${killPid.error}`); process.exit(1); }
     const fromId = process.env.TELE_FROM_ID || '';

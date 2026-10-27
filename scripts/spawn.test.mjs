@@ -640,13 +640,13 @@ test('checkPidKillAuth: owner only, daemon only, needs a configured owner', () =
   assert.match(checkPidKillAuth({ fromId: '144', daemonUserId: null }).error, /no daemon owner/);
 });
 
-test('resolveKillPid: pid:<N>, split "pid: N", bad targets; hashtag kills untouched', () => {
+test('resolveKillPid: pid:<N>, split "pid: N", bad targets; live-screen hashtag kills untouched', () => {
   assert.deepEqual(resolveKillPid(['--kill', 'pid:830318']), { found: true, pid: 830318 });
   assert.deepEqual(resolveKillPid(['--kill', 'pid:', '830318']), { found: true, pid: 830318 });
   assert.deepEqual(resolveKillPid(['--quit', 'PID:42']), { found: true, pid: 42 });
   assert.match(resolveKillPid(['--kill', 'pid:abc']).error, /bad pid target/);
   assert.match(resolveKillPid(['--kill', 'pid:']).error, /bad pid target/);
-  assert.deepEqual(resolveKillPid(['--kill', 'a7611284']), { found: false });
+  assert.deepEqual(resolveKillPid(['--kill', 'a7611284'], { isScreen: () => true }), { found: false });
   assert.deepEqual(resolveKillPid(['--list']), { found: false });
 });
 
@@ -1045,6 +1045,18 @@ test('resolveKillPid: name: — quoted (one token) or unquoted (words up to the 
   assert.match(resolveKillPid(['--kill', 'name:']).error, /needs a name/);
 });
 
+test('resolveKillPid: name: is optional — a bare name/#hashtag is a name unless it is a live tele-* screen', () => {
+  assert.deepEqual(resolveKillPid(['--kill', 'Rắn', '3', '--restart']), { found: true, name: 'Rắn 3' });
+  assert.deepEqual(resolveKillPid(['--kill', '#a7611284']), { found: true, name: '#a7611284' });
+  const isScreen = (id) => id.replace(/^#/, '') === 'a7611284';
+  assert.deepEqual(resolveKillPid(['--kill', '#a7611284'], { isScreen }), { found: false }, 'live screen → screen kill');
+  assert.deepEqual(resolveKillPid(['--kill', 'tele-b1234567']), { found: false }, 'tele- is always the screen kill');
+  assert.deepEqual(resolveKillPid(['--kill', 'name:#a7611284'], { isScreen }), { found: true, name: '#a7611284' }, 'explicit name: wins');
+  assert.deepEqual(resolveKillPid(['--kill', 'a7611284', 'helper', '--restart'], { isScreen }), { found: true, name: 'a7611284 helper' }, 'several words are never a screen');
+  assert.deepEqual(resolveKillPid(['--kill']), { found: false });
+  assert.deepEqual(resolveKillPid(['--kill', '--restart']), { found: false });
+});
+
 test('matchProcsByName: full name via session name or persona; emoji/case ignored; ambiguity refused', () => {
   const rows = [
     { pid: 1, name: '🐍 Rắn 3', hashtag: 'a', procStart: '111' }, { pid: 2, name: '🐍 Rắn', hashtag: 'b' },
@@ -1059,6 +1071,8 @@ test('matchProcsByName: full name via session name or persona; emoji/case ignore
   assert.match(matchProcsByName('Hà Mã', rows, persona).error, /matches 2 processes: PID 4 \(digesty-a7\), PID 5/);
   assert.match(matchProcsByName('Cú', rows, persona).error, /no claude process named/);
   assert.equal(normalizeAgentName(' 🐍  Rắn   3 '), 'rắn 3');
+  const look = [{ pid: 9, name: 'a1234567', hashtag: 'b7654321', procStart: '1' }];
+  assert.match(matchProcsByName('#a1234567', look).error, /no live claude process with #a1234567/, 'a hashtag never falls back to names');
 });
 
 test('acquireResumeLock: one lock per session (different uuids don\'t block each other); cooldown counts from the failure', async () => {
@@ -1108,7 +1122,7 @@ test('matchProcsByName: a hashtag (with or without #) picks the process by sessi
   const rows = [{ pid: 7, name: '🪱 Giun', hashtag: 'a7611284', procStart: '9' }, { pid: 8, name: 'x', hashtag: 'b1234567' }];
   assert.deepEqual(matchProcsByName('#a7611284', rows), { pid: 7, start: '9' });
   assert.deepEqual(matchProcsByName('a7611284', rows), { pid: 7, start: '9' });
-  assert.match(matchProcsByName('#c0000000', rows).error, /no claude process named/);
+  assert.match(matchProcsByName('#c0000000', rows).error, /no live claude process with #c0000000/);
   assert.match(matchProcsByName('#a7611284', [...rows, { pid: 9, hashtag: 'a7611284' }]).error, /matches 2 processes/);
 });
 
