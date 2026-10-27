@@ -32,9 +32,10 @@ test('loadCommands: merges base file with projects.json._commands (custom wins)'
 
 test('resolveCommand: normalises defaults (args/needsProject/minRole)', () => {
   const c = resolveCommand('x', { x: { run: 'run.mjs' } });
-  assert.deepEqual(c, { run: 'run.mjs', args: [], needsProject: false, minRole: 'public', wantsReplyText: false, splitBlocks: false, desc: '' });
+  assert.deepEqual(c, { run: 'run.mjs', args: [], needsProject: false, minRole: 'public', wantsReplyText: false, splitBlocks: false, rawText: false, desc: '' });
   const d = resolveCommand('y', { y: { run: 'spawn.mjs', args: ['--list'], needsProject: true, minRole: 'admin', desc: 'hi' } });
-  assert.deepEqual(d, { run: 'spawn.mjs', args: ['--list'], needsProject: true, minRole: 'admin', wantsReplyText: false, splitBlocks: false, desc: 'hi' });
+  assert.deepEqual(d, { run: 'spawn.mjs', args: ['--list'], needsProject: true, minRole: 'admin', wantsReplyText: false, splitBlocks: false, rawText: false, desc: 'hi' });
+  assert.equal(resolveCommand('w', { w: { alias: 'whisper' }, whisper: { run: 'whisper.mjs', rawText: true } }).rawText, true, 'rawText through an alias');
   assert.equal(resolveCommand('ls', { ls: { run: 'spawn.mjs', splitBlocks: true } }).splitBlocks, true);
   assert.equal(resolveCommand('l', { l: { alias: 'ls' }, ls: { run: 'spawn.mjs', splitBlocks: true } }).splitBlocks, true, 'through an alias');
   // opt-in capability surfaces on the normalised spec

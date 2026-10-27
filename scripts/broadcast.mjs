@@ -47,6 +47,20 @@ export function parseBroadcastArgs(argv) {
   return out;
 }
 
+/**
+ * The daemon's raw text (TELE_RAW_ARGS, RFC 26 §3.8) → { chat, text, error }: an optional LEADING
+ * `--chat <id>` / `--chat=<id>`, then the message VERBATIM (quotes, newlines kept). A `--chat`
+ * later in the text is just text. Pure.
+ */
+export function parseBroadcastRaw(raw) {
+  const s = String(raw ?? '').trim();
+  const m = s.match(/^--chat(?:=(\S*)|\s+(\S+))(?:\s+([\s\S]*))?$/) || s.match(/^--chat()()$/);
+  const out = m ? { chat: m[1] || m[2] || null, text: (m[3] || '').trim(), error: null } : { chat: null, text: s, error: null };
+  if (m && !out.chat) out.error = USAGE;
+  else if (!out.text) out.error = USAGE;
+  return out;
+}
+
 // The injected system prompt. `broadcast:true` marks it; non-privileged `fromRole`
 // (the sender's real role is carried for the receiver's sensitive-action gate, but
 // 'broadcast' itself grants nothing). `messageId:null` = injected, not a real message.
@@ -74,8 +88,9 @@ export function buildBroadcastPrompt({ targetConvoId, targetChatId, fromUserId, 
 export async function doBroadcast(argv, {
   from = {}, config = readProjectsConfig(), store = readTopicsStore(),
   tmpDir = DEFAULT_TMP_DIR, writePrompt = durableWrite, env = process.env, envFile = {},
+  raw = process.env.TELE_RAW_ARGS, // the daemon's untokenized text; unset/'' → argv
 } = {}) {
-  const args = parseBroadcastArgs(argv);
+  const args = raw ? parseBroadcastRaw(raw) : parseBroadcastArgs(argv);
   if (args.error) return { ok: false, message: args.error };
   const chatIds = args.chat ? [String(args.chat)] : groupChatIds(config, { env, envFile });
   const live = listLiveTopics(store, chatIds);

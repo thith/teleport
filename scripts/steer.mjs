@@ -7,6 +7,7 @@
 import path from 'node:path';
 import { readTopicsStore } from './topics-store.mjs';
 import { listSteerableTargets, normalizeTarget, matchTarget } from './handover.mjs';
+import { normalizeAgentName } from './agent-target.mjs';
 import { DEFAULT_TMP_DIR, mergeOrSpoolPrompt } from './tele-listen.mjs';
 
 // RFC 03 §5.1 — default durable write: coalesce/spool into the target's OPEN prompt
@@ -110,9 +111,11 @@ export function groupChatIds(config) {
 export function resolveSteerTarget(argv, { live, replyText, usage }) {
   const a0 = argv[0];
   const fail = (t, status) => ({ error: `target ${t} ${status === 'ambiguous' ? 'is ambiguous' : 'not found among live topics'}.` });
+  // Names go through matchSteerName (two persona topics with one name → refuse); # / convoId stay exact.
+  const find = (t) => (t.kind === 'name' ? matchSteerName(t.value, live) : matchTarget(t, live));
 
   if (a0 && a0.startsWith('#')) {
-    const m = matchTarget(normalizeTarget(a0), live);
+    const m = find(normalizeTarget(a0));
     if (m.status !== 'found') return fail(a0, m.status); // hard error — never fall to reply
     return { match: m.match, text: argv.slice(1).join(' ').trim() };
   }
@@ -120,9 +123,74 @@ export function resolveSteerTarget(argv, { live, replyText, usage }) {
   if (replyMatch?.ambiguous) return fail(replyMatch.ambiguous, 'ambiguous');   // say WHY, don't guess
   if (replyMatch) return { match: replyMatch, text: argv.join(' ').trim() };   // ALL argv = text
   if (a0) {
-    const m = matchTarget(normalizeTarget(a0), live); // non-reply: convoId or persona-name
+    const m = find(normalizeTarget(a0)); // non-reply: convoId or persona-name
     if (m.status !== 'found') return fail(a0, m.status);
     return { match: m.match, text: argv.slice(1).join(' ').trim() };
+  }
+  return { error: usage };
+}
+
+// Quotes that may wrap a multi-word target (RFC 26 §3.8): ASCII and the phone's curly ones.
+const QUOTE_PAIRS = { '"': '"', "'": "'", '“': '”', '‘': '’' };
+
+/**
+ * The raw command text (TELE_RAW_ARGS) → its first token and the rest VERBATIM (quotes, newlines,
+ * inner spaces kept). A token opening with a quote runs to the matching close quote — none → error,
+ * never a guess. → { token, quoted, text } | { error }. Pure.
+ */
+export function splitRawTarget(raw) {
+  const s = String(raw ?? '').replace(/^\s+/, '');
+  if (!s) return { token: '', quoted: false, text: '' };
+  const close = QUOTE_PAIRS[s[0]];
+  if (close) {
+    const end = s.indexOf(close, 1);
+    if (end === -1) return { error: `thiếu dấu đóng ${close} cho tên đích.` };
+    return { token: s.slice(1, end).trim(), quoted: true, text: s.slice(end + 1).trim() };
+  }
+  const m = s.match(/^(\S+)([\s\S]*)$/);
+  return { token: m[1], quoted: false, text: m[2].trim() };
+}
+
+/**
+ * A persona name → one live topic (RFC 26 §3.8): tier 1 literal (case-insensitive, leading emoji
+ * off), tier 2 normalized (`_` = space); the first tier with a hit decides. Two DIFFERENT convos →
+ * ambiguous (a private /w, /i must never pick the newest). Alive-only rows never match by name. Pure.
+ */
+export function matchSteerName(value, live) {
+  const pool = live.filter((t) => t.source !== 'alive' && t.persona && t.persona.name);
+  const strip = (s) => String(s).trim().replace(/^[^\p{L}\p{N}]+\s*/u, '').toLowerCase();
+  const lit = strip(value), norm = normalizeAgentName(value);
+  let hits = pool.filter((t) => strip(t.persona.name) === lit);
+  if (!hits.length) hits = pool.filter((t) => normalizeAgentName(t.persona.name) === norm);
+  if (!hits.length) return { status: 'not_found' };
+  const sorted = [...hits].sort((a, b) => (b.ts || 0) - (a.ts || 0));
+  if (new Set(hits.map((h) => String(h.convoId))).size > 1) return { status: 'ambiguous', candidates: sorted };
+  return { status: 'found', match: sorted[0] };
+}
+
+/**
+ * resolveSteerTarget over the RAW text (the daemon's TELE_RAW_ARGS): same precedence — an unquoted
+ * `#…` first token is explicit; else a reply with a hashtag → ALL of it is text (quotes, `_` mean
+ * nothing); else the first token (quoted or not) is the target. The text keeps its quotes/newlines.
+ */
+export function resolveSteerTargetRaw(raw, { live, replyText, usage }) {
+  const sp = splitRawTarget(raw);
+  if (sp.error) return { error: sp.error };
+  const fail = (t, status, cands) => ({ error: `target ${t} ${status === 'ambiguous' ? `is ambiguous${cands?.length ? ` (${cands.map((c) => `#${c.hashtag}`).join(', ')}) — dùng #hashtag` : ''}` : 'not found among live topics'}.` });
+  const find = (tok) => {
+    const t = normalizeTarget(tok);
+    return t.kind === 'name' ? matchSteerName(t.value, live) : matchTarget(t, live);
+  };
+  if (!sp.quoted && sp.token.startsWith('#')) {
+    const m = find(sp.token);
+    return m.status === 'found' ? { match: m.match, text: sp.text } : fail(sp.token, m.status, m.candidates);
+  }
+  const replyMatch = targetFromReply(replyText, live);
+  if (replyMatch?.ambiguous) return fail(replyMatch.ambiguous, 'ambiguous');
+  if (replyMatch) return { match: replyMatch, text: String(raw).trim() };
+  if (sp.token) {
+    const m = find(sp.token);
+    return m.status === 'found' ? { match: m.match, text: sp.text } : fail(sp.quoted ? `"${sp.token}"` : sp.token, m.status, m.candidates);
   }
   return { error: usage };
 }
@@ -134,11 +202,12 @@ export function resolveSteerTarget(argv, { live, replyText, usage }) {
 export async function doSteer(argv, { flag, usage, ack }, {
   from = {}, config = readProjectsConfig(), store = readTopicsStore(),
   tmpDir = DEFAULT_TMP_DIR, writePrompt = durableWrite, replyText = process.env.TELE_REPLY_TEXT,
+  raw = process.env.TELE_RAW_ARGS, // the daemon's untokenized text (rawText commands); unset/'' → argv
 } = {}) {
   // RFC 14: steerable = live topics ∪ live-but-topic-less convos (DM-only
   // sessions), so `/instruct #hash` reaches a session that only DM'd the owner.
   const live = listSteerableTargets(store, groupChatIds(config));
-  const r = resolveSteerTarget(argv, { live, replyText, usage });
+  const r = raw ? resolveSteerTargetRaw(raw, { live, replyText, usage }) : resolveSteerTarget(argv, { live, replyText, usage });
   if (r.error) return { ok: false, message: r.error };
   if (!r.text) return { ok: false, message: `${flag} cần nội dung sau target.` };
   const { convoId, chatId } = r.match;

@@ -69,6 +69,9 @@ export function resolveCommand(name, registry) {
     // Long output goes out as several plain messages cut between blocks (an empty line), not one
     // .md file — the /ls links must stay tappable (RFC 26 §3.10).
     splitBlocks: c.splitBlocks === true,
+    // The untokenized text after the command, as TELE_RAW_ARGS (RFC 26 §3.8): /w, /i keep quotes,
+    // newlines and spacing, and a quoted multi-word target.
+    rawText: c.rawText === true,
     desc: typeof c.desc === 'string' ? c.desc : '',
   };
 }

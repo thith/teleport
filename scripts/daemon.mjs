@@ -877,6 +877,9 @@ export async function dispatchCommand(parsed, from, {
     // (/whisper, /instruct). Lets kind-aware reply routing thread the agent's
     // reply under the sender's command in their DM. Not a privilege input.
     TELE_MESSAGE_ID: (spec.wantsReplyText && messageId != null) ? String(messageId) : '',
+    // The text after the command, untokenized — ONLY for `rawText` commands; always set so a stray
+    // value in the daemon's own env never reaches a child. Not a privilege input.
+    TELE_RAW_ARGS: spec.rawText ? String(parsed.rest ?? '') : '',
   });
   try {
     const { stdout, stderr } = await runner(process.execPath, argv, {
