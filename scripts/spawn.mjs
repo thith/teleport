@@ -1444,7 +1444,11 @@ if (isDirectRun) {
     let procs;
     try { procs = listClaudeProcs({ strict: true }); } catch (e) { console.error(`[spawn] ❌ cannot list claude processes (${e.message}) — nothing killed.`); process.exit(1); }
     // One window = one direct child of the SCREEN process (window titles can't fool a count of processes).
-    const screenPid = Number(listSpawnSessions().find((s) => s.name.toLowerCase() === name.toLowerCase())?.pid) || null;
+    // ONE screen identity for both the check and the kill (names differing only in case → refuse).
+    const sameName = listSpawnSessions().filter((s) => s.name.toLowerCase() === name.toLowerCase());
+    if (sameName.length > 1) { console.error(`[spawn] ❌ ${sameName.length} screens named like "${name}" (${sameName.map((s) => `${s.pid}.${s.name}`).join(', ')}) — use /kill pid:<PID>.`); process.exit(1); }
+    if (sameName.length === 1) name = sameName[0].name;
+    const screenPid = Number(sameName[0]?.pid) || null;
     const ps = screenPid ? readPs() : null;
     const windows = ps ? ps.filter((p) => p.ppid === screenPid).length : null;
     const descendantClaudes = [];
