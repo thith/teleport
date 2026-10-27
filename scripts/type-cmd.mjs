@@ -18,6 +18,10 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { listClaudeProcs, parseSessionFile, inspectPid, SESSIONS_DIR } from './claude-procs.mjs';
+import { parseAgentTarget, normalizeAgentName } from './agent-target.mjs';
+import { createListenerStatus } from './listener-status.mjs';
+import { countUnread } from './mailbox.mjs';
+import { uuidToConvoInt } from './convo-registry.mjs';
 import { transcriptState, findTranscript, compactAfter, formatContext, contextWindowFor, fmtTokens } from './transcript-state.mjs';
 
 export const TYPE_BUTTON_TTL_MS = 10 * 60 * 1000;
@@ -40,9 +44,11 @@ export const AUDIT_FILE = path.join(process.env.XDG_STATE_HOME || path.join(os.h
 
 // op letter (callback data) → command. Fixed table: the command never comes from stored data.
 // 'k' only asks (a confirm button follows); 'y' is that confirmation: /kill pid:<PID> (SIGTERM), not a keystroke.
-export const TYPE_OPS = { c: '/compact', r: '/remote-control', e: 'esc', i: 'read-input', u: 'clear-input', k: 'kill-ask', y: 'kill' };
+export const TYPE_OPS = { c: '/compact', r: '/remote-control', e: 'esc', i: 'read-input', u: 'clear-input', k: 'kill-ask', y: 'kill', n: 'nudge' };
+// The ONE line /nudge types (Thi, RFC 26) — fixed, never from input.
+export const NUDGE_TEXT = 'Restart Telegram monitor and check your mailbox.';
 export const COMPACT_OK = '✅ đã compact'; // a watch() result starting with this = a confirmed compaction
-export const TYPE_BUTTON_RE = /^ty:(?:pick:([0-9a-z]{8})|([0-9a-f]{16}):([crexiuky]))$/;
+export const TYPE_BUTTON_RE = /^ty:(?:pick:([0-9a-z]{8})|([0-9a-f]{16}):([crexiukyn]))$/;
 
 // ── Pure helpers ──────────────────────────────────────────────────────────────
 
@@ -84,10 +90,56 @@ export function typeTargets(rows) {
 
 /** The pinned target stored in a button entry. Pure. */
 export function pinTarget(r) {
-  return { pid: r.pid, procStart: String(r.procStart), sessionId: r.sessionId, screenPid: r.screenPid, screen: r.screen, hashtag: r.hashtag, cwd: r.cwd };
+  return { pid: r.pid, procStart: String(r.procStart), sessionId: r.sessionId, screenPid: r.screenPid, screen: r.screen, hashtag: r.hashtag, cwd: r.cwd, name: r.name ?? null };
 }
 
 export const screenId = (t) => `${t.screenPid}.${t.screen}`;
+
+/** Outer quotes (ASCII or a phone's curly ones) off a whole-rest target. Pure. */
+export function unquoteTarget(s) {
+  const q = String(s ?? '').trim();
+  const m = q.match(/^(["'“‘])([\s\S]*)(["'”’])$/);
+  const pair = { '"': '"', "'": "'", '“': '”', '‘': '’' };
+  return m && pair[m[1]] === m[3] ? m[2].trim() : q;
+}
+
+/**
+ * `/compact`, `/nudge` target (RFC 26 §3.2): `query` = the whole rest (spaces allowed). A hashtag must be
+ * unique across ALL live claude rows first (a terminal twin is never "replaced" by a reachable screen
+ * one); then only `typeTargets` rows. Names: tier 1 literal (case-insensitive, leading emoji off), tier 2
+ * normalized with `_` → space; the first tier with a hit decides, > 1 session → refuse. → { row } | { error }. Pure.
+ */
+export function findTypeTarget(query, rows, personaOf = () => null) {
+  const t = parseAgentTarget(unquoteTarget(query));
+  if (t.kind === 'pid' || t.kind === 'convoId' || !String(t.value ?? '').trim()) return { error: 'cần <tên | #hashtag> (xem /ls).' };
+  const label = (r) => `${personaOf(r.hashtag) || r.name || '?'} #${r.hashtag} · PID ${r.pid}`;
+  const sessions = (hits) => new Set(hits.map((r) => r.sessionId || `pid:${r.pid}`)).size;
+  const reachable = typeTargets(rows);
+  const pick = (hits) => {
+    if (sessions(hits) > 1) return { error: `"${t.value}" khớp ${sessions(hits)} phiên: ${hits.map(label).join(', ')} — dùng #hashtag.` };
+    const ok = hits.filter((r) => reachable.includes(r));
+    if (!ok.length) return { error: `${label(hits[0])} không ở trong screen tele-* của nó — không gõ được (xem /ls).` };
+    return { row: ok[0] };
+  };
+  if (t.kind === 'hashtag') {
+    const hits = rows.filter((r) => r.hashtag === t.value);
+    return hits.length ? pick(hits) : { error: `không thấy agent #${t.value} đang chạy (xem /ls).` };
+  }
+  const names = (r) => [r.name, personaOf(r.hashtag)].filter(Boolean);
+  const strip = (s) => String(s).trim().replace(/^[^\p{L}\p{N}]+\s*/u, '').toLowerCase();
+  const lit = strip(t.value);
+  let hits = rows.filter((r) => names(r).some((n) => strip(n) === lit));
+  if (!hits.length) {
+    const norm = normalizeAgentName(String(t.value).replace(/_+/g, ' '));
+    hits = rows.filter((r) => names(r).some((n) => normalizeAgentName(n) === norm));
+  }
+  return hits.length ? pick(hits) : { error: `không thấy agent "${t.value}" đang chạy (xem /ls).` };
+}
+
+/** Is a nudge worth sending? `listener` 'on'|'off'|null, `mail` unread count|null. → null (go) | reason. Pure. */
+export function nudgeRefusal({ listener, mail }) {
+  return listener === 'on' && mail === 0 ? 'listener đang chạy, không có thư — không nudge (nhắn bằng /w nếu cần).' : null;
+}
 
 /** One agent line — carries `#hash` and `PID n` (a press is checked against them). Pure. */
 export function agentLine(t, { persona = null, state = 'unknown', ctx = null, bridge = null } = {}) {
@@ -180,6 +232,15 @@ export function defaultIo({ exec = execFileSync, sessionsDir = SESSIONS_DIR } = 
     transcriptFile: (sessionId, cwd) => findTranscript(sessionId, cwd),
     transcriptSize: (file) => { try { const st = fs.statSync(file); return { size: st.size, ino: st.ino, dev: st.dev }; } catch { return null; } },
     compactAfter,
+    // Listener on/off + unread mailbox mail for the PINNED session's convo (RFC 26 §3.5). Never throws.
+    nudgeSignals: (t) => {
+      const convo = uuidToConvoInt(t.sessionId);
+      if (convo == null) return { listener: null, mail: null };
+      let listener = null, mail = null;
+      try { listener = createListenerStatus().listener(convo); } catch {}
+      try { mail = countUnread(String(convo)); } catch {}
+      return { listener, mail };
+    },
     audit: (entry) => { try { fs.mkdirSync(path.dirname(AUDIT_FILE), { recursive: true }); fs.appendFileSync(AUDIT_FILE, JSON.stringify({ at: new Date().toISOString(), ...entry }) + '\n', { mode: 0o600 }); } catch {} },
   };
 }
@@ -231,12 +292,21 @@ export class TypeRunner {
     this.locks.add(t.pid);
     this.cancel.delete(t.pid);
     this.keysDone.delete(t.pid);
-    try { return op === 'c' ? await this.compact(t, audit) : op === 'u' ? await this.clearInput(t, audit) : await this.remoteControl(t, audit); }
+    try {
+      if (op === 'c') return await this.compact(t, audit);
+      if (op === 'u') return await this.clearInput(t, audit);
+      if (op === 'r') return await this.remoteControl(t, audit);
+      if (op === 'n') return await this.nudge(t, audit);
+      audit('refused', { reason: `unknown op ${op}` });
+      return { text: `❌ lệnh không hợp lệ (${op}).` };
+    }
     finally { this.locks.delete(t.pid); this.keysDone.delete(t.pid); }
   }
 
   /** Common part: check → type the command → verify on screen → re-check → Enter. → { ok } | { text }. */
-  async typeAndEnter(t, cmd, audit, { needNoBridge = false, allowBusy = false } = {}) {
+  async typeAndEnter(t, cmd, audit, { needNoBridge = false, allowBusy = false, slash = true } = {}) {
+    // slash=false (the fixed nudge line only): no slash-command suggestion row to check — the input line alone must match.
+    const selects = (scr) => !slash || suggestionSelects(scr, cmd);
     const io = this.io, sid = screenId(t);
     const ok = (st) => st === 'idle' || (allowBusy && st === 'busy');
     const pre = observe(t, io);
@@ -269,9 +339,9 @@ export class TypeRunner {
       await io.sleep(TYPE_GAP_MS);
       scr = await io.hardcopy(sid);
       line = parseInputLine(scr);
-      if ((line === cmd && suggestionSelects(scr, cmd)) || waited + TYPE_GAP_MS >= TYPE_SETTLE_MS) break;
+      if ((line === cmd && selects(scr)) || waited + TYPE_GAP_MS >= TYPE_SETTLE_MS) break;
     }
-    if (line !== cmd || !suggestionSelects(scr, cmd)) {
+    if (line !== cmd || !selects(scr)) {
       audit('input-mismatch', { line });
       return { text: `⚠️ ô nhập có chữ khác (đọc được: "${line ?? '?'}") — đã gõ ${cmd} nhưng KHÔNG Enter, không gửi thêm phím nào. Vào xoá tay.` };
     }
@@ -286,7 +356,7 @@ export class TypeRunner {
     // A busy agent can open a dialog (permission / question) at any moment, and Enter would answer
     // it: read the screen AGAIN, then status, then Enter with no await in between.
     const scr2 = await io.hardcopy(sid);
-    if (parseInputLine(scr2) !== cmd || !suggestionSelects(scr2, cmd)) {
+    if (parseInputLine(scr2) !== cmd || !selects(scr2)) {
       audit('changed-before-enter', { reason: 'screen' });
       return { text: `⚠️ màn hình vừa đổi (có thể một hộp thoại mở ra) — đã gõ ${cmd} nhưng KHÔNG Enter. Kiểm tra tay.` };
     }
@@ -327,6 +397,15 @@ export class TypeRunner {
       return `❔ chưa thấy compact xong sau ${r.queued ? 30 : 5} phút — kiểm tra tay.`;
     };
     return { text: `⌨️ đã gõ /compact vào #${t.hashtag}${r.queued ? ' (đang bận → đã xếp hàng, chạy khi xong lượt)' : ''} — đang chờ kết quả…`, watch };
+  }
+
+  async nudge(t, audit) {
+    // Checked HERE (not only when a button was drawn): an old 👋 pressed after the listener came back must not fire.
+    const why = nudgeRefusal(this.io.nudgeSignals ? this.io.nudgeSignals(t) : { listener: null, mail: null });
+    if (why) { audit('refused', { reason: 'healthy' }); return { text: `ℹ️ #${t.hashtag}: ${why}` }; }
+    const r = await this.typeAndEnter(t, NUDGE_TEXT, audit, { allowBusy: true, slash: false });
+    if (!r.ok) return r;
+    return { text: `👋 đã nudge #${t.hashtag}${r.queued ? ' (đang bận → đã xếp hàng, chạy khi xong lượt)' : ''}.` };
   }
 
   async remoteControl(t, audit) {

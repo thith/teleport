@@ -93,6 +93,8 @@ another resume of the same session is in progress (per-session lock) — stop th
   The owner id comes from `projects.json` `_config.daemonUserId` only (the deprecated `.env DAEMON_CHAT_ID` is not
   read here → "no daemon owner configured").
 - **`/kill <persona or session name | #hashtag>`** (like `/resume`; the old `name:` prefix still works) picks the process by name/hashtag instead of PID — a hashtag whose `tele-*` screen is live keeps the screen kill above (full name, emoji/case ignored; must match exactly one — else it lists the PIDs). Works with `--restart`.
+- **`/kill_<hashtag>`** (tap, e.g. from `/ls`): asks ✅, then SIGTERM by PID (same as `/type` 💀 — pid + start + session re-checked). Typed `/kill #hash` keeps the screen `/exit` path above.
+- **`/compact <tên | #hash>`**, **`/nudge <tên | #hash>`** (owner, also `/compact_<hash>`, `/nudge_<hash>`): type `/compact`, or the line "Restart Telegram monitor and check your mailbox.", into the agent's `tele-*` screen through the same checks as `/type`. `/nudge` is refused while the agent's listener runs and it has no mail. If you are the agent and receive that line: re-arm your Monitor (canonical command, with `--first-run`) and run `mailbox.mjs check`.
 - **`/kill pid:<PID> --restart`** = both in one: SIGTERM, wait for exit, then resume that session in screen
   `tele-<hashtag>` in its **old cwd**. Everything the restart needs (a session id from the session file — never a
   guess — and its transcript) is checked **before** killing, so a doomed restart kills nothing.

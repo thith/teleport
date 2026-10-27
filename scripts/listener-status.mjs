@@ -138,7 +138,14 @@ export function createListenerStatus({
     return m == null ? null : `⏳ đang xử lý ${formatAge(now - m)}`;
   }
 
-  return function statusOf(convoId) {
+  // Structured listener signal for callers that decide on it (RFC 26 /nudge): 'on' | 'off' | null (unknown).
+  statusOf.listener = (convoId) => {
+    const convo = Number(convoId);
+    if (!Number.isSafeInteger(convo) || convo <= 0) return null;
+    try { const p = listenerPart(convo); return p == null ? null : p.startsWith('🎧') ? 'on' : 'off'; } catch { return null; }
+  };
+  return statusOf;
+  function statusOf(convoId) {
     const convo = Number(convoId);
     if (!Number.isSafeInteger(convo) || convo <= 0) return null;
     const parts = [];
@@ -149,5 +156,5 @@ export function createListenerStatus({
       } catch { /* omit this part */ }
     }
     return parts.length ? parts.join(' · ') : null;
-  };
+  }
 }

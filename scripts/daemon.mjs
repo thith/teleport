@@ -78,9 +78,11 @@ import { formatPersona } from './persona.mjs';
 import { shortConvoHash } from './convo-hash.mjs';
 import { personaByHashtag } from './spawn.mjs';
 import {
-  TypeRunner, listForType, allowedOps, agentLine, messageNamesTarget, defaultIo,
+  TypeRunner, listForType, allowedOps, agentLine, messageNamesTarget, defaultIo, observe, classify,
+  findTypeTarget, pinTarget, nudgeRefusal,
   TYPE_BUTTON_RE, TYPE_BUTTON_TTL_MS, TYPE_OPS, STATE_LABEL, COMPACT_OK,
 } from './type-cmd.mjs';
+import { listClaudeProcs } from './claude-procs.mjs';
 import { uuidToConvoInt } from './convo-registry.mjs';
 import { formatContext, contextWindowFor } from './transcript-state.mjs';
 
@@ -95,7 +97,7 @@ const PID_FILE = path.join(DEFAULT_TMP_DIR, 'daemon.pid');
 // ── Pure helpers (unit-tested) ────────────────────────────────────────────────
 
 // Commands Telegram can link as `/<cmd>_<hashtag>` (RFC 26): a tap = `/<cmd> #<hashtag>`.
-export const TAP_COMMANDS = new Set(['resume']);
+export const TAP_COMMANDS = new Set(['resume', 'kill', 'compact', 'nudge']);
 
 // Parse the leading `/command` of a message. Returns { cmd, rest } or null.
 // `cmd` is lower-cased, sans the leading slash and any @botname suffix. A tap form
@@ -824,6 +826,14 @@ export async function dispatchCommand(parsed, from, {
     await startType(parsed.rest, { daemonUserId, projectsConfig, sendText, ...extra });
     return;
   }
+  if (parsed.cmd === COMPACT_COMMAND || parsed.cmd === NUDGE_COMMAND || (parsed.cmd === 'kill' && parsed.tapped)) {
+    // Owner only, like /type: they type keys into (or SIGTERM) another agent's session.
+    if (String(from?.id) !== String(daemonUserId)) { await sendText(daemonUserId, `❌ /${parsed.cmd} chỉ owner dùng được.`); return; }
+    const c = { daemonUserId, projectsConfig, sendText, registry, secretEnvKeys, ...extra };
+    if (parsed.cmd === 'kill') await startTapKill(parsed.rest, c);
+    else await runTypeCommand(parsed.cmd === COMPACT_COMMAND ? 'c' : 'n', parsed.rest, from, c);
+    return;
+  }
   if (parsed.cmd === RELOAD_COMMAND && reload) {
     const role = resolveSenderRole(projectsConfig, from && from.id);
     if (!roleMeets(role, 'admin')) { await sendText(daemonUserId, `❌ /${RELOAD_COMMAND} cần quyền admin (bạn: ${role}).`); return; }
@@ -908,9 +918,11 @@ if (isDirectRun) {
 // ── /type (RFC 22): type /compact, /remote-control or ⎋ Esc into an agent's screen ──
 
 export const TYPE_COMMAND = 'type';
-const TYPE_OP_LABEL = { c: '/compact', r: '/remote-control', e: '⎋ Esc', i: '🔍 ô nhập', u: '🧹 Xoá ô nhập' };
+export const COMPACT_COMMAND = 'compact';
+export const NUDGE_COMMAND = 'nudge';
+const TYPE_OP_LABEL = { c: '/compact', r: '/remote-control', e: '⎋ Esc', i: '🔍 ô nhập', u: '🧹 Xoá ô nhập', n: '👋 nudge' };
 // Buttons are emoji only (Thi), except Esc (short already); no legend (the owner knows them).
-const TYPE_BUTTON_LABEL = { c: '🗜️', r: '📡', e: 'Esc', i: '🔍', u: '🧹', k: '💀', y: '✅' };
+const TYPE_BUTTON_LABEL = { c: '🗜️', r: '📡', e: 'Esc', i: '🔍', u: '🧹', k: '💀', y: '✅', n: '👋' };
 const CANCEL_BUTTON = (tok) => ({ text: '✖', callback_data: `ty:${tok}:x` });
 // Below this context /compact gains little (Thi): no 🗜️ button. Unknown usage keeps it.
 export const COMPACT_MIN_TOKENS = 100_000;
@@ -924,14 +936,17 @@ const personaLookup = () => {
 };
 
 /** Step 2 text + keyboard for one agent (fresh observation). Pure-ish (no I/O beyond `obs`). */
-export function typeStep2({ target, obs, persona, cfg = {}, tok }) {
+export function typeStep2({ target, obs, persona, cfg = {}, tok, signals = null }) {
   const ctx = obs.mismatch ? null : formatContext(obs.usage, contextWindowFor(cfg, { hashtag: target.hashtag, model: obs.usage?.model }));
   const line = agentLine(target, { persona, state: obs.mismatch ? 'unknown' : obs.state, ctx, bridge: obs.bridge });
   const small = obs.usage?.tokens != null && obs.usage.tokens < COMPACT_MIN_TOKENS;
   const ops = obs.mismatch ? [] : allowedOps(obs.state, obs.bridge).filter((op) => !(op === 'c' && small));
+  // 👋 only when it is worth it: listener off or mail waiting (RFC 26 §3.6); same states as /compact.
+  const why = [signals?.listener === 'off' ? '🔇 listener tắt' : null, signals?.mail > 0 ? `📬 ${signals.mail} thư chưa đọc` : null].filter(Boolean);
+  if (!obs.mismatch && why.length && (obs.state === 'idle' || obs.state === 'busy')) ops.push('n');
   // Kill works in any state (a stuck agent is the usual reason), but not on a target that changed under us.
   const buttons = obs.mismatch ? [] : [...ops, 'k'];
-  const text = `⌨️ /type — ${line}\n`
+  const text = `⌨️ /type — ${line}${why.length ? ` · ${why.join(' · ')}` : ''}\n`
     + (ops.length ? 'Chọn lệnh (nút hết hạn sau 10 phút):' : `Không có lệnh nào gõ được lúc này (${obs.mismatch || STATE_LABEL[obs.state]}).`)
     + (obs.bridge ? `\n📡 Remote Control đang bật: https://claude.ai/code/${obs.bridge}` : '');
   const row = buttons.map((op) => ({ text: TYPE_BUTTON_LABEL[op], callback_data: `ty:${tok}:${op}` }));
@@ -951,7 +966,7 @@ export async function startType(rest, ctx, { list = listForType, io = defaultIo(
     const a = agents.find((x) => x.target.hashtag === want);
     if (!a) { await sendText(daemonUserId, `❌ không thấy agent #${want} trong screen tele-* (agent mở trong terminal thường không gõ vào được).`); return; }
     const tok = crypto.randomBytes(8).toString('hex');
-    const step = typeStep2({ target: a.target, obs: a.obs, persona: personaOf(want), cfg: projectsConfig, tok });
+    const step = typeStep2({ target: a.target, obs: a.obs, persona: personaOf(want), cfg: projectsConfig, tok, signals: io.nudgeSignals?.(a.target) });
     const sent = await sendButtonRows(daemonUserId, step.text, step.rows);
     buttonStore.set(tok, { kind: 'type', target: a.target, chatId: daemonUserId, messageId: sent?.message_id ?? null, createdAt: Date.now(), ops: step.buttons });
     return;
@@ -989,6 +1004,55 @@ export function buildCompactNoticePrompt({ convoId, chatId, text }) {
 }
 
 /**
+ * `/compact <tên | #hash>` and `/nudge <tên | #hash>` (RFC 26): straight to the shared TypeRunner (locks,
+ * cool-down, every RFC 22 check). The whole rest is the target. Results go out as new messages.
+ */
+export async function runTypeCommand(op, rest, from, ctx, { list = () => listClaudeProcs(), io = defaultIo(), runner = getTypeRunner(), personaOf = personaLookup(), deliver = deliverResult } = {}) {
+  const { daemonUserId, sendText, projectsConfig } = ctx;
+  const cmd = op === 'c' ? '/compact' : '/nudge';
+  if (!String(rest || '').trim()) { await sendText(daemonUserId, `usage: ${cmd} <tên | #hashtag>  (bấm ${cmd}_<hashtag> trong /ls)`); return; }
+  const f = findTypeTarget(rest, list(), personaOf);
+  if (f.error) { await sendText(daemonUserId, `❌ ${cmd}: ${f.error}`); return; }
+  const t = pinTarget(f.row);
+  const obs = observe(t, io);
+  if (obs.mismatch) { await sendText(daemonUserId, `❌ ${cmd} #${t.hashtag}: ${obs.mismatch}.`); return; }
+  const ctxNote = op === 'c' ? formatContext(obs.usage, contextWindowFor(projectsConfig || {}, { hashtag: t.hashtag, model: obs.usage?.model })) : null;
+  const r = await runner.run(op, t, String(from?.id ?? 'owner'));
+  await sendText(daemonUserId, `${r.text}${ctxNote && obs.usage?.tokens != null && obs.usage.tokens < COMPACT_MIN_TOKENS ? ` (${ctxNote})` : ''}`);
+  if (!r.watch) return;
+  const more = await r.watch().catch((e) => `❔ ${e?.message ?? e}`);
+  await sendText(daemonUserId, `#${t.hashtag}: ${more}`);
+  const convoId = uuidToConvoInt(t.sessionId);
+  if (String(more).startsWith(COMPACT_OK) && convoId != null) {
+    await deliver({ convoId, text: more }, { build: buildCompactNoticePrompt }).catch((e) => console.error(`[daemon] compact notice: ${e?.message ?? e}`));
+  }
+}
+
+/**
+ * A tapped `/kill_<hash>` (RFC 26 §3.7): ask ✅ first, then the SAME confirm branch as /type 💀
+ * (handleTypeButton 'y': one-shot, message must name #hash + PID, pid + start + session re-checked).
+ */
+export async function startTapKill(rest, ctx, { list = () => listClaudeProcs(), io = defaultIo(), personaOf = personaLookup() } = {}) {
+  const { daemonUserId, sendText, sendButtonRows, buttonStore, projectsConfig } = ctx;
+  if (!sendButtonRows || !buttonStore) { await sendText(daemonUserId, '❌ /kill_… cần chạy trong daemon.'); return; }
+  const tag = String(rest).replace(/^#/, '').toLowerCase();
+  const rows = list().filter((r) => r.hashtag === tag);
+  if (!rows.length) { await sendText(daemonUserId, `ℹ️ #${tag} không chạy — /resume_${tag}`); return; }
+  if (new Set(rows.map((r) => r.sessionId || `pid:${r.pid}`)).size > 1) { await sendText(daemonUserId, `❌ #${tag} khớp ${rows.length} process: ${rows.map((r) => `PID ${r.pid}`).join(', ')} — dùng /kill pid:<PID>.`); return; }
+  const r = rows.find((x) => !x.guessed && x.sessionId && x.procStart);
+  if (!r) { await sendText(daemonUserId, `❌ #${tag}: không xác định chắc process (${rows.map((x) => `PID ${x.pid}`).join(', ')}) — dùng /kill pid:<PID>.`); return; }
+  const t = pinTarget(r);
+  // State without observe(): a terminal agent is not a screen child, and a kill needs no screen.
+  const sess = io.session(t.pid), tr = io.transcript(t.sessionId, t.cwd);
+  const ctxStr = formatContext(tr?.usage, contextWindowFor(projectsConfig || {}, { hashtag: tag, model: tr?.usage?.model }));
+  const line = agentLine(t, { persona: personaOf(tag), state: classify(sess?.status, tr?.ended), ctx: ctxStr });
+  const tok = crypto.randomBytes(8).toString('hex');
+  const sent = await sendButtonRows(daemonUserId, `💀 ${line}\n\nKill agent này (SIGTERM, phiên dừng hẳn — muốn chạy lại dùng /resume_${tag})? Bấm ✅ để xác nhận.`,
+    [[{ text: TYPE_BUTTON_LABEL.y, callback_data: `ty:${tok}:y` }, CANCEL_BUTTON(tok)]]);
+  buttonStore.set(tok, { kind: 'type', target: t, chatId: daemonUserId, messageId: sent?.message_id ?? null, createdAt: Date.now(), ops: ['y', 'x'] });
+}
+
+/**
  * `/kill pid:<PID> --expect-start <start>` through the registry's kill command (spawn.mjs: owner gate,
  * refuses a reused pid, SIGTERM, audit) → output text.
  */
@@ -1015,7 +1079,7 @@ export async function handleTypeButton(cq, ctx, { runner = getTypeRunner(), list
     const a = list({ personaOf, cfg: ctx.projectsConfig, io }).find((x) => x.target.hashtag === h);
     if (!a) { await ctx.answerButton(cq.id, 'Agent không còn.'); await ctx.editButtonRows(chatId, messageId, `${original}\n\n❌ #${h} không còn trong screen — gõ /type lại.`, []); return; }
     const tok = crypto.randomBytes(8).toString('hex');
-    const step = typeStep2({ target: a.target, obs: a.obs, persona: personaOf(h), cfg: ctx.projectsConfig, tok });
+    const step = typeStep2({ target: a.target, obs: a.obs, persona: personaOf(h), cfg: ctx.projectsConfig, tok, signals: io.nudgeSignals?.(a.target) });
     ctx.buttonStore.set(tok, { kind: 'type', target: a.target, chatId, messageId, createdAt: Date.now(), ops: step.buttons });
     await ctx.answerButton(cq.id);
     await ctx.editButtonRows(chatId, messageId, step.text, step.rows);
