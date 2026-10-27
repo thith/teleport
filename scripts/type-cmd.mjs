@@ -88,18 +88,18 @@ export function typeTargets(rows) {
     && r.screenPid && r.ppid === r.screenPid && r.sessionId && !r.guessed && r.procStart);
 }
 
-// Below this context /compact gains little (Thi): no 🗜️ button, no /compact_x link. Unknown usage keeps them.
+// Below this context /compact gains little (Thi): no 🗜️ button (unknown usage keeps it), no /compact_x link.
 export const COMPACT_MIN_TOKENS = 100_000;
 
 /**
  * The tappable commands under one /ls block (RFC 26 §3.10) — the same gates the taps re-check:
- * /kill_x: a known (not guessed) session + start; /compact_x: typeable and context ≥ 100k (or unknown);
+ * /kill_x: a known (not guessed) session + start; /compact_x: typeable and context ≥ 100k (known — Thi 11229);
  * /nudge_x: typeable and (listener off or mail waiting). `reachable` = typeTargets(rows) includes it. Pure.
  */
 export function lsLinks(r, { reachable = false, tokens = null, listener = null, mail = null } = {}) {
   if (!r.hashtag || r.guessed || !r.sessionId || !r.procStart) return [];
   const out = [];
-  if (reachable && !(tokens != null && tokens < COMPACT_MIN_TOKENS)) out.push(`/compact_${r.hashtag}`);
+  if (reachable && tokens != null && tokens >= COMPACT_MIN_TOKENS) out.push(`/compact_${r.hashtag}`);
   out.push(`/kill_${r.hashtag}`);
   if (reachable && (listener === 'off' || mail > 0)) out.push(`/nudge_${r.hashtag}`);
   return out;

@@ -609,8 +609,8 @@ test('lsLinks: the same gates as the taps — kill needs a known session + start
   const r = { hashtag: 'a1111111', sessionId: 's1', procStart: '9', guessed: false };
   assert.deepEqual(lsLinks(r, { reachable: true, tokens: 150_000, listener: 'on', mail: 0 }), ['/compact_a1111111', '/kill_a1111111']);
   assert.deepEqual(lsLinks(r, { reachable: true, tokens: 42_000, listener: 'off', mail: 0 }), ['/kill_a1111111', '/nudge_a1111111'], 'no /compact_ under 100k');
-  assert.deepEqual(lsLinks(r, { reachable: true, tokens: null, listener: 'on', mail: 2 }), ['/compact_a1111111', '/kill_a1111111', '/nudge_a1111111'], 'unknown context keeps /compact_; mail → /nudge_');
-  assert.deepEqual(lsLinks(r, { reachable: true, tokens: null, listener: null, mail: null }), ['/compact_a1111111', '/kill_a1111111'], 'unknown signals → no nudge');
+  assert.deepEqual(lsLinks(r, { reachable: true, tokens: null, listener: 'on', mail: 2 }), ['/kill_a1111111', '/nudge_a1111111'], 'unknown context → no /compact_; mail → /nudge_');
+  assert.deepEqual(lsLinks(r, { reachable: true, tokens: 100_000, listener: null, mail: null }), ['/compact_a1111111', '/kill_a1111111'], 'unknown signals → no nudge');
   assert.deepEqual(lsLinks(r, { reachable: false, tokens: 150_000, listener: 'off', mail: 3 }), ['/kill_a1111111'], 'not typeable → kill only');
   assert.deepEqual(lsLinks({ ...r, guessed: true }, { reachable: true }), [], 'guessed → nothing');
   assert.deepEqual(lsLinks({ ...r, procStart: null }, { reachable: true }), []);
