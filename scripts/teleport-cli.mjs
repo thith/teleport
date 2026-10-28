@@ -13,6 +13,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { PERMISSION_MODES } from './spawn.mjs';
+import { SEPARATORS } from './spawn-extra-args.mjs';
 
 // Full topic hashtag (not the 3-char tail). Same shape as the HASHTAG_RE family.
 export const KILL_ID_RE = /^[a-j]\d{7}$/i;
@@ -67,7 +68,8 @@ export function parse(argv) {
       const id = rest[0].replace(/^#/, '');
       if (!id) return { error: `${sub}: empty <id>` };
       // Check AFTER stripping "#": a quoted '#--help' must not reach spawn.mjs as a flag.
-      if (id.startsWith('-')) return { error: `${sub}: unknown option "${rest[0]}"` };
+      // spawn.mjs also reads '—' / '–' (phone dashes) as the "--" separator and would drop the id.
+      if (id.startsWith('-') || SEPARATORS.has(id)) return { error: `${sub}: unknown option "${rest[0]}"` };
       return { spawnArgs: ['--attach', id] };
     }
     case 'kill':

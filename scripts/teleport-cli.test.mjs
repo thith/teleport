@@ -42,7 +42,7 @@ test('parse: flags of other subcommands and stray args are rejected', () => {
     // Codex review: a duplicate --mode must not let the last one win; unknown modes and a
     // quoted '#--help' id are refused here, not by spawn.mjs.
     ['spawn', '--mode', 'plan', '--mode', 'bypassPermissions'], ['spawn', '--mode', 'yolo'],
-    ['spawn', '--mode=plan', '--mode', 'auto'], ['attach', '#--help'], ['a', '#-x'],
+    ['spawn', '--mode=plan', '--mode', 'auto'], ['attach', '#--help'], ['a', '#-x'], ['attach', '—'], ['attach', '–'],
   ]) {
     const r = parse(argv);
     assert.ok(r.error, `expected error for ${argv.join(' ')}`);
