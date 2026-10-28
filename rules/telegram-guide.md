@@ -50,6 +50,8 @@ When the user asks to **spawn / start / launch** a Claude agent — e.g. "spawn 
   `--mode <default|auto|acceptEdits|bypassPermissions|dontAsk|plan>` (also `--mode=<value>`),
   e.g. `node ../teleport/scripts/spawn.mjs --interactive --mode plan`.
 
+**Terminal shortcut (for the human; RFC 27):** `teleport ls [full]` · `teleport attach [<id>]` · `teleport kill <hashtag>` · `teleport spawn [--headless] [--mode <m>]` — works from any folder (`spawn` uses the cwd's group). Install once: `~/Projects/teleport/bin/teleport.mjs install`. `pnpm spawn:*` aliases are the old way. The `node ../teleport/scripts/spawn.mjs …` forms below are what **agents** run; they stay as is.
+
 **List / attach / kill running agents:**
 - **"list agents / which agents are running"** → `node ../teleport/scripts/spawn.mjs --list` (prints each `tele-<hashtag>`
   session + its topic hashtag) in two sections: **📺 Screen** (each `tele-*` screen with the claude PID inside) then

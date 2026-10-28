@@ -21,8 +21,12 @@
 //   --mode <default|auto|acceptEdits|bypassPermissions|dontAsk|plan>
 // (also accepts `--mode=<value>`).
 //
-// Verbal convention (telegram-guide): "spawn Claude" → pnpm spawn:i (interactive);
-// "spawn Claude headless" → pnpm spawn:headless.
+// From a terminal use the `teleport` command (RFC 27: `teleport ls|attach|kill|spawn`,
+// installed once via `bin/teleport.mjs install`); it just builds this script's argv.
+// Agents keep calling `node ../teleport/scripts/spawn.mjs …` directly.
+//
+// Verbal convention (telegram-guide): "spawn Claude" → `--interactive`
+// (terminal: `teleport spawn`); "spawn Claude headless" → no flag (`teleport spawn --headless`).
 //
 // Run `node spawn.mjs --help` (or `-h`) for the full flag reference (see USAGE).
 
@@ -132,8 +136,9 @@ Manage sessions (interactive/screen only):
 The prompt is HARD-CODED ("${SPAWN_PROMPT}"): the new
 instance greets you in its own Telegram persona topic and waits for work there.
 
-Verbal convention (telegram-guide): "spawn Claude" → pnpm spawn:i (interactive);
-"spawn Claude headless" → pnpm spawn:headless.`;
+Verbal convention (telegram-guide): "spawn Claude" → --interactive;
+"spawn Claude headless" → no flag. From a terminal: \`teleport spawn [--headless]\`,
+\`teleport ls\`, \`teleport attach\`, \`teleport kill <hashtag>\` (RFC 27).`;
 
 // Session names must be shell/argv-safe — they're interpolated into the printed
 // teardown command and passed to `screen`. Reject anything else (review C-Minor).
@@ -518,7 +523,7 @@ export function formatSessionList(sessions) {
  * survivor. Pure → testable. Returns `{ ok, name }` or `{ error }`.
  */
 export function resolveAttachTarget(raw, sessions) {
-  if (!sessions.length) return { error: 'no live agent sessions (try: spawn.mjs --list).' };
+  if (!sessions.length) return { error: 'no live agent sessions (try: teleport ls).' };
   const id = raw == null ? '' : String(raw).trim().replace(/^#/, '');
 
   // (1) NO id → attach iff exactly one session is live (the "nếu chỉ 1 thì bỏ qua
@@ -633,7 +638,7 @@ export function checkResumePreflight({ sessionId, sessionName, cwd, procs, procs
   if (unknown.length) {
     return { error: `live claude process(es) ${unknown.map((r) => `PID ${r.pid}`).join(', ')} in ${cwd} have no session file, so they might hold this session — check /ls; stop them (/kill pid:<PID>) if they do.` };
   }
-  if (screenExists) return { error: `a screen session "${sessionName}" already exists (try: spawn.mjs --attach ${sessionName}).` };
+  if (screenExists) return { error: `a screen session "${sessionName}" already exists (try: teleport attach ${sessionName}).` };
   const slug = cwdToProjectSlug(cwd);
   if (!transcriptDirs.includes(slug)) {
     if (transcriptDirs.length) return { error: `session ${sessionId} belongs to another folder (${transcriptDirs.join(', ')}), not ${cwd} — resume it from that project.` };
@@ -1458,13 +1463,13 @@ if (isDirectRun) {
   // --kill <id>: id may be `d1331668`, `#d1331668`, or `tele-d1331668`.
   const kill = resolveKillId(argv);
   if (kill.found) {
-    if (!kill.raw) { console.error('[spawn] --kill needs an id, e.g. `pnpm spawn:kill d1331668` (or #d1331668 / tele-d1331668).'); process.exit(1); }
+    if (!kill.raw) { console.error('[spawn] --kill needs an id, e.g. `teleport kill d1331668` (or #d1331668 / tele-d1331668).'); process.exit(1); }
     if (!hasBinary('screen')) { console.error('[spawn] `screen` not found on PATH.'); process.exit(1); }
     let name;
     try { name = normalizeSessionName(kill.raw); }
     catch (e) { console.error(`[spawn] ${e.message}`); process.exit(1); }
     if (!screenSessionExists(name)) {
-      console.error(`[spawn] no screen session "${name}" (try: spawn.mjs --list). NB: --kill needs the FULL hashtag — the 3-char tail / no-id shortcuts are --attach only (destructive, so kill stays explicit).`);
+      console.error(`[spawn] no screen session "${name}" (try: teleport ls). NB: --kill needs the FULL hashtag — the 3-char tail / no-id shortcuts are --attach only (destructive, so kill stays explicit).`);
       process.exit(1);
     }
     // The screen's NAME is not proof of who is inside it: check the occupant first.
