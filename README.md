@@ -146,7 +146,7 @@ The spawn helper lives at `teleport/scripts/spawn.mjs`. Add these scripts to eac
 "spawn:kill": "node ../teleport/scripts/spawn.mjs --kill"
 ```
 
-`spawn:i` (interactive, subscription billing) / `spawn:headless` (`claude -p`, SDK pool) launch an agent; `spawn:ls` lists running agents; `spawn:kill <id>` stops one (id = the topic hashtag). Interactive mode needs `screen` (preinstalled on macOS) or `tmux` on the host. (Command/billing specifics live in `rules/telegram-guide.md` — the single source of truth — so this README and the wiring snippet never drift.)
+From a terminal, anywhere: `teleport ls` / `teleport attach [<id>]` / `teleport kill <hashtag>` / `teleport spawn [--headless]` (`teleport --help` for details). Install once with `~/Projects/teleport/bin/teleport.mjs install` (symlinks `~/.local/bin/teleport`; `git pull` updates it). The `pnpm spawn:*` aliases above are the old way and still work: `spawn:i` (interactive, subscription billing) / `spawn:headless` (`claude -p`, SDK pool) launch an agent; `spawn:ls` lists running agents; `spawn:kill <id>` stops one (id = the topic hashtag). Interactive mode needs `screen` (preinstalled on macOS) or `tmux` on the host. (Command/billing specifics live in `rules/telegram-guide.md` — the single source of truth — so this README and the wiring snippet never drift.)
 
 ## Supervisor daemon (optional)
 
