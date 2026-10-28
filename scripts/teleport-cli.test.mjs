@@ -39,6 +39,10 @@ test('parse: flags of other subcommands and stray args are rejected', () => {
     ['spawn', '--kill', 'x'], ['spawn', 'luni'], ['spawn', '--mode'], ['spawn', '--mode', '--headless'],
     ['ls', '--kill', 'x'], ['ls', 'full', 'x'], ['install', 'x'], ['frobnicate'],
     ['kill'], ['kill', 'a', 'b'], ['kill', '--list'],
+    // Codex review: a duplicate --mode must not let the last one win; unknown modes and a
+    // quoted '#--help' id are refused here, not by spawn.mjs.
+    ['spawn', '--mode', 'plan', '--mode', 'bypassPermissions'], ['spawn', '--mode', 'yolo'],
+    ['spawn', '--mode=plan', '--mode', 'auto'], ['attach', '#--help'], ['a', '#-x'],
   ]) {
     const r = parse(argv);
     assert.ok(r.error, `expected error for ${argv.join(' ')}`);
@@ -93,6 +97,19 @@ test('install: already installed (absolute and relative symlink) is exit 0', () 
   fs.rmSync(f.link);
   fs.symlinkSync(path.relative(path.dirname(f.link), path.join(f.root, 'bin', 'teleport.mjs')), f.link);
   assert.equal(inst(f).code, 0);
+});
+
+test('install: re-running when already installed still reports PATH and shadowing problems', () => {
+  const f = fixture();
+  inst(f);
+  const shadow = tmp();
+  fs.writeFileSync(path.join(shadow, 'teleport'), '');
+  const r = inst(f, { env: { PATH: shadow }, isWorktree: () => true });
+  assert.equal(r.code, 0);
+  assert.match(r.out[0], /already installed/);
+  assert.ok(r.out.join('\n').includes('export PATH'));
+  assert.ok(r.err.some((l) => l.includes('shadow')));
+  assert.ok(r.err.some((l) => l.includes('worktree')));
 });
 
 test('install: refuses (and never touches) a foreign file, dir, other symlink, dangling link', () => {

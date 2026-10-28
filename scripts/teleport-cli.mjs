@@ -12,6 +12,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
+import { PERMISSION_MODES } from './spawn.mjs';
 
 // Full topic hashtag (not the 3-char tail). Same shape as the HASHTAG_RE family.
 export const KILL_ID_RE = /^[a-j]\d{7}$/i;
@@ -41,8 +42,6 @@ Notes:
   detach      Ctrl-A then D leaves an attached agent running.
 `;
 
-const SPAWN_MODE_RE = /^[A-Za-z]+$/;
-
 const stripId = (s) => s.replace(/^#/, '').replace(/^tele-/i, '');
 
 /**
@@ -65,9 +64,10 @@ export function parse(argv) {
     case 'a': {
       if (rest.length > 1) return { error: `${sub}: takes at most one <id>` };
       if (rest.length === 0) return { spawnArgs: ['--attach'] };
-      if (rest[0].startsWith('-')) return { error: `${sub}: unknown option "${rest[0]}"` };
       const id = rest[0].replace(/^#/, '');
       if (!id) return { error: `${sub}: empty <id>` };
+      // Check AFTER stripping "#": a quoted '#--help' must not reach spawn.mjs as a flag.
+      if (id.startsWith('-')) return { error: `${sub}: unknown option "${rest[0]}"` };
       return { spawnArgs: ['--attach', id] };
     }
     case 'kill':
@@ -90,7 +90,9 @@ export function parse(argv) {
         if (a === '--headless') { headless = true; continue; }
         if (a === '--mode' || a.startsWith('--mode=')) {
           const v = a === '--mode' ? rest[++i] : a.slice('--mode='.length);
-          if (!v || v.startsWith('-') || !SPAWN_MODE_RE.test(v)) return { error: 'spawn: --mode needs a value (e.g. --mode plan)' };
+          if (mode !== null) return { error: 'spawn: --mode given twice' };
+          if (!v || v.startsWith('-')) return { error: 'spawn: --mode needs a value (e.g. --mode plan)' };
+          if (!PERMISSION_MODES.includes(v)) return { error: `spawn: unknown --mode "${v}" (one of: ${PERMISSION_MODES.join(', ')})` };
           mode = v;
           continue;
         }
@@ -141,10 +143,7 @@ export function install({ root, home, env = process.env, fs: fsImpl = fs, isWork
   if (st) {
     let same = false;
     try { same = st.isSymbolicLink() && fsImpl.realpathSync(link) === fsImpl.realpathSync(target); } catch { /* dangling */ }
-    if (same) {
-      out.push(`already installed: ${link} -> ${target}`);
-      return { code: 0, out, err };
-    }
+    if (same) return diagnose({ root, binDir, env, fsImpl, isWorktree, out: [`already installed: ${link} -> ${target}`], err });
     let what = 'a file or directory';
     if (st.isSymbolicLink()) {
       let dest = '?';
@@ -163,7 +162,12 @@ export function install({ root, home, env = process.env, fs: fsImpl = fs, isWork
     return { code: 1, out, err };
   }
   out.push(`installed: ${link} -> ${target}`);
+  return diagnose({ root, binDir, env, fsImpl, isWorktree, out, err });
+}
 
+// Worktree / PATH / shadowing checks — run on a fresh install AND on "already
+// installed", so a re-run explains why `teleport` still isn't found.
+function diagnose({ root, binDir, env, fsImpl, isWorktree, out, err }) {
   if ((isWorktree ?? detectWorktree)(root, fsImpl)) {
     err.push(`warning: ${root} is a git worktree; the symlink breaks when the worktree is removed. Install from the main checkout for a permanent command.`);
   }
