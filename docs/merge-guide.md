@@ -56,7 +56,7 @@ node ../teleport/scripts/merge-request.mjs <URL PR> [<URL PR> …] [--keep-branc
 ```
 
 - Nhiều PR cùng lúc thì ghi theo **đúng thứ tự cần merge** (PR nền trước).
-- **Nhánh nguồn:** mặc định bị xoá sau khi merge. Thêm `--keep-branch` (vị trí nào cũng được, áp cho mọi PR trong yêu cầu) khi nhánh nguồn phải còn: nhánh dài hạn dùng làm head, hoặc bạn còn làm tiếp trên đó. Owner thấy "giữ nhánh nguồn" trong tin xin merge trước khi bấm, và cờ được giữ cho cả đường tự merge lẫn nút [✅ Merge]. Nhánh tích hợp (`main`, `master`, `develop`, `pre-develop`, `staging`, `production`) luôn được giữ, không cần cờ.
+- `--keep-branch`: giữ nhánh nguồn sau merge (mặc định xoá; áp cho mọi PR trong yêu cầu, owner thấy "giữ nhánh nguồn" trước khi bấm). Nhánh tích hợp (`main`, `master`, `develop`, `pre-develop`, `staging`, `production`) luôn được giữ.
 - Lệnh chỉ xếp yêu cầu vào hộp thư của daemon rồi thoát ngay. Nó **không** merge và không cấp quyền gì.
 
 **Chuyện gì xảy ra sau đó:**
