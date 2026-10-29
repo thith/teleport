@@ -67,11 +67,11 @@ test('pick: hash must be in the message; the agent is looked up FRESH; step 2 re
   const { ctx, calls } = ui();
   await handleTypeButton(cq('ty:pick:c2383556', 'menu without it'), ctx, { list: () => [agent(T)] });
   assert.match(calls[0][1], /không khớp/);
-  await handleTypeButton(cq('ty:pick:c2383556', '⌨️ /type — chọn agent:\n• #c2383556 · PID 644406'), ctx, { list: () => [agent(T)] });
+  await handleTypeButton(cq('ty:pick:c2383556', '⌨️ /type — chọn agent:\n• #c2383556 · PID 644406'), ctx, { list: () => [agent(T)], procs: () => [asRow(T)] });
   const edit = calls.find((c) => c[0] === 'edit');
   assert.match(edit[1], /#c2383556 · PID 644406/);
   assert.equal([...ctx.buttonStore.values()][0].messageId, 100);
-  await handleTypeButton(cq('ty:pick:c2383556', '• #c2383556'), ctx, { list: () => [] });
+  await handleTypeButton(cq('ty:pick:c2383556', '• #c2383556'), ctx, { list: () => [], procs: () => [asRow(T)] });
   assert.match(calls.at(-1)[1], /không còn trong screen/);
 });
 
@@ -163,8 +163,8 @@ test('/type <3 digits | name> (RFC 28): resolved over ALL live rows; a terminal 
 
 test('pick button: two live agents behind one hashtag → nothing is picked', async () => {
   const { ctx, calls } = ui();
-  await handleTypeButton(cq('ty:pick:c2383556', '⌨️ /type — chọn agent:\n• #c2383556 · PID 644406'), ctx, { list: () => [agent(T), agent({ ...T, pid: 7 })] });
-  assert.match(calls.at(-1)[1], /không còn/);
+  await handleTypeButton(cq('ty:pick:c2383556', '⌨️ /type — chọn agent:\n• #c2383556 · PID 644406'), ctx, { list: () => [agent(T), agent({ ...T, pid: 7 })], procs: () => [asRow(T), asRow({ ...T, pid: 7 })] });
+  assert.match(calls.at(-1)[1], /2 process/);
   assert.equal(ctx.buttonStore.size, 0);
 });
 
@@ -350,4 +350,13 @@ test('dispatch: /compact, /nudge, a tapped /kill are owner-only; typed /kill sti
   }
   assert.deepEqual(parseDaemonCommand('/kill_c2383556'), { cmd: 'kill', rest: '#c2383556', tapped: true });
   assert.deepEqual(parseDaemonCommand('/kill c2383556'), { cmd: 'kill', rest: 'c2383556' });
+});
+
+test('pick button: a TERMINAL twin sharing the hashtag (never in the menu list) refuses the pick, like a typed /type #h', async () => {
+  const { ctx, calls } = ui();
+  const twin = { pid: 9, hashtag: 'c2383556', sessionId: 'X', screen: null, ppid: 1, procStart: '1' };
+  await handleTypeButton(cq('ty:pick:c2383556', '⌨️ /type — chọn agent:\n• #c2383556 · PID 644406'), ctx, { list: () => [agent(T)], procs: () => [asRow(T), twin] });
+  assert.match(calls.at(-1)[1], /2 process/);
+  assert.equal(ctx.buttonStore.size, 0);
+  assert.ok(!calls.some((c) => c[0] === 'edit' && /rảnh/.test(c[1]) && c[2]?.length), 'no step-2 keyboard was offered');
 });

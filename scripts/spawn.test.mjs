@@ -1237,14 +1237,55 @@ test('resolveAttachTarget: addresses never fall to a name — `#Ong`, `tele-Sứ
   assert.equal(resolveAttachTarget('Giun', sessions, { ...o, personaOf: () => '🪱 Giun' }).ok, true, '4+ chars: a name');
 });
 
-test('resolveAttachTarget: an exact screen name (custom `tele-giun`) is a candidate; a persona Giun elsewhere makes it ambiguous → refuse and list', () => {
+test('resolveAttachTarget: an exact screen name (custom `tele-giun`, occupant CONFIRMED) is a candidate; a persona Giun elsewhere makes it ambiguous → refuse and list the screen name', () => {
   const sessions = [scr('giun', 10), scr('d3333333', 20)];
-  const procs = [inRow('giun', 10, { sessionId: null }), inRow('d3333333', 20)];
+  const procs = [inRow('giun', 10, { hashtag: 'c7777777', sessionId: 'sid-c' }), inRow('d3333333', 20)];
   const o = { personaOf: (r) => (r.hashtag === 'd3333333' ? '🪱 Giun' : null), procs };
   const e = resolveAttachTarget('giun', sessions, o).error;
-  assert.match(e, /"giun" matches 2 agents/); assert.match(e, /#giun/); assert.match(e, /🪱 Giun #d3333333/);
-  // without the namesake the custom screen name works
-  assert.deepEqual(resolveAttachTarget('giun', [scr('giun', 10)], { procs: [inRow('giun', 10, { sessionId: null })] }), { ok: true, name: 'tele-giun', pid: '10' });
+  assert.match(e, /"giun" matches 2 agents/); assert.match(e, /#c7777777 \(screen tele-giun\)/); assert.match(e, /🪱 Giun #d3333333/);
+  // without the namesake the custom screen name works, and its occupant is still addressable by hashtag
+  assert.deepEqual(resolveAttachTarget('giun', [sessions[0]], { procs: [procs[0]] }), { ok: true, name: 'tele-giun', pid: '10' });
+  assert.equal(resolveAttachTarget('#c7777777', sessions, o).name, 'tele-giun');
+});
+
+test('resolveAttachTarget: `attach bot` (3 chars) reaches the custom screen tele-bot holding a confirmed agent; #bot is only an exact hashtag', () => {
+  const sessions = [scr('bot', 10), scr('d3333333', 20)];
+  const procs = [inRow('bot', 10, { hashtag: 'c7777777', sessionId: 'sid-c' }), inRow('d3333333', 20)];
+  assert.deepEqual(resolveAttachTarget('bot', sessions, { procs }), { ok: true, name: 'tele-bot', pid: '10' });
+  assert.match(resolveAttachTarget('#bot', sessions, { procs }).error, /no live session "bot"/);
+  assert.equal(resolveAttachTarget('tele-bot', sessions, { procs }).name, 'tele-bot');
+});
+
+test('resolveAttachTarget: `#x` is an EXACT hashtag — `#780` never selects #a1234780, a 3-letter `#abc` never a tail', () => {
+  const sessions = [scr('a1234780', 10), scr('c1111abc', 20)];
+  const procs = [inRow('a1234780', 10), inRow('c1111abc', 20)];
+  assert.match(resolveAttachTarget('#780', sessions, { procs }).error, /no live session "780"/);
+  assert.equal(resolveAttachTarget('780', sessions, { procs }).name, 'tele-a1234780');
+  assert.match(resolveAttachTarget('#abc', sessions, { procs }).error, /no live session "abc"/);
+  assert.equal(resolveAttachTarget('abc', sessions, { procs }).name, 'tele-c1111abc');
+});
+
+test('resolveKillTail: the pool is EVERY live claude row — a `claude -p` child on a colliding tail makes /kill refuse instead of picking the parent', () => {
+  const sessions = [scr('h6710657', 10)];
+  const parent = inRow('h6710657', 10);
+  const child = { pid: 99, ppid: parent.pid, screen: 'tele-h6710657', screenPid: 10, sessionId: 'sid-child', guessed: false, hashtag: 'h6711657' };
+  const e = resolveKillTail('657', sessions, [parent, child], pOf).error;
+  assert.match(e, /"657" khớp 2 agent/); assert.match(e, /#h6710657/); assert.match(e, /#h6711657/);
+  assert.deepEqual(resolveKillTail('657', sessions, [parent], pOf), { screen: 'tele-h6710657' });
+  // a child resuming the occupant's own session is the same agent, not a twin
+  assert.deepEqual(resolveKillTail('657', sessions, [parent, { ...child, hashtag: 'h6710657' }], pOf), { screen: 'tele-h6710657' });
+});
+
+test('resolveKillPid: the WHOLE target is read before classifying — curly/straight quotes and a split `name: 780` still go through tailAs', () => {
+  const seen = [];
+  const tailAs = (v) => { seen.push(v); return { name: `#x${v}` }; };
+  const isScreen = () => { throw new Error('no isScreen for a tail'); };
+  for (const argv of [['--kill', '“780”'], ['--kill', '"780"'], ['--kill', "'780'"], ['--kill', 'name:', '780'], ['--kill', 'name:“780”'], ['--kill', 'NAME:780']]) {
+    assert.deepEqual(resolveKillPid(argv, { isScreen, tailAs }), { found: true, name: '#x780' }, argv.join(' '));
+  }
+  assert.equal(seen.length, 6);
+  assert.deepEqual(resolveKillPid(['--kill', 'pid:780'], { isScreen: () => false, tailAs }).pid, 780);
+  assert.equal(seen.length, 6, 'pid: is not a tail');
 });
 
 test('resolveAttachTarget: two live convos sharing a hashtag but not a persona → the name matches only the one whose OWN persona it is (no map-overwrite)', () => {
@@ -1295,7 +1336,7 @@ test('resolveAttachTarget: two screens whose names differ only in case → refus
   assert.equal(resolveAttachTarget(null, one, { procsError: 'ps failed' }).name, 'tele-a1111780');
 });
 
-test('agentIdentities: occupant per screen, label-only mismatch, unconfirmed by label, plain rows; descendants (`claude -p`) are not agents', () => {
+test('agentIdentities: occupant per screen, label-only mismatch, unconfirmed by label, plain rows; a descendant (`claude -p`) is a plain row entry (its tail still counts)', () => {
   const sessions = [scr('a1111111', 10), scr('b2222222', 20), scr('c3333333', 30)];
   const procs = [
     inRow('a1111111', 10),
@@ -1305,7 +1346,7 @@ test('agentIdentities: occupant per screen, label-only mismatch, unconfirmed by 
   ];
   const ids = agentIdentities(sessions, procs, pOf);
   const sig = ids.map((x) => `${x.hashtag}${x.screen ? `@${x.screen}` : ''}${x.mismatch ? '!' : ''}${x.confirmed ? '+' : ''}`);
-  assert.deepEqual(sig, ['a1111111@tele-a1111111+', 'd4444444@tele-b2222222+', 'b2222222@tele-b2222222!', 'c3333333@tele-c3333333', 'f6666666']);
+  assert.deepEqual(sig, ['a1111111@tele-a1111111+', 'd4444444@tele-b2222222+', 'b2222222@tele-b2222222!', 'c3333333@tele-c3333333', 'e5555555', 'f6666666']);
 });
 
 test('makePersonaOf / personaOfRow: the persona of the row\'s OWN convo; a bare hashtag uses the Set map (several personas behind it → null)', () => {

@@ -59,7 +59,11 @@ export function findResumeTarget(query, cands, { aliveSessions = new Set(), live
   const typedTail = t.kind === 'tail' ? t.value : null;
   if (typedTail) {
     const state = (x) => (x.pid != null ? ` — đang chạy, PID ${x.pid}` : aliveSessions.has(x.sessionId) ? ' — đang chạy' : '');
-    const r = resolveTail(typedTail, [...candidates, ...liveRows], (x) => `${x.persona || '?'} #${x.hashtag}${state(x)}`);
+    // A confirmed live session is ONE identity: its candidate merged with its live row (keeps the PID); guessed rows stay apart.
+    const liveBySid = new Map(liveRows.filter((r) => r.sessionId && !r.guessed).map((r) => [r.sessionId, r]));
+    const pool = [...candidates.map((c) => (liveBySid.has(c.sessionId) ? { ...c, pid: liveBySid.get(c.sessionId).pid } : c)),
+      ...liveRows.filter((r) => !(r.sessionId && !r.guessed && candidates.some((c) => c.sessionId === r.sessionId)))];
+    const r = resolveTail(typedTail, pool, (x) => `${x.persona || '?'} #${x.hashtag}${state(x)}`);
     if (r.error) return { error: r.error };
     if (r.none) return { error: `no agent ending in "${typedTail}" with a Telegram topic in the last ${RECENT_DAYS} days.` };
     t = { kind: 'hashtag', value: r.hashtag };

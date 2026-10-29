@@ -197,3 +197,12 @@ test('runMain: tail → performResume with the right session, flags forwarded; r
   assert.equal(await runMain(['999'], d), 1);
   assert.equal(calls.length, 1);
 });
+
+test('findResumeTarget: a confirmed live session is ONE entry in the tail ambiguity list (candidate + live row coalesced, PID kept); a guessed row stays separate', () => {
+  const live = { pid: 77, hashtag: 'f4451780', sessionId: 'u-sua', persona: '🪼 Sứa', screen: 'tele-f4451780' };
+  const e = findResumeTarget('780', [SUA, CAO], { aliveSessions: new Set(['u-sua']), liveRows: [live] }).error;
+  assert.equal((e.match(/#f4451780/g) || []).length, 1, e);
+  assert.match(e, /Sứa #f4451780 — đang chạy, PID 77/);
+  const g = findResumeTarget('780', [SUA, CAO], { aliveSessions: new Set(), liveRows: [{ ...live, guessed: true }] }).error;
+  assert.equal((g.match(/#f4451780/g) || []).length, 2, 'guessed rows are not merged');
+});

@@ -576,10 +576,13 @@ export function agentIdentities(screens, procs, personaOf = () => null) {
     const inside = direct.length ? direct : all.filter((r) => !all.some((o) => o.pid === r.ppid));
     const sure = inside.filter((r) => r.sessionId && !r.guessed && r.hashtag);
     const base = { screen: sc.name, screenPid: String(sc.pid) };
-    for (const r of all) taken.add(r); // a screen's claudes are its identity; descendants (`claude -p`) are no agents of their own
+    for (const r of inside) taken.add(r);
+    // A descendant (`claude -p`) is no occupant, but its tail still counts (a /kill 657 must not pick the parent when the child ends in 657) — except one on the occupant's own hashtag (same agent).
+    for (const r of all) if (!inside.includes(r) && sure.some((o) => o.hashtag === r.hashtag)) taken.add(r);
     for (const r of sure) out.push({ ...base, hashtag: r.hashtag.toLowerCase(), persona: safe(r), row: r, confirmed: true });
     if (!sure.length) out.push({ ...base, hashtag: label, persona: safe({ hashtag: label }), confirmed: false, occupied: inside.length > 0 });
-    else if (!sure.some((r) => r.hashtag.toLowerCase() === label)) out.push({ ...base, hashtag: label, persona: null, confirmed: false, mismatch: true });
+    // A custom screen name (tele-giun, tele-bot) is a screen name only: a label identity exists when the label has hashtag shape.
+    else if (HASHTAG_RE.test(label) && !sure.some((r) => r.hashtag.toLowerCase() === label)) out.push({ ...base, hashtag: label, persona: null, confirmed: false, mismatch: true });
     // A guessed occupant under another hashtag: not an identity, but its tail still counts toward ambiguity.
     for (const r of inside) if (!sure.includes(r) && r.hashtag && r.hashtag.toLowerCase() !== label) out.push({ ...base, hashtag: r.hashtag.toLowerCase(), persona: null, confirmed: false, mismatch: true });
   }
@@ -588,7 +591,7 @@ export function agentIdentities(screens, procs, personaOf = () => null) {
 }
 
 /** `🪼 Sứa #f4451780` — how errors name an agent identity. */
-export const identityLabel = (x) => `${x.persona ? `${x.persona} ` : ''}#${x.hashtag}${x.screen && x.mismatch ? ` (screen ${x.screen})` : ''}`;
+export const identityLabel = (x) => `${x.persona ? `${x.persona} ` : ''}#${x.hashtag}${x.screen && (x.mismatch || x.screen.toLowerCase() !== `tele-${x.hashtag}`) ? ` (screen ${x.screen})` : ''}`;
 // Live screens (one per screen PID) as `persona #hashtag`, for "live: …" lists.
 const liveScreens = (ids) => [...new Map(ids.filter((x) => x.screen && !x.mismatch).map((x) => [`${x.screenPid}.${x.screen}`, x])).values()];
 const liveList = (ids) => liveScreens(ids).map(identityLabel).join(', ');
@@ -635,10 +638,17 @@ export function resolveAttachTarget(raw, sessions, { personaOf = () => null, pro
   if (isAddress) {
     const blocked = needProcs();
     if (blocked) return blocked;
+    const hashed = id.startsWith('#'); // `#x` is an EXACT hashtag (RFC §2.2): tail / 3-char shorthand only for bare input
     const bare = id.replace(/^#/, '');
     const lid = bare.toLowerCase();
     let tag = lid;
-    if (/^\d{3}$/.test(bare) || (/^[A-Za-z0-9]{3}$/.test(bare) && !ids.some((x) => x.hashtag === lid))) {
+    if (!hashed && /^[A-Za-z0-9]{3}$/.test(bare) && !/^\d{3}$/.test(bare) && !ids.some((x) => x.hashtag === lid)) {
+      // 3 letters/digits that are no hashtag: an exact custom screen name (tele-bot) still answers to them.
+      const sc = sessions.filter((s) => s.name.toLowerCase() === `tele-${lid}`);
+      if (sc.length > 1) return { error: `"${bare}" matches ${sc.length} screens (${sc.map((s) => `${s.pid}.${s.name}`).join(', ')}) — rename one, or kill the stale one.` };
+      if (sc.length === 1) return { ok: true, name: sc[0].name, pid: String(sc[0].pid) };
+    }
+    if (!hashed && (/^\d{3}$/.test(bare) || (/^[A-Za-z0-9]{3}$/.test(bare) && !ids.some((x) => x.hashtag === lid)))) {
       const t = resolveTail(lid, ids, identityLabel);
       if (t.error) return { error: t.error.replace('gõ hashtag đầy đủ', 'gõ #hashtag đầy đủ (hoặc tele-<tên screen>)') };
       if (t.none) return { error: `no session matching "${bare}". ${listing()}` };
@@ -1135,8 +1145,9 @@ export function resolveKillPid(argv, { isScreen = () => false, tailAs = null } =
   // is a name, never the a7611284 screen.
   const words = [explicit ? tok.slice(5) : tok];
   for (let j = i + 2; i !== -1 && j < argv.length && !argv[j].startsWith('--'); j++) words.push(argv[j]);
-  if (i !== -1 && tailAs && words.length === 1) {
-    const t = parseAgentTarget(explicit ? tok.slice(5) : tok);
+  if (i !== -1 && tailAs && !/^pid:/i.test(tok)) {
+    // Read the WHOLE target like the process branch does (curly quotes survive the daemon tokenizer; `name: 780` is split) before classifying.
+    const t = parseAgentTarget(unquoteTarget(words.join(' ').trim()));
     if (t.kind === 'tail') {
       const r = tailAs(t.value);
       if (r.error) return { found: true, error: r.error };

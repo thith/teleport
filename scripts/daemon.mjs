@@ -1133,7 +1133,7 @@ export async function killViaSpawn(target, from, ctx, { runner = execFileP, scri
   } catch (e) { return ((e.stdout || '') + (e.stderr ? `\n${e.stderr}` : '')).trim() || `❌ kill lỗi: ${e.message || e}`; }
 }
 
-export async function handleTypeButton(cq, ctx, { runner = getTypeRunner(), list = listForType, io = defaultIo(), deliver = deliverResult, kill = killViaSpawn } = {}) {
+export async function handleTypeButton(cq, ctx, { runner = getTypeRunner(), list = listForType, procs = () => listClaudeProcs(), io = defaultIo(), deliver = deliverResult, kill = killViaSpawn } = {}) {
   const m = String(cq.data || '').match(TYPE_BUTTON_RE);
   const chatId = cq.message?.chat?.id, messageId = cq.message?.message_id;
   const original = cq.message?.text || '';
@@ -1142,8 +1142,10 @@ export async function handleTypeButton(cq, ctx, { runner = getTypeRunner(), list
     const h = m[1];
     if (!new RegExp(`#${h}\\b`).test(original)) { await ctx.answerButton(cq.id, 'Nút không khớp tin nhắn.'); return; }
     const personaOf = personaLookup();
-    // The tap names a hashtag only: two live agents behind it → nothing is picked (never the first).
-    const as = list({ personaOf, cfg: ctx.projectsConfig, io }).filter((x) => x.target.hashtag === h);
+    // The tap names a hashtag only: resolve it over ALL live rows first (a terminal twin the menu never listed refuses, like a typed /type #h).
+    const f = findTypeTarget(`#${h}`, procs(), personaOf);
+    if (f.error) { await ctx.answerButton(cq.id, 'Agent không còn / trùng.'); await ctx.editButtonRows(chatId, messageId, `${original}\n\n❌ #${h}: ${f.error}`, []); return; }
+    const as = list({ personaOf, cfg: ctx.projectsConfig, io }).filter((x) => x.target.hashtag === h && x.target.pid === f.row.pid);
     const a = as.length === 1 ? as[0] : null;
     if (!a) { await ctx.answerButton(cq.id, 'Agent không còn.'); await ctx.editButtonRows(chatId, messageId, `${original}\n\n❌ #${h} không còn trong screen — gõ /type lại.`, []); return; }
     const tok = crypto.randomBytes(8).toString('hex');
