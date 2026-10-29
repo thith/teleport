@@ -27,7 +27,8 @@ import { transcriptState, findTranscript, compactAfter, formatContext, contextWi
 
 export const TYPE_BUTTON_TTL_MS = 10 * 60 * 1000;
 export const TYPE_GAP_MS = 500;          // text → Enter (paste detection / suggestion box)
-export const TYPE_SETTLE_MS = 4000;      // how long to keep re-reading until the typed text shows (a busy box renders late)
+export const TYPE_SETTLE_MS = 12000;     // how long to keep re-reading until the typed text shows (a busy box renders late; an ATTACHED screen with a background tool running measured ~5–6 s). Every loop exits early on a match.
+export const SHOTS_KEEP = 10;            // hardcopies kept in type-shots/ (mismatch diagnostics)
 export const PROBE_CHAR = 'x';           // typed (then ⌫) to tell an empty box from Claude's dim suggestion
 // One clear round: End, kill to line start, kill to line end (on the now-empty line: pulls the next
 // line up), ⌫ (at column 0: joins the previous line). Repeated, it empties a draft of any length,
@@ -42,6 +43,23 @@ export const RC_BRIDGE_WAIT_MS = 15000;
 export const COMPACT_WATCH_MS = 5 * 60 * 1000;
 export const COMPACT_QUEUED_WATCH_MS = 30 * 60 * 1000; // queued behind a running turn
 export const AUDIT_FILE = path.join(process.env.XDG_STATE_HOME || path.join(os.homedir(), '.local', 'state'), 'teleport', 'type-audit.jsonl');
+
+/** Keep only the `keep` newest files in `dir` (names start with an ISO timestamp → name order = age). Never throws. */
+export function pruneShots(dir, keep = SHOTS_KEEP) {
+  try { for (const f of fs.readdirSync(dir).filter((n) => n.endsWith('.txt')).sort().reverse().slice(keep)) { try { fs.unlinkSync(path.join(dir, f)); } catch {} } } catch {}
+}
+/** Save a raw hardcopy as <dir>/<name> (0600, dir 0700), then prune. → path, or null. Best-effort, never throws. */
+export function saveShotFile(dir, name, text, keep = SHOTS_KEEP) {
+  try {
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    fs.chmodSync(dir, 0o700); // mkdir leaves an existing dir's mode as it was
+    const file = path.join(dir, name);
+    // 'wx' = O_EXCL: never reuse an existing file's mode or follow a planted symlink.
+    fs.writeFileSync(file, Buffer.from(String(text), 'latin1'), { mode: 0o600, flag: 'wx' });
+    pruneShots(dir, keep);
+    return file;
+  } catch { return null; }
+}
 
 // op letter (callback data) → command. Fixed table: the command never comes from stored data.
 // 'k' only asks (a confirm button follows); 'y' is that confirmation: /kill pid:<PID> (SIGTERM), not a keystroke.
@@ -271,6 +289,7 @@ export function defaultIo({ exec = execFileSync, sessionsDir = SESSIONS_DIR } = 
       try { mail = countUnread(String(convo)); } catch {}
       return { listener, mail };
     },
+    saveShot: (name, text) => saveShotFile(path.join(path.dirname(AUDIT_FILE), 'type-shots'), name, text),
     audit: (entry) => { try { fs.mkdirSync(path.dirname(AUDIT_FILE), { recursive: true }); fs.appendFileSync(AUDIT_FILE, JSON.stringify({ at: new Date().toISOString(), ...entry }) + '\n', { mode: 0o600 }); } catch {} },
   };
 }
@@ -364,16 +383,19 @@ export class TypeRunner {
     io.stuff(sid, cmd);
     audit('typed', { status: pre.status });
     // The text can take a moment to show: re-read until it does (≤ TYPE_SETTLE_MS) before calling it a mismatch.
-    let scr = null, line = null;
+    let scr = null, line = null, lastShot = null; // lastShot: the last READABLE screen, for the diagnostic only
     for (let waited = 0; ; waited += TYPE_GAP_MS) {
       await io.sleep(TYPE_GAP_MS);
       scr = await io.hardcopy(sid);
+      if (scr != null) lastShot = scr;
       line = parseInputLine(scr);
       if ((line === cmd && selects(scr)) || waited + TYPE_GAP_MS >= TYPE_SETTLE_MS) break;
     }
     if (line !== cmd || !selects(scr)) {
-      audit('input-mismatch', { line });
-      return { text: `⚠️ ô nhập có chữ khác (đọc được: "${line ?? '?'}") — đã gõ ${cmd} nhưng KHÔNG Enter, không gửi thêm phím nào. Vào xoá tay.` };
+      let shot = null; // the last raw hardcopy, for diagnosing late renders (best-effort)
+      if (lastShot != null) { try { shot = io.saveShot?.(`${new Date().toISOString().replaceAll(':', '-')}-${t.hashtag}.txt`, lastShot) ?? null; } catch {} }
+      audit('input-mismatch', { line, ...(shot ? { shot } : {}) });
+      return { text: `⚠️ ô nhập có chữ khác (đọc được: "${line ?? '?'}") sau ${Math.round(TYPE_SETTLE_MS / 1000)}s — đã gõ ${cmd} nhưng KHÔNG Enter, không gửi thêm phím nào. Chữ có thể hiện muộn (nhất là khi đang attach): nếu ô nhập đã có đúng lệnh thì Enter tay, không thì 🧹 xoá rồi thử lại.` };
     }
     const mid = observe(t, io);
     if (this.cancel.get(t.pid)) { audit('cancelled'); return { text: `✖ đã huỷ (⎋ Esc) — đã gõ ${cmd} nhưng KHÔNG Enter.` }; }
