@@ -137,6 +137,14 @@ export function pinTarget(r) {
   return { pid: r.pid, procStart: String(r.procStart), sessionId: r.sessionId, screenPid: r.screenPid, screen: r.screen, hashtag: r.hashtag, cwd: r.cwd, name: r.name ?? null };
 }
 
+/** Windows in `screen -Q windows` output (`0*$ bash  1 claude`): one match per window entry. Pure. */
+export const countScreenWindows = (out) => (String(out).match(/(?:^|\s{2})\d+\S*(?:\s|$)/g) || []).length;
+
+/** A screen's own window count (`sid` = `<pid>.<name>`), or null on any error — callers refuse unless it is exactly 1. */
+export function screenWindowCount(sid, exec = execFileSync) {
+  try { return countScreenWindows(exec('screen', ['-S', sid, '-Q', 'windows'], { encoding: 'utf8', timeout: 5000 })); } catch { return null; }
+}
+
 export const screenId = (t) => `${t.screenPid}.${t.screen}`;
 
 
@@ -271,7 +279,7 @@ export function defaultIo({ exec = execFileSync, sessionsDir = SESSIONS_DIR } = 
     proc: (pid) => inspectPid(pid),
     session: (pid) => { try { return parseSessionFile(fs.readFileSync(path.join(sessionsDir, `${pid}.json`), 'utf8')); } catch { return null; } },
     ppid: (pid) => { try { const s = fs.readFileSync(`/proc/${pid}/stat`, 'utf8'); return Number(s.slice(s.lastIndexOf(')') + 2).split(' ')[1]); } catch { return null; } },
-    windows: (sid) => { try { const out = String(exec('screen', ['-S', sid, '-Q', 'windows'], { encoding: 'utf8', timeout: 5000 })); return (out.match(/(?:^|\s{2})\d+\S*(?:\s|$)/g) || []).length; } catch { return null; } },
+    windows: (sid) => screenWindowCount(sid, exec),
     stuff: (sid, data) => exec('screen', ['-S', sid, '-p', '0', '-X', 'stuff', data], { timeout: 5000 }),
     hardcopy: async (sid) => {
       const f = path.join(os.tmpdir(), `teleport-type-${process.pid}-${crypto.randomBytes(4).toString('hex')}.txt`);

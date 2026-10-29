@@ -42,7 +42,7 @@ import { shortConvoHash } from './convo-hash.mjs';
 import { normalizeAgentName, parseAgentTarget, unquoteTarget, resolveTail, HASHTAG_RE } from './agent-target.mjs';
 import { createListenerStatus } from './listener-status.mjs';
 import { countUnread } from './mailbox.mjs';
-import { typeTargets, lsLinks } from './type-cmd.mjs';
+import { typeTargets, lsLinks, screenWindowCount } from './type-cmd.mjs';
 import { readTopicsStore } from './topics-store.mjs';
 import { formatPersona } from './persona.mjs';
 import { peekPersona } from './persona-store.mjs';
@@ -495,7 +495,7 @@ export async function gracefulKill(name, {
  * session with the same hashtag, and ONE window (an un-targeted `/exit` / quit would hit any
  * other window too). Occupants are found by screen NAME and by the screen's PID (a claude's STY
  * keeps the pid across a screen rename), so an unknown `screenPid` refuses; with it, no
- * occupant = empty screen → ok. `windows` = direct children of the screen process (one per
+ * occupant = empty screen → ok. `windows` = the screen's own window count (screenWindowCount; one per
  * window); null = unknown → refuse. Pure → { ok } | { error } (RFC 26 §3.7).
  */
 export function checkScreenKillTarget(name, procs, { screenPid = null, windows = null, descendantClaudes = [] } = {}) {
@@ -1656,7 +1656,7 @@ if (isDirectRun) {
     if (sameName.length === 1) name = sameName[0].name;
     const screenPid = Number(sameName[0]?.pid) || null;
     const ps = screenPid ? readPs() : null;
-    const windows = ps ? ps.filter((p) => p.ppid === screenPid).length : null;
+    const windows = screenPid ? screenWindowCount(`${screenPid}.${name}`) : null; // the screen's own window list (zombie windows count)
     const descendantClaudes = [];
     if (ps) {
       const byPpid = new Map();
@@ -1694,9 +1694,7 @@ if (isDirectRun) {
     const sessions = listSpawnSessions();
     let procs = [], procsError = null;
     try { procs = listClaudeProcs({ strict: true }); } catch (e) { procsError = e.message; }
-    let ps = null;
-    try { ps = readPs(); } catch { /* window counts unknown → agent addresses refused */ }
-    const windowsOf = (spid) => (ps && Number(spid) ? ps.filter((p) => p.ppid === Number(spid)).length : null);
+    const windowsOf = (spid) => (Number(spid) ? screenWindowCount(`${spid}.${sessions.find((x) => String(x.pid) === String(spid))?.name}`) : null);
     const r = resolveAttachTarget(attach.raw, sessions, { personaOf: makePersonaOf(), procs, procsError, windowsOf });
     if (r.error) { console.error(`[spawn] ${r.error}`); process.exit(1); }
     const name = r.name;

@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import {
   classify, allowedOps, typeTargets, pinTarget, agentLine, messageNamesTarget, parseInputLine, suggestionSelects,
   rcDialogReady, targetMismatch, TypeRunner, listForType, TYPE_BUTTON_RE, COOLDOWN_MS, defaultIo, compactRefusedOnScreen, isPlaceholder,
-  CLEAR_ROUND, CLEAR_ROUNDS_PER_SEND, CLEAR_MAX_SENDS, NUDGE_TEXT, NUDGE_LINES, NUDGE_MAX_LEN, findTypeTarget, nudgeText, unquoteTarget, lsLinks, TYPE_SETTLE_MS, saveShotFile } from './type-cmd.mjs';
+  CLEAR_ROUND, CLEAR_ROUNDS_PER_SEND, CLEAR_MAX_SENDS, NUDGE_TEXT, NUDGE_LINES, NUDGE_MAX_LEN, findTypeTarget, countScreenWindows, screenWindowCount, nudgeText, unquoteTarget, lsLinks, TYPE_SETTLE_MS, saveShotFile } from './type-cmd.mjs';
 
 const FIX = path.join(path.dirname(fileURLToPath(import.meta.url)), 'fixtures', 'type-hardcopy');
 const hc = (name) => fs.readFileSync(path.join(FIX, `${name}.txt`)).toString('latin1'); // as the daemon reads them
@@ -754,4 +754,15 @@ test('lsLinks: the same gates as the taps — kill needs a known session + start
   assert.deepEqual(lsLinks({ ...r, procStart: null }, { reachable: true }), []);
   assert.deepEqual(lsLinks({ ...r, sessionId: null }, { reachable: true }), []);
   assert.deepEqual(lsLinks({ ...r, hashtag: null }, { reachable: true }), []);
+});
+
+test('countScreenWindows / screenWindowCount: `-Q windows` output with 2 windows (one a dead/zombie entry) counts 2; any error → null', () => {
+  assert.equal(countScreenWindows('0*$ claude  1$ bash (Zombie)'), 2);
+  assert.equal(countScreenWindows('0*$ claude'), 1);
+  assert.equal(countScreenWindows(''), 0);
+  const seen = [];
+  const exec = (bin, argv, o) => { seen.push([bin, argv, o.timeout]); return '0*$ claude  1$ bash'; };
+  assert.equal(screenWindowCount('10.tele-a1111111', exec), 2);
+  assert.deepEqual(seen[0], ['screen', ['-S', '10.tele-a1111111', '-Q', 'windows'], 5000]);
+  assert.equal(screenWindowCount('10.x', () => { throw new Error('no screen'); }), null);
 });

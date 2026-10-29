@@ -1452,3 +1452,14 @@ test('RFC 28 r2 #3: agent-addressed attach refuses a multi-window / unknown-wind
   }
   assert.equal(resolveAttachTarget(null, [scr('f4451780', 10)], { windowsOf: () => 3 }).name, 'tele-f4451780', 'no-id lone session is unchanged');
 });
+
+test('attach window count comes from the screen\'s own window list: 2 windows (one zombie) or an unreadable list refuse agent addresses', async () => {
+  const { screenWindowCount } = await import('./type-cmd.mjs');
+  const sessions = [scr('f4451780', 10)];
+  const procs = [inRow('f4451780', 10)];
+  const mk = (exec) => ({ personaOf: pOf, procs, windowsOf: (spid) => screenWindowCount(`${spid}.tele-f4451780`, exec) });
+  assert.equal(resolveAttachTarget('780', sessions, mk(() => '0*$ claude')).name, 'tele-f4451780');
+  assert.match(resolveAttachTarget('780', sessions, mk(() => '0*$ claude  1$ bash (Zombie)')).error, /2 windows.*tele-f4451780/);
+  assert.match(resolveAttachTarget('780', sessions, mk(() => { throw new Error('boom'); })).error, /\? windows/);
+  assert.equal(resolveAttachTarget('tele-f4451780', sessions, mk(() => { throw new Error('boom'); })).name, 'tele-f4451780');
+});
