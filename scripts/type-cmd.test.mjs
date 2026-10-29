@@ -1,12 +1,13 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   classify, allowedOps, typeTargets, pinTarget, agentLine, messageNamesTarget, parseInputLine, suggestionSelects,
   rcDialogReady, targetMismatch, TypeRunner, listForType, TYPE_BUTTON_RE, COOLDOWN_MS, defaultIo, compactRefusedOnScreen, isPlaceholder,
-  CLEAR_ROUND, CLEAR_ROUNDS_PER_SEND, CLEAR_MAX_SENDS, NUDGE_TEXT, NUDGE_LINES, NUDGE_MAX_LEN, findTypeTarget, nudgeText, unquoteTarget, lsLinks } from './type-cmd.mjs';
+  CLEAR_ROUND, CLEAR_ROUNDS_PER_SEND, CLEAR_MAX_SENDS, NUDGE_TEXT, NUDGE_LINES, NUDGE_MAX_LEN, findTypeTarget, nudgeText, unquoteTarget, lsLinks, TYPE_SETTLE_MS, saveShotFile } from './type-cmd.mjs';
 
 const FIX = path.join(path.dirname(fileURLToPath(import.meta.url)), 'fixtures', 'type-hardcopy');
 const hc = (name) => fs.readFileSync(path.join(FIX, `${name}.txt`)).toString('latin1'); // as the daemon reads them
@@ -158,8 +159,45 @@ test('runner: a draft in the input box → typed but NO Enter and no other key (
   const { io, st } = fakeIo({ screens: [IDLE, hc('draft').replace('abc draft', 'abc draft/compact')] });
   const r = await new TypeRunner(io).run('c', T);
   assert.deepEqual(st.keys, ['/compact']);
-  assert.match(r.text, /KHÔNG Enter.*xoá tay/);
+  assert.match(r.text, /KHÔNG Enter.*Enter tay.*🧹/);
   assert.equal(st.audits.at(-1).step, 'input-mismatch');
+});
+
+test('runner: text appearing late (6 s, attached screen) still gets Enter', async () => {
+  const { io, st } = fakeIo({ screens: [IDLE] });
+  io.hardcopy = async () => (st.keys.length && st.now >= 6000 ? hc('compact-typed') : st.keys.length ? IDLE : IDLE);
+  const r = await new TypeRunner(io).run('c', T);
+  assert.deepEqual(st.keys, ['/compact', '\r']);
+  assert.match(r.text, /đã gõ \/compact/);
+});
+
+test('runner: mismatch after the cap saves the hardcopy (saveShot) and records `shot` in the audit', async () => {
+  const draft = hc('draft').replace('abc draft', 'abc draft/compact');
+  const { io, st } = fakeIo({ screens: [IDLE, draft] });
+  const saved = [];
+  io.saveShot = (name, text) => { saved.push({ name, text }); return `/shots/${name}`; };
+  const r = await new TypeRunner(io).run('c', T);
+  assert.deepEqual(st.keys, ['/compact']);
+  assert.ok(st.now >= TYPE_SETTLE_MS - 500);
+  assert.match(r.text, new RegExp(`sau ${Math.round(TYPE_SETTLE_MS / 1000)}s`));
+  assert.equal(saved.length, 1);
+  assert.match(saved[0].name, /^\d{4}-\d\d-\d\dT\d\d-\d\d-\d\d\.\d+Z-abcd1234\.txt$/);
+  assert.equal(saved[0].text, draft);
+  assert.equal(st.audits.at(-1).shot, `/shots/${saved[0].name}`);
+});
+
+test('saveShotFile: 0600 file in a 0700 dir, raw latin1 bytes, keeps only the 10 newest', () => {
+  const dir = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'shots-')), 'type-shots');
+  for (let i = 0; i < 13; i++) saveShotFile(dir, `2026-10-29T10-00-${String(i).padStart(2, '0')}.000Z-x.txt`, `s${i}\u00e9`);
+  const left = fs.readdirSync(dir).sort();
+  assert.equal(left.length, 10);
+  assert.equal(left[0], '2026-10-29T10-00-03.000Z-x.txt');
+  assert.equal(left.at(-1), '2026-10-29T10-00-12.000Z-x.txt');
+  assert.equal(fs.statSync(dir).mode & 0o777, 0o700);
+  const f = path.join(dir, left.at(-1));
+  assert.equal(fs.statSync(f).mode & 0o777, 0o600);
+  assert.deepEqual([...fs.readFileSync(f)], [...Buffer.from('s12\u00e9', 'latin1')]);
+  assert.equal(saveShotFile(path.join(f, 'sub'), 'a.txt', 'x'), null); // parent is a file → null, no throw
 });
 
 test('runner: state changes between typing and Enter → no Enter', async () => {
