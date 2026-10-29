@@ -52,8 +52,10 @@ export function pruneShots(dir, keep = SHOTS_KEEP) {
 export function saveShotFile(dir, name, text, keep = SHOTS_KEEP) {
   try {
     fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    fs.chmodSync(dir, 0o700); // mkdir leaves an existing dir's mode as it was
     const file = path.join(dir, name);
-    fs.writeFileSync(file, Buffer.from(String(text), 'latin1'), { mode: 0o600 });
+    // 'wx' = O_EXCL: never reuse an existing file's mode or follow a planted symlink.
+    fs.writeFileSync(file, Buffer.from(String(text), 'latin1'), { mode: 0o600, flag: 'wx' });
     pruneShots(dir, keep);
     return file;
   } catch { return null; }
@@ -381,16 +383,17 @@ export class TypeRunner {
     io.stuff(sid, cmd);
     audit('typed', { status: pre.status });
     // The text can take a moment to show: re-read until it does (≤ TYPE_SETTLE_MS) before calling it a mismatch.
-    let scr = null, line = null;
+    let scr = null, line = null, lastShot = null; // lastShot: the last READABLE screen, for the diagnostic only
     for (let waited = 0; ; waited += TYPE_GAP_MS) {
       await io.sleep(TYPE_GAP_MS);
       scr = await io.hardcopy(sid);
+      if (scr != null) lastShot = scr;
       line = parseInputLine(scr);
       if ((line === cmd && selects(scr)) || waited + TYPE_GAP_MS >= TYPE_SETTLE_MS) break;
     }
     if (line !== cmd || !selects(scr)) {
       let shot = null; // the last raw hardcopy, for diagnosing late renders (best-effort)
-      if (scr != null) { try { shot = io.saveShot?.(`${new Date().toISOString().replaceAll(':', '-')}-${t.hashtag}.txt`, scr) ?? null; } catch {} }
+      if (lastShot != null) { try { shot = io.saveShot?.(`${new Date().toISOString().replaceAll(':', '-')}-${t.hashtag}.txt`, lastShot) ?? null; } catch {} }
       audit('input-mismatch', { line, ...(shot ? { shot } : {}) });
       return { text: `⚠️ ô nhập có chữ khác (đọc được: "${line ?? '?'}") sau ${Math.round(TYPE_SETTLE_MS / 1000)}s — đã gõ ${cmd} nhưng KHÔNG Enter, không gửi thêm phím nào. Chữ có thể hiện muộn (nhất là khi đang attach): nếu ô nhập đã có đúng lệnh thì Enter tay, không thì 🧹 xoá rồi thử lại.` };
     }

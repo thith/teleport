@@ -200,6 +200,32 @@ test('saveShotFile: 0600 file in a 0700 dir, raw latin1 bytes, keeps only the 10
   assert.equal(saveShotFile(path.join(f, 'sub'), 'a.txt', 'x'), null); // parent is a file → null, no throw
 });
 
+test('runner: the last READ fails (null) → the last readable screen is still saved; no Enter', async () => {
+  const draft = hc('draft').replace('abc draft', 'abc draft/compact');
+  const { io, st } = fakeIo({ screens: [IDLE] });
+  io.hardcopy = async () => (!st.keys.length ? IDLE : st.now >= TYPE_SETTLE_MS - 1000 ? null : draft);
+  const saved = [];
+  io.saveShot = (name, text) => { saved.push(text); return '/shots/x'; };
+  const r = await new TypeRunner(io).run('c', T);
+  assert.deepEqual(st.keys, ['/compact']);
+  assert.match(r.text, /KHÔNG Enter/);
+  assert.deepEqual(saved, [draft]);
+});
+
+test('saveShotFile: tightens an existing permissive dir, never overwrites or follows a symlink', () => {
+  const dir = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'shots-')), 'type-shots');
+  fs.mkdirSync(dir, { mode: 0o755 }); fs.chmodSync(dir, 0o755);
+  const target = path.join(path.dirname(dir), 'victim');
+  fs.writeFileSync(target, 'keep');
+  fs.symlinkSync(target, path.join(dir, 'a.txt'));
+  assert.equal(saveShotFile(dir, 'a.txt', 'secret'), null); // O_EXCL refuses the planted symlink
+  assert.equal(fs.readFileSync(target, 'utf8'), 'keep');
+  assert.equal(fs.statSync(dir).mode & 0o777, 0o700);
+  fs.writeFileSync(path.join(dir, 'b.txt'), 'old', { mode: 0o644 });
+  assert.equal(saveShotFile(dir, 'b.txt', 'new'), null); // an existing file is never reused
+  assert.equal(fs.readFileSync(path.join(dir, 'b.txt'), 'utf8'), 'old');
+});
+
 test('runner: state changes between typing and Enter → no Enter', async () => {
   const { io, st } = fakeIo({ screens: [IDLE, hc('compact-typed')], onStuff: (s, d) => { if (d === '/compact') s.status = 'waiting'; } });
   const r = await new TypeRunner(io).run('c', T);
