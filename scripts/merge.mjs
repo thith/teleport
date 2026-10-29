@@ -168,11 +168,20 @@ export function branchRefPath(branch) {
  * keep it. Pure → { ok } | { keep: reason }.
  */
 export const OPEN_PR_LIST_LIMIT = 1000;
+/**
+ * Long-lived integration branches: a release PR (`pre-develop → main`) has one
+ * as its HEAD, but it must survive the merge — deleting it broke every agent's
+ * PR/deploy target (digesty-frontend pre-develop, 28/10). For the same reason
+ * such a base is never a stacked PR's "dead" base, even while its tip still
+ * equals that release PR's head.
+ */
+export const INTEGRATION_BRANCHES = new Set(['main', 'master', 'develop', 'pre-develop', 'staging', 'production']);
 export function branchDeletable(branch, { defaultBranch, openPrs, selfNumber, limit = OPEN_PR_LIST_LIMIT }) {
   if (!defaultBranch || !Array.isArray(openPrs)) return { keep: 'could not check whether other PRs use it' };
   // A full page may be truncated: an unseen PR could still use the branch.
   if (openPrs.length >= limit) return { keep: `too many open PRs (≥${limit}) to be sure no other PR uses it` };
   if (branch === defaultBranch) return { keep: 'it is the default branch' };
+  if (INTEGRATION_BRANCHES.has(branch)) return { keep: 'it is a long-lived integration branch' };
   const users = openPrs.filter((p) => p.number !== selfNumber && (p.headRefName === branch || p.baseRefName === branch));
   if (users.length) return { keep: `still used by open PR ${users.map((p) => `#${p.number}`).join(', ')}` };
   return { ok: true };
@@ -197,6 +206,7 @@ export function repoCtx(repo) {
 
 export function baseIsMergedHead(base, gh, repo = null) {
   const c = repoCtx(repo);
+  if (INTEGRATION_BRANCHES.has(base)) return false;
   const defaultBranch = JSON.parse(gh([...c.view, '--json', 'defaultBranchRef'])).defaultBranchRef?.name;
   if (base === defaultBranch) return false;
   const merged = JSON.parse(gh(['pr', 'list', ...c.R, '--state', 'merged', '--head', base, '--limit', '50', '--json', 'number,headRefOid,isCrossRepository']));
