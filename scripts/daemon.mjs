@@ -531,10 +531,14 @@ const pinLine = (l, sha, base) => `📌 ${l} @ ${String(sha).slice(0, 12)}${base
  * (and its pinned commit, when pinned) must be written in it — so a tampered
  * persisted entry can't redirect the owner's tap. Pure.
  */
+export const KEEP_BRANCH_NOTE = 'giữ nhánh nguồn (--keep-branch)';
 export function entryMatchesMessage(entry, text) {
   const t = String(text || '');
   const heads = entry.heads || {}, bases = entry.bases || {};
   const lines = t.split('\n');
+  // The owner tapped a message that either showed "giữ nhánh nguồn (--keep-branch)" or not: the
+  // stored flag must agree, so an edited store can't flip whether the source branch is deleted.
+  if ((entry.keepBranch === true) !== t.includes(KEEP_BRANCH_NOTE)) return false;
   // Whole lines / whole links: `…/pull/3` must not match a message showing `…/pull/36`.
   return (entry.links || []).length > 0 && entry.links.every((l) => (heads[l]
     ? lines.includes(pinLine(l, heads[l], bases[l]))
@@ -570,7 +574,7 @@ function childEnv(from, role, secretEnvKeys, extra = {}) {
 export async function handlePrLinks(links, msg, {
   daemonUserId, projectsConfig, registry, sendText, sendButtons, secretEnvKeys = [],
   runner = execFileP, scriptsDir = __dirname, parentDir = PARENT_DIR, store = pendingMergeButtons,
-  requester = null, header = '', deliver = deliverResult, fetchHead = null,
+  requester = null, header = '', deliver = deliverResult, fetchHead = null, keepBranch = false,
 }) {
   const spec = resolveCommand('merge', registry);
   if (!spec || !sendButtons) return;
@@ -621,7 +625,7 @@ export async function handlePrLinks(links, msg, {
     return { offered: false };
   }
   const tok = crypto.randomBytes(8).toString('hex');
-  store.set(tok, { links, chatId: msg.chat.id, createdAt: Date.now(), canMerge, heads, bases, ...(requester ? { requester } : {}) });
+  store.set(tok, { links, chatId: msg.chat.id, createdAt: Date.now(), canMerge, heads, bases, ...(requester ? { requester } : {}), ...(keepBranch === true ? { keepBranch: true } : {}) });
   // Keep the button message well under Telegram's 4096 chars (status edits are
   // appended later): a long batch preview goes out first as its own message.
   const what = links.length > 1 ? `these ${links.length} PRs (in order)` : 'this PR';
@@ -630,8 +634,9 @@ export async function handlePrLinks(links, msg, {
   // The pinned commits are part of the button message itself: a press is only
   // honoured if what it would act on is written in the message the owner saw.
   const pins = pinLines(heads, bases);
-  let body = `${head}${out}${pins}\n\n${ask}`;
-  if (body.length > PREVIEW_INLINE_MAX) { await sendText(msg.chat.id, out); body = `${head}🔎 ${links.length} PR(s) ready — details above.${pins}\n\n${ask}`; }
+  const keepNote = keepBranch === true ? ` · ${KEEP_BRANCH_NOTE}` : '';
+  let body = `${head}${out}${pins}\n\n${ask}${keepNote}`;
+  if (body.length > PREVIEW_INLINE_MAX) { await sendText(msg.chat.id, out); body = `${head}🔎 ${links.length} PR(s) ready — details above.${pins}\n\n${ask}${keepNote}`; }
   await sendButtons(msg.chat.id, body,
     [
       ...(canMerge ? [{ text: '✅ Merge', callback_data: `mg:${tok}` }] : []),
@@ -695,7 +700,7 @@ export async function handleMergeButton(cq, ctx, { take = takeMergeButton, dispa
       await deliver({ convoId: entry.requester.convoId, text: t, mode: 'ask' }).catch(() => {});
     }
     : ctx.sendText;
-  await dispatch({ cmd: 'merge', rest: entry.links.join(' ') + (closing ? ' --close' : pinArgs) }, cq.from || {}, { ...ctx, registry, sendText });
+  await dispatch({ cmd: 'merge', rest: entry.links.join(' ') + (closing ? ' --close' : pinArgs + (entry.keepBranch === true ? ' --keep-branch' : '')) }, cq.from || {}, { ...ctx, registry, sendText });
 }
 
 // ── Agent merge requests (file inbox; see merge-request.mjs / merge-inbox.mjs) ─
@@ -763,7 +768,7 @@ export async function processMergeRequests(ctx, {
         let ok = true, text;
         try {
           // --skip-merged: a request retried after a crash continues past the PRs it already merged.
-          const r = await runner(process.execPath, [path.join(scriptsDir, spec.run), ...spec.args.filter((a) => a !== '--close'), ...req.links, '--skip-merged'], {
+          const r = await runner(process.execPath, [path.join(scriptsDir, spec.run), ...spec.args.filter((a) => a !== '--close'), ...req.links, '--skip-merged', ...(req.keepBranch ? ['--keep-branch'] : [])], {
             cwd: ctx.parentDir ?? PARENT_DIR, env: childEnv(owner, role, secretEnvKeys), timeout: COMMAND_TIMEOUT_MS, maxBuffer: COMMAND_MAX_BUFFER,
           });
           text = (r.stdout || '').trim();
@@ -775,7 +780,7 @@ export async function processMergeRequests(ctx, {
       } else {
         try {
           await prLinks(req.links, { chat: { id: daemonUserId }, from: { id: daemonUserId } },
-            { ...ctx, requester: { convoId: req.convoId, label: who }, header: `📨 ${who} xin merge (${decision.reason}):`, deliver });
+            { ...ctx, requester: { convoId: req.convoId, label: who }, header: `📨 ${who} xin merge${req.keepBranch ? ' · giữ nhánh nguồn' : ''} (${decision.reason}):`, deliver, keepBranch: req.keepBranch });
         } catch (e) {
           // Couldn't reach the owner (Telegram error) → the agent must not wait forever.
           await deliver({ convoId: req.convoId, text: `⚠️ Không gửi được yêu cầu tới owner (${e?.message ?? e}) — thử merge-request lại sau.`, mode: 'ask' }).catch(() => {});

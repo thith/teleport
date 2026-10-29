@@ -103,14 +103,15 @@ export function decideRequest(links, { autoEnabled, allowed }) {
   return { mode: 'auto' };
 }
 
-/** Validate a parsed request body → { links, convoId } | null. Pure. */
+/** Validate a parsed request body → { links, convoId, keepBranch? } | null. Pure. */
 export function validRequest(req, { now = Date.now(), maxAgeMs = REQUEST_MAX_AGE_MS } = {}) {
   if (!req || typeof req !== 'object' || !Array.isArray(req.links) || !req.links.length || req.links.length > 20) return null;
   if (!req.links.every((l) => typeof l === 'string' && parsePrUrl(l))) return null;
   if (!/^\d{1,20}$/.test(String(req.convoId ?? ''))) return null;
+  if (req.keepBranch !== undefined && typeof req.keepBranch !== 'boolean') return null;
   if (typeof req.createdAt === 'number' && now - req.createdAt > maxAgeMs) return null;
   // Canonical URLs only from here on: nothing but owner/name/pull/N reaches merge.mjs.
-  return { links: [...new Set(req.links.map(canonicalPrUrl))], convoId: String(req.convoId) };
+  return { links: [...new Set(req.links.map(canonicalPrUrl))], convoId: String(req.convoId), ...(req.keepBranch === true ? { keepBranch: true } : {}) };
 }
 
 /**

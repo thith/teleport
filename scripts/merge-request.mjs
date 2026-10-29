@@ -1,6 +1,10 @@
 // merge-request.mjs — an AGENT asks the teleport daemon to merge its PR(s).
 //
-//   node ../teleport/scripts/merge-request.mjs <PR URL> [<PR URL> …]
+//   node ../teleport/scripts/merge-request.mjs <PR URL> [<PR URL> …] [--keep-branch]
+//
+// --keep-branch: do NOT delete the PRs' source branches after merge (default: deleted).
+// Applies to every PR in the request. Long-lived integration branches (main, master,
+// develop, pre-develop, staging, production) are always kept regardless.
 //
 // Writes a request into the daemon's file inbox (scripts/tmp/merge-requests/).
 // The daemon then either merges it right away (auto-merge ON and every PR's repo
@@ -24,26 +28,28 @@ import { parsePrUrl } from './merge.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 export const MERGE_REQUEST_DIR = path.join(__dirname, 'tmp', 'merge-requests');
-export const USAGE = 'usage: node ../teleport/scripts/merge-request.mjs <PR URL> [<PR URL> …]   (run inside your agent session)';
+export const USAGE = 'usage: node ../teleport/scripts/merge-request.mjs <PR URL> [<PR URL> …] [--keep-branch]   (run inside your agent session)';
 
-/** argv → { links } | { error }. Pure. */
+/** argv → { links, keepBranch? } | { error }. `--keep-branch` may appear anywhere. Pure. */
 export function parseRequestArgs(argv) {
   const links = [];
+  let keepBranch = false;
   for (const a of argv) {
+    if (a === '--keep-branch') { keepBranch = true; continue; }
     if (!parsePrUrl(a)) return { error: `not a GitHub PR URL: ${JSON.stringify(a)}\n${USAGE}` };
     if (!links.includes(a)) links.push(a);
   }
   if (!links.length) return { error: USAGE };
-  return { links };
+  return keepBranch ? { links, keepBranch: true } : { links };
 }
 
 /** Atomically drop one request file (write temp, then rename) → its path. */
-export function writeRequest({ links, convoId, dir = MERGE_REQUEST_DIR, now = Date.now() }) {
+export function writeRequest({ links, convoId, keepBranch = false, dir = MERGE_REQUEST_DIR, now = Date.now() }) {
   fs.mkdirSync(dir, { recursive: true });
   const name = `${now}-${crypto.randomBytes(4).toString('hex')}`;
   const tmp = path.join(dir, `.${name}.tmp`);
   const file = path.join(dir, `${name}.json`);
-  fs.writeFileSync(tmp, JSON.stringify({ links, convoId: String(convoId), createdAt: now }) + '\n', { mode: 0o600 });
+  fs.writeFileSync(tmp, JSON.stringify({ links, convoId: String(convoId), createdAt: now, ...(keepBranch === true ? { keepBranch: true } : {}) }) + '\n', { mode: 0o600 });
   fs.renameSync(tmp, file);
   return file;
 }
@@ -53,6 +59,6 @@ if (isMainModule(import.meta.url)) {
   if (args.error) { console.error(`[merge-request] ${args.error}`); process.exit(2); }
   const { convoId } = resolveConvoIdFromEnv({ argConvo: null });
   if (convoId == null) { console.error('[merge-request] no session convo (run inside your agent session) — the result could not be routed back.'); process.exit(2); }
-  writeRequest({ links: args.links, convoId });
-  console.log(`[merge-request] queued ${args.links.length} PR(s). The daemon merges it (auto-merge) or asks the owner with buttons; the result comes back to your topic as a prompt (mergeResult). Don't ask the user to type /merge.`);
+  writeRequest({ links: args.links, convoId, keepBranch: args.keepBranch });
+  console.log(`[merge-request] queued ${args.links.length} PR(s)${args.keepBranch ? ' (source branch kept)' : ''}. The daemon merges it (auto-merge) or asks the owner with buttons; the result comes back to your topic as a prompt (mergeResult). Don't ask the user to type /merge.`);
 }
