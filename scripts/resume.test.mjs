@@ -178,7 +178,7 @@ test('runMain: --list-stopped (the ONLY argument) lists and never resumes; with 
   // an unreadable process list degrades to a warning in list mode …
   const bad = { ...d, listClaudeProcs: () => { throw new Error('ps down'); } };
   assert.equal(await runMain(['--list-stopped'], bad), 0);
-  assert.match(logs.at(-1), /⚠️ không đọc được danh sách process/);
+  assert.match(logs.at(-1), /⚠️ +không đọc được danh sách process/);
   // … but resuming blind is refused
   assert.equal(await runMain(['780'], bad), 1);
   assert.match(logs.at(-1), /not resuming blind/);

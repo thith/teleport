@@ -428,3 +428,10 @@ test('formatAgentList: the leading emoji of EVERY label branch is Emoji_Presenta
   for (const label of ['🚦 Trạng thái:', '🕒 Uptime:', '💻 Terminal (', '💻 PID 3', '📺 Screen (']) assert.ok(all.includes(label), label);
   assert.doesNotMatch(all, /[\u{1F5A5}\u2699\u23F1]/u, 'the old text-presentation emoji are gone');
 });
+
+test('padNarrowEmoji: one extra space after a narrow-by-default emoji (🕷 🕊 ☃ ⚠), wide ones and text untouched', async () => {
+  const { padNarrowEmoji } = await import('./claude-procs.mjs');
+  assert.equal(padNarrowEmoji('🕷️ Nhện · 🕊 Bồ câu · ☃ Tuyết'), '🕷️  Nhện · 🕊  Bồ câu · ☃  Tuyết');
+  assert.equal(padNarrowEmoji('🐺 Sói · 🪼 Sứa #f4451780 · 🚦 Trạng thái'), '🐺 Sói · 🪼 Sứa #f4451780 · 🚦 Trạng thái');
+  assert.equal(padNarrowEmoji('©x 🕷end'), '©x 🕷end'); // no space after → nothing to protect
+});

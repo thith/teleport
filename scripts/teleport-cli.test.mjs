@@ -12,7 +12,7 @@ const BIN = path.join(ROOT, 'bin', 'teleport.mjs');
 const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), 'tele-cli-'));
 
 test('parse: each subcommand builds the right spawn.mjs argv', () => {
-  assert.deepEqual(parse(['ls']), { script: 'spawn', args: ['--list'] });
+  assert.deepEqual(parse(['ls']), { script: 'spawn', args: ['--list', '--short'] });
   assert.deepEqual(parse(['ls', 'full']), { script: 'spawn', args: ['--list', 'full'] });
   assert.deepEqual(parse(['attach']), { script: 'spawn', args: ['--attach'] });
   assert.deepEqual(parse(['a', '116']), { script: 'spawn', args: ['--attach', '116'] });
