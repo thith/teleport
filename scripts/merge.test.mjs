@@ -64,6 +64,14 @@ test('branchDeletable: never the default branch or a branch another open PR uses
   assert.match(branchDeletable('feat/x', { defaultBranch: 'main', openPrs, selfNumber: 5, limit: 2 }).keep, /too many open PRs/, 'a full page may be truncated → keep');
 });
 
+test('integration branches: never deleted after a release PR, never a stacked PR\'s dead base', async () => {
+  for (const b of ['pre-develop', 'develop', 'main', 'master', 'staging'])
+    assert.match(branchDeletable(b, { defaultBranch: 'trunk', openPrs: [], selfNumber: 1 }).keep, /integration branch/, b);
+  // release pre-develop → main merged; pre-develop re-created / unmoved at that head: a PR into it still merges
+  const f = fakeGh({ 955: PR(955, { state: 'MERGED', headRefName: 'pre-develop', baseRefName: 'main' }), 956: PR(956, { baseRefName: 'pre-develop' }) }, { defaultBranch: 'develop', tips: { 'pre-develop': 'sha955' } });
+  assert.equal((await mergeOne(956, ARGS([956]), { gh: f.gh })).ok, true);
+});
+
 // Fake gh: a tiny in-memory GitHub.
 function fakeGh(prs, { defaultBranch = 'main', unknownFor = {}, tips = {} } = {}) {
   const calls = [];
