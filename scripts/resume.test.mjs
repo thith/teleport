@@ -176,9 +176,11 @@ test('runMain: --list-stopped (the ONLY argument) lists and never resumes; with 
   assert.equal(await runMain(['--list-stopped', '--', '--model', 'x'], d), 1, 'a query with forwarded flags is not list mode');
   assert.equal(performed, 0);
   // an unreadable process list degrades to a warning in list mode …
-  const bad = { ...d, listClaudeProcs: () => { throw new Error('ps down'); } };
+  const bad = { ...d, env: {}, listClaudeProcs: () => { throw new Error('ps down'); } };
   assert.equal(await runMain(['--list-stopped'], bad), 0);
-  assert.match(logs.at(-1), /⚠️ +không đọc được danh sách process/);
+  assert.match(logs.at(-1), /⚠️  không đọc được danh sách process/, 'a terminal gets the narrow ⚠️ padded');
+  assert.equal(await runMain(['--list-stopped'], { ...bad, env: { TELE_FROM_ID: '1' } }), 0);
+  assert.match(logs.at(-1), /⚠️ không đọc được danh sách process/, 'Telegram (/resume --list-stopped via the daemon) is not padded');
   // … but resuming blind is refused
   assert.equal(await runMain(['780'], bad), 1);
   assert.match(logs.at(-1), /not resuming blind/);

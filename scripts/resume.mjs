@@ -178,7 +178,9 @@ export async function runMain(argv, d = {}) {
   if (argv.length === 1 && argv[0] === '--list-stopped') {
     let liveRows = [], procsError = null;
     try { liveRows = listLive({ strict: true }); } catch (e) { procsError = e?.message ?? String(e); }
-    log(procsMod.padNarrowEmoji(formatStopped(candidates(), { liveRows, procsError, now: d.now }))); // terminal only
+    const out = formatStopped(candidates(), { liveRows, procsError, now: d.now });
+    // The daemon forwards `/resume --list-stopped` here with TELE_FROM_ID set: pad for a terminal only.
+    log((d.env ?? process.env).TELE_FROM_ID ? out : procsMod.padNarrowEmoji(out));
     return 0;
   }
   // Forwarded claude flags (RFC 18): split BEFORE joining the name query — a flag must never become part of the name.
