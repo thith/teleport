@@ -170,9 +170,9 @@ test('formatAgentList: status + mailbox lines in the block of agents with a conv
     mailOf: (c) => (c === cTerm ? 2 : 0),
     convoOfHashtag: (h) => (h === 'e5424020' ? 4242 : null),
   });
-  assert.match(out, new RegExp(`⏱️ Uptime: 1:00\\n🎧 S${cScreen}\\n\\n`));
-  assert.match(out, new RegExp(`📁 Folder: b\\n⏱️ Uptime: 1:00\\n🎧 S${cTerm}\\n📬 Mailbox: 2 thư chưa đọc`));
-  assert.match(out, /🖥 PID 3\n🔢 PID: 3\n📁 Folder: c\n⏱️ Uptime: 1:00(\n\n|$)/); // no convo → nothing extra
+  assert.match(out, new RegExp(`🕒 Uptime: 1:00\\n🎧 S${cScreen}\\n\\n`));
+  assert.match(out, new RegExp(`📁 Folder: b\\n🕒 Uptime: 1:00\\n🎧 S${cTerm}\\n📬 Mailbox: 2 thư chưa đọc`));
+  assert.match(out, /💻 PID 3\n🔢 PID: 3\n📁 Folder: c\n🕒 Uptime: 1:00(\n\n|$)/); // no convo → nothing extra
   assert.match(out, /🎧 S4242/, 'a tele-* screen without a session falls back to the topics store');
   assert.deepEqual(seen.sort(), [4242, cScreen, cTerm].sort());
 });
@@ -206,4 +206,19 @@ test('newestUnreadAt: newest unread topic message (its date) or queued prompt (m
   assert.equal(status(dir2, { cacheFile: writeCache(dir2, [edited]) }).newestUnreadAt(CONVO), sec(30) * 1000, 'an edit counts at its edit_date');
   assert.equal(status(tmp()).newestUnreadAt(CONVO), null);
   assert.equal(st.newestUnreadAt('garbage'), null);
+});
+
+test('status labels (inline and /ls lines): the leading emoji is Emoji_Presentation with no U+FE0F (RFC 28 §2.1)', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ls-emoji-'));
+  fs.writeFileSync(path.join(dir, 'prompt-convo-7.json'), JSON.stringify({ messages: [{ text: 'a' }] }));
+  fs.writeFileSync(path.join(dir, 'prompt-convo-7.processing.json'), '{}');
+  const off = createListenerStatus({ tmpDir: dir, registryFile: path.join(dir, 'none.jsonl'), cacheFile: null, topics: {}, isLive: () => false });
+  const on = createListenerStatus({ tmpDir: dir, registryFile: path.join(dir, 'none.jsonl'), cacheFile: null, topics: {}, isLive: () => true });
+  const labels = [...off.lines(7), ...on.lines(7), ...off(7).split(' · '), ...on(7).split(' · ')];
+  assert.ok(labels.length >= 6);
+  for (const l of labels) {
+    assert.match(l, /^\p{Emoji_Presentation}/u, l);
+    assert.doesNotMatch(l, /\uFE0F/u, l);
+  }
+  fs.rmSync(dir, { recursive: true, force: true });
 });
