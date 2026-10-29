@@ -516,7 +516,7 @@ export function checkScreenKillTarget(name, procs, { screenPid = null, windows =
     return { error: `claude trong "${name}" không phải session #${tag}${r.sessionId ? ` (${r.guessed ? 'đoán ' : ''}${r.sessionId})` : ''} — dùng /kill pid:${r.pid}.` };
   }
   // Any OTHER live claude with this hashtag — even one holding the same session — except the occupant's own children.
-  const twins = procs.filter((p) => p.pid !== r.pid && p.ppid !== r.pid && p.hashtag === tag);
+  const twins = procs.filter((p) => p.pid !== r.pid && !(p.ppid === r.pid && p.sessionId && !p.guessed && p.sessionId === r.sessionId) && p.hashtag === tag); // a child is the same agent only on the SAME session (hashtags can collide)
   if (twins.length) return { error: `#${tag} trùng với ${twins.map((p) => `PID ${p.pid}`).join(', ')} — dùng /kill pid:${r.pid}.` };
   return { ok: true };
 }
@@ -577,12 +577,12 @@ export function agentIdentities(screens, procs, personaOf = () => null) {
     const sure = inside.filter((r) => r.sessionId && !r.guessed && r.hashtag);
     const base = { screen: sc.name, screenPid: String(sc.pid) };
     for (const r of inside) taken.add(r);
-    // A descendant (`claude -p`) is no occupant, but its tail still counts (a /kill 657 must not pick the parent when the child ends in 657) — except one on the occupant's own hashtag (same agent).
-    for (const r of all) if (!inside.includes(r) && sure.some((o) => o.hashtag === r.hashtag)) taken.add(r);
+    // A descendant (`claude -p`) is no occupant, but its tail still counts (a /kill 657 must not pick the parent when the child ends in 657) — except one holding the occupant's own (confirmed) session: distinct sessions can share a hashtag.
+    for (const r of all) if (!inside.includes(r) && r.sessionId && !r.guessed && sure.some((o) => o.sessionId === r.sessionId)) taken.add(r);
     for (const r of sure) out.push({ ...base, hashtag: r.hashtag.toLowerCase(), persona: safe(r), row: r, confirmed: true });
     if (!sure.length) out.push({ ...base, hashtag: label, persona: safe({ hashtag: label }), confirmed: false, occupied: inside.length > 0 });
-    // A custom screen name (tele-giun, tele-bot) is a screen name only: a label identity exists when the label has hashtag shape.
-    else if (HASHTAG_RE.test(label) && !sure.some((r) => r.hashtag.toLowerCase() === label)) out.push({ ...base, hashtag: label, persona: null, confirmed: false, mismatch: true });
+    // A custom screen name (tele-giun, tele-bot) is a screen name only: a label identity exists when a hashtag/tail address could match the label (hashtag shape or exactly 3 digits).
+    else if ((HASHTAG_RE.test(label) || /^\d{3}$/.test(label)) && !sure.some((r) => r.hashtag.toLowerCase() === label)) out.push({ ...base, hashtag: label, persona: null, confirmed: false, mismatch: true });
     // A guessed occupant under another hashtag: not an identity, but its tail still counts toward ambiguity.
     for (const r of inside) if (!sure.includes(r) && r.hashtag && r.hashtag.toLowerCase() !== label) out.push({ ...base, hashtag: r.hashtag.toLowerCase(), persona: null, confirmed: false, mismatch: true });
   }
@@ -610,12 +610,17 @@ const liveList = (ids) => liveScreens(ids).map(identityLabel).join(', ');
  * `personaOf(row)` and `procs` (listClaudeProcs rows) come from the caller; `procsError` set = the
  * process list is unknown, so agent addresses (3, 4) are refused. Pure → `{ ok, name, pid }` | `{ error }`.
  */
-export function resolveAttachTarget(raw, sessions, { personaOf = () => null, procs = [], procsError = null } = {}) {
+export function resolveAttachTarget(raw, sessions, { personaOf = () => null, procs = [], procsError = null, windowsOf = () => 1 } = {}) {
   if (!sessions.length) return { error: 'no live agent sessions (try: teleport ls).' };
   const id = raw == null ? '' : String(raw).trim();
   const ids = agentIdentities(sessions, procs, personaOf);
   const listing = () => `live: ${liveList(ids) || formatSessionList(sessions)}`;
-  const done = (x) => ({ ok: true, name: x.screen, pid: x.screenPid });
+  // `screen -r pid.name` selects no window: an agent address into a multi-window (or unknown) screen could open another agent's window.
+  const done = (x) => {
+    const w = windowsOf(x.screenPid);
+    if (w !== 1) return { error: `screen ${x.screen} has ${w ?? '?'} windows — can't tell which holds the agent. Use the explicit screen address: tele-… (${x.screen}).` };
+    return { ok: true, name: x.screen, pid: x.screenPid };
+  };
 
   // (1) NO id → exactly one live session (a lone survivor), else require an id.
   if (!id) {
@@ -646,7 +651,7 @@ export function resolveAttachTarget(raw, sessions, { personaOf = () => null, pro
       // 3 letters/digits that are no hashtag: an exact custom screen name (tele-bot) still answers to them.
       const sc = sessions.filter((s) => s.name.toLowerCase() === `tele-${lid}`);
       if (sc.length > 1) return { error: `"${bare}" matches ${sc.length} screens (${sc.map((s) => `${s.pid}.${s.name}`).join(', ')}) — rename one, or kill the stale one.` };
-      if (sc.length === 1) return { ok: true, name: sc[0].name, pid: String(sc[0].pid) };
+      if (sc.length === 1) return done({ screen: sc[0].name, screenPid: String(sc[0].pid) });
     }
     if (!hashed && (/^\d{3}$/.test(bare) || (/^[A-Za-z0-9]{3}$/.test(bare) && !ids.some((x) => x.hashtag === lid)))) {
       const t = resolveTail(lid, ids, identityLabel);
@@ -1689,7 +1694,10 @@ if (isDirectRun) {
     const sessions = listSpawnSessions();
     let procs = [], procsError = null;
     try { procs = listClaudeProcs({ strict: true }); } catch (e) { procsError = e.message; }
-    const r = resolveAttachTarget(attach.raw, sessions, { personaOf: makePersonaOf(), procs, procsError });
+    let ps = null;
+    try { ps = readPs(); } catch { /* window counts unknown → agent addresses refused */ }
+    const windowsOf = (spid) => (ps && Number(spid) ? ps.filter((p) => p.ppid === Number(spid)).length : null);
+    const r = resolveAttachTarget(attach.raw, sessions, { personaOf: makePersonaOf(), procs, procsError, windowsOf });
     if (r.error) { console.error(`[spawn] ${r.error}`); process.exit(1); }
     const name = r.name;
     // Hand the TTY to screen. `-r` re-attaches; `-d -r` steals it back if the

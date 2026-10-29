@@ -1414,3 +1414,41 @@ test('resolveKillTail: tele-<hashtag> screen holding that very agent → screen 
   assert.match(resolveKillTail('780', [scr('780', 30), ...sessions], [...procs, inRow('780', 30, { sessionId: null, hashtag: null })], pOf).error, /khớp 2 agent/);
   assert.match(resolveKillTail('999', sessions, procs, pOf).error, /no live agent with tail/);
 });
+
+test('RFC 28 r2 #1: a numeric screen label `tele-780` (holding #a1111111) still collides with tail 780 of #b2222780 — attach and /kill refuse', () => {
+  const sessions = [scr('780', 10), scr('b2222780', 20)];
+  const procs = [inRow('780', 10, { hashtag: 'a1111111', sessionId: 'sid-a' }), inRow('b2222780', 20)];
+  assert.match(resolveAttachTarget('780', sessions, { procs }).error, /"780" khớp 2 agent/);
+  assert.match(resolveKillTail('780', sessions, procs, pOf).error, /"780" khớp 2 agent/);
+  assert.equal(resolveAttachTarget('tele-780', sessions, { procs }).name, 'tele-780');
+  // ordinary custom names stay out of tail resolution
+  assert.equal(resolveAttachTarget('780', [scr('giun', 10), scr('b2222780', 20)], { procs: [inRow('giun', 10, { hashtag: 'a1111111', sessionId: 'sid-a' }), inRow('b2222780', 20)] }).name, 'tele-b2222780');
+});
+
+test('RFC 28 r2 #2: a child is the occupant\'s twin unless it holds the SAME confirmed session (distinct sessions can share a hashtag)', () => {
+  const sessions = [scr('h3501892', 10)];
+  const parent = inRow('h3501892', 10, { sessionId: '12345678-9abc-4000-8000-000000000001' });
+  const child = (extra) => ({ pid: 99, ppid: parent.pid, screen: 'tele-h3501892', screenPid: 10, guessed: false, hashtag: 'h3501892', sessionId: '123456d7-f8cc-4000-8000-000000000002', ...extra });
+  const ids = (c) => agentIdentities(sessions, [parent, c], pOf).filter((x) => x.hashtag === 'h3501892').length;
+  assert.equal(ids(child({})), 2, 'other session on the same hashtag → separate identity');
+  assert.equal(ids(child({ guessed: true })), 2, 'a guessed child is never coalesced');
+  assert.equal(ids(child({ sessionId: parent.sessionId })), 1, 'same session → same agent');
+  assert.match(resolveAttachTarget('#h3501892', sessions, { procs: [parent, child({})] }).error, /matches 2 agents/);
+  // the screen-kill twin check follows the same rule
+  assert.match(checkScreenKillTarget('tele-h3501892', [parent, child({})], { screenPid: 10, windows: 1 }).error ?? '', /trùng/);
+  assert.equal(checkScreenKillTarget('tele-h3501892', [parent, child({ sessionId: parent.sessionId })], { screenPid: 10, windows: 1 }).ok, true);
+});
+
+test('RFC 28 r2 #3: agent-addressed attach refuses a multi-window / unknown-window screen; tele-… and the lone-session case still attach', () => {
+  const sessions = [scr('f4451780', 10), scr('b2222222', 20)];
+  const procs = [inRow('f4451780', 10), inRow('b2222222', 20)];
+  const one = { personaOf: pOf, procs, windowsOf: () => 1 };
+  for (const a of ['780', '#f4451780', 'Sứa']) assert.equal(resolveAttachTarget(a, sessions, one).name, 'tele-f4451780', a);
+  for (const w of [2, 0, null]) {
+    const o = { ...one, windowsOf: (pid) => (pid === '10' ? w : 1) };
+    for (const a of ['780', '#f4451780', 'Sứa']) assert.match(resolveAttachTarget(a, sessions, o).error, /windows.*tele-f4451780/, `${a} w=${w}`);
+    assert.equal(resolveAttachTarget('tele-f4451780', sessions, o).name, 'tele-f4451780');
+    assert.equal(resolveAttachTarget('2222222'.padStart(8, 'b'), sessions, o).name, 'tele-b2222222', 'other screens unaffected');
+  }
+  assert.equal(resolveAttachTarget(null, [scr('f4451780', 10)], { windowsOf: () => 3 }).name, 'tele-f4451780', 'no-id lone session is unchanged');
+});
