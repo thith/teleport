@@ -172,12 +172,15 @@ export function checkCwd(cwd, { parentDir = PARENT_DIR, realpath = fs.realpathSy
  */
 export async function runMain(argv, d = {}) {
   const log = d.log ?? ((m) => console.log(m));
-  const listLive = d.listClaudeProcs ?? (await import('./claude-procs.mjs')).listClaudeProcs;
+  const procsMod = await import('./claude-procs.mjs');
+  const listLive = d.listClaudeProcs ?? procsMod.listClaudeProcs;
   const candidates = d.listCandidates ?? listCandidates;
   if (argv.length === 1 && argv[0] === '--list-stopped') {
     let liveRows = [], procsError = null;
     try { liveRows = listLive({ strict: true }); } catch (e) { procsError = e?.message ?? String(e); }
-    log(formatStopped(candidates(), { liveRows, procsError, now: d.now }));
+    const out = formatStopped(candidates(), { liveRows, procsError, now: d.now });
+    // The daemon forwards `/resume --list-stopped` here with TELE_FROM_ID set: pad for a terminal only.
+    log((d.env ?? process.env).TELE_FROM_ID ? out : procsMod.padNarrowEmoji(out));
     return 0;
   }
   // Forwarded claude flags (RFC 18): split BEFORE joining the name query — a flag must never become part of the name.

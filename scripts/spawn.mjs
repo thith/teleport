@@ -47,7 +47,7 @@ import { readTopicsStore } from './topics-store.mjs';
 import { formatPersona } from './persona.mjs';
 import { peekPersona } from './persona-store.mjs';
 import {
-  listClaudeProcs, findProcForSession, findUnidentifiedProcs, cwdToProjectSlug, PROJECTS_DIR,
+  listClaudeProcs, padNarrowEmoji, findProcForSession, findUnidentifiedProcs, cwdToProjectSlug, PROJECTS_DIR,
   formatAgentList, hashtagForSession, readPs, parseKillPidArg, killClaudePid, KILL_PID_GRACE_MS, inspectPid, etimeToSeconds,
 } from './claude-procs.mjs';
 import { readProjectsConfig, resolveDaemonUserId } from './projects-config.mjs';
@@ -116,6 +116,7 @@ Manage sessions (interactive/screen only):
   --list, --ls       show running \`tele-*\` sessions with persona, pid, and topic,
                      then EVERY claude process of this user (pid, cwd, tty, uptime,
                      screen or terminal, session id + #hashtag) — incl. hand-opened ones.
+                     Add --short for one line per agent (what \`teleport ls\` runs).
   --attach [<id>]    re-attach; <id> = 3-char tail (116), #hashtag, persona name, or tele-name.
     (--resume)       Omit <id> when exactly one session is live. Detach: Ctrl-A D.
   --kill <id>        send /exit, wait up to ${KILL_GRACE_MS / 1000}s, then force-quit.
@@ -1465,11 +1466,12 @@ if (isDirectRun) {
       return usageOf.get(r);
     };
     const mailOf = (c) => countUnread(c);
-    console.log(formatAgentList({
+    const out = formatAgentList({
       screens, procs,
       personaOf: (h) => (pmap[h] ? formatPersona(pmap[h]) : null),
       statusLinesOf: (c) => statusOf?.lines(c) ?? [], mailOf, convoOfHashtag: (h) => cmap[h] ?? null,
-      showSession: fromId === '', full: fromId === '' || argv.includes('full') || argv.includes('--full'), // a terminal always gets the UUIDs
+      // A terminal gets the UUIDs, and the full blocks unless `--short` (`teleport ls`) asks for one line each.
+      showSession: fromId === '', full: argv.includes('full') || argv.includes('--full') || (fromId === '' && !argv.includes('--short')),
       listenerOf: (c) => statusOf?.listener(c) ?? null,
       tokensOf: (r) => usage(r)?.tokens ?? null,
       ctxOf: (r) => {
@@ -1482,7 +1484,8 @@ if (isDirectRun) {
         const sig = (f) => { try { return convo == null ? null : f(convo); } catch { return null; } };
         return lsLinks(r, { reachable: reachable.has(r), unique: tagCount.get(r.hashtag) === 1, tokens: usage(r)?.tokens ?? null, listener: sig((c) => statusOf?.listener(c) ?? null), mail: sig(mailOf) });
       },
-    }));
+        });
+    console.log(fromId === '' ? padNarrowEmoji(out) : out);
     if (wiped.length) console.log(`\n🧹 đã dọn ${wiped.length} screen chết: ${wiped.join(', ')}`);
     console.log(`\n${LS_SHORTCUTS}`);
     process.exit(0);

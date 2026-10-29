@@ -196,6 +196,15 @@ export function buildProcRows({ psRows, uid, sessions = new Map(), procExtras = 
 }
 
 /**
+ * Terminal-only: an extra space after an emoji that is narrow by default (Emoji_Presentation=No, e.g.
+ * the persona emoji 🕷 🕊 ☃). GNOME Terminal draws it two cells wide over the space that follows, so
+ * "🕷 Nhện" reads as "🕷Nhện". Telegram renders them fine — don't apply it there.
+ */
+export function padNarrowEmoji(text) {
+  return String(text).replace(/(\p{Extended_Pictographic})(\uFE0F?) /gu, (m, ch, vs) => (/\p{Emoji_Presentation}/u.test(ch) ? m : `${ch}${vs}  `));
+}
+
+/**
  * Render `/ls` (plain text; cwd shown as its folder name), in two sections:
  *   📺 Screen   — every `tele-*` screen (spawned agents) plus any other screen that
  *                 hosts a claude;

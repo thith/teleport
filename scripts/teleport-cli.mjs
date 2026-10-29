@@ -73,7 +73,7 @@ export function parse(argv) {
 
   switch (sub) {
     case 'ls': {
-      if (rest.length === 0) return { script: 'spawn', args: ['--list'] };
+      if (rest.length === 0) return { script: 'spawn', args: ['--list', '--short'] };
       if (rest.length === 1 && rest[0] === 'full') return { script: 'spawn', args: ['--list', 'full'] };
       if (rest.length === 1 && rest[0] === 'off') return { script: 'resume', args: ['--list-stopped'] };
       return { error: `ls: unexpected argument "${rest.find((a) => a !== 'full' && a !== 'off') ?? rest[1]}" (accepts one of: full, off)` };
