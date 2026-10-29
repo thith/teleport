@@ -697,7 +697,7 @@ test('findTypeTarget: hashtag twins across ALL rows refused; names by literal ti
     scr({ pid: 3, hashtag: 'c3333333', sessionId: 's3', name: 'my agent' }),
     { pid: 4, hashtag: 'd4444444', sessionId: 's4', screen: null, procStart: '1', name: 'term' },
   ];
-  const persona = (h) => ({ b2222222: '🐉 Cà Rồng' })[h] || null;
+  const persona = (r) => ({ b2222222: '🐉 Cà Rồng' })[r.hashtag] || null;
   assert.equal(findTypeTarget('#a1111111', rows, persona).row.pid, 1);
   assert.equal(findTypeTarget('my_agent', rows, persona).row.pid, 1, 'literal tier first');
   assert.equal(findTypeTarget('my agent', rows, persona).row.pid, 3);
@@ -714,6 +714,32 @@ test('findTypeTarget: hashtag twins across ALL rows refused; names by literal ti
   const shadow = [{ pid: 6, hashtag: 'e5555555', sessionId: 's6', screen: null, procStart: '1', name: 'my_agent' }, rows[2]];
   assert.equal(findTypeTarget('my_agent', shadow, persona).row.pid, 3, 'a terminal namesake does not shadow the screen agent');
   assert.match(findTypeTarget('term', rows, persona).error, /không ở trong screen/);
+});
+
+test('findTypeTarget (RFC 28): a 3-digit tail = the hashtag it ends, over ALL live rows (a terminal twin of the tail makes it ambiguous)', () => {
+  const scr = (o) => ({ screen: `tele-${o.hashtag}`, screenPid: o.pid + 1000, ppid: o.pid + 1000, guessed: false, procStart: '1', ...o });
+  const rows = [scr({ pid: 1, hashtag: 'f4451780', sessionId: 's1' }), scr({ pid: 2, hashtag: 'b2222222', sessionId: 's2' })];
+  assert.equal(findTypeTarget('780', rows).row.pid, 1);
+  assert.equal(findTypeTarget('name:780', rows).row.pid, 1);
+  assert.equal(findTypeTarget('#780', rows).error.includes('780'), true, '#780 is a (non-existent) hashtag, not a tail');
+  assert.match(findTypeTarget('999', rows).error, /không thấy/);
+  // a terminal claude (never typeable) with another hashtag ending in 780: refuse, name both
+  const twin = [...rows, { pid: 5, hashtag: 'b2222780', sessionId: 's5', screen: null, procStart: '1' }];
+  const e = findTypeTarget('780', twin, (r) => ({ f4451780: '🪼 Sứa' })[r.hashtag] || null).error;
+  assert.match(e, /khớp 2 agent/); assert.match(e, /🪼 Sứa #f4451780/); assert.match(e, /#b2222780/);
+  // same hashtag twice (terminal copy) → the usual hashtag-twin refusal, not a pick
+  assert.match(findTypeTarget('780', [...rows, { pid: 6, hashtag: 'f4451780', sessionId: 's6', screen: null, procStart: '1' }]).error, /2 process/);
+  // a guessed row still counts toward the tail
+  assert.match(findTypeTarget('780', [...rows, { pid: 7, hashtag: 'c0000780', sessionId: 's7', guessed: true, screen: null }]).error, /khớp 2 agent/);
+});
+
+test('findTypeTarget (RFC 28): a name goes by the ROW\'s persona (two rows sharing a hashtag, different personas → no cross-talk)', () => {
+  const scr = (o) => ({ screen: `tele-${o.hashtag}`, screenPid: o.pid + 1000, ppid: o.pid + 1000, guessed: false, procStart: '1', ...o });
+  const rows = [scr({ pid: 1, hashtag: 'a1111111', sessionId: 'sA' }), scr({ pid: 2, hashtag: 'a1111111', sessionId: 'sB' })];
+  const personaOf = (r) => ({ sA: '🐺 Sói', sB: '🦊 Cáo' })[r.sessionId] || null;
+  assert.match(findTypeTarget('Sói', rows, personaOf).error, /2 process/); // still refused (hashtag twin), but never "Cáo" for pid 1
+  assert.match(findTypeTarget('Sói', rows, personaOf).error, /🐺 Sói #a1111111 · PID 1/);
+  assert.match(findTypeTarget('Sói', rows, personaOf).error, /🦊 Cáo #a1111111 · PID 2/);
 });
 
 test('lsLinks: the same gates as the taps — kill needs a known session + start; compact/nudge need a typeable row', () => {

@@ -30,7 +30,7 @@ export function autoNudgeNeed({ mailAt, tgAt, listener, prev = {}, now, windowMs
 
 /**
  * One heartbeat pass. deps: list() rows, io (observe), runner (TypeRunner), mailAt(convo), tgAt(convo),
- * listener(convo), personaOf(hashtag), now, seen (Map), log. → [{ hashtag, line, text }] of the nudges tried.
+ * listener(convo), personaOf(target), now, seen (Map), log. → [{ hashtag, line, text }] of the nudges tried.
  */
 export async function autoNudgeTick({ list, io, runner, mailAt, tgAt, listener, personaOf = () => null, now = Date.now(), seen, log = () => {} }) {
   const rows = list();
@@ -45,7 +45,7 @@ export async function autoNudgeTick({ list, io, runner, mailAt, tgAt, listener, 
     if (!need) continue;
     const t = pinTarget(r);
     if (observe(t, io).mismatch) continue;
-    const res = await runner.run('n', t, 'auto', { persona: personaOf(t.hashtag), line: need.line }).catch((e) => ({ text: `❌ ${e?.message ?? e}` }));
+    const res = await runner.run('n', t, 'auto', { persona: personaOf(t), line: need.line }).catch((e) => ({ text: `❌ ${e?.message ?? e}` }));
     // Marked only once typed: a refusal (lock, cool-down, dialog) is retried next tick while still in the window.
     if (String(res.text).startsWith(NUDGED)) seen.set(convo, need.mark);
     log(`[auto-nudge] #${t.hashtag}: ${res.text}`);

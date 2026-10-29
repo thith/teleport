@@ -18,7 +18,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { listClaudeProcs, parseSessionFile, inspectPid, SESSIONS_DIR } from './claude-procs.mjs';
-import { parseAgentTarget, normalizeAgentName, unquoteTarget } from './agent-target.mjs';
+import { parseAgentTarget, normalizeAgentName, unquoteTarget, resolveTail } from './agent-target.mjs';
 export { unquoteTarget };
 import { createListenerStatus } from './listener-status.mjs';
 import { countUnread } from './mailbox.mjs';
@@ -144,12 +144,20 @@ export const screenId = (t) => `${t.screenPid}.${t.screen}`;
  * `/compact`, `/nudge` target (RFC 26 §3.2): `query` = the whole rest (spaces allowed). A hashtag must be
  * unique across ALL live claude rows first (a terminal twin is never "replaced" by a reachable screen
  * one); then only `typeTargets` rows. Names: tier 1 literal (case-insensitive, leading emoji off), tier 2
- * normalized with `_` → space; the first tier with a hit decides, > 1 session → refuse. → { row } | { error }. Pure.
+ * normalized with `_` → space; the first tier with a hit decides, > 1 session → refuse. A 3-digit tail (RFC 28) is a
+ * hashtag shorthand resolved over ALL live rows (not just typeable ones: a terminal twin makes it ambiguous).
+ * `personaOf(row)` takes the row (its own convo's persona). → { row } | { error }. Pure.
  */
 export function findTypeTarget(query, rows, personaOf = () => null) {
-  const t = parseAgentTarget(unquoteTarget(query));
-  if (t.kind === 'pid' || t.kind === 'convoId' || !String(t.value ?? '').trim()) return { error: 'cần <tên | #hashtag> (xem /ls).' };
-  const label = (r) => `${personaOf(r.hashtag) || r.name || '?'} #${r.hashtag} · PID ${r.pid}`;
+  let t = parseAgentTarget(unquoteTarget(query));
+  if (t.kind === 'pid' || t.kind === 'convoId' || !String(t.value ?? '').trim()) return { error: 'cần <tên | #hashtag | 3 số cuối> (xem /ls).' };
+  const label = (r) => `${personaOf(r) || r.name || '?'} #${r.hashtag} · PID ${r.pid}`;
+  if (t.kind === 'tail') {
+    const r = resolveTail(t.value, rows, label);
+    if (r.error) return { error: r.error };
+    if (r.none) return { error: `không thấy agent có đuôi "${t.value}" đang chạy (xem /ls).` };
+    t = { kind: 'hashtag', value: r.hashtag };
+  }
   const sessions = (hits) => hits.length; // processes, not sessions: two PIDs on one session are ambiguous too
   const reachable = typeTargets(rows);
   const pick = (hits) => {
@@ -163,7 +171,7 @@ export function findTypeTarget(query, rows, personaOf = () => null) {
     return hits.length ? pick(hits) : { error: `không thấy agent #${t.value} đang chạy (xem /ls).` };
   }
   // Names: over the agents we can type into (a terminal namesake must not shadow a screen one).
-  const names = (r) => [r.name, personaOf(r.hashtag)].filter(Boolean);
+  const names = (r) => [r.name, personaOf(r)].filter(Boolean);
   const strip = (s) => String(s).trim().replace(/^[^\p{L}\p{N}]+\s*/u, '').toLowerCase();
   const lit = strip(t.value), norm = normalizeAgentName(String(t.value).replace(/_+/g, ' '));
   const byName = (pool) => {
@@ -309,7 +317,7 @@ export function listForType({ list = () => listClaudeProcs(), personaOf = () => 
     const t = pinTarget(r);
     const o = observe(t, io);
     const ctx = o.mismatch ? null : formatContext(o.usage, contextWindowFor(cfg, { hashtag: t.hashtag, model: o.usage?.model }));
-    return { target: t, obs: o, ctx, line: agentLine(t, { persona: personaOf(t.hashtag), state: o.mismatch ? 'unknown' : o.state, ctx, bridge: o.bridge }) };
+    return { target: t, obs: o, ctx, line: agentLine(t, { persona: personaOf(r), state: o.mismatch ? 'unknown' : o.state, ctx, bridge: o.bridge }) };
   });
 }
 

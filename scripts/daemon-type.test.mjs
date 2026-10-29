@@ -5,6 +5,7 @@ import { startType, handleTypeButton, takeTypeButton, typeStep2, takeMergeButton
 const T = { pid: 644406, procStart: '5', sessionId: 'S', screenPid: 644405, screen: 'tele-c2383556', hashtag: 'c2383556', cwd: '/w' };
 const T2 = { ...T, pid: 331131, screenPid: 331130, screen: 'tele-d8133684', hashtag: 'd8133684' };
 const idle = { mismatch: null, state: 'idle', status: 'shell', bridge: null, usage: { compacted: false, tokens: 693000, model: 'm' } };
+const asRow = (t) => ({ ...t, ppid: t.screenPid, guessed: false }); // a /ls row for a pinned target
 const agent = (t, obs = idle) => ({ target: t, obs, line: `#${t.hashtag} · PID ${t.pid} · rảnh` });
 
 function ui() {
@@ -46,13 +47,13 @@ test('/type (no arg): one pick button per agent, no stored entry; /type #hash: s
   assert.deepEqual(calls[0][2].map((r) => r[0].callback_data), ['ty:pick:c2383556', 'ty:pick:d8133684']);
   assert.match(calls[0][1], /#c2383556 · PID 644406/); // the list keeps the #hash (the pick is checked against it)
   assert.equal(ctx.buttonStore.size, 0);
-  await startType('#c2383556', ctx, { list: () => [agent(T), agent(T2)] });
+  await startType('#c2383556', ctx, { list: () => [agent(T), agent(T2)], procs: () => [asRow(T), asRow(T2)] });
   const [tok, e] = [...ctx.buttonStore][0];
   assert.equal(e.kind, 'type');
   assert.equal(e.messageId, 101);
   assert.equal(e.target.pid, 644406);
   assert.ok(calls[1][2][0].some((b) => b.callback_data === `ty:${tok}:c`));
-  await startType('#ffffffff', ctx, { list: () => [agent(T)] });
+  await startType('#ffffffff', ctx, { list: () => [agent(T)], procs: () => [asRow(T)] });
   assert.match(calls.at(-1)[1], /không thấy agent #ffffffff/);
 });
 
@@ -133,12 +134,38 @@ test('button store: merge taker never consumes /type (or any kind) entries; /typ
   assert.equal(fresh.size, 0);
 });
 
-test('/type arguments: one optional #hashtag; anything else → usage (never a lookup of junk)', async () => {
-  for (const bad of ['#c2383556 /compact', 'not-a-hash', '#c23835']) {
+test('/type <x>: the same lookup as /compact (hashtag, tail, name); junk or an unknown target → refusal + usage, never a menu or a keystroke', async () => {
+  for (const bad of ['#c2383556 /compact', 'not-a-hash', '#c23835', '999']) {
     const { ctx, calls } = ui();
-    await startType(bad, ctx, { list: () => { throw new Error('must not list'); } });
-    assert.match(calls[0][1], /usage: \/type/);
+    await startType(bad, ctx, { list: () => { throw new Error('must not list'); }, procs: () => [asRow(T), asRow(T2)] });
+    assert.match(calls[0][1], /❌ \/type: .*\nusage: \/type/s);
+    assert.equal(ctx.buttonStore.size, 0);
   }
+});
+
+test('/type <3 digits | name> (RFC 28): resolved over ALL live rows; a terminal twin of the tail makes it ambiguous; a name goes by the row\'s own persona', async () => {
+  const personaOf = (x) => ({ c2383556: '👻 Ma' })[x.hashtag] || null;
+  // tail 556 → T only → step 2 for T
+  const a = ui();
+  await startType('556', a.ctx, { list: () => [agent(T), agent(T2)], procs: () => [asRow(T), asRow(T2)], personaOf });
+  assert.match(a.calls[0][1], /👻 Ma #c2383556/);
+  assert.equal([...a.ctx.buttonStore.values()][0].target.pid, 644406);
+  // a terminal claude (not typeable) shares the tail with a different hashtag → refuse, list both
+  const b = ui();
+  await startType('556', b.ctx, { list: () => [agent(T), agent(T2)], procs: () => [asRow(T), asRow(T2), { pid: 9, hashtag: 'e9999556', sessionId: 'X', screen: null, ppid: 1 }], personaOf });
+  assert.match(b.calls[0][1], /khớp 2 agent.*#c2383556.*#e9999556/s);
+  assert.equal(b.ctx.buttonStore.size, 0);
+  // name → persona
+  const c = ui();
+  await startType('ma', c.ctx, { list: () => [agent(T), agent(T2)], procs: () => [asRow(T), asRow(T2)], personaOf });
+  assert.equal([...c.ctx.buttonStore.values()][0].target.pid, 644406);
+});
+
+test('pick button: two live agents behind one hashtag → nothing is picked', async () => {
+  const { ctx, calls } = ui();
+  await handleTypeButton(cq('ty:pick:c2383556', '⌨️ /type — chọn agent:\n• #c2383556 · PID 644406'), ctx, { list: () => [agent(T), agent({ ...T, pid: 7 })] });
+  assert.match(calls.at(-1)[1], /không còn/);
+  assert.equal(ctx.buttonStore.size, 0);
 });
 
 test('compact notice: only after a CONFIRMED compaction (not on "not enough", timeout, Esc or /remote-control)', async () => {
@@ -160,7 +187,7 @@ test('compact notice: only after a CONFIRMED compaction (not on "not enough", ti
 
 test('/type (no arg): the pick button shows persona (or #hash) + context use, not just the hashtag', async () => {
   const { ctx, calls } = ui();
-  const personaOf = (h) => (h === 'c2383556' ? '👻 Ma' : null);
+  const personaOf = (x) => (x.hashtag === 'c2383556' ? '👻 Ma' : null);
   await startType('', ctx, { personaOf, list: () => [{ ...agent(T), ctx: 'ctx 693k (35%)' }, { ...agent(T2), ctx: 'ctx 12k (1%)' }, agent({ ...T2, hashtag: 'e0000001' })] });
   assert.deepEqual(calls[0][2].map((r) => r[0].text), ['👻 Ma · 693k (35%)', '#d8133684 · 12k (1%)', '#e0000001']);
 });
@@ -212,7 +239,7 @@ test('a token answers only its own buttons: ✅ from a step-2 or 🧹 token is r
     assert.match(calls.at(-1)[1], /Nút không khớp/);
   }
   const { ctx, calls } = ui(); // /type #hash stores the ops it showed
-  await startType('#c2383556', ctx, { list: () => [agent(T)] });
+  await startType('#c2383556', ctx, { list: () => [agent(T)], procs: () => [asRow(T)] });
   assert.deepEqual([...ctx.buttonStore.values()][0].ops, ['c', 'r', 'i', 'k', 'x']);
   assert.ok(calls.length);
 });
@@ -246,7 +273,7 @@ test('/compact <name>: runs TypeRunner op c on the found agent; under 100k it st
   const sent = []; const ran = []; const delivered = [];
   const ctx = { daemonUserId: '42', sendText: async (c, t) => sent.push(t), projectsConfig: {} };
   const runner = { run: async (op, t) => { ran.push([op, t.pid]); return { text: '⌨️ đã gõ /compact vào #c2383556 — đang chờ kết quả…', watch: async () => '✅ đã compact: 42k → 8k' }; } };
-  await runTypeCommand('c', 'Ma', { id: 42 }, ctx, { list: () => [row({ pid: 644406, hashtag: 'c2383556', sessionId: 'S', name: 'umipay-ae' })], io: liveIo, runner, personaOf: (h) => (h === 'c2383556' ? '👻 Ma' : null), deliver: async (p) => delivered.push(p) });
+  await runTypeCommand('c', 'Ma', { id: 42 }, ctx, { list: () => [row({ pid: 644406, hashtag: 'c2383556', sessionId: 'S', name: 'umipay-ae' })], io: liveIo, runner, personaOf: (x) => (x.hashtag === 'c2383556' ? '👻 Ma' : null), deliver: async (p) => delivered.push(p) });
   assert.deepEqual(ran, [['c', 644406]]);
   assert.match(sent[0], /ctx 42k/);
   assert.match(sent[1], /^👻 Ma #c2383556: ✅ đã compact/);
@@ -270,7 +297,7 @@ test('/nudge with no target: every agent with listener off or mail, never a heal
     row({ pid: 105, hashtag: 'aaaa0005', sessionId: 'S' }),
   ];
   const io = { ...liveIo, ppid: (pid) => pid - 1, nudgeSignals: (t) => sig[t.hashtag] };
-  await nudgeAll({ id: 42 }, ctx, { list: () => rows, io, runner, personaOf: (h) => (h === 'aaaa0001' ? '🐺 Sói' : null) });
+  await nudgeAll({ id: 42 }, ctx, { list: () => rows, io, runner, personaOf: (x) => (x.hashtag === 'aaaa0001' ? '🐺 Sói' : null) });
   assert.deepEqual(ran, [['n', 'aaaa0001', '🐺 Sói'], ['n', 'aaaa0002', null]]);
   assert.equal(sent.length, 1);
   assert.match(sent[0], /đã nudge 🐺 Sói #aaaa0001\.\n👋 đã nudge #aaaa0002\.\n❌ #aaaa0004: hashtag trùng 2 process/);

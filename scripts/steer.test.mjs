@@ -62,3 +62,20 @@ test('doSteer: raw (TELE_RAW_ARGS) wins over the tokenized argv — newlines and
   assert.equal(res.ok, true, res.message);
   assert.equal(writes[0].text, `dòng 1\n"dòng 2" it's`);
 });
+
+test('resolveSteerTargetRaw (RFC 28): `convo:<id>` is explicit like #hash; a bare 3-digit tail is a target when not replying, text when replying; two hashtags behind a tail → ambiguous', () => {
+  const T1 = '3552300954451780', T2 = '1111111112222780';
+  const live = [row(T1, 'Sứa'), row(T2, 'Cáo'), row(C, 'Mèo')];
+  const tail = shortConvoHash(C).slice(-3);
+  assert.equal(resolveSteerTargetRaw(`${tail} hi`, { live, usage: 'U' }).match.convoId, C);
+  assert.equal(resolveSteerTargetRaw(`convo:${C} hi`, { live, usage: 'U' }).match.convoId, C);
+  assert.deepEqual(resolveSteerTargetRaw(`convo:${C} hi`, { live, usage: 'U' }).text, 'hi');
+  assert.match(resolveSteerTargetRaw('convo:123 hi', { live, usage: 'U' }).error, /not found/);
+  assert.match(resolveSteerTargetRaw('780 hi', { live, usage: 'U' }).error, /ambiguous \(#.*\) — dùng #hashtag/);
+  // replying: `convo:` stays explicit (a hard error), a bare tail is just the text
+  const rep = `ack #${shortConvoHash(C)}`;
+  assert.match(resolveSteerTargetRaw('convo:123 hi', { live, replyText: rep, usage: 'U' }).error, /not found/);
+  assert.equal(resolveSteerTargetRaw('780 hi', { live, replyText: rep, usage: 'U' }).match.convoId, C);
+  assert.equal(resolveSteerTargetRaw('780 hi', { live, replyText: rep, usage: 'U' }).text, '780 hi');
+  assert.equal(resolveSteerTarget(['999', 'x'], { live, usage: 'U' }).error, 'target 999 not found among live topics.');
+});

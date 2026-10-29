@@ -53,7 +53,7 @@ import { resolveConvoIdFromEnv, uuidToConvoInt, CONVO_ID_RE } from './convo-regi
 import { personaForConvo, formatPersona } from './persona.mjs';
 import { peekPersona } from './persona-store.mjs';
 import { shortConvoHash } from './convo-hash.mjs';
-import { parseAgentTarget } from './agent-target.mjs';
+import { parseAgentTarget, resolveTail } from './agent-target.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -275,9 +275,18 @@ export function listAgents({ dir = DEFAULT_MAILBOX_DIR, root = DEFAULT_TRANSCRIP
  */
 export function resolveRecipient(target, agents, { self = null } = {}) {
   const raw = String(target ?? '').trim();
-  if (!raw) return { error: 'no recipient: pass --to <persona|#hashtag|convoId>' };
+  if (!raw) return { error: 'no recipient: pass --to <persona|#hashtag|3-digit tail|convo:<id>>' };
 
-  const t = parseAgentTarget(raw); // the shared reading (agent-target.mjs); `name:<convoId>` is still a convoId
+  let t = parseAgentTarget(raw); // the shared reading (agent-target.mjs); `name:<convoId>` is still a convoId
+  if (t.error) return { error: t.error };
+  // A bare 3-digit string is a tail (RFC 28), never a short convoId: resolved over EVERY agent of the
+  // list; no match is an error (no more mail into an unregistered inbox "780"). `convo:780` is the explicit form.
+  if (t.kind === 'tail') {
+    const r = resolveTail(t.value, agents);
+    if (r.error) return { ambiguous: agents.filter((a) => String(a.hashtag ?? '').toLowerCase().endsWith(t.value)) };
+    if (r.none) return { error: `no agent with a hashtag ending in ${t.value} — run \`mailbox.mjs ls\` to see who is around (a convoId is written convo:<id>)` };
+    t = { kind: 'hashtag', value: r.hashtag };
+  }
   if (t.kind === 'convoId' && CONVO_ID_RE.test(t.value)) {
     const known = agents.find((a) => String(a.convoId) === t.value);
     // An unknown convoId is still deliverable — the inbox is keyed by id, so mail
@@ -625,7 +634,7 @@ export const USAGE = `mailbox.mjs — file-based agent↔agent mail (no Telegram
 
   node ../teleport/scripts/mailbox.mjs whoami
   node ../teleport/scripts/mailbox.mjs ls [--all]
-  node ../teleport/scripts/mailbox.mjs send --to <persona|#hashtag|convoId> "text"
+  node ../teleport/scripts/mailbox.mjs send --to <persona|#hashtag|3-digit tail|convoId> "text"
   node ../teleport/scripts/mailbox.mjs send --to Voi --file ./report.md "kèm file"
   node ../teleport/scripts/mailbox.mjs check
   node ../teleport/scripts/mailbox.mjs read [--max N] [--json]
@@ -702,7 +711,7 @@ if (isMainModule(import.meta.url)) {
     }
     const r = resolveRecipient(args.to, listAgents(), { self });
     if (r.ambiguous) {
-      console.error(`[mailbox] "${args.to}" matches ${r.ambiguous.length} agents — say which by convoId:`);
+      console.error(`[mailbox] "${args.to}" matches ${r.ambiguous.length} agents — say which by convoId (convo:<id>) or the full #hashtag:`);
       for (const a of r.ambiguous) console.error(`    ${a.name} #${a.hashtag} (convo ${a.convoId}, ${a.project})`);
       process.exit(EXIT.AMBIGUOUS);
     }

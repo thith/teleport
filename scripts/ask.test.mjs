@@ -56,14 +56,14 @@ const depsInGroup = (chatIds) => ({ readTopicsStore: () => STORE, resolveChatIds
 
 test('planAsk: cross-group target is NOT_FOUND (security scope guard)', () => {
   // Asker is in G1; tries to ask convo 222 which lives in G2 → forbidden.
-  const r = planAsk({ args: { to: '222', reply: false }, sourceConvoId: '111', text: 'q', nowSec: 1, deps: depsInGroup(['G1']) });
+  const r = planAsk({ args: { to: 'convo:222', reply: false }, sourceConvoId: '111', text: 'q', nowSec: 1, deps: depsInGroup(['G1']) });
   assert.equal(r.code, EXIT.NOT_FOUND);
   assert.match(r.message, /cross-group ask is forbidden/);
 });
 
 test('planAsk: same-group target resolves and builds an ASK prompt', () => {
   // Asker (convo 999, group G1) asks convo 111 (also G1).
-  const r = planAsk({ args: { to: '111', reply: false }, sourceConvoId: '999', text: 'tone?', nowSec: 1, deps: depsInGroup(['G1']) });
+  const r = planAsk({ args: { to: 'convo:111', reply: false }, sourceConvoId: '999', text: 'tone?', nowSec: 1, deps: depsInGroup(['G1']) });
   assert.equal(r.code, EXIT.OK);
   assert.equal(r.match.convoId, '111');
   assert.match(r.promptFile, /prompt-convo-111\.json$/);
@@ -73,7 +73,7 @@ test('planAsk: same-group target resolves and builds an ASK prompt', () => {
 test('planAsk: reply mode builds an askReply prompt back to the asker', () => {
   // B (convo 111) replies to A (convo 222) — but A must be in B's group; put A in G1.
   const store = { 'G1': { '111': 55, '222': 77, _ts: {} } };
-  const r = planAsk({ args: { to: '222', reply: true }, sourceConvoId: '111', text: 'answer', nowSec: 1,
+  const r = planAsk({ args: { to: 'convo:222', reply: true }, sourceConvoId: '111', text: 'answer', nowSec: 1,
     deps: { readTopicsStore: () => store, resolveChatIds: () => ({ chatIds: ['G1'] }) } });
   assert.equal(r.code, EXIT.OK);
   assert.equal(r.promptObj.askReply.answer, 'answer');
@@ -82,7 +82,7 @@ test('planAsk: reply mode builds an askReply prompt back to the asker', () => {
 
 test('planAsk: asking yourself → USAGE (no self-inject)', () => {
   const store = { 'G1': { '111': 55, _ts: {} } };
-  const r = planAsk({ args: { to: '111', reply: false }, sourceConvoId: '111', text: 'q', nowSec: 1,
+  const r = planAsk({ args: { to: 'convo:111', reply: false }, sourceConvoId: '111', text: 'q', nowSec: 1,
     deps: { readTopicsStore: () => store, resolveChatIds: () => ({ chatIds: ['G1'] }) } });
   assert.equal(r.code, EXIT.USAGE);
   assert.match(r.message, /cannot ask yourself/);
@@ -125,6 +125,16 @@ test('inactivityNote: no heartbeat at all → advisory names absent listener', (
 test('planAsk: routes with the SAME (numeric) convo it attributes to', () => {
   let seen;
   const deps = { ...depsInGroup(['G1']), resolveChatIds: (o) => { seen = o; return { chatIds: ['G1'] }; } };
-  planAsk({ args: { to: '111', reply: false }, sourceConvoId: '999', text: 'q', nowSec: 1, deps });
+  planAsk({ args: { to: 'convo:111', reply: false }, sourceConvoId: '999', text: 'q', nowSec: 1, deps });
   assert.strictEqual(seen.convoId, 999);
+});
+
+test('planAsk (RFC 28): a 3-digit tail resolves inside the asker\'s own group only; a tail of another group is NOT_FOUND', () => {
+  const ok = planAsk({ args: { to: '111', reply: false }, sourceConvoId: '999', text: 'q', nowSec: 1, deps: depsInGroup(['G1']) });
+  assert.equal(ok.code, EXIT.OK); assert.equal(ok.match.convoId, '111');
+  const far = planAsk({ args: { to: '222', reply: false }, sourceConvoId: '999', text: 'q', nowSec: 1, deps: depsInGroup(['G1']) });
+  assert.equal(far.code, EXIT.NOT_FOUND);
+  const store = { G1: { '3552300954451780': 5, '1111111112222780': 6 } };
+  const amb = planAsk({ args: { to: '780', reply: false }, sourceConvoId: '999', text: 'q', nowSec: 1, deps: { readTopicsStore: () => store, resolveChatIds: () => ({ chatIds: ['G1'] }) } });
+  assert.equal(amb.code, EXIT.AMBIGUOUS);
 });
