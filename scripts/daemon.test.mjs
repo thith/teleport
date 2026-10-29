@@ -854,3 +854,43 @@ test('handlePrLinks: a link copied from the Files tab / a comment is canonicaliz
   assert.equal(buttons[0].b[0].text, '✅ Merge');
   assert.deepEqual([...store.values()][0].links, [L1]);
 });
+
+test('keepBranch request: --keep-branch reaches merge.mjs on the AUTO path, and is carried to the ASK preview', async () => {
+  const sent = [], runs = [], asked = [];
+  const base = { autoEnabled: () => true, allowed: () => new Set(['icetea-labs/umipay-hub']), deliver: async () => {}, audit: () => {}, remove: () => {}, label: () => 'Giun', scriptsDir: '/s' };
+  await processMergeRequests(reqCtx(sent), { ...base,
+    claim: () => [{ file: 'f', body: { links: [RQ], convoId: '42', keepBranch: true, createdAt: Date.now() } }],
+    runner: async (bin, argv) => { runs.push(argv); return { stdout: 'ok' }; } });
+  assert.deepEqual(runs[0], ['/s/merge.mjs', RQ, '--skip-merged', '--keep-branch']);
+  await processMergeRequests(reqCtx(sent), { ...base, autoEnabled: () => false,
+    claim: () => [{ file: 'f', body: { links: [RQ], convoId: '42', keepBranch: true, createdAt: Date.now() } }],
+    prLinks: async (links, msg, c) => asked.push(c) });
+  assert.equal(asked[0].keepBranch, true);
+  assert.match(asked[0].header, /giữ nhánh nguồn/);
+});
+
+test('keepBranch ASK path: preview text shows it, pending entry stores it, Merge button dispatches --keep-branch; default does not', async () => {
+  for (const keepBranch of [true, false]) {
+    const store = new Map(), texts = [], buttons = [];
+    await handlePrLinks([L1], { chat: { id: 1 }, from: { id: 1 } }, { daemonUserId: '1', projectsConfig: OWNER_CFG, registry: MREG, store, keepBranch,
+      sendText: async () => {}, sendButtons: async (c, t, b) => { texts.push(t); buttons.push(b); }, runner: async () => ({ stdout: 'ok' }), scriptsDir: '/s', parentDir: '/w' });
+    assert.equal(/giữ nhánh nguồn/.test(texts[0]), keepBranch);
+    const tok = buttons[0][0].callback_data.slice(3);
+    let seen;
+    await handleMergeButton({ id: 'q', data: `mg:${tok}`, from: { id: 1 }, message: { chat: { id: 1 }, message_id: 1, text: `${texts[0]}\n${L1}` } },
+      { registry: MREG, answerButton: async () => {}, editButtonsMessage: async () => {} },
+      { take: (t) => takeMergeButton(t, { store }), dispatch: async (p) => { seen = p; } });
+    assert.equal(/--keep-branch/.test(seen.rest), keepBranch);
+  }
+});
+
+test('entryMatchesMessage: stored keepBranch must agree with what the owner saw', async () => {
+  const { entryMatchesMessage, KEEP_BRANCH_NOTE } = await import('./daemon.mjs');
+  const L = 'https://github.com/o/r/pull/7';
+  const shown = `Merge or close this PR? · ${KEEP_BRANCH_NOTE}\n${L}`;
+  const plain = `Merge or close this PR?\n${L}`;
+  assert.equal(entryMatchesMessage({ links: [L], keepBranch: true }, shown), true);
+  assert.equal(entryMatchesMessage({ links: [L] }, plain), true, 'old entries without the flag still match');
+  assert.equal(entryMatchesMessage({ links: [L] }, shown), false, 'flag stripped from store → refuse');
+  assert.equal(entryMatchesMessage({ links: [L], keepBranch: true }, plain), false, 'flag added to store → refuse');
+});

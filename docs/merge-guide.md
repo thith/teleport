@@ -52,10 +52,11 @@ Cũng có thể khai báo cố định trong `projects.json` → `_config.autoMe
 **Gọi thế nào** (chạy trong session của bạn, từ project root):
 
 ```
-node ../teleport/scripts/merge-request.mjs <URL PR> [<URL PR> …]
+node ../teleport/scripts/merge-request.mjs <URL PR> [<URL PR> …] [--keep-branch]
 ```
 
 - Nhiều PR cùng lúc thì ghi theo **đúng thứ tự cần merge** (PR nền trước).
+- `--keep-branch`: giữ nhánh nguồn sau merge (mặc định xoá; áp cho mọi PR trong yêu cầu, owner thấy "giữ nhánh nguồn" trước khi bấm). Nhánh tích hợp (`main`, `master`, `develop`, `pre-develop`, `staging`, `production`) luôn được giữ.
 - Lệnh chỉ xếp yêu cầu vào hộp thư của daemon rồi thoát ngay. Nó **không** merge và không cấp quyền gì.
 
 **Chuyện gì xảy ra sau đó:**

@@ -190,3 +190,20 @@ test('buildMergeResultPrompt: a merge adds the short worktree-cleanup hint; a re
   const batch = buildMergeResultPrompt({ convoId: 1, chatId: -1, mode: 'ask', text: '✅ merged PR o/r#3 "a" into main (squash).\n\n❌ PR o/r#4 "b": conflicts' }).text;
   assert.match(batch, /PR đã merge/);
 });
+
+test('--keep-branch: parsed anywhere, stored only when set, validated as boolean', () => {
+  assert.deepEqual(parseRequestArgs(['--keep-branch', L1]), { links: [L1], keepBranch: true });
+  assert.deepEqual(parseRequestArgs([L1, '--keep-branch']), { links: [L1], keepBranch: true });
+  assert.match(parseRequestArgs(['--keep-branch']).error, /usage/);
+  assert.match(parseRequestArgs(['--keep-brnch', L1]).error, /not a GitHub PR URL/);
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mr-kb-'));
+  writeRequest({ links: [L1], convoId: '42', keepBranch: true, dir, now: Date.now() });
+  writeRequest({ links: [L1], convoId: '42', dir, now: Date.now() + 1 });
+  const [a, b] = [...claimRequests(dir)];
+  assert.equal(a.body.keepBranch, true);
+  assert.equal('keepBranch' in b.body, false, 'default request carries no flag');
+  assert.deepEqual(validRequest(a.body), { links: [L1], convoId: '42', keepBranch: true });
+  assert.deepEqual(validRequest(b.body), { links: [L1], convoId: '42' });
+  assert.deepEqual(validRequest({ links: [L1], convoId: '1', keepBranch: false }), { links: [L1], convoId: '1' });
+  for (const bad of ['true', 1, null, {}]) assert.equal(validRequest({ links: [L1], convoId: '1', keepBranch: bad }), null);
+});
