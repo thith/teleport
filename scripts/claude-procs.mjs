@@ -199,7 +199,7 @@ export function buildProcRows({ psRows, uid, sessions = new Map(), procExtras = 
  * Render `/ls` (plain text; cwd shown as its folder name), in two sections:
  *   📺 Screen   — every `tele-*` screen (spawned agents) plus any other screen that
  *                 hosts a claude;
- *   🖥 Terminal — claude processes opened by hand (no screen).
+ *   💻 Terminal — claude processes opened by hand (no screen).
  * One block per claude PROCESS (RFC 26 §3.10): a title line (persona #hashtag), then one
  * `<emoji> <name>: <value>` line per known attribute, then the tappable commands. A screen
  * with no claude inside is a one-line block. Blocks are separated by ONE empty line (the
@@ -214,7 +214,7 @@ export function buildProcRows({ psRows, uid, sessions = new Map(), procExtras = 
  *   ctxOf(row) → "ctx 172k (17%)" | null; linksOf(row) → ['/kill_x', …] (the caller decides who may tap)
  *   tokensOf(row) → context tokens | null — 🟡/🔴 highlight on a big context.
  *   showSession — print the full session UUID (terminal use; hidden on Telegram).
- *   full     — false (the default `/ls`, Thi): one line per agent — 📺/🖥, name #hashtag, state, context,
+ *   full     — false (the default `/ls`, Thi): one line per agent — 📺/💻, name #hashtag, state, context,
  *              🔇 listener off / 📬 mail — then its links; no section headers. `listenerOf(convo)` → 'on'|'off'|null.
  */
 export function formatAgentList({ screens = [], procs = [], personaOf = () => null, home = os.homedir(), statusLinesOf = () => [], mailOf = () => null, convoOfHashtag = () => null, ctxOf = () => null, linksOf = () => [], showSession = true, full = true, listenerOf = () => null, tokensOf = () => null } = {}) {
@@ -240,7 +240,7 @@ export function formatAgentList({ screens = [], procs = [], personaOf = () => nu
   const block = (r) => {
     const tag = r.hashtag || (typeof r.screen === 'string' && r.screen.startsWith('tele-') ? r.screen.slice(5) : null);
     // A guessed session's persona/hashtag is a guess too: say so in the title (both forms, UUID shown or not).
-    const title = ([persona(tag) || r.name, tag ? `#${tag}` : null].filter(Boolean).join(' ') || `${r.screen ? '📺' : '🖥'} PID ${r.pid}`) + (r.guessed ? ' (đoán)' : '');
+    const title = ([persona(tag) || r.name, tag ? `#${tag}` : null].filter(Boolean).join(' ') || `${r.screen ? '📺' : '💻'} PID ${r.pid}`) + (r.guessed ? ' (đoán)' : '');
     const convo = convoOf(r);
     const ctx = safe(() => ctxOf(r), null);
     const mail = convo != null ? safe(() => mailOf(convo), null) : null;
@@ -253,9 +253,9 @@ export function formatAgentList({ screens = [], procs = [], personaOf = () => nu
       // 📨 = the session's name — the address for Claude's cross-session messages (SendMessage to=<name>)
       r.name ? `📨 Session: ${r.name}` : null,
       showSession && r.sessionId ? `🆔 Session: ${r.sessionId}${r.guessed ? ' (đoán)' : ''}` : null,
-      r.status ? `⚙️ Trạng thái: ${r.status}` : null,
+      r.status ? `🚦 Trạng thái: ${r.status}` : null,
       short(r.cwd) ? `📁 Folder: ${short(r.cwd)}` : null,
-      r.etime ? `⏱️ Uptime: ${r.etime}` : null,
+      r.etime ? `🕒 Uptime: ${r.etime}` : null,
       ctx ? `🧠 Context: ${ctxText(ctx, r)}` : null,
       r.bridgeSessionId ? '📡 Remote Control: bật' : null,
       ...status,
@@ -273,7 +273,7 @@ export function formatAgentList({ screens = [], procs = [], personaOf = () => nu
     const off = convo != null && safe(() => listenerOf(convo), null) === 'off';
     const links = safe(() => linksOf(r), []);
     const head = [
-      `${r.screen ? '📺' : '🖥'} ${[persona(tag) || r.name, tag ? `#${tag}` : null].filter(Boolean).join(' ') || `PID ${r.pid}`}${r.guessed ? ' (đoán)' : ''}`,
+      `${r.screen ? '📺' : '💻'} ${[persona(tag) || r.name, tag ? `#${tag}` : null].filter(Boolean).join(' ') || `PID ${r.pid}`}${r.guessed ? ' (đoán)' : ''}`,
       r.status, ctx ? ctxText(ctx, r) : null, off ? '🔇' : null, mail > 0 ? `📬${mail}` : null,
     ].filter(Boolean).join(' · ');
     return links.length ? `${head}\n${links.join(' ')}` : head;
@@ -297,7 +297,7 @@ export function formatAgentList({ screens = [], procs = [], personaOf = () => nu
   const section = (head, blocks) => [head, ...(blocks.length ? blocks : ['(không có)'])].join('\n\n');
   return [
     section(`📺 Screen (${screenNames.length})`, screenBlocks),
-    section(`🖥 Terminal (${terminal.length})`, terminal.map(block)),
+    section(`💻 Terminal (${terminal.length})`, terminal.map(block)),
   ].join('\n\n');
 }
 

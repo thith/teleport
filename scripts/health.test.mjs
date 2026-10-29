@@ -29,7 +29,7 @@ test('formatHealth: all sections + warnings only when thresholds are crossed', (
   assert.match(ok, /RAM: dùng 10\.0 GB \/ 16\.0 GB · còn khả dụng 6\.0 GB/);
   assert.match(ok, /Swap: 1\.0 GB \/ 2\.0 GB\n/);
   assert.match(ok, /Disk \/: còn trống 120\.0 GB \/ 500\.0 GB \(24%\)/);
-  assert.match(ok, /Agent claude: 2 đang chạy \(📺 screen 1 · 🖥 terminal 1\) · busy 1/);
+  assert.match(ok, /Agent claude: 2 đang chạy \(📺 screen 1 · 💻 terminal 1\) · busy 1/);
   assert.match(ok, /• java ×2: 4\.1 GB\n• node ×22: 700 MB/);
   assert.match(ok, /✅ Không có cảnh báo\.\n\n\/cswap {3}\/type {3}\/ls$/); // tappable shortcuts close the message
   const bad = formatHealth({ ...base, load: [14, 9, 8], mem: { total: 16 * GB, available: 1 * GB, swapTotal: 2 * GB, swapFree: 0 }, disk: { size: 500 * GB, avail: 20 * GB, target: '/' }, oomKills: 3 });

@@ -1,7 +1,9 @@
-// teleport-cli.mjs — pure logic behind the `teleport` terminal command (RFC 27).
+// teleport-cli.mjs — pure logic behind the `teleport` terminal command (RFC 27, RFC 28).
 //
 // `bin/teleport.mjs` is the thin runner; everything testable lives here: argv
 // parsing, the help text, and `install` (symlink into ~/.local/bin).
+//
+// parse() names the script to run: `{ script: 'spawn' | 'resume', args }` (resume.mjs for `resume` and `ls off`).
 //
 // WHY the wrapper builds spawn.mjs argv itself instead of forwarding argv:
 // spawn.mjs picks its mode with `argv.includes(...)` in a fixed order (help →
@@ -18,12 +20,15 @@ import { SEPARATORS } from './spawn-extra-args.mjs';
 // Full topic hashtag (not the 3-char tail). Same shape as the HASHTAG_RE family.
 export const KILL_ID_RE = /^[a-j]\d{7}$/i;
 
-export const HELP = `teleport — list / attach / kill / spawn Telegram-connected agents from a terminal
+export const HELP = `teleport — list / attach / kill / spawn / resume Telegram-connected agents from a terminal
 
 Usage:
-  teleport ls [full]                 list running agents ("full" = detailed blocks)
-  teleport attach [<id>]             re-attach this terminal to an interactive agent (alias: a)
+  teleport ls [full|off]             list running agents ("full" = detailed blocks;
+                                     "off" = agents stopped in the last 30 days)
+  teleport attach [<id>|<name>]      re-attach this terminal to an interactive agent (alias: a)
   teleport kill <hashtag>            gracefully stop an agent (alias: k)
+  teleport resume <name|hashtag|3-digit tail> [-- <claude flags>]
+                                     bring a stopped agent back in a screen (alias: r)
   teleport spawn [--headless] [--mode <m>] [-- <claude flags>]
                                      start a new agent in the CURRENT folder (its Telegram group)
   teleport install                   symlink this command into ~/.local/bin
@@ -33,7 +38,11 @@ Notes:
   <id>        the last 3 chars of the hashtag, the full hashtag, or tele-<hashtag>;
               omit it when only one session is live. Write it WITHOUT "#"
               (bash treats "#" as a comment).
-  kill        needs the FULL hashtag (e.g. d1331668). Killing by name or pid:<PID>
+  <name>      a persona name (emoji and case are ignored; several words need no quotes),
+              e.g. teleport attach Robot 2. It addresses the agent running in the screen.
+              A last-3-digits tail that matches several agents is refused with a list.
+  resume      take the tail or name from "teleport ls off". A running agent is not resumed.
+  kill        needs the FULL hashtag (e.g. d1331668). Killing by name, tail or pid:<PID>
               is Telegram /kill only.
   spawn       interactive by default (subscription billing, runs in screen);
               --headless runs "claude -p" instead (Agent SDK pool).
@@ -45,9 +54,16 @@ Notes:
 
 const stripId = (s) => s.replace(/^#/, '').replace(/^tele-/i, '');
 
+// Every token of an address is checked on its own (a joined string would hide `foo --kill`): not a flag,
+// also not once a leading "#" is off, and not the phone dashes spawn.mjs / resume.mjs read as "--".
+const badAddressToken = (t) => {
+  const bare = t.replace(/^#/, '');
+  return t.startsWith('-') || bare.startsWith('-') || SEPARATORS.has(t) || SEPARATORS.has(bare);
+};
+
 /**
  * Turn argv (without node + script) into one of
- *   { spawnArgs } | { help: true } | { install: true } | { error }.
+ *   { script: 'spawn' | 'resume', args } | { help: true } | { install: true } | { error }.
  */
 export function parse(argv) {
   const [sub, ...rest] = argv;
@@ -57,20 +73,31 @@ export function parse(argv) {
 
   switch (sub) {
     case 'ls': {
-      if (rest.length === 0) return { spawnArgs: ['--list'] };
-      if (rest.length === 1 && rest[0] === 'full') return { spawnArgs: ['--list', 'full'] };
-      return { error: `ls: unexpected argument "${rest.find((a) => a !== 'full') ?? rest[1]}" (only "full" is accepted)` };
+      if (rest.length === 0) return { script: 'spawn', args: ['--list'] };
+      if (rest.length === 1 && rest[0] === 'full') return { script: 'spawn', args: ['--list', 'full'] };
+      if (rest.length === 1 && rest[0] === 'off') return { script: 'resume', args: ['--list-stopped'] };
+      return { error: `ls: unexpected argument "${rest.find((a) => a !== 'full' && a !== 'off') ?? rest[1]}" (accepts one of: full, off)` };
     }
     case 'attach':
     case 'a': {
-      if (rest.length > 1) return { error: `${sub}: takes at most one <id>` };
-      if (rest.length === 0) return { spawnArgs: ['--attach'] };
-      const id = rest[0].replace(/^#/, '');
-      if (!id) return { error: `${sub}: empty <id>` };
-      // Check AFTER stripping "#": a quoted '#--help' must not reach spawn.mjs as a flag.
-      // spawn.mjs also reads '—' / '–' (phone dashes) as the "--" separator and would drop the id.
-      if (id.startsWith('-') || SEPARATORS.has(id)) return { error: `${sub}: unknown option "${rest[0]}"` };
-      return { spawnArgs: ['--attach', id] };
+      if (rest.length === 0) return { script: 'spawn', args: ['--attach'] };
+      // Words of one name ("Robot 2") are joined into ONE argv element; a "#" is kept, so `#Ong` stays an address.
+      const bad = rest.find(badAddressToken);
+      if (bad !== undefined) return { error: `${sub}: unknown option "${bad}"` };
+      const id = rest.join(' ').trim();
+      if (!id.replace(/^#/, '').trim()) return { error: `${sub}: empty <id>` };
+      return { script: 'spawn', args: ['--attach', id] };
+    }
+    case 'resume':
+    case 'r': {
+      const sep = rest.indexOf('--');
+      const own = sep === -1 ? rest : rest.slice(0, sep);
+      const bad = own.find(badAddressToken);
+      if (bad !== undefined) return { error: `${sub}: unknown option "${bad}" (claude flags go after "--")` };
+      const query = own.join(' ').trim();
+      if (!query.replace(/^#/, '').trim()) return { error: `${sub}: needs a <name|hashtag|3-digit tail> (see: teleport ls off)` };
+      // The query keeps its "#" (an exact address, never a name); everything from "--" on goes through as typed.
+      return { script: 'resume', args: [query, ...(sep === -1 ? [] : rest.slice(sep))] };
     }
     case 'kill':
     case 'k': {
@@ -80,7 +107,7 @@ export function parse(argv) {
       if (!KILL_ID_RE.test(id)) {
         return { error: `${sub}: "${rest[0]}" is not a full hashtag (e.g. d1331668). Killing by 3-char tail, name or pid: is only possible via Telegram /kill.` };
       }
-      return { spawnArgs: ['--kill', `tele-${id}`] };
+      return { script: 'spawn', args: ['--kill', `tele-${id}`] };
     }
     case 'spawn': {
       let headless = false;
@@ -100,11 +127,11 @@ export function parse(argv) {
         }
         return { error: `spawn: unknown argument "${a}"` };
       }
-      const spawnArgs = [];
-      if (!headless) spawnArgs.push('--interactive');
-      if (mode) spawnArgs.push('--mode', mode);
-      spawnArgs.push(...passthrough);
-      return { spawnArgs };
+      const args = [];
+      if (!headless) args.push('--interactive');
+      if (mode) args.push('--mode', mode);
+      args.push(...passthrough);
+      return { script: 'spawn', args };
     }
     case 'install':
       if (rest.length) return { error: `install: unexpected argument "${rest[0]}"` };

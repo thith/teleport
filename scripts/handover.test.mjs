@@ -153,7 +153,7 @@ test('matchTarget: by name, case-insensitive', () => {
 
 test('matchTarget: by hashtag and by convoId', () => {
   assert.equal(matchTarget(normalizeTarget('#t333'), [heoA, cu]).match, cu);
-  assert.equal(matchTarget(normalizeTarget('333'), [heoA, cu]).match, cu);
+  assert.equal(matchTarget(normalizeTarget('convo:333'), [heoA, cu]).match, cu);
 });
 
 test('matchTarget: name collision → prefer most recent, report shadowed', () => {
@@ -489,4 +489,22 @@ test('matchTarget: does NOT resolve alive-only by persona-name (reuse risk)', ()
   const live = listSteerableTargets({}, ['-100'], { aliveDir, now });
   const persona = personaForConvo(convo);
   assert.equal(matchTarget(normalizeTarget(persona.name), live).status, 'not_found');
+});
+
+test('matchTarget (RFC 28): a 3-digit tail = the hashtag it ends, over the whole pool; several hashtags → ambiguous (never a pick); none → not_found', () => {
+  const sua = { convoId: '3552300954451780', hashtag: 'f4451780', ts: 100, persona: { emoji: '🪼', name: 'Sứa', index: 1 } };
+  const cao = { convoId: '1111111112222780', hashtag: 'b2222780', ts: 900, persona: { emoji: '🦊', name: 'Cáo', index: 2 } };
+  const other = { convoId: '5555555555555555', hashtag: 'e5555555', ts: 5, persona: { emoji: '🦉', name: 'Cú', index: 3 } };
+  assert.deepEqual(normalizeTarget('780'), { kind: 'tail', value: '780' });
+  assert.equal(matchTarget(normalizeTarget('555'), [sua, cao, other]).match, other);
+  assert.equal(matchTarget(normalizeTarget('780'), [sua, other]).match, sua);
+  assert.equal(matchTarget(normalizeTarget('999'), [sua, other]).status, 'not_found');
+  const amb = matchTarget(normalizeTarget('780'), [sua, cao, other]);
+  assert.equal(amb.status, 'ambiguous', 'the fresher Cáo must NOT win a recency pick');
+  assert.deepEqual(amb.candidates.map((c) => c.hashtag).sort(), ['b2222780', 'f4451780']);
+  assert.match(formatTopicList(amb.candidates), /Sứa #f4451780/);
+  // the same convo in two groups is one hashtag → found
+  assert.equal(matchTarget(normalizeTarget('780'), [sua, { ...sua, chatId: 'other', ts: 50 }]).status, 'found');
+  // an old test used 3-digit convoIds: that address is now convo:<id>
+  assert.equal(matchTarget(normalizeTarget('convo:333'), [{ convoId: '333', hashtag: 't333', persona: null }]).status, 'found');
 });

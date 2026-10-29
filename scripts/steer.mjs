@@ -103,10 +103,13 @@ export function groupChatIds(config) {
   return [...ids];
 }
 
+// Explicit target tokens (a hard error when unresolved, never text): `#hash` and `convo:<id>` (RFC 28).
+// A bare 3-digit tail is NOT explicit: like a bare convoId it is plain text when replying, a tail otherwise.
+const isExplicitTarget = (tok) => typeof tok === 'string' && (tok.startsWith('#') || /^convo:/i.test(tok));
 // Resolve the target + the message text from argv, with reply context. Precedence
 // (RFC 07 §2.1, airtight): 1) argv[0] starts with `#` → explicit hash (fail =
-// hard error); 2) reply mode (reply has a resolvable hash) → ALL argv is text,
-// no convoId/persona detection on argv[0]; 3) non-reply convoId (all-digits);
+// hard error; `convo:<id>` too); 2) reply mode (reply has a resolvable hash) → ALL argv is text,
+// no convoId/persona detection on argv[0]; 3) non-reply convoId (all-digits) or 3-digit tail;
 // 4) non-reply persona-name. Returns { match, text } or { error }.
 export function resolveSteerTarget(argv, { live, replyText, usage }) {
   const a0 = argv[0];
@@ -114,7 +117,7 @@ export function resolveSteerTarget(argv, { live, replyText, usage }) {
   // Names go through matchSteerName (two persona topics with one name → refuse); # / convoId stay exact.
   const find = (t) => (t.kind === 'name' ? matchSteerName(t.value, live) : matchTarget(t, live));
 
-  if (a0 && a0.startsWith('#')) {
+  if (isExplicitTarget(a0)) {
     const m = find(normalizeTarget(a0));
     if (m.status !== 'found') return fail(a0, m.status); // hard error — never fall to reply
     return { match: m.match, text: argv.slice(1).join(' ').trim() };
@@ -187,7 +190,7 @@ export function resolveSteerTargetRaw(raw, { live, replyText, usage }) {
     const t = normalizeTarget(tok);
     return t.kind === 'name' ? matchSteerName(t.value, live) : matchTarget(t, live);
   };
-  if (!sp.error && !sp.quoted && sp.token.startsWith('#')) {
+  if (!sp.error && !sp.quoted && isExplicitTarget(sp.token)) {
     const m = find(sp.token);
     return m.status === 'found' ? { match: m.match, text: sp.text } : fail(sp.token, m.status, m.candidates);
   }

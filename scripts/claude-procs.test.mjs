@@ -156,22 +156,22 @@ test('formatAgentList: one block per claude process — title, `<emoji> <name>: 
     linksOf: (r) => (r.pid === 830318 ? ['/compact_a7611284', '/kill_a7611284'] : []),
   });
   const iScreen = out.indexOf('📺 Screen (3)');
-  const iTerm = out.indexOf('🖥 Terminal (1)');
+  const iTerm = out.indexOf('💻 Terminal (1)');
   assert.ok(iScreen === 0 && iTerm > iScreen, out);
-  assert.match(out, new RegExp(`\n\n🦛 Hà Mã #i0744244 \\(đoán\\)\n📺 Screen: tele-i0744244\n🔢 PID: 9\n🆔 Session: ${SID2} \\(đoán\\)\n⏱️ Uptime: 00:01\n\n`));
+  assert.match(out, new RegExp(`\n\n🦛 Hà Mã #i0744244 \\(đoán\\)\n📺 Screen: tele-i0744244\n🔢 PID: 9\n🆔 Session: ${SID2} \\(đoán\\)\n🕒 Uptime: 00:01\n\n`));
   assert.match(out, /\n\n📺 tele-empty123 · không thấy claude bên trong\n\n/);
-  assert.match(out, /\n\nx\n📺 Screen: work\n🔢 PID: 11\n📨 Session: x\n📁 Folder: w\n⏱️ Uptime: 00:02\n\n/); // non-tele screen hosting a claude
+  assert.match(out, /\n\nx\n📺 Screen: work\n🔢 PID: 11\n📨 Session: x\n📁 Folder: w\n🕒 Uptime: 00:02\n\n/); // non-tele screen hosting a claude
   const term = out.slice(iTerm);
-  assert.equal(term, `🖥 Terminal (1)\n\n🪱 Giun #a7611284\n🔢 PID: 830318\n📨 Session: 🪱 Giun\n🆔 Session: ${SID}\n⚙️ Trạng thái: idle\n📁 Folder: umipay\n⏱️ Uptime: 2-00:49:26\n🧠 Context: 172k\n📡 Remote Control: bật\n/compact_a7611284 /kill_a7611284`);
+  assert.equal(term, `💻 Terminal (1)\n\n🪱 Giun #a7611284\n🔢 PID: 830318\n📨 Session: 🪱 Giun\n🆔 Session: ${SID}\n🚦 Trạng thái: idle\n📁 Folder: umipay\n🕒 Uptime: 2-00:49:26\n🧠 Context: 172k\n📡 Remote Control: bật\n/compact_a7611284 /kill_a7611284`);
   assert.doesNotMatch(out, /pts\//);   // no tty line
   assert.doesNotMatch(out, /\n\n\n/);  // exactly one empty line between blocks
   const hidden = formatAgentList({ procs, showSession: false });
   assert.doesNotMatch(hidden, /🆔|5ce13594/, 'UUIDs hidden on Telegram');
   assert.match(formatAgentList({ procs: [{ ...procs[1], name: 'g' }], showSession: false }), /🦛 Hà Mã #i0744244 \(đoán\)|g #i0744244 \(đoán\)/, 'a guess stays visible without the UUID');
   assert.match(formatAgentList({ full: false, procs: [procs[1]] }), /^📺 #i0744244 \(đoán\)$/, 'short form too');
-  assert.match(formatAgentList({ procs: [{ pid: 5 }] }), /🖥 Terminal \(1\)\n\n🖥 PID 5\n🔢 PID: 5$/);
+  assert.match(formatAgentList({ procs: [{ pid: 5 }] }), /💻 Terminal \(1\)\n\n💻 PID 5\n🔢 PID: 5$/);
   const empty = formatAgentList({});
-  assert.equal(empty, '📺 Screen (0)\n\n(không có)\n\n🖥 Terminal (0)\n\n(không có)');
+  assert.equal(empty, '📺 Screen (0)\n\n(không có)\n\n💻 Terminal (0)\n\n(không có)');
 });
 
 test('formatAgentList full:false — one line per agent (icon, name #hash, state, ctx, 🔇, 📬) + its links', () => {
@@ -190,8 +190,8 @@ test('formatAgentList full:false — one line per agent (icon, name #hash, state
   assert.equal(out, [
     '📺 tele-empty123 · không thấy claude bên trong',
     '📺 🪱 Giun #a7611284 · busy · 150k · 🔇 · 📬2\n/compact_a7611284 /kill_a7611284 /nudge_a7611284',
-    '🖥 term',
-    '🖥 PID 3',
+    '💻 term',
+    '💻 PID 3',
   ].join('\n\n'));
   assert.equal(formatAgentList({ full: false }), '(không có agent nào)');
   const hl = (n) => formatAgentList({ full: false, procs: [procs[0]], ctxOf: () => 'ctx Xk (9%)', tokensOf: () => n });
@@ -406,3 +406,25 @@ test('killClaudePid: expectStart (caller snapshot) mismatch → refused, no sign
   assert.equal(sent.length, 0);
 });
 
+// RFC 28 §2.1: GNOME Terminal (VTE) draws the text-presentation emoji ⚙️ ⏱️ 🖥 wider than it counts them, so the next
+// space is eaten. Every label emoji must be Emoji_Presentation (wide by default) and carry no VS16.
+test('formatAgentList: the leading emoji of EVERY label branch is Emoji_Presentation and has no U+FE0F', () => {
+  const SIDX = '848e5ded-a905-4b49-8448-12ed50f4a7dc';
+  const procs = [
+    { pid: 1, etime: '2-00:49:26', cwd: '/w/a', screen: 'tele-a7611284', sessionId: SIDX, guessed: false, hashtag: 'a7611284', name: 'n', status: 'idle', bridgeSessionId: 'b1', tty: 'pts/1' },
+    { pid: 2, etime: '1:00', cwd: '/w/b', screen: null, sessionId: SIDX, guessed: true, hashtag: 'b1111111', name: null, status: 'busy' },
+    { pid: 3 },
+  ];
+  const opts = { screens: [{ pid: '9', name: 'tele-empty123' }], procs, home: '/h', ctxOf: () => 'ctx 172k (17%)', tokensOf: () => 800_000, mailOf: () => 3, listenerOf: () => 'off', statusLinesOf: () => ['🎧 Listener: đang nghe'], linksOf: () => ['/kill_a7611284'] };
+  const outs = [formatAgentList(opts), formatAgentList({ ...opts, showSession: false }), formatAgentList({ ...opts, full: false }), formatAgentList({}), formatAgentList({ full: false })];
+  for (const out of outs) {
+    assert.doesNotMatch(out, /\uFE0F/u, out);
+    for (const line of out.split('\n')) {
+      if (!/^[^\x00-\x7f]/.test(line)) continue; // links, plain-name titles
+      assert.match(line, /^\p{Emoji_Presentation}/u, `label emoji of: ${line}`);
+    }
+  }
+  const all = outs.join('\n');
+  for (const label of ['🚦 Trạng thái:', '🕒 Uptime:', '💻 Terminal (', '💻 PID 3', '📺 Screen (']) assert.ok(all.includes(label), label);
+  assert.doesNotMatch(all, /[\u{1F5A5}\u2699\u23F1]/u, 'the old text-presentation emoji are gone');
+});

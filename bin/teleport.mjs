@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-// teleport — terminal command for listing / attaching / killing / spawning
-// agents (RFC 27). Thin runner over scripts/spawn.mjs; parsing, help and
+// teleport — terminal command for listing / attaching / killing / spawning / resuming
+// agents (RFC 27, 28). Thin runner over scripts/spawn.mjs and scripts/resume.mjs; parsing, help and
 // install live in scripts/teleport-cli.mjs so they can be unit-tested.
 //
 // Exit codes: bad args 2; spawn.mjs's own status; killed by a signal →
@@ -30,12 +30,13 @@ function main() {
     return r.code;
   }
 
-  // TELEPORT_CLI_SPAWN: tests only — substitute a fake spawn script.
-  const script = process.env.TELEPORT_CLI_SPAWN || path.join(root, 'scripts', 'spawn.mjs');
+  // TELEPORT_CLI_SPAWN / TELEPORT_CLI_RESUME: tests only — substitute a fake script.
+  const override = parsed.script === 'resume' ? process.env.TELEPORT_CLI_RESUME : process.env.TELEPORT_CLI_SPAWN;
+  const script = override || path.join(root, 'scripts', `${parsed.script}.mjs`);
   // Keep cwd (spawn.mjs picks the Telegram group from it) and the TTY (attach).
-  const res = spawnSync(process.execPath, [script, ...parsed.spawnArgs], { stdio: 'inherit' });
+  const res = spawnSync(process.execPath, [script, ...parsed.args], { stdio: 'inherit' });
   if (res.error) {
-    console.error(`teleport: cannot run spawn.mjs: ${res.error.message}`);
+    console.error(`teleport: cannot run ${parsed.script}.mjs: ${res.error.message}`);
     return 127;
   }
   if (typeof res.status === 'number') return res.status;

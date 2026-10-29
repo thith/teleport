@@ -78,7 +78,7 @@ export function formatHealth({ cores, load, mem, disk, agents, top, oomKills, lo
   const ioPsi = psi?.io?.full ?? null;
   if (load) {
     const pct = cores ? Math.round((load[0] / cores) * 100) : null;
-    lines.push(`🖥 CPU: ${cores} nhân · load ${load.map((x) => x.toFixed(2)).join(' / ')}${pct != null ? ` (~${pct}%)` : ''}${cpuPsi ? ` · chờ CPU ${Math.round(cpuPsi.avg10)}%` : ''}`);
+    lines.push(`💻 CPU: ${cores} nhân · load ${load.map((x) => x.toFixed(2)).join(' / ')}${pct != null ? ` (~${pct}%)` : ''}${cpuPsi ? ` · chờ CPU ${Math.round(cpuPsi.avg10)}%` : ''}`);
     if (cpuPsi) {
       if (cpuPsi.avg10 >= CPU_PSI_ALERT) warn.push(`CPU quá tải (${Math.round(cpuPsi.avg10)}% thời gian có tiến trình chờ CPU)`);
     } else if (cores && load[0] > cores) warn.push(`CPU quá tải (load ${load[0].toFixed(1)} > ${cores} nhân)`);
@@ -107,7 +107,7 @@ export function formatHealth({ cores, load, mem, disk, agents, top, oomKills, lo
   if (agents) {
     const screen = agents.filter((a) => a.screen).length;
     const busy = agents.filter((a) => a.status === 'busy').length;
-    lines.push(`🤖 Agent claude: ${agents.length} đang chạy (📺 screen ${screen} · 🖥 terminal ${agents.length - screen}) · busy ${busy}`);
+    lines.push(`🤖 Agent claude: ${agents.length} đang chạy (📺 screen ${screen} · 💻 terminal ${agents.length - screen}) · busy ${busy}`);
   }
   if (top && top.length) {
     lines.push('', 'Ăn RAM nhiều nhất:');

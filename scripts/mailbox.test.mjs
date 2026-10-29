@@ -598,3 +598,19 @@ test('registry row cannot borrow identity: name/hashtag recomputed from convoId;
   const self = selfIdentity({ env: { CLAUDE_CODE_SESSION_ID: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee' }, argConvo: '5555666677778888' });
   assert.equal(self.convoId, '5555666677778888');
 });
+
+test('resolveRecipient (RFC 28): a 3-digit tail resolves over EVERY agent; no match is an error (never an unregistered inbox "780"); several → ambiguous; convo:780 is the explicit short convoId', () => {
+  const agents = [
+    { convoId: A, name: '🪼 Sứa', hashtag: 'f4451780', lastActive: 1000 },
+    { convoId: B, name: '🦊 Cáo', hashtag: 'e5555555', lastActive: 9000 },
+  ];
+  assert.equal(resolveRecipient('780', agents).convoId, A);
+  assert.equal(resolveRecipient('name:780', agents).convoId, A);
+  assert.match(resolveRecipient('999', agents).error, /no agent with a hashtag ending in 999.*convo:<id>/);
+  const amb = resolveRecipient('780', [...agents, { convoId: '777', name: '🐺 Sói', hashtag: 'c0000780', lastActive: 99999 }]);
+  assert.equal(amb.ambiguous.length, 2, 'the freshest Sói must not win');
+  assert.equal(amb.convoId, undefined);
+  const short = resolveRecipient('convo:780', agents);
+  assert.equal(short.convoId, '780'); assert.equal(short.unregistered, true);
+  assert.match(resolveRecipient('convo:x', agents).error, /bad convo target/);
+});

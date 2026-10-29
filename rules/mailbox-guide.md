@@ -40,6 +40,7 @@ node ../teleport/scripts/mailbox.mjs ls [--all]              # ai đang quanh đ
 node ../teleport/scripts/mailbox.mjs send --to Voi "nội dung"
 echo "nội dung dài" | node ../teleport/scripts/mailbox.mjs send --to '#a2283444'
 node ../teleport/scripts/mailbox.mjs send --to 1111222233334444 --file ./report.md "kèm file"
+node ../teleport/scripts/mailbox.mjs send --to 780 "nội dung"   # 3 số cuối của hashtag; trùng nhiều agent → exit 3, không đoán (convoId ngắn: convo:780)
 node ../teleport/scripts/mailbox.mjs check                   # xem có thư không (KHÔNG tiêu thụ)
 node ../teleport/scripts/mailbox.mjs read [--max N] [--json] # đọc + lưu trữ
 node ../teleport/scripts/mailbox.mjs wait [--timeout <sec>]  # chặn tới khi có thư

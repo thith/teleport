@@ -79,7 +79,7 @@ import { processCleanupRequests, processCleanupOffers, handleCleanupButton, CLEA
 import { PersistentMap } from './button-store.mjs';
 import { formatPersona } from './persona.mjs';
 import { shortConvoHash } from './convo-hash.mjs';
-import { personaByHashtag } from './spawn.mjs';
+import { makePersonaOf } from './spawn.mjs';
 import {
   TypeRunner, listForType, allowedOps, agentLine, messageNamesTarget, defaultIo, observe, classify,
   findTypeTarget, pinTarget, typeTargets, agentLabel,
@@ -943,11 +943,8 @@ export { COMPACT_MIN_TOKENS }; // type-cmd.mjs (shared with the /ls links)
 let typeRunner = null; // one per daemon: per-agent locks, cool-down, Esc rate limit
 const getTypeRunner = () => (typeRunner ||= new TypeRunner(defaultIo()));
 
-const personaLookup = () => {
-  let pmap = {};
-  try { pmap = personaByHashtag(); } catch {}
-  return (h) => (pmap[h] ? formatPersona(pmap[h]) : null);
-};
+// personaOf(row | hashtag) — a row gets its own convo's persona (RFC 28 §2.5); a bare hashtag (display) the map fallback.
+const personaLookup = () => makePersonaOf();
 
 /** Step 2 text + keyboard for one agent (fresh observation). Pure-ish (no I/O beyond `obs`). */
 export function typeStep2({ target, obs, persona, cfg = {}, tok, signals = null }) {
@@ -968,19 +965,19 @@ export function typeStep2({ target, obs, persona, cfg = {}, tok, signals = null 
   return { text, rows: [row], ops, buttons: [...buttons, 'x'] };
 }
 
-/** `/type` (agent menu) or `/type #hash` (straight to the commands). */
-export async function startType(rest, ctx, { list = listForType, io = defaultIo(), personaOf = personaLookup() } = {}) {
+/** `/type` (agent menu) or `/type <tên | #hash | 3 số cuối>` (straight to the commands; same lookup as /compact). */
+export async function startType(rest, ctx, { list = listForType, io = defaultIo(), personaOf = personaLookup(), procs = () => listClaudeProcs() } = {}) {
   const { daemonUserId, projectsConfig, sendText, sendButtonRows, buttonStore } = ctx;
   if (!sendButtonRows || !buttonStore) { await sendText(daemonUserId, '❌ /type cần chạy trong daemon.'); return; }
-  const toks = tokenizeArgs(rest);
-  const want = (toks[0] || '').replace(/^#/, '').toLowerCase();
-  if (toks.length > 1 || (want && !/^[0-9a-z]{8}$/.test(want))) { await sendText(daemonUserId, 'usage: /type  ·  /type #<hashtag>   (lệnh chọn bằng nút)'); return; }
+  const query = String(rest || '').trim();
+  const f = query ? findTypeTarget(query, procs(), personaOf) : null;
+  if (f?.error) { await sendText(daemonUserId, `❌ /type: ${f.error}\nusage: /type  ·  /type <tên | #hashtag | 3 số cuối>   (lệnh chọn bằng nút)`); return; }
   const agents = list({ personaOf, cfg: projectsConfig, io });
-  if (want) {
-    const a = agents.find((x) => x.target.hashtag === want);
-    if (!a) { await sendText(daemonUserId, `❌ không thấy agent #${want} trong screen tele-* (agent mở trong terminal thường không gõ vào được).`); return; }
+  if (f) {
+    const a = agents.find((x) => x.target.pid === f.row.pid && x.target.hashtag === f.row.hashtag);
+    if (!a) { await sendText(daemonUserId, `❌ không thấy agent #${f.row.hashtag} trong screen tele-* (agent mở trong terminal thường không gõ vào được).`); return; }
     const tok = crypto.randomBytes(8).toString('hex');
-    const step = typeStep2({ target: a.target, obs: a.obs, persona: personaOf(want), cfg: projectsConfig, tok, signals: io.nudgeSignals?.(a.target) });
+    const step = typeStep2({ target: a.target, obs: a.obs, persona: personaOf(a.target), cfg: projectsConfig, tok, signals: io.nudgeSignals?.(a.target) });
     const sent = await sendButtonRows(daemonUserId, step.text, step.rows);
     buttonStore.set(tok, { kind: 'type', target: a.target, chatId: daemonUserId, messageId: sent?.message_id ?? null, createdAt: Date.now(), ops: step.buttons });
     return;
@@ -989,7 +986,7 @@ export async function startType(rest, ctx, { list = listForType, io = defaultIo(
   const text = `⌨️ /type — chọn agent:\n${agents.map((a) => `• ${a.line}`).join('\n')}`;
   // The label is free text (the pick is bound by callback data + the #hash in the list above): persona + context
   // use without the "ctx" word ("👻 Ma · 693k (35%)"); the #hash only when there is no persona to tell agents apart.
-  const rows = agents.map((a) => [{ text: [personaOf(a.target.hashtag) || `#${a.target.hashtag}`, a.ctx?.replace(/^ctx /, '')].filter(Boolean).join(' · '), callback_data: `ty:pick:${a.target.hashtag}` }]);
+  const rows = agents.map((a) => [{ text: [personaOf(a.target) || `#${a.target.hashtag}`, a.ctx?.replace(/^ctx /, '')].filter(Boolean).join(' · '), callback_data: `ty:pick:${a.target.hashtag}` }]);
   await sendButtonRows(daemonUserId, text, rows);
 }
 
@@ -1029,7 +1026,7 @@ export async function runTypeCommand(op, rest, from, ctx, { list = () => listCla
   const f = findTypeTarget(rest, list(), personaOf);
   if (f.error) { await sendText(daemonUserId, `❌ ${cmd}: ${f.error}`); return; }
   const t = pinTarget(f.row);
-  const persona = personaOf(t.hashtag);
+  const persona = personaOf(f.row);
   const obs = observe(t, io);
   if (obs.mismatch) { await sendText(daemonUserId, `❌ ${cmd} ${agentLabel(t, persona)}: ${obs.mismatch}.`); return; }
   const ctxNote = op === 'c' ? formatContext(obs.usage, contextWindowFor(projectsConfig || {}, { hashtag: t.hashtag, model: obs.usage?.model })) : null;
@@ -1082,7 +1079,7 @@ export async function nudgeAll(from, ctx, { list = () => listClaudeProcs(), io =
     const t = pinTarget(r);
     const s = io.nudgeSignals?.(t);
     if (!(s?.listener === 'off' || s?.mail > 0)) continue;
-    const persona = personaOf(t.hashtag);
+    const persona = personaOf(r);
     const name = agentLabel(t, persona);
     if (seen.get(t.hashtag) > 1) { out.push(`❌ ${name}: hashtag trùng ${seen.get(t.hashtag)} process — bỏ qua (xem /ls).`); continue; }
     const obs = observe(t, io);
@@ -1114,7 +1111,7 @@ export async function startTapKill(rest, ctx, { list = () => listClaudeProcs(), 
   if (!proc || proc.comm !== 'claude' || String(proc.start) !== String(t.procStart) || sess?.sessionId !== t.sessionId) { await sendText(daemonUserId, `❌ #${tag}: process vừa đổi — gõ lại /kill_${tag}.`); return; }
   const tr = io.transcript(t.sessionId, t.cwd);
   const ctxStr = formatContext(tr?.usage, contextWindowFor(projectsConfig || {}, { hashtag: tag, model: tr?.usage?.model }));
-  const line = agentLine(t, { persona: personaOf(tag), state: classify(sess?.status, tr?.ended), ctx: ctxStr });
+  const line = agentLine(t, { persona: personaOf(r), state: classify(sess?.status, tr?.ended), ctx: ctxStr });
   const tok = crypto.randomBytes(8).toString('hex');
   const sent = await sendButtonRows(daemonUserId, `💀 ${line}\n\nKill agent này (SIGTERM, phiên dừng hẳn — muốn chạy lại dùng /resume_${tag})? Bấm ✅ để xác nhận.`,
     [[{ text: TYPE_BUTTON_LABEL.y, callback_data: `ty:${tok}:y` }, CANCEL_BUTTON(tok)]]);
@@ -1136,7 +1133,7 @@ export async function killViaSpawn(target, from, ctx, { runner = execFileP, scri
   } catch (e) { return ((e.stdout || '') + (e.stderr ? `\n${e.stderr}` : '')).trim() || `❌ kill lỗi: ${e.message || e}`; }
 }
 
-export async function handleTypeButton(cq, ctx, { runner = getTypeRunner(), list = listForType, io = defaultIo(), deliver = deliverResult, kill = killViaSpawn } = {}) {
+export async function handleTypeButton(cq, ctx, { runner = getTypeRunner(), list = listForType, procs = () => listClaudeProcs(), io = defaultIo(), deliver = deliverResult, kill = killViaSpawn } = {}) {
   const m = String(cq.data || '').match(TYPE_BUTTON_RE);
   const chatId = cq.message?.chat?.id, messageId = cq.message?.message_id;
   const original = cq.message?.text || '';
@@ -1145,10 +1142,14 @@ export async function handleTypeButton(cq, ctx, { runner = getTypeRunner(), list
     const h = m[1];
     if (!new RegExp(`#${h}\\b`).test(original)) { await ctx.answerButton(cq.id, 'Nút không khớp tin nhắn.'); return; }
     const personaOf = personaLookup();
-    const a = list({ personaOf, cfg: ctx.projectsConfig, io }).find((x) => x.target.hashtag === h);
+    // The tap names a hashtag only: resolve it over ALL live rows first (a terminal twin the menu never listed refuses, like a typed /type #h).
+    const f = findTypeTarget(`#${h}`, procs(), personaOf);
+    if (f.error) { await ctx.answerButton(cq.id, 'Agent không còn / trùng.'); await ctx.editButtonRows(chatId, messageId, `${original}\n\n❌ #${h}: ${f.error}`, []); return; }
+    const as = list({ personaOf, cfg: ctx.projectsConfig, io }).filter((x) => x.target.hashtag === h && x.target.pid === f.row.pid);
+    const a = as.length === 1 ? as[0] : null;
     if (!a) { await ctx.answerButton(cq.id, 'Agent không còn.'); await ctx.editButtonRows(chatId, messageId, `${original}\n\n❌ #${h} không còn trong screen — gõ /type lại.`, []); return; }
     const tok = crypto.randomBytes(8).toString('hex');
-    const step = typeStep2({ target: a.target, obs: a.obs, persona: personaOf(h), cfg: ctx.projectsConfig, tok, signals: io.nudgeSignals?.(a.target) });
+    const step = typeStep2({ target: a.target, obs: a.obs, persona: personaOf(a.target), cfg: ctx.projectsConfig, tok, signals: io.nudgeSignals?.(a.target) });
     ctx.buttonStore.set(tok, { kind: 'type', target: a.target, chatId, messageId, createdAt: Date.now(), ops: step.buttons });
     await ctx.answerButton(cq.id);
     await ctx.editButtonRows(chatId, messageId, step.text, step.rows);
@@ -1208,7 +1209,7 @@ export async function handleTypeButton(cq, ctx, { runner = getTypeRunner(), list
   }
   await ctx.answerButton(cq.id, op === 'i' ? 'Đang đọc ô nhập…' : op === 'u' ? 'Đang xoá ô nhập…' : `Đang gõ ${TYPE_OPS[op] === 'esc' ? 'Esc' : TYPE_OPS[op]}…`);
   await ctx.editButtonRows(chatId, messageId, `${base}\n\n⏳ ${op === 'i' ? 'đang đọc' : op === 'u' ? 'đang xoá' : 'đang gõ'} ${TYPE_OP_LABEL[op]}…`, []);
-  const r = await runner.run(op, entry.target, String(cq.from?.id ?? 'owner'), { persona: personaLookup()(entry.target.hashtag) });
+  const r = await runner.run(op, entry.target, String(cq.from?.id ?? 'owner'), { persona: personaLookup()(entry.target) });
   if (r.canClear) { // the box holds text: offer [🧹 Xoá] (a fresh one-shot token for the same pinned target)
     const t2 = crypto.randomBytes(8).toString('hex');
     ctx.buttonStore.set(t2, { kind: 'type', target: entry.target, chatId, messageId, createdAt: Date.now(), ops: ['u', 'x'] });

@@ -39,10 +39,10 @@ import { fileURLToPath } from 'node:url';
 import { isMainModule } from './is-direct-run.mjs';
 import { uuidToConvoInt } from './convo-registry.mjs';
 import { shortConvoHash } from './convo-hash.mjs';
-import { normalizeAgentName, parseAgentTarget, unquoteTarget } from './agent-target.mjs';
+import { normalizeAgentName, parseAgentTarget, unquoteTarget, resolveTail, HASHTAG_RE } from './agent-target.mjs';
 import { createListenerStatus } from './listener-status.mjs';
 import { countUnread } from './mailbox.mjs';
-import { typeTargets, lsLinks } from './type-cmd.mjs';
+import { typeTargets, lsLinks, screenWindowCount } from './type-cmd.mjs';
 import { readTopicsStore } from './topics-store.mjs';
 import { formatPersona } from './persona.mjs';
 import { peekPersona } from './persona-store.mjs';
@@ -116,7 +116,7 @@ Manage sessions (interactive/screen only):
   --list, --ls       show running \`tele-*\` sessions with persona, pid, and topic,
                      then EVERY claude process of this user (pid, cwd, tty, uptime,
                      screen or terminal, session id + #hashtag) — incl. hand-opened ones.
-  --attach [<id>]    re-attach; <id> = 3-char tail (116), #hashtag, or tele-name.
+  --attach [<id>]    re-attach; <id> = 3-char tail (116), #hashtag, persona name, or tele-name.
     (--resume)       Omit <id> when exactly one session is live. Detach: Ctrl-A D.
   --kill <id>        send /exit, wait up to ${KILL_GRACE_MS / 1000}s, then force-quit.
     (--quit)         Needs the FULL hashtag (no shortcuts — it's destructive).
@@ -369,6 +369,47 @@ export function personaByHashtag(store = readTopicsStore()) {
 }
 
 /**
+ * `personaOf(row)` for every name match against a LIVE claude (RFC 28 §2.5): the persona of the
+ * row's OWN convo (`peekPersona(uuidToConvoInt(sessionId))`, only for a known, non-guessed session) —
+ * exact, no map by hashtag, so two convos sharing a hashtag can't overwrite each other. A row without
+ * a sure session falls back to a hashtag → Set(persona) map; a hashtag with several distinct personas
+ * answers null (no name match). A string argument is a bare hashtag (display callers). `store`/`peek`
+ * injectable; an unreadable store = no fallback names, addresses by hashtag/tail still work.
+ */
+export function makePersonaOf({ store, peek = peekPersona } = {}) {
+  let byTag = null;
+  const tags = () => {
+    if (byTag) return byTag;
+    byTag = new Map();
+    try {
+      for (const entry of Object.values(store ?? readTopicsStore() ?? {})) {
+        if (!entry || typeof entry !== 'object' || Array.isArray(entry)) continue;
+        for (const key of Object.keys(entry)) {
+          if (key.startsWith('_')) continue;
+          const p = peek(key);
+          if (!p) continue;
+          const h = shortConvoHash(key);
+          (byTag.get(h) || byTag.set(h, new Set()).get(h)).add(formatPersona(p));
+        }
+      }
+    } catch { /* no store → no fallback names */ }
+    return byTag;
+  };
+  return (row) => {
+    const r = typeof row === 'string' ? { hashtag: row } : row;
+    if (!r) return null;
+    if (r.sessionId && !r.guessed) {
+      const c = uuidToConvoInt(r.sessionId);
+      const p = c == null ? null : peek(c);
+      return p ? formatPersona(p) : null;
+    }
+    const set = r.hashtag ? tags().get(r.hashtag) : null;
+    return set && set.size === 1 ? [...set][0] : null;
+  };
+}
+export const personaOfRow = (row, opts) => makePersonaOf(opts)(row);
+
+/**
  * How to bring a killed session back: `/resume_<hashtag>` when it has a Telegram
  * topic (/resume only finds those), else the UUID form. null for an unknown session.
  */
@@ -454,7 +495,7 @@ export async function gracefulKill(name, {
  * session with the same hashtag, and ONE window (an un-targeted `/exit` / quit would hit any
  * other window too). Occupants are found by screen NAME and by the screen's PID (a claude's STY
  * keeps the pid across a screen rename), so an unknown `screenPid` refuses; with it, no
- * occupant = empty screen → ok. `windows` = direct children of the screen process (one per
+ * occupant = empty screen → ok. `windows` = the screen's own window count (screenWindowCount; one per
  * window); null = unknown → refuse. Pure → { ok } | { error } (RFC 26 §3.7).
  */
 export function checkScreenKillTarget(name, procs, { screenPid = null, windows = null, descendantClaudes = [] } = {}) {
@@ -475,7 +516,7 @@ export function checkScreenKillTarget(name, procs, { screenPid = null, windows =
     return { error: `claude trong "${name}" không phải session #${tag}${r.sessionId ? ` (${r.guessed ? 'đoán ' : ''}${r.sessionId})` : ''} — dùng /kill pid:${r.pid}.` };
   }
   // Any OTHER live claude with this hashtag — even one holding the same session — except the occupant's own children.
-  const twins = procs.filter((p) => p.pid !== r.pid && p.ppid !== r.pid && p.hashtag === tag);
+  const twins = procs.filter((p) => p.pid !== r.pid && !(p.ppid === r.pid && p.sessionId && !p.guessed && p.sessionId === r.sessionId) && p.hashtag === tag); // a child is the same agent only on the SAME session (hashtags can collide)
   if (twins.length) return { error: `#${tag} trùng với ${twins.map((p) => `PID ${p.pid}`).join(', ')} — dùng /kill pid:${r.pid}.` };
   return { ok: true };
 }
@@ -512,46 +553,137 @@ export function formatSessionList(sessions) {
 }
 
 /**
- * Resolve `--attach <raw>` against the LIVE sessions (convenience, RFC 03 follow-up):
- *  1. NO id → attach iff exactly ONE session is live ("nếu chỉ có 1 thì bỏ qua ID").
- *     With ≥2 → require an id.
- *  2. `raw` is exactly 3 chars → an EXACT hashtag wins, else match the hashtag TAIL
- *     (`116` → `tele-c8630116`). 0 → not-found, 1 → attach, ≥2 → ambiguous (list).
- *  3. Otherwise → the full form (bare hashtag / `#hashtag` / `tele-name`), which must
- *     exist among the live sessions (case-insensitive).
- * A *given* id is always validated — a wrong id never silently attaches to the lone
- * survivor. Pure → testable. Returns `{ ok, name }` or `{ error }`.
+ * Who is behind each live screen, for address resolution (RFC 28 §2.5b). An agent address (hashtag,
+ * tail, name) names the claude INSIDE a screen, not the screen's label: `tele-a1111780` can hold
+ * another session. Entries `{ hashtag, persona, screen?, screenPid?, row?, confirmed?, mismatch? }`:
+ *  - a screen with exactly-known occupants → one entry per occupant (`confirmed`);
+ *  - a screen whose label differs from its confirmed occupant also gets a label-only `mismatch` entry
+ *    (so its tail still counts toward ambiguity; it never resolves to an agent);
+ *  - a screen with no identifiable claude → an unconfirmed entry by its label;
+ *  - every other live claude row (terminal, `claude -p` child…) → a plain row entry (no screen).
+ * `screens` = listSpawnSessions rows `{ pid, name }`, `procs` = listClaudeProcs rows. Pure.
  */
-export function resolveAttachTarget(raw, sessions) {
+export function agentIdentities(screens, procs, personaOf = () => null) {
+  const safe = (r) => { try { return personaOf(r) ?? null; } catch { return null; } };
+  const out = [];
+  const taken = new Set();
+  for (const sc of screens) {
+    const label = String(sc.name).replace(/^tele-/i, '').toLowerCase();
+    const sp = Number(sc.pid) || null;
+    const all = procs.filter((r) => r.screen === sc.name || (sp != null && r.screenPid === sp));
+    // The window's own claude = the screen's direct child; a `claude -p` it runs is a descendant, not an occupant.
+    const direct = all.filter((r) => sp != null && r.ppid === sp);
+    const inside = direct.length ? direct : all.filter((r) => !all.some((o) => o.pid === r.ppid));
+    const sure = inside.filter((r) => r.sessionId && !r.guessed && r.hashtag);
+    const base = { screen: sc.name, screenPid: String(sc.pid) };
+    for (const r of inside) taken.add(r);
+    // A descendant (`claude -p`) is no occupant, but its tail still counts (a /kill 657 must not pick the parent when the child ends in 657) — except one holding the occupant's own (confirmed) session: distinct sessions can share a hashtag.
+    for (const r of all) if (!inside.includes(r) && r.sessionId && !r.guessed && sure.some((o) => o.sessionId === r.sessionId)) taken.add(r);
+    for (const r of sure) out.push({ ...base, hashtag: r.hashtag.toLowerCase(), persona: safe(r), row: r, confirmed: true });
+    if (!sure.length) out.push({ ...base, hashtag: label, persona: safe({ hashtag: label }), confirmed: false, occupied: inside.length > 0 });
+    // A custom screen name (tele-giun, tele-bot) is a screen name only: a label identity exists when a hashtag/tail address could match the label (hashtag shape or exactly 3 digits).
+    else if ((HASHTAG_RE.test(label) || /^\d{3}$/.test(label)) && !sure.some((r) => r.hashtag.toLowerCase() === label)) out.push({ ...base, hashtag: label, persona: null, confirmed: false, mismatch: true });
+    // A guessed occupant under another hashtag: not an identity, but its tail still counts toward ambiguity.
+    for (const r of inside) if (!sure.includes(r) && r.hashtag && r.hashtag.toLowerCase() !== label) out.push({ ...base, hashtag: r.hashtag.toLowerCase(), persona: null, confirmed: false, mismatch: true });
+  }
+  for (const r of procs) if (r.hashtag && !taken.has(r)) out.push({ hashtag: r.hashtag.toLowerCase(), persona: safe(r), row: r });
+  return out;
+}
+
+/** `🪼 Sứa #f4451780` — how errors name an agent identity. */
+export const identityLabel = (x) => `${x.persona ? `${x.persona} ` : ''}#${x.hashtag}${x.screen && (x.mismatch || x.screen.toLowerCase() !== `tele-${x.hashtag}`) ? ` (screen ${x.screen})` : ''}`;
+// Live screens (one per screen PID) as `persona #hashtag`, for "live: …" lists.
+const liveScreens = (ids) => [...new Map(ids.filter((x) => x.screen && !x.mismatch).map((x) => [`${x.screenPid}.${x.screen}`, x])).values()];
+const liveList = (ids) => liveScreens(ids).map(identityLabel).join(', ');
+
+/**
+ * Resolve `--attach <raw>` against the LIVE sessions (convenience, RFC 03 follow-up; RFC 28):
+ *  1. NO id → attach iff exactly ONE session is live. With ≥2 → require an id.
+ *  2. `tele-…` = a SCREEN address: the exact screen name (case-insensitive), which must be ONE screen.
+ *  3. Any other ADDRESS (`#x`, a hashtag shape, or exactly 3 chars `[A-Za-z0-9]`) = an AGENT address,
+ *     resolved on the claude INSIDE each screen (agentIdentities) and never falling back to names:
+ *     3 digits → resolveTail (no exact-hashtag shortcut: a screen `tele-780` must not shadow agent
+ *     `#a1234780`); other 3 chars → an exact hashtag wins (Gemini `t12`), else the tail.
+ *  4. Anything else is a NAME (`Sứa`, `Robot 2`, `giun`): an exact screen name (`tele-<raw>` / `<raw>`)
+ *     ∪ sessions whose persona (their own convo's) matches. ≥ 2 different → refuse and list.
+ * A *given* id is always validated — a wrong id never silently attaches to the lone survivor.
+ * `personaOf(row)` and `procs` (listClaudeProcs rows) come from the caller; `procsError` set = the
+ * process list is unknown, so agent addresses (3, 4) are refused. Pure → `{ ok, name, pid }` | `{ error }`.
+ */
+export function resolveAttachTarget(raw, sessions, { personaOf = () => null, procs = [], procsError = null, windowsOf = () => 1 } = {}) {
   if (!sessions.length) return { error: 'no live agent sessions (try: teleport ls).' };
-  const id = raw == null ? '' : String(raw).trim().replace(/^#/, '');
+  const id = raw == null ? '' : String(raw).trim();
+  const ids = agentIdentities(sessions, procs, personaOf);
+  const listing = () => `live: ${liveList(ids) || formatSessionList(sessions)}`;
+  // `screen -r pid.name` selects no window: an agent address into a multi-window (or unknown) screen could open another agent's window.
+  const done = (x) => {
+    const w = windowsOf(x.screenPid);
+    if (w !== 1) return { error: `screen ${x.screen} has ${w ?? '?'} windows — can't tell which holds the agent. Use the explicit screen address: tele-… (${x.screen}).` };
+    return { ok: true, name: x.screen, pid: x.screenPid };
+  };
 
-  // (1) NO id → attach iff exactly one session is live (the "nếu chỉ 1 thì bỏ qua
-  //     ID" case). With ≥2, require an id. A *given* id is always validated below —
-  //     a wrong id never silently lands you in the lone survivor.
+  // (1) NO id → exactly one live session (a lone survivor), else require an id.
   if (!id) {
-    if (sessions.length === 1) return { ok: true, name: sessions[0].name };
-    return { error: `${sessions.length} live sessions — give an id (3-char tail or #hashtag): ${formatSessionList(sessions)}` };
-  }
-  const lid = id.toLowerCase();
-
-  // (2) 3-char shorthand: an EXACT hashtag wins (e.g. Gemini `t12`), else match the
-  //     hashtag TAIL (`116` → `tele-c8630116`). ≥2 tail matches → ambiguous.
-  if (/^[A-Za-z0-9]{3}$/.test(id)) {
-    const exact = sessions.find((s) => sessHashtag(s) === lid);
-    if (exact) return { ok: true, name: exact.name };
-    const hits = sessions.filter((s) => sessHashtag(s).endsWith(lid));
-    if (hits.length === 0) return { error: `no session matching "${id}". live: ${formatSessionList(sessions)}` };
-    if (hits.length > 1) return { error: `"${id}" matches ${hits.length} sessions (${formatSessionList(hits)}) — use the full #hashtag.` };
-    return { ok: true, name: hits[0].name };
+    if (sessions.length === 1) return { ok: true, name: sessions[0].name, pid: String(sessions[0].pid) };
+    return { error: `${sessions.length} live sessions — give an id (3-char tail, #hashtag or name): ${liveList(ids) || formatSessionList(sessions)}` };
   }
 
-  // (3) full form (bare / #/ tele- hashtag) → must exist among live sessions (case-insensitive).
-  let name;
-  try { name = normalizeSessionName(id); } catch (e) { return { error: e.message }; }
-  const hit = sessions.find((s) => s.name.toLowerCase() === name.toLowerCase());
-  if (!hit) return { error: `no live session "${name}". live: ${formatSessionList(sessions)}` };
-  return { ok: true, name: hit.name };
+  // (2) a screen address — never an agent lookup.
+  if (/^tele-/i.test(id)) {
+    if (!SAFE_SESSION_NAME.test(id)) return { error: `invalid session id ${JSON.stringify(id)} (allowed: A-Za-z0-9_.-)` };
+    const hits = sessions.filter((s) => s.name.toLowerCase() === id.toLowerCase());
+    if (!hits.length) return { error: `no live session "${id}". ${listing()}` };
+    if (hits.length > 1) return { error: `"${id}" matches ${hits.length} screens (${hits.map((s) => `${s.pid}.${s.name}`).join(', ')}) — rename one, or kill the stale one.` };
+    return { ok: true, name: hits[0].name, pid: String(hits[0].pid) };
+  }
+  const isAddress = id.startsWith('#') || HASHTAG_RE.test(id) || /^[A-Za-z0-9]{3}$/.test(id);
+  const needProcs = () => (procsError ? { error: `cannot read the process list (${procsError}) — can't tell who is inside each screen. Use the exact screen name: tele-<hashtag>.` } : null);
+
+  // (3) an agent address.
+  if (isAddress) {
+    const blocked = needProcs();
+    if (blocked) return blocked;
+    const hashed = id.startsWith('#'); // `#x` is an EXACT hashtag (RFC §2.2): tail / 3-char shorthand only for bare input
+    const bare = id.replace(/^#/, '');
+    const lid = bare.toLowerCase();
+    let tag = lid;
+    if (!hashed && /^[A-Za-z0-9]{3}$/.test(bare) && !/^\d{3}$/.test(bare) && !ids.some((x) => x.hashtag === lid)) {
+      // 3 letters/digits that are no hashtag: an exact custom screen name (tele-bot) still answers to them.
+      const sc = sessions.filter((s) => s.name.toLowerCase() === `tele-${lid}`);
+      if (sc.length > 1) return { error: `"${bare}" matches ${sc.length} screens (${sc.map((s) => `${s.pid}.${s.name}`).join(', ')}) — rename one, or kill the stale one.` };
+      if (sc.length === 1) return done({ screen: sc[0].name, screenPid: String(sc[0].pid) });
+    }
+    if (!hashed && (/^\d{3}$/.test(bare) || (/^[A-Za-z0-9]{3}$/.test(bare) && !ids.some((x) => x.hashtag === lid)))) {
+      const t = resolveTail(lid, ids, identityLabel);
+      if (t.error) return { error: t.error.replace('gõ hashtag đầy đủ', 'gõ #hashtag đầy đủ (hoặc tele-<tên screen>)') };
+      if (t.none) return { error: `no session matching "${bare}". ${listing()}` };
+      tag = t.hashtag;
+    }
+    const hits = ids.filter((x) => x.hashtag === tag);
+    if (!hits.length) return { error: `no live session "${bare}". ${listing()}` };
+    if (hits.length > 1) return { error: `#${tag} matches ${hits.length} agents (${hits.map(identityLabel).join(', ')}) — use tele-<screen name>.` };
+    const x = hits[0];
+    if (x.mismatch) return { error: `screen ${x.screen} is named #${tag} but the claude inside is another agent — not attaching. Use tele-… for that exact screen.` };
+    if (!x.screen) return { error: `#${tag} (PID ${x.row?.pid}) is not inside a tele-* screen — nothing to attach to.` };
+    return done(x);
+  }
+
+  // (4) a name.
+  const blocked = needProcs();
+  if (blocked) return blocked;
+  const nq = normalizeAgentName(id);
+  const exact = SAFE_SESSION_NAME.test(id) ? sessions.filter((s) => [`tele-${id}`, id].some((n) => n.toLowerCase() === s.name.toLowerCase())) : [];
+  const byPersona = nq ? ids.filter((x) => !x.mismatch && x.persona && normalizeAgentName(x.persona) === nq) : [];
+  // Distinct targets: screens by PID+name (an exact-name screen with a persona hit is ONE), rows apart.
+  const key = (x) => (x.screen ? `${x.screenPid}.${x.screen}` : `row.${x.row?.pid}`);
+  const cands = new Map();
+  for (const s of exact) cands.set(`${s.pid}.${s.name}`, ids.find((x) => x.screen === s.name && String(x.screenPid) === String(s.pid) && !x.mismatch) || { screen: s.name, screenPid: String(s.pid), hashtag: sessHashtag(s) });
+  for (const x of byPersona) if (!cands.has(key(x))) cands.set(key(x), x);
+  if (!cands.size) return { error: `no live session named "${id}". ${listing()}` };
+  if (cands.size > 1) return { error: `"${id}" matches ${cands.size} agents (${[...cands.values()].map(identityLabel).join(', ')}) — use the #hashtag.` };
+  const x = [...cands.values()][0];
+  if (!x.screen) return { error: `${identityLabel(x)} (PID ${x.row?.pid}) is not inside a tele-* screen — nothing to attach to.` };
+  return done(x);
 }
 
 /**
@@ -1005,9 +1137,11 @@ export function checkPidKillAuth({ fromId, daemonUserId }) {
  * The process target after --kill/--quit: `pid:<N>` (also split as `pid: N`), or a
  * name. `name:` is optional — any other id is a name (persona, session name or
  * #hashtag, like /resume), EXCEPT a `tele-` id or a hashtag whose tele-* screen is
- * live (`isScreen`): those stay the screen kill (`{ found: false }`). Pure.
+ * live (`isScreen`): those stay the screen kill (`{ found: false }`). A 3-digit tail (RFC 28) is classified
+ * FIRST, by `tailAs(value)` → `{ screen }` (→ `{ found: false, screen }`: kill that screen) | `{ name }`
+ * (the process branch) | `{ error }` — never by `isScreen`. Pure.
  */
-export function resolveKillPid(argv, { isScreen = () => false } = {}) {
+export function resolveKillPid(argv, { isScreen = () => false, tailAs = null } = {}) {
   const i = argv.findIndex((a) => a === '--kill' || a === '--quit');
   const tok = argv[i + 1] ?? '';
   const explicit = /^name:/i.test(tok);
@@ -1016,6 +1150,15 @@ export function resolveKillPid(argv, { isScreen = () => false } = {}) {
   // is a name, never the a7611284 screen.
   const words = [explicit ? tok.slice(5) : tok];
   for (let j = i + 2; i !== -1 && j < argv.length && !argv[j].startsWith('--'); j++) words.push(argv[j]);
+  if (i !== -1 && tailAs && !/^pid:/i.test(tok)) {
+    // Read the WHOLE target like the process branch does (curly quotes survive the daemon tokenizer; `name: 780` is split) before classifying.
+    const t = parseAgentTarget(unquoteTarget(words.join(' ').trim()));
+    if (t.kind === 'tail') {
+      const r = tailAs(t.value);
+      if (r.error) return { found: true, error: r.error };
+      return r.screen ? { found: false, screen: r.screen } : { found: true, name: r.name };
+    }
+  }
   const screen = words.length === 1 && (/^tele-/i.test(tok) || isScreen(tok));
   if (i !== -1 && (explicit || (tok && !tok.startsWith('-') && !/^pid:/i.test(tok) && !screen))) {
     const name = unquoteTarget(words.join(' ')); // a phone's curly quotes survive the daemon tokenizer
@@ -1025,6 +1168,23 @@ export function resolveKillPid(argv, { isScreen = () => false } = {}) {
   const raw = argv[i + 1] === 'pid:' || /^pid:$/i.test(argv[i + 1]) ? `pid:${argv[i + 2] ?? ''}` : argv[i + 1];
   const pid = parseKillPidArg(raw);
   return pid ? { found: true, pid } : { found: true, error: `bad pid target ${JSON.stringify(raw)} — use pid:<PID> (see /ls).` };
+}
+
+/**
+ * `/kill <3 digits>` (RFC 28 §2.5b): the tail over every live screen's occupant ∪ every live claude row
+ * (agentIdentities) → one hashtag. A hashtag whose `tele-<hashtag>` screen holds that very agent → the
+ * screen kill, exactly as `/kill <hashtag>` (maintainers may; checkScreenKillTarget still applies); any
+ * other case → the process kill by `#hashtag` (owner-only, matchProcsByName refuses a twin). → { screen }
+ * | { name } | { error }. Pure.
+ */
+export function resolveKillTail(value, screens, procs, personaOf = () => null) {
+  const ids = agentIdentities(screens, procs, personaOf);
+  const t = resolveTail(value, ids, identityLabel);
+  if (t.error) return { error: t.error.replace('gõ hashtag đầy đủ', 'gõ #hashtag đầy đủ') };
+  if (t.none) return { error: `no live agent with tail "${value}" (see /ls).` };
+  const own = ids.filter((x) => x.hashtag === t.hashtag && x.screen && !x.mismatch && x.screen.toLowerCase() === `tele-${t.hashtag}`);
+  const scr = own.length === 1 && screens.filter((s) => s.name.toLowerCase() === own[0].screen.toLowerCase()).length === 1;
+  return scr ? { screen: own[0].screen } : { name: `#${t.hashtag}` };
 }
 
 export { normalizeAgentName }; // re-exported: session-name and older imports read it from here
@@ -1037,7 +1197,14 @@ export { normalizeAgentName }; // re-exported: session-name and older imports re
 export function matchProcsByName(name, rows, personaOf = () => null) {
   // A hashtag (`#a7611284` or `a7611284`, as copied from an agent's messages)
   // picks the process whose session has that hashtag.
-  const t = parseAgentTarget(name);
+  let t = parseAgentTarget(name);
+  // A 3-digit tail is a hashtag shorthand: resolved over ALL live rows first, then the hashtag path below.
+  if (t.kind === 'tail') {
+    const r = resolveTail(t.value, rows, (x) => `${personaOf(x) || x.name || '?'} #${x.hashtag} · PID ${x.pid}`);
+    if (r.error) return { error: r.error.replace('gõ hashtag đầy đủ', 'gõ #hashtag đầy đủ hoặc /kill pid:<PID>') };
+    if (r.none) return { error: `no live claude process with tail "${t.value}" (see /ls).` };
+    t = { kind: 'hashtag', value: r.hashtag };
+  }
   if (t.kind === 'hashtag') {
     const tag = t.value;
     const byTag = rows.filter((r) => r.hashtag === tag);
@@ -1322,9 +1489,16 @@ if (isDirectRun) {
   }
 
   // --kill pid:<PID>: owner-only SIGTERM of one claude process (via the daemon).
-  const killPid = resolveKillPid(argv, { isScreen: (id) => {
-    try { return hasBinary('screen') && screenSessionExists(normalizeSessionName(id)); } catch { return false; }
-  } });
+  const killPid = resolveKillPid(argv, {
+    isScreen: (id) => {
+      try { return hasBinary('screen') && screenSessionExists(normalizeSessionName(id)); } catch { return false; }
+    },
+    tailAs: (v) => {
+      if (!hasBinary('screen')) return { name: null, error: '`screen` not found on PATH.' };
+      try { return resolveKillTail(v, listSpawnSessions(), listClaudeProcs({ strict: true }), makePersonaOf()); }
+      catch (e) { return { error: `cannot list processes (${e.message}) — nothing killed.` }; }
+    },
+  });
   if (killPid.found) {
     if (killPid.error) { console.error(`[spawn] ${killPid.error}`); process.exit(1); }
     const fromId = process.env.TELE_FROM_ID || '';
@@ -1346,8 +1520,7 @@ if (isDirectRun) {
     }
     if (killPid.name) {
       // Owner only from here (no process list for anyone else).
-      const pmap = personaByHashtag();
-      const m = matchProcsByName(killPid.name, listClaudeProcs(), (r) => (r.hashtag && pmap[r.hashtag] ? formatPersona(pmap[r.hashtag]) : null));
+      const m = matchProcsByName(killPid.name, listClaudeProcs(), makePersonaOf());
       if (m.error) { appendKillAudit({ name: killPid.name, fromId, result: 'refused', reason: m.error }); console.error(`[spawn] ❌ ${m.error}`); process.exit(1); }
       // The name picked THIS process: keep its start fingerprint so a pid reused
       // by another claude before the kill is refused (with or without --restart).
@@ -1462,6 +1635,7 @@ if (isDirectRun) {
 
   // --kill <id>: id may be `d1331668`, `#d1331668`, or `tele-d1331668`.
   const kill = resolveKillId(argv);
+  if (killPid.screen) kill.raw = killPid.screen; // a tail that resolved to a screen kill (resolveKillTail)
   if (kill.found) {
     if (!kill.raw) { console.error('[spawn] --kill needs an id, e.g. `teleport kill d1331668` (or #d1331668 / tele-d1331668).'); process.exit(1); }
     if (!hasBinary('screen')) { console.error('[spawn] `screen` not found on PATH.'); process.exit(1); }
@@ -1482,7 +1656,7 @@ if (isDirectRun) {
     if (sameName.length === 1) name = sameName[0].name;
     const screenPid = Number(sameName[0]?.pid) || null;
     const ps = screenPid ? readPs() : null;
-    const windows = ps ? ps.filter((p) => p.ppid === screenPid).length : null;
+    const windows = screenPid ? screenWindowCount(`${screenPid}.${name}`) : null; // the screen's own window list (zombie windows count)
     const descendantClaudes = [];
     if (ps) {
       const byPpid = new Map();
@@ -1510,14 +1684,18 @@ if (isDirectRun) {
   }
 
   // --attach <id>: re-attach this terminal to a running agent's screen session.
-  // id may be the 3-char hashtag tail (`116`), a bare/`#`/`tele-` hashtag, or OMITTED
-  // when only one session is live (see resolveAttachTarget). ≥2 suffix matches → error.
+  // id may be the 3-char hashtag tail (`116`), a bare/`#`/`tele-` hashtag, a persona name, or
+  // OMITTED when only one session is live (see resolveAttachTarget). ≥2 matches → error.
   const attach = resolveAttachId(argv);
   if (attach.found) {
     if (!hasBinary('screen')) { console.error('[spawn] `screen` not found on PATH.'); process.exit(1); }
-    // Resolve against the live session list: a 3-char suffix (`116`) is enough, and
-    // when only ONE session is live the id is optional. ≥2 matches → ambiguous error.
-    const r = resolveAttachTarget(attach.raw, listSpawnSessions());
+    // Resolve against the live session list AND the claude inside each screen (RFC 28): a tail, hashtag
+    // or persona name addresses the agent, not the screen label; `tele-…` addresses the screen.
+    const sessions = listSpawnSessions();
+    let procs = [], procsError = null;
+    try { procs = listClaudeProcs({ strict: true }); } catch (e) { procsError = e.message; }
+    const windowsOf = (spid) => (Number(spid) ? screenWindowCount(`${spid}.${sessions.find((x) => String(x.pid) === String(spid))?.name}`) : null);
+    const r = resolveAttachTarget(attach.raw, sessions, { personaOf: makePersonaOf(), procs, procsError, windowsOf });
     if (r.error) { console.error(`[spawn] ${r.error}`); process.exit(1); }
     const name = r.name;
     // Hand the TTY to screen. `-r` re-attaches; `-d -r` steals it back if the
@@ -1526,7 +1704,7 @@ if (isDirectRun) {
     // running. We exit with screen's own status.
     console.log(`[spawn] attaching to "${name}" — detach with Ctrl-A then D (leaves the agent running).`);
     try {
-      execFileSync('screen', ['-U', '-d', '-r', name], { stdio: 'inherit' });
+      execFileSync('screen', ['-U', '-d', '-r', r.pid ? `${r.pid}.${name}` : name], { stdio: 'inherit' }); // pid.name: exactly the screen we resolved
       process.exit(0);
     } catch (e) {
       process.exit(typeof e?.status === 'number' ? e.status : 1);

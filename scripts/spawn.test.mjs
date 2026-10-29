@@ -10,10 +10,12 @@ import { fileURLToPath } from 'node:url';
 process.env.TELE_PERSONA_STORE = path.join(os.tmpdir(), `teleport-persona-store-spawn-${process.pid}.jsonl`);
 // No real systemd-run probe in unit tests (escapeServiceCgroup is tested with injected probes).
 process.env.TELEPORT_NO_SCOPE = '1';
-import { buildSpawnPlan, genSessionSeed, runSpawn, childLaunch, loginSeedEnv, wrapInLoginShell, scrubClaudeEnv, SEED_PATH, hasBinary, screenSessionExists, normalizeSessionName, parseScreenSessions, listSpawnSessions, resolveKillId, resolveAttachId, resolveAttachTarget, formatSessionList, resolveMode, SPAWN_PROMPT, PERMISSION_MODES, DEFAULT_PERMISSION_MODE, USAGE, personaByHashtag, gracefulKill, KILL_GRACE_MS, RESUME_PROMPT, resolveResumeSession, checkResumePreflight, findTranscriptDirs, checkPidKillAuth, resolveKillPid, normalizeAgentName, matchProcsByName, resumeHint, checkScreenKillTarget, appendKillAudit, acquireResumeLock, acquireResumeFileLock, performResume, checkRestartTarget, checkRestartPreflight, RESUME_LOCK_STALE_MS, resumeLockSecret, inSystemdService, escapeServiceCgroup, SYSTEMD_SCOPE_PREFIX } from './spawn.mjs';
-import fs from 'node:fs';
 import { uuidToConvoInt } from './convo-registry.mjs';
 import { shortConvoHash } from './convo-hash.mjs';
+import { formatPersona } from './persona.mjs';
+import { peekPersona } from './persona-store.mjs';
+import { buildSpawnPlan, genSessionSeed, runSpawn, childLaunch, loginSeedEnv, wrapInLoginShell, scrubClaudeEnv, SEED_PATH, hasBinary, screenSessionExists, normalizeSessionName, parseScreenSessions, listSpawnSessions, resolveKillId, resolveAttachId, resolveAttachTarget, formatSessionList, resolveMode, SPAWN_PROMPT, PERMISSION_MODES, DEFAULT_PERMISSION_MODE, USAGE, personaByHashtag, gracefulKill, KILL_GRACE_MS, RESUME_PROMPT, resolveResumeSession, checkResumePreflight, findTranscriptDirs, checkPidKillAuth, resolveKillPid, normalizeAgentName, matchProcsByName, resumeHint, makePersonaOf, personaOfRow, agentIdentities, resolveKillTail, checkScreenKillTarget, appendKillAudit, acquireResumeLock, acquireResumeFileLock, performResume, checkRestartTarget, checkRestartPreflight, RESUME_LOCK_STALE_MS, resumeLockSecret, inSystemdService, escapeServiceCgroup, SYSTEMD_SCOPE_PREFIX } from './spawn.mjs';
+import fs from 'node:fs';
 import { personaForConvo } from './persona.mjs';
 
 // A fixed UUID for deterministic seed tests (not a real session — never executed).
@@ -441,7 +443,7 @@ test('gracefulKill: already-gone session returns instantly (no pre-check sleep)'
 const S = (h) => ({ pid: '1', name: `tele-${h}` });
 
 test('resolveAttachTarget: single live session, NO id → attach it', () => {
-  assert.deepEqual(resolveAttachTarget(null, [S('c8630116')]), { ok: true, name: 'tele-c8630116' });
+  assert.deepEqual(resolveAttachTarget(null, [S('c8630116')]), { ok: true, name: 'tele-c8630116', pid: '1' });
 });
 
 test('resolveAttachTarget: single session + a WRONG id → error (no silent attach to lone survivor)', () => {
@@ -455,7 +457,7 @@ test('resolveAttachTarget: single session + a WRONG id → error (no silent atta
 
 test('resolveAttachTarget: 3-char EXACT hashtag wins over a tail match (Gemini t12)', () => {
   const sess = [S('t12'), S('foot12')];   // both end in "t12"; exact should pick tele-t12
-  assert.deepEqual(resolveAttachTarget('t12', sess), { ok: true, name: 'tele-t12' });
+  assert.deepEqual(resolveAttachTarget('t12', sess), { ok: true, name: 'tele-t12', pid: '1' });
 });
 
 test('resolveAttachTarget: case-insensitive (suffix + full form)', () => {
@@ -466,21 +468,21 @@ test('resolveAttachTarget: case-insensitive (suffix + full form)', () => {
 
 test('resolveAttachTarget: 2-char id routes to full-form (not suffix) → not found', () => {
   const r = resolveAttachTarget('11', [S('c8630116'), S('a1234999')]);
-  assert.ok(r.error); assert.match(r.error, /no live session "tele-11"/);
+  assert.ok(r.error); assert.match(r.error, /no live session named "11"/);
 });
 
 test('resolveAttachTarget: 3-char suffix matches the hashtag tail', () => {
   const sess = [S('c8630116'), S('a1234999')];
   const r = resolveAttachTarget('116', sess);
-  assert.deepEqual(r, { ok: true, name: 'tele-c8630116' });
-  assert.deepEqual(resolveAttachTarget('999', sess), { ok: true, name: 'tele-a1234999' });
+  assert.deepEqual(r, { ok: true, name: 'tele-c8630116', pid: '1' });
+  assert.deepEqual(resolveAttachTarget('999', sess), { ok: true, name: 'tele-a1234999', pid: '1' });
 });
 
 test('resolveAttachTarget: ambiguous 3-char suffix → error listing matches', () => {
   const sess = [S('c8630116'), S('a1234116')];   // both end in 116
   const r = resolveAttachTarget('116', sess);
   assert.ok(r.error);
-  assert.match(r.error, /matches 2 sessions/);
+  assert.match(r.error, /khớp 2 agent/);
   assert.match(r.error, /#c8630116/);
 });
 
@@ -1202,4 +1204,262 @@ test('checkScreenKillTarget: the claude inside must be that agent, alone, in a o
   assert.match(ok([own, { pid: 9, ppid: 1, screen: null, sessionId: sid, hashtag: tag }]).error, /trùng/, 'same session in a terminal too');
   const renamed = { ...own, screen: 'tele-zzzz0000', sessionId: '3b6f622a-63a9-491a-b683-b125b54d75fc', hashtag: 'i9661332' };
   assert.match(ok([renamed]).error, /không phải session/, 'a renamed screen is found by its pid');
+});
+
+// ── RFC 28: shared tail, persona per row, attach by name, /kill tail ─────────────
+
+const scr = (h, pid, name = `tele-${h}`) => ({ pid: String(pid), name });
+// A claude inside a screen: the screen process `sp` is its direct parent.
+const inRow = (h, sp, extra = {}) => ({ pid: sp + 1, ppid: sp, screen: `tele-${h}`, screenPid: sp, sessionId: `sid-${h}`, guessed: false, hashtag: h, name: null, ...extra });
+const PERSONA = { f4451780: '🪼 Sứa', b2222222: '🤖 Robot 2', d3333333: '🐺 Sói', e4444444: '🦊 Cáo', c5555555: '🦊 Cáo' };
+const pOf = (r) => PERSONA[r?.hashtag] || null;
+
+test('resolveAttachTarget: persona names go through the real resolver — `Sứa`, `Robot 2`, case/emoji ignored; never validated as a screen id', () => {
+  const sessions = [scr('f4451780', 10), scr('b2222222', 20)];
+  const procs = [inRow('f4451780', 10), inRow('b2222222', 20)];
+  const o = { personaOf: pOf, procs };
+  assert.deepEqual(resolveAttachTarget('Sứa', sessions, o), { ok: true, name: 'tele-f4451780', pid: '10' });
+  assert.deepEqual(resolveAttachTarget('robot 2', sessions, o), { ok: true, name: 'tele-b2222222', pid: '20' });
+  assert.deepEqual(resolveAttachTarget('🤖 Robot 2', sessions, o), { ok: true, name: 'tele-b2222222', pid: '20' });
+  const miss = resolveAttachTarget('Nobody', sessions, o);
+  assert.match(miss.error, /no live session named "Nobody"/); assert.match(miss.error, /🪼 Sứa #f4451780/);
+  assert.match(resolveAttachTarget('Cú', sessions, o).error, /no live session named "Cú"/, 'a 2-char Vietnamese name is a name, not an invalid id');
+});
+
+test('resolveAttachTarget: addresses never fall to a name — `#Ong`, `tele-Sứa`, `#`, and a 3-ASCII-char name is an address', () => {
+  const sessions = [scr('f4451780', 10)];
+  const o = { personaOf: (r) => (r.hashtag === 'ong' ? '🐝 Ong' : '🐝 Ong'), procs: [inRow('f4451780', 10)] };
+  assert.match(resolveAttachTarget('#Ong', sessions, o).error, /no (live )?session/);
+  assert.match(resolveAttachTarget('tele-Sứa', sessions, o).error, /invalid session id/);
+  assert.match(resolveAttachTarget('tele-Ong', sessions, o).error, /no live session "tele-Ong"/);
+  assert.match(resolveAttachTarget('#', [...sessions, scr('b2222222', 20)], o).error, /no (live )?session/, '`#` alone is never "no id"');
+  assert.match(resolveAttachTarget('Ong', sessions, o).error, /no session matching "Ong"/, '3 ASCII chars = address (hashtag/tail), even though Ong is the persona');
+  assert.equal(resolveAttachTarget('Giun', sessions, { ...o, personaOf: () => '🪱 Giun' }).ok, true, '4+ chars: a name');
+});
+
+test('resolveAttachTarget: an exact screen name (custom `tele-giun`, occupant CONFIRMED) is a candidate; a persona Giun elsewhere makes it ambiguous → refuse and list the screen name', () => {
+  const sessions = [scr('giun', 10), scr('d3333333', 20)];
+  const procs = [inRow('giun', 10, { hashtag: 'c7777777', sessionId: 'sid-c' }), inRow('d3333333', 20)];
+  const o = { personaOf: (r) => (r.hashtag === 'd3333333' ? '🪱 Giun' : null), procs };
+  const e = resolveAttachTarget('giun', sessions, o).error;
+  assert.match(e, /"giun" matches 2 agents/); assert.match(e, /#c7777777 \(screen tele-giun\)/); assert.match(e, /🪱 Giun #d3333333/);
+  // without the namesake the custom screen name works, and its occupant is still addressable by hashtag
+  assert.deepEqual(resolveAttachTarget('giun', [sessions[0]], { procs: [procs[0]] }), { ok: true, name: 'tele-giun', pid: '10' });
+  assert.equal(resolveAttachTarget('#c7777777', sessions, o).name, 'tele-giun');
+});
+
+test('resolveAttachTarget: `attach bot` (3 chars) reaches the custom screen tele-bot holding a confirmed agent; #bot is only an exact hashtag', () => {
+  const sessions = [scr('bot', 10), scr('d3333333', 20)];
+  const procs = [inRow('bot', 10, { hashtag: 'c7777777', sessionId: 'sid-c' }), inRow('d3333333', 20)];
+  assert.deepEqual(resolveAttachTarget('bot', sessions, { procs }), { ok: true, name: 'tele-bot', pid: '10' });
+  assert.match(resolveAttachTarget('#bot', sessions, { procs }).error, /no live session "bot"/);
+  assert.equal(resolveAttachTarget('tele-bot', sessions, { procs }).name, 'tele-bot');
+});
+
+test('resolveAttachTarget: `#x` is an EXACT hashtag — `#780` never selects #a1234780, a 3-letter `#abc` never a tail', () => {
+  const sessions = [scr('a1234780', 10), scr('c1111abc', 20)];
+  const procs = [inRow('a1234780', 10), inRow('c1111abc', 20)];
+  assert.match(resolveAttachTarget('#780', sessions, { procs }).error, /no live session "780"/);
+  assert.equal(resolveAttachTarget('780', sessions, { procs }).name, 'tele-a1234780');
+  assert.match(resolveAttachTarget('#abc', sessions, { procs }).error, /no live session "abc"/);
+  assert.equal(resolveAttachTarget('abc', sessions, { procs }).name, 'tele-c1111abc');
+});
+
+test('resolveKillTail: the pool is EVERY live claude row — a `claude -p` child on a colliding tail makes /kill refuse instead of picking the parent', () => {
+  const sessions = [scr('h6710657', 10)];
+  const parent = inRow('h6710657', 10);
+  const child = { pid: 99, ppid: parent.pid, screen: 'tele-h6710657', screenPid: 10, sessionId: 'sid-child', guessed: false, hashtag: 'h6711657' };
+  const e = resolveKillTail('657', sessions, [parent, child], pOf).error;
+  assert.match(e, /"657" khớp 2 agent/); assert.match(e, /#h6710657/); assert.match(e, /#h6711657/);
+  assert.deepEqual(resolveKillTail('657', sessions, [parent], pOf), { screen: 'tele-h6710657' });
+  // a child resuming the occupant's own session is the same agent, not a twin
+  assert.deepEqual(resolveKillTail('657', sessions, [parent, { ...child, hashtag: 'h6710657' }], pOf), { screen: 'tele-h6710657' });
+});
+
+test('resolveKillPid: the WHOLE target is read before classifying — curly/straight quotes and a split `name: 780` still go through tailAs', () => {
+  const seen = [];
+  const tailAs = (v) => { seen.push(v); return { name: `#x${v}` }; };
+  const isScreen = () => { throw new Error('no isScreen for a tail'); };
+  for (const argv of [['--kill', '“780”'], ['--kill', '"780"'], ['--kill', "'780'"], ['--kill', 'name:', '780'], ['--kill', 'name:“780”'], ['--kill', 'NAME:780']]) {
+    assert.deepEqual(resolveKillPid(argv, { isScreen, tailAs }), { found: true, name: '#x780' }, argv.join(' '));
+  }
+  assert.equal(seen.length, 6);
+  assert.deepEqual(resolveKillPid(['--kill', 'pid:780'], { isScreen: () => false, tailAs }).pid, 780);
+  assert.equal(seen.length, 6, 'pid: is not a tail');
+});
+
+test('resolveAttachTarget: two live convos sharing a hashtag but not a persona → the name matches only the one whose OWN persona it is (no map-overwrite)', () => {
+  const sessions = [scr('a1111111', 10, 'tele-a1111111'), scr('x', 20, 'tele-x')];
+  const procs = [inRow('a1111111', 10, { sessionId: 'sA' }), inRow('x', 20, { sessionId: 'sB', hashtag: 'a1111111' })];
+  const personaOf = (r) => ({ sA: '🐺 Sói', sB: '🦊 Cáo' })[r.sessionId] || null;
+  assert.equal(resolveAttachTarget('Sói', sessions, { personaOf, procs }).name, 'tele-a1111111');
+  assert.equal(resolveAttachTarget('Cáo', sessions, { personaOf, procs }).name, 'tele-x');
+  // …and the shared hashtag itself is refused, listing both
+  assert.match(resolveAttachTarget('#a1111111', sessions, { personaOf, procs }).error, /matches 2 agents.*🐺 Sói.*🦊 Cáo/);
+});
+
+test('resolveAttachTarget: a 3-digit tail is ALWAYS resolveTail — a screen `tele-780` does not shadow agent #a1234780; tele-780 stays an explicit screen address', () => {
+  const sessions = [scr('780', 10), scr('a1234780', 20)];
+  const procs = [inRow('780', 10, { sessionId: null }), inRow('a1234780', 20)];
+  const e = resolveAttachTarget('780', sessions, { personaOf: pOf, procs }).error;
+  assert.match(e, /"780" khớp 2 agent/);
+  assert.equal(resolveAttachTarget('tele-780', sessions, { procs }).name, 'tele-780');
+  assert.equal(resolveAttachTarget('#a1234780', sessions, { procs }).name, 'tele-a1234780');
+  assert.equal(resolveAttachTarget('t12', [scr('t12', 1), scr('foot12', 2)]).name, 'tele-t12', 'letter+digit: an exact hashtag wins');
+});
+
+test('resolveAttachTarget (§2.5b): agent addresses name the claude INSIDE, not the screen label', () => {
+  // screen tele-a1111780 actually holds #b2222222; the real #a1111780 lives in tele-c9999999
+  const sessions = [scr('a1111780', 10), scr('c9999999', 20)];
+  const procs = [inRow('a1111780', 10, { hashtag: 'b2222222', sessionId: 'sid-b' }), inRow('c9999999', 20, { hashtag: 'a1111780', sessionId: 'sid-a' })];
+  const o = { personaOf: pOf, procs };
+  // the label of tele-a1111780 claims #a1111780 too → not unique → refused (never attach to the label-holder OR guess the real one)
+  assert.match(resolveAttachTarget('#a1111780', sessions, o).error, /#a1111780 matches 2 agents.*use tele-/);
+  assert.match(resolveAttachTarget('780', sessions, o).error, /matches 2 agents/, 'a tail follows the hashtag it resolves to');
+  assert.equal(resolveAttachTarget('#a1111780', [sessions[1]], { personaOf: pOf, procs: [procs[1]] }).name, 'tele-c9999999', 'alone, the real occupant is found by its hashtag, not its label');
+  assert.equal(resolveAttachTarget('#b2222222', sessions, o).name, 'tele-a1111780');
+  assert.equal(resolveAttachTarget('tele-a1111780', sessions, o).name, 'tele-a1111780', 'tele-… is the explicit screen address');
+  // label-only match with nobody else: refuse rather than attach to the wrong agent
+  assert.match(resolveAttachTarget('#a1111780', [scr('a1111780', 10)], { procs: [inRow('a1111780', 10, { hashtag: 'b2222222', sessionId: 'sid-b' })] }).error, /another agent/);
+  // unconfirmed (no claude row) → by label
+  assert.equal(resolveAttachTarget('#a1111780', [scr('a1111780', 10)], { procs: [] }).name, 'tele-a1111780');
+});
+
+test('resolveAttachTarget: two screens whose names differ only in case → refused (screen PID must be unique); procs unreadable → agent addresses refused, tele-… still works', () => {
+  const sessions = [scr('a1111780', 10), scr('A1111780', 11, 'tele-A1111780')];
+  assert.match(resolveAttachTarget('#a1111780', sessions, {}).error, /matches 2 agents/);
+  assert.match(resolveAttachTarget('tele-a1111780', sessions, {}).error, /matches 2 screens/);
+  const one = [scr('a1111780', 10)];
+  assert.match(resolveAttachTarget('780', one, { procsError: 'ps failed' }).error, /process list/);
+  assert.match(resolveAttachTarget('Sứa', one, { procsError: 'ps failed' }).error, /process list/);
+  assert.equal(resolveAttachTarget('tele-a1111780', one, { procsError: 'ps failed' }).name, 'tele-a1111780');
+  assert.equal(resolveAttachTarget(null, one, { procsError: 'ps failed' }).name, 'tele-a1111780');
+});
+
+test('agentIdentities: occupant per screen, label-only mismatch, unconfirmed by label, plain rows; a descendant (`claude -p`) is a plain row entry (its tail still counts)', () => {
+  const sessions = [scr('a1111111', 10), scr('b2222222', 20), scr('c3333333', 30)];
+  const procs = [
+    inRow('a1111111', 10),
+    inRow('b2222222', 20, { hashtag: 'd4444444', sessionId: 'sid-d' }),
+    { pid: 999, ppid: 11, screen: 'tele-a1111111', screenPid: 10, sessionId: 'sid-child', guessed: false, hashtag: 'e5555555' }, // a claude -p of the first
+    { pid: 50, ppid: 1, screen: null, screenPid: null, sessionId: 'sid-t', guessed: false, hashtag: 'f6666666' },
+  ];
+  const ids = agentIdentities(sessions, procs, pOf);
+  const sig = ids.map((x) => `${x.hashtag}${x.screen ? `@${x.screen}` : ''}${x.mismatch ? '!' : ''}${x.confirmed ? '+' : ''}`);
+  assert.deepEqual(sig, ['a1111111@tele-a1111111+', 'd4444444@tele-b2222222+', 'b2222222@tele-b2222222!', 'c3333333@tele-c3333333', 'e5555555', 'f6666666']);
+});
+
+test('makePersonaOf / personaOfRow: the persona of the row\'s OWN convo; a bare hashtag uses the Set map (several personas behind it → null)', () => {
+  const sid = 'ac22f365-d351-4e54-82a5-303156081507';
+  const convo = uuidToConvoInt(sid);
+  const personaOf = makePersonaOf({ store: { '-1': { [convo]: 5 } } });
+  const want = formatPersona(peekPersona(convo));
+  assert.equal(personaOf({ sessionId: sid, guessed: false, hashtag: 'whatever' }), want, 'real store/persona object → label');
+  assert.equal(personaOfRow({ sessionId: sid }, { store: {} }), want);
+  assert.equal(personaOf({ hashtag: shortConvoHash(convo) }), want, 'bare row: hashtag fallback');
+  assert.equal(personaOf(shortConvoHash(convo)), want, 'a string is a bare hashtag');
+  assert.equal(personaOf({ sessionId: sid, guessed: true, hashtag: 'zzz' }), null, 'a guessed session is not trusted');
+  assert.equal(personaOf(null), null);
+  // two convos sharing the last 8 digits but different personas → null by hashtag, exact by row
+  const c1 = '1205483045424020', c2 = '2205483045424020';
+  const p2 = makePersonaOf({ store: { '-1': { [c1]: 1, [c2]: 2 } }, peek: (c) => ({ emoji: '🐘', name: String(c) === c1 ? 'Voi' : 'Rùa' }) });
+  assert.equal(p2({ hashtag: 'e5424020' }), null);
+  assert.equal(makePersonaOf({ store: { '-1': { [c1]: 1, [c1 + '0']: 2 } }, peek: () => ({ emoji: '🐘', name: 'Voi' }) })({ hashtag: shortConvoHash(c1) }), '🐘 Voi', 'same persona twice = one');
+  // an unreadable store → no fallback names, no throw
+  assert.equal(makePersonaOf({ store: null === 0 ? {} : { get x() { throw new Error('boom'); } } })({ hashtag: 'a1111111' }), null);
+});
+
+test('matchProcsByName (RFC 28): a 3-digit tail resolves over ALL live rows then the hashtag path; several hashtags → refuse; none → error', () => {
+  const rows = [
+    { pid: 1, hashtag: 'f4451780', name: 'a', procStart: '5', sessionId: 's1' },
+    { pid: 2, hashtag: 'b2222222', name: 'b', procStart: '6', sessionId: 's2' },
+  ];
+  assert.deepEqual(matchProcsByName('780', rows, pOf), { pid: 1, start: '5' });
+  assert.deepEqual(matchProcsByName('name:780', rows, pOf), { pid: 1, start: '5' });
+  assert.match(matchProcsByName('999', rows, pOf).error, /no live claude process with tail "999"/);
+  const twin = [...rows, { pid: 3, hashtag: 'c0000780', procStart: '7', sessionId: 's3', guessed: true }];
+  const e = matchProcsByName('780', twin, pOf).error;
+  assert.match(e, /"780" khớp 2 agent/); assert.match(e, /🪼 Sứa #f4451780 · PID 1/); assert.match(e, /#c0000780 · PID 3/);
+  // the same hashtag on two PIDs → the usual hashtag refusal
+  assert.match(matchProcsByName('780', [...rows, { pid: 4, hashtag: 'f4451780', procStart: '8' }], pOf).error, /matches 2 processes/);
+  // names go by personaOf(row)
+  assert.deepEqual(matchProcsByName('Robot 2', rows, pOf), { pid: 2, start: '6' });
+  assert.match(matchProcsByName('Cáo', [{ pid: 7, hashtag: 'e4444444', procStart: '1' }, { pid: 8, hashtag: 'c5555555', procStart: '2' }], pOf).error, /matches 2 processes/);
+});
+
+test('resolveKillPid (RFC 28): a tail is classified BEFORE isScreen; tailAs picks the screen or the process branch', () => {
+  const tailAs = (v) => (v === '780' ? { screen: 'tele-f4451780' } : v === '555' ? { name: '#e5555555' } : { error: `no ${v}` });
+  const isScreen = () => { throw new Error('isScreen must not be consulted for a tail'); };
+  assert.deepEqual(resolveKillPid(['--kill', '780'], { isScreen, tailAs }), { found: false, screen: 'tele-f4451780' });
+  assert.deepEqual(resolveKillPid(['--kill', 'name:555'], { isScreen, tailAs }), { found: true, name: '#e5555555' });
+  assert.deepEqual(resolveKillPid(['--kill', '999'], { isScreen, tailAs }), { found: true, error: 'no 999' });
+  // a multi-word name or a hashtag/tele- id is not a tail
+  assert.deepEqual(resolveKillPid(['--kill', 'Rắn', '780'], { isScreen: () => false, tailAs }), { found: true, name: 'Rắn 780' });
+  assert.deepEqual(resolveKillPid(['--kill', 'tele-a1111111'], { isScreen: () => true, tailAs }), { found: false });
+  // without tailAs the tail is just a name for matchProcsByName
+  assert.deepEqual(resolveKillPid(['--kill', '780'], {}), { found: true, name: '780' });
+});
+
+test('resolveKillTail: tele-<hashtag> screen holding that very agent → screen kill; otherwise the process branch (#hashtag); twins/ambiguity → error', () => {
+  const sessions = [scr('f4451780', 10), scr('b2222222', 20)];
+  const procs = [inRow('f4451780', 10), inRow('b2222222', 20)];
+  assert.deepEqual(resolveKillTail('780', sessions, procs, pOf), { screen: 'tele-f4451780' });
+  // terminal agent (no screen) → process branch
+  assert.deepEqual(resolveKillTail('666', sessions, [...procs, { pid: 50, ppid: 1, screen: null, hashtag: 'd1111666', sessionId: 'z' }], pOf), { name: '#d1111666' });
+  // the agent lives in a differently-named screen → process branch, never the label screen
+  const moved = [inRow('f4451780', 10, { hashtag: 'e7777777', sessionId: 'sid-e' }), inRow('b2222222', 20)];
+  assert.deepEqual(resolveKillTail('780', sessions, moved, pOf), { name: '#f4451780' }, 'label-only match: never the screen kill — the process branch finds no such claude and refuses');
+  assert.deepEqual(resolveKillTail('777', sessions, moved, pOf), { name: '#e7777777' });
+  // a screen literally named tele-780 plus agent #a1234780: ambiguous, nothing killed
+  assert.match(resolveKillTail('780', [scr('780', 30), ...sessions], [...procs, inRow('780', 30, { sessionId: null, hashtag: null })], pOf).error, /khớp 2 agent/);
+  assert.match(resolveKillTail('999', sessions, procs, pOf).error, /no live agent with tail/);
+});
+
+test('RFC 28 r2 #1: a numeric screen label `tele-780` (holding #a1111111) still collides with tail 780 of #b2222780 — attach and /kill refuse', () => {
+  const sessions = [scr('780', 10), scr('b2222780', 20)];
+  const procs = [inRow('780', 10, { hashtag: 'a1111111', sessionId: 'sid-a' }), inRow('b2222780', 20)];
+  assert.match(resolveAttachTarget('780', sessions, { procs }).error, /"780" khớp 2 agent/);
+  assert.match(resolveKillTail('780', sessions, procs, pOf).error, /"780" khớp 2 agent/);
+  assert.equal(resolveAttachTarget('tele-780', sessions, { procs }).name, 'tele-780');
+  // ordinary custom names stay out of tail resolution
+  assert.equal(resolveAttachTarget('780', [scr('giun', 10), scr('b2222780', 20)], { procs: [inRow('giun', 10, { hashtag: 'a1111111', sessionId: 'sid-a' }), inRow('b2222780', 20)] }).name, 'tele-b2222780');
+});
+
+test('RFC 28 r2 #2: a child is the occupant\'s twin unless it holds the SAME confirmed session (distinct sessions can share a hashtag)', () => {
+  const sessions = [scr('h3501892', 10)];
+  const parent = inRow('h3501892', 10, { sessionId: '12345678-9abc-4000-8000-000000000001' });
+  const child = (extra) => ({ pid: 99, ppid: parent.pid, screen: 'tele-h3501892', screenPid: 10, guessed: false, hashtag: 'h3501892', sessionId: '123456d7-f8cc-4000-8000-000000000002', ...extra });
+  const ids = (c) => agentIdentities(sessions, [parent, c], pOf).filter((x) => x.hashtag === 'h3501892').length;
+  assert.equal(ids(child({})), 2, 'other session on the same hashtag → separate identity');
+  assert.equal(ids(child({ guessed: true })), 2, 'a guessed child is never coalesced');
+  assert.equal(ids(child({ sessionId: parent.sessionId })), 1, 'same session → same agent');
+  assert.match(resolveAttachTarget('#h3501892', sessions, { procs: [parent, child({})] }).error, /matches 2 agents/);
+  // the screen-kill twin check follows the same rule
+  assert.match(checkScreenKillTarget('tele-h3501892', [parent, child({})], { screenPid: 10, windows: 1 }).error ?? '', /trùng/);
+  assert.equal(checkScreenKillTarget('tele-h3501892', [parent, child({ sessionId: parent.sessionId })], { screenPid: 10, windows: 1 }).ok, true);
+});
+
+test('RFC 28 r2 #3: agent-addressed attach refuses a multi-window / unknown-window screen; tele-… and the lone-session case still attach', () => {
+  const sessions = [scr('f4451780', 10), scr('b2222222', 20)];
+  const procs = [inRow('f4451780', 10), inRow('b2222222', 20)];
+  const one = { personaOf: pOf, procs, windowsOf: () => 1 };
+  for (const a of ['780', '#f4451780', 'Sứa']) assert.equal(resolveAttachTarget(a, sessions, one).name, 'tele-f4451780', a);
+  for (const w of [2, 0, null]) {
+    const o = { ...one, windowsOf: (pid) => (pid === '10' ? w : 1) };
+    for (const a of ['780', '#f4451780', 'Sứa']) assert.match(resolveAttachTarget(a, sessions, o).error, /windows.*tele-f4451780/, `${a} w=${w}`);
+    assert.equal(resolveAttachTarget('tele-f4451780', sessions, o).name, 'tele-f4451780');
+    assert.equal(resolveAttachTarget('2222222'.padStart(8, 'b'), sessions, o).name, 'tele-b2222222', 'other screens unaffected');
+  }
+  assert.equal(resolveAttachTarget(null, [scr('f4451780', 10)], { windowsOf: () => 3 }).name, 'tele-f4451780', 'no-id lone session is unchanged');
+});
+
+test('attach window count comes from the screen\'s own window list: 2 windows (one zombie) or an unreadable list refuse agent addresses', async () => {
+  const { screenWindowCount } = await import('./type-cmd.mjs');
+  const sessions = [scr('f4451780', 10)];
+  const procs = [inRow('f4451780', 10)];
+  const mk = (exec) => ({ personaOf: pOf, procs, windowsOf: (spid) => screenWindowCount(`${spid}.tele-f4451780`, exec) });
+  assert.equal(resolveAttachTarget('780', sessions, mk(() => '0*$ claude')).name, 'tele-f4451780');
+  assert.match(resolveAttachTarget('780', sessions, mk(() => '0*$ claude  1$ bash (Zombie)')).error, /2 windows.*tele-f4451780/);
+  assert.match(resolveAttachTarget('780', sessions, mk(() => { throw new Error('boom'); })).error, /\? windows/);
+  assert.equal(resolveAttachTarget('tele-f4451780', sessions, mk(() => { throw new Error('boom'); })).name, 'tele-f4451780');
 });

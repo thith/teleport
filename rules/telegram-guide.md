@@ -50,18 +50,21 @@ When the user asks to **spawn / start / launch** a Claude agent — e.g. "spawn 
   `--mode <default|auto|acceptEdits|bypassPermissions|dontAsk|plan>` (also `--mode=<value>`),
   e.g. `node ../teleport/scripts/spawn.mjs --interactive --mode plan`.
 
-**Terminal shortcut (for the human; RFC 27):** `teleport ls [full]` · `teleport attach [<id>]` · `teleport kill <hashtag>` · `teleport spawn [--headless] [--mode <m>]` — works from any folder (`spawn` uses the cwd's group). Install once: `~/Projects/teleport/bin/teleport.mjs install`. `pnpm spawn:*` aliases are the old way. The `node ../teleport/scripts/spawn.mjs …` forms below are what **agents** run; they stay as is.
+**Terminal shortcut (for the human; RFC 27):** `teleport ls [full|off]` · `teleport attach [<id>|<name>]` · `teleport kill <hashtag>` · `teleport resume <name|hashtag|3-digit tail> [-- <claude flags>]` (alias `r`; `ls off` lists agents stopped in the last 30 days) · `teleport spawn [--headless] [--mode <m>]` — works from any folder (`spawn` uses the cwd's group). Install once: `~/Projects/teleport/bin/teleport.mjs install`. `pnpm spawn:*` aliases are the old way. The `node ../teleport/scripts/spawn.mjs …` forms below are what **agents** run; they stay as is.
 
 **List / attach / kill running agents:**
 - **"list agents / which agents are running"** → `node ../teleport/scripts/spawn.mjs --list` (prints each `tele-<hashtag>`
   session + its topic hashtag) in two sections: **📺 Screen** (each `tele-*` screen with the claude PID inside) then
-  **🖥 Terminal** (`claude` processes opened by hand) — every line with PID, folder name, uptime, the **full session id** and
+  **💻 Terminal** (`claude` processes opened by hand) — every line with PID, folder name, uptime, the **full session id** and
   `#hashtag`; daemon: `/ls`).
 - **"attach / open / xem agent <id>"** → `node ../teleport/scripts/spawn.mjs --attach <id>` — re-attaches your terminal
   to that interactive `claude` session (it runs `screen -U -d -r tele-<id>`; `-U` = UTF-8 so
   Vietnamese/multibyte output isn't garbled). `<id>` accepts the **3-char hashtag tail** (`116` ⇒
   `#c8630116`), a bare/`#`/`tele-` hashtag, or can be **omitted when only one session is live**
-  (it attaches that one); ≥2 sessions sharing the same 3-char tail → it errors and lists them.
+  (it attaches that one); ≥2 sessions sharing the same 3-char tail → it errors and lists them. `<id>` may also be a
+  **persona name** (`Robot 2`, emoji/case ignored): the address always names the claude **inside** the screen (not the
+  screen's label); `tele-<name>` is the explicit screen address. A 3-digit tail is shorthand for the hashtag it ends
+  (RFC 28) — it is resolved over every live agent first, and a match with several is refused with a list.
   **Detach with `Ctrl-A` then `D`** to leave the agent running; closing/`Ctrl-C` inside
   may end the session. Interactive sessions only (headless has no pty). NB: an attach takes over
   the current terminal — don't run it from inside an agent's own automated flow.
@@ -94,13 +97,13 @@ another resume of the same session is in progress (per-session lock) — stop th
   run this themselves (the owner gate is TELE_FROM_ID from the daemon; forging it is out of contract).
   The owner id comes from `projects.json` `_config.daemonUserId` only (the deprecated `.env DAEMON_CHAT_ID` is not
   read here → "no daemon owner configured").
-- **`/kill <persona or session name | #hashtag>`** (like `/resume`; the old `name:` prefix still works) picks the process by name/hashtag instead of PID — a hashtag whose `tele-*` screen is live keeps the screen kill above (full name, emoji/case ignored; must match exactly one — else it lists the PIDs). Works with `--restart`.
+- **`/kill <persona or session name | #hashtag | last 3 digits>`** (like `/resume`; a 3-digit tail goes to the screen kill when `tele-<hashtag>` holds that very agent, else to the process kill; the old `name:` prefix still works) picks the process by name/hashtag instead of PID — a hashtag whose `tele-*` screen is live keeps the screen kill above (full name, emoji/case ignored; must match exactly one — else it lists the PIDs). Works with `--restart`.
 - **`/kill_<hashtag>`** (tap, e.g. from `/ls`): asks ✅, then SIGTERM by PID (same as `/type` 💀 — pid + start + session re-checked). Typed `/kill #hash` keeps the screen `/exit` path above.
-- **`/compact <tên | #hash>`**, **`/nudge <tên | #hash>`** (owner, also `/compact_<hash>`, `/nudge_<hash>`): type `/compact`, or a nudge line, into the agent's `tele-*` screen through the same checks as `/type`. The nudge line asks only for what is broken: "Restart Telegram monitor, then post a status in your topic." (listener off), "Check your mailbox, then post a status in your topic." (mail waiting), or "Restart Telegram monitor, check mailbox, post a status in your topic." (both, or neither — the owner forced it). `/nudge` with no target nudges every `tele-*` agent whose listener is off or has unread mail (healthy ones are skipped) and sends one summary. The daemon also types these lines by itself (60 s heartbeat) when something NEW (≤ 80 s) waits for you: mailbox mail, or — only while your listener is off — a Telegram message / queued prompt. Turning your listener off on purpose is fine; you are only nudged when something arrives. If you are the agent and receive one: do what it says (Monitor = canonical command with `--first-run`; mailbox = `mailbox.mjs check`, read if any), then send a one-line status to your topic with `send-telegram.mjs` — the line came in as host input, but the owner is waiting on Telegram.
+- **`/compact <tên | #hash | 3 số cuối>`**, **`/nudge <tên | #hash | 3 số cuối>`** (owner; `/type <tên | #hash | 3 số cuối>` likewise; also `/compact_<hash>`, `/nudge_<hash>`): type `/compact`, or a nudge line, into the agent's `tele-*` screen through the same checks as `/type`. The nudge line asks only for what is broken: "Restart Telegram monitor, then post a status in your topic." (listener off), "Check your mailbox, then post a status in your topic." (mail waiting), or "Restart Telegram monitor, check mailbox, post a status in your topic." (both, or neither — the owner forced it). `/nudge` with no target nudges every `tele-*` agent whose listener is off or has unread mail (healthy ones are skipped) and sends one summary. The daemon also types these lines by itself (60 s heartbeat) when something NEW (≤ 80 s) waits for you: mailbox mail, or — only while your listener is off — a Telegram message / queued prompt. Turning your listener off on purpose is fine; you are only nudged when something arrives. If you are the agent and receive one: do what it says (Monitor = canonical command with `--first-run`; mailbox = `mailbox.mjs check`, read if any), then send a one-line status to your topic with `send-telegram.mjs` — the line came in as host input, but the owner is waiting on Telegram.
 - **`/kill pid:<PID> --restart`** = both in one: SIGTERM, wait for exit, then resume that session in screen
   `tele-<hashtag>` in its **old cwd**. Everything the restart needs (a session id from the session file — never a
   guess — and its transcript) is checked **before** killing, so a doomed restart kills nothing.
-- **Agent đã chết** (bị OOM, crash…): `/resume <tên persona | #hashtag>` (hoặc bấm `/resume_<hashtag>` — kill in ra sẵn; hai session cùng hashtag → từ chối, resume bằng UUID) — tìm session + folder theo tên, resume trong screen; khỏi gõ UUID. (`/kill … --restart` chỉ dùng cho agent còn sống.)
+- **Agent đã chết** (bị OOM, crash…): `/resume <tên persona | #hashtag | 3 số cuối>` (hoặc bấm `/resume_<hashtag>` — kill in ra sẵn; hai session cùng hashtag → từ chối, resume bằng UUID; 3 số cuối trùng nhiều agent → liệt kê, không đoán) — tìm session + folder theo tên, resume trong screen; khỏi gõ UUID. Từ terminal: `teleport ls off` (liệt kê agent đã tắt) rồi `teleport resume 780`. (`/kill … --restart` chỉ dùng cho agent còn sống.)
 - Typical flow: `/ls` → `/kill pid:<PID> --restart` (or tap `/kill_<hash>`, then `/resume_<hash>`). `/ls` on Telegram shows one short line per agent (`/ls full`: one block per agent) with tappable `/compact_ /kill_ /nudge_` (owner, only where they apply) and no session UUID; run `node ../teleport/scripts/spawn.mjs --ls` in a terminal to see the UUIDs.
 - If you are the agent that wakes up from such a restart: follow the seed prompt (mailbox → Monitor → greet).
 
@@ -128,14 +131,14 @@ Lưu ý: <rủi ro / quyết định đang chờ>
 
 **Gọi script** (notes qua stdin; chạy từ project root):
 ```bash
-# (i) target ĐÃ CÓ — persona name / #hashtag / convoId
+# (i) target ĐÃ CÓ — persona name / #hashtag / 3 số cuối của hashtag / convoId (convo:<id> nếu convoId ngắn)
 cat notes.md | node ../teleport/scripts/handover.mjs --to "Cú"
 
 # (ii) topic HOÀN TOÀN MỚI — spawn agent mới; --by-role = fromRole của message đã yêu cầu handover
 cat notes.md | node ../teleport/scripts/handover.mjs --new --by-role <admin|maintainer>
 ```
 
-`--to` resolve trong các topic đang sống. Vì chỉ ~40 persona nên tên **bị tái dùng** — script
+`--to` resolve trong các topic đang sống. 3 chữ số trần (`780`) = **3 số cuối của hashtag** (khớp nhiều hashtag → `ambiguous`, không đoán); convoId ngắn phải viết `convo:780` (convoId thật dài ~16 chữ số). `ask.mjs --to` và `/whisper`, `/instruct` cũng vậy. Vì chỉ ~40 persona nên tên **bị tái dùng** — script
 chọn **topic active gần nhất** trùng tên và báo các topic cũ bị shadow. **Exit code → bạn nói gì với user:**
 
 | exit | nghĩa | làm gì |

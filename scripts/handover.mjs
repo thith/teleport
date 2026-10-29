@@ -41,7 +41,7 @@ function isWatchableConvoId(s) {
 }
 import { buildCombinedPromptData, resyncPromptSegments, DEFAULT_TMP_DIR, mergeOrSpoolPrompt } from './tele-listen.mjs';
 import { loadEnvFromFile, parseAdminChatIds, extractBotId } from './send-telegram.mjs';
-import { parseAgentTarget } from './agent-target.mjs';
+import { parseAgentTarget, resolveTail } from './agent-target.mjs';
 import { buildSpawnPlan, runSpawn, genSessionSeed, listSpawnSessions, hasBinary } from './spawn.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -73,7 +73,7 @@ export function isPrivilegedRole(role) {
 }
 
 const USAGE = `Usage:
-  cat notes.md | node handover.mjs --to <persona|#hashtag|convoId> [--from-convo N] [--chat-id ID]
+  cat notes.md | node handover.mjs --to <persona|#hashtag|3-digit tail|convoId> [--from-convo N] [--chat-id ID]
   cat notes.md | node handover.mjs --new --by-role <admin|maintainer> [--from-convo N]
   node handover.mjs --to "Cú" --notes-file ./tmp/handover.md
   node handover.mjs --ack <sourceConvoId> [--from-convo N]   # receiver confirms receipt back to source
@@ -125,7 +125,8 @@ export function parseArgs(argv) {
 /**
  * Classify a raw --to target. Returns `{ kind, value }`:
  * - hashtag: leading `#`, or the shortConvoHash shape (`[a-j]` + 7 digits, or `t` + digits)
- * - convoId: all-digits
+ * - tail:    exactly 3 digits (RFC 28) — a hashtag shorthand, resolved by matchTarget over the whole pool
+ * - convoId: `convo:<digits>`, or 4+ digits
  * - name:    anything else (persona name, case-insensitive)
  */
 export function normalizeTarget(raw) {
@@ -232,6 +233,17 @@ export function listSteerableTargets(store, chatIds, { aliveDir, now = Date.now(
  */
 export function matchTarget(target, liveTopics) {
   let hits;
+  // A 3-digit tail (RFC 28) is only a way to type a hashtag: resolved over EVERY topic in the pool,
+  // then matched exactly like the full hashtag. Different hashtags behind it → ambiguous, never a pick.
+  if (target.kind === 'tail') {
+    const r = resolveTail(target.value, liveTopics, (t) => `${t.persona ? formatPersona(t.persona) : '?'} #${t.hashtag}`);
+    if (r.none) return { status: 'not_found' };
+    if (r.error) {
+      const candidates = liveTopics.filter((t) => String(t.hashtag).toLowerCase().endsWith(target.value)).sort((a, b) => (b.ts || 0) - (a.ts || 0));
+      return { status: 'ambiguous', candidates, error: r.error };
+    }
+    target = { kind: 'hashtag', value: r.hashtag };
+  }
   if (target.kind === 'hashtag') {
     hits = liveTopics.filter((t) => t.hashtag === target.value);
   } else if (target.kind === 'convoId') {

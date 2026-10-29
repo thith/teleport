@@ -4,7 +4,7 @@
 // transfer). ASK is a round-trip Q&A between two LIVE agents in the SAME group, to
 // pull information — it does NOT transfer work and does NOT raise privilege.
 //
-//   ASK   (A→B): echo "<question>" | ask.mjs --to <persona|#hashtag|convoId> [--from-convo N]
+//   ASK   (A→B): echo "<question>" | ask.mjs --to <persona|#hashtag|3-digit tail|convoId> [--from-convo N]
 //   REPLY (B→A): echo "<answer>"   | ask.mjs --reply --to <A-convoId>        [--from-convo N]
 //
 // Mechanism (reuses handover infra): the asker submits the question to the SYSTEM,
@@ -42,7 +42,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ENV_FILE = path.join(__dirname, '..', '.env');
 
 export const USAGE = `usage:
-  ASK:   echo "<question>" | ask.mjs --to <persona|#hashtag|convoId> [--from-convo N]
+  ASK:   echo "<question>" | ask.mjs --to <persona|#hashtag|3-digit tail|convoId> [--from-convo N]
   REPLY: echo "<answer>"   | ask.mjs --reply --to <A-convoId>        [--from-convo N]`;
 
 // ── Pure helpers (unit-tested) ────────────────────────────────────────────────
@@ -58,7 +58,7 @@ export function parseAskArgs(argv) {
     else if (a.startsWith('--from-convo=')) out.fromConvo = a.slice('--from-convo='.length);
     else if (!a.startsWith('-') && out.text == null) out.text = a; // optional inline question/answer
   }
-  if (!out.to) out.error = 'missing --to <persona|#hashtag|convoId>';
+  if (!out.to) out.error = 'missing --to <persona|#hashtag|3-digit tail|convoId>';
   else if (out.fromConvo != null && !/^\d+$/.test(String(out.fromConvo))) {
     out.error = `--from-convo must be a positive integer convoId (got "${out.fromConvo}")`;
   }
