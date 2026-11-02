@@ -17,7 +17,7 @@ import { execFileSync } from 'node:child_process';
 import { PERMISSION_MODES } from './spawn.mjs';
 import { SEPARATORS } from './spawn-extra-args.mjs';
 
-// Full topic hashtag (not the 3-char tail). Same shape as the HASHTAG_RE family.
+// Full topic hashtag (not the 3-digit tail). Same shape as the HASHTAG_RE family.
 export const KILL_ID_RE = /^[a-j]\d{7}$/i;
 
 export const HELP = `teleport — list / attach / kill / spawn / resume Telegram-connected agents from a terminal
@@ -35,10 +35,11 @@ Usage:
   teleport help | -h | --help        show this help
 
 Notes:
-  <id>        the last 3 chars of the hashtag, the full hashtag, or tele-<hashtag>;
+  <id>        the last 3 digits of the hashtag, the full hashtag, or tele-<hashtag>;
               omit it when only one session is live. Write it WITHOUT "#"
               (bash treats "#" as a comment).
   <name>      a persona name (emoji and case are ignored; several words need no quotes),
+              with or without Vietnamese accents (sau = Sâu, tien = Tiên),
               e.g. teleport attach Robot 2. It addresses the agent running in the screen.
               A last-3-digits tail that matches several agents is refused with a list.
   resume      take the tail or name from "teleport ls off". A running agent is not resumed.
@@ -105,7 +106,7 @@ export function parse(argv) {
       if (rest[0].startsWith('-')) return { error: `${sub}: unknown option "${rest[0]}"` };
       const id = stripId(rest[0]);
       if (!KILL_ID_RE.test(id)) {
-        return { error: `${sub}: "${rest[0]}" is not a full hashtag (e.g. d1331668). Killing by 3-char tail, name or pid: is only possible via Telegram /kill.` };
+        return { error: `${sub}: "${rest[0]}" is not a full hashtag (e.g. d1331668). Killing by 3-digit tail, name or pid: is only possible via Telegram /kill.` };
       }
       return { script: 'spawn', args: ['--kill', `tele-${id}`] };
     }

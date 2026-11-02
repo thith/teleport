@@ -8,11 +8,18 @@
 // exact address: callers never fall back to name matching on it. Real convoIds are ~16 digits, so a
 // bare 3-digit string is always a tail; `convo:780` names a short convoId explicitly.
 
+import { readFileSync } from 'node:fs';
+
+const PERSONA_ALIASES = JSON.parse(readFileSync(new URL('./persona-aliases.json', import.meta.url), 'utf8'));
+
 export const HASHTAG_RE = /^(?:[a-j]\d{7}|t\d+)$/i;
 
-/** Name → comparable form: drop emoji/symbols, collapse spaces, lowercase. */
+/** Name → comparable form, including ASCII persona aliases and numbered variants. */
 export function normalizeAgentName(s) {
-  return String(s ?? '').normalize('NFC').replace(/[^\p{L}\p{N}\s]/gu, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
+  const name = String(s ?? '').normalize('NFC').replace(/[^\p{L}\p{N}\s]/gu, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
+  const [, base, ordinal = ''] = name.match(/^(.*?)( \d+)?$/);
+  // Only registered persona aliases are expanded; arbitrary session names keep their spelling.
+  return Object.hasOwn(PERSONA_ALIASES, base) ? PERSONA_ALIASES[base].toLowerCase() + ordinal : name;
 }
 
 /** Outer quotes (ASCII or a phone's curly ones) off a whole-rest target. Pure. */
