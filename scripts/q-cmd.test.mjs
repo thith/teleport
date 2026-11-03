@@ -11,6 +11,7 @@ import { defaultPolicy, readPolicy, writePolicy, TICKET_V } from './build-policy
 import { gatherQ, renderQ, qCallback, Q_BUTTON_RE, Q_PAGE_SIZE } from './q-panel.mjs';
 import { startQ, qPress, handleQButton, runQCommand, latestQ, queueTargetTiers } from './q-cmd.mjs';
 import { readNotices } from './queue-control.mjs';
+import { quietState, readOverride, writeOverride, clearOverride } from './quiet-hours.mjs';
 import { loadCommands, resolveCommand } from './commands.mjs';
 import { dispatchCommand, clearBotMenus, takeMergeButton, Q_COMMAND } from './daemon.mjs';
 import {
@@ -622,4 +623,104 @@ test('F2 starting a board is ONE strict write: the new entry in, older q boards 
   await startQ(ctx, { rand: () => 'cccccccccccc' });
   assert.ok(ctx.buttonStore.get('bbbbbbbbbbbb'), 'old board still there');
   assert.equal(ctx.buttonStore.get('cccccccccccc'), undefined);
+});
+
+// ── RFC 32: CPU gate note + quiet-hours button ──
+
+// (the real clock, with a window around it: the button store's TTL uses Date.now())
+const NIGHT = Date.now();
+const clock = (ms) => new Date(ms).toTimeString().slice(0, 5);
+const QCFG = { from: clock(NIGHT - 10 * 60_000), to: clock(NIGHT + 3 * 3600_000), cpuPercent: 25, maxBuilds: 1 };
+const UNTIL = quietState({ config: QCFG, now: NIGHT }).until;
+const quietFor = (cfg = QCFG) => (d, now) => quietState({ config: cfg, now, override: readOverride(d) });
+const quietDeps = (extra = {}) => ({ now: () => NIGHT, quietOf: quietFor(), syncQuiet: () => {}, ...extra });
+const gatherWith = (deps) => (o) => gatherQ({ ...o, slotsOf: () => 2, quietOf: deps.quietOf });
+
+test('RFC32 /q header: appends " · <note>" when a slot is free but the CPU gate is closed (never replaces the header)', () => {
+  const dir = tmpDir(); holder(dir, 0);
+  const closed = { ok: false, reason: 'cpu', load1: 11.2, cores: 12 };
+  const r = renderQ(gatherQ({ dir, slotsOf: () => 2, gate: () => closed }), { tok: 'a'.repeat(12), rev: 0 });
+  assert.match(r.text, /^🔒 build 1\/2 · chờ 0 · max tắt · chờ CPU \(load 11\.2\/12\)\n/);
+  const q = renderQ(gatherQ({ dir, slotsOf: () => 2, gate: () => ({ ok: false, reason: 'quiet', load1: 0, cores: 12 }) }), { tok: 'a'.repeat(12), rev: 0 });
+  assert.match(q.text, /^🔒 build 1\/2 · chờ 0 · max tắt · 🌙 giờ im lặng\n/);
+  const open = renderQ(gatherQ({ dir, slotsOf: () => 2, gate: () => ({ ok: true }) }), { tok: 'a'.repeat(12), rev: 0 });
+  assert.match(open.text, /^🔒 build 1\/2 · chờ 0 · max tắt\n/);
+});
+
+test('RFC32 /q quiet button: only while the window is active; label by state; the state is in the stored entry, callback_data stays short', async () => {
+  const dir = tmpDir(); ticket(dir, 'A');
+  const deps = quietDeps();
+  const ctx = fakeCtx(dir);
+  await startQ(ctx, { ...deps, gather: gatherWith(deps) });
+  const { entry } = boardOf(ctx);
+  assert.equal(entry.quiet.active, true); assert.equal(entry.quiet.overridden, false);
+  assert.equal(entry.quiet.until, UNTIL);
+  const b = btn(ctx.sent[0].rows, new RegExp(`Tắt giờ im lặng tới ${clock(UNTIL)}`));
+  assert.ok(b, 'button present');
+  assert.match(b.callback_data, Q_BUTTON_RE);
+  assert.ok(Buffer.byteLength(b.callback_data) < 48);
+  assert.doesNotMatch(b.callback_data, /\d{4}/, 'no until in callback_data');
+  // outside the window: no button
+  const day = quietDeps({ quietOf: quietFor({ ...QCFG, from: clock(NIGHT + 3600_000), to: clock(NIGHT + 2 * 3600_000) }) });
+  const c2 = fakeCtx(dir);
+  await startQ(c2, { ...day, gather: gatherWith(day) });
+  assert.equal(btn(c2.sent[0].rows, /giờ im lặng|Bật lại/), undefined);
+  assert.equal(boardOf(c2).entry.quiet.active, false);
+});
+
+test('RFC32 /q quiet button press: off writes quiet.override.json (offUntil = window end) and syncs; the board flips to "Bật lại"; pressing again removes it', async () => {
+  const dir = tmpDir(); ticket(dir, 'A');
+  let syncs = 0;
+  const deps = quietDeps({ syncQuiet: () => { syncs++; } });
+  const g = { ...deps, gather: gatherWith(deps) };
+  const ctx = fakeCtx(dir);
+  await startQ(ctx, g);
+  const { tok } = boardOf(ctx);
+  await qPress(cqFor(ctx, qCallback(tok, 0, 'qz')), ctx, g);
+  const ov = readOverride(dir);
+  assert.equal(ov.offUntil, UNTIL);
+  assert.equal(fs.statSync(path.join(dir, 'quiet.override.json')).mode & 0o777, 0o600);
+  assert.equal(syncs, 1);
+  assert.match(ctx.edits.at(-1).text, new RegExp(`Đã tắt giờ im lặng tới ${clock(UNTIL)}`));
+  assert.ok(btn(ctx.edits.at(-1).rows, /🌙 Bật lại/));
+  assert.equal(boardOf(ctx).entry.quiet.overridden, true);
+  await qPress(cqFor(ctx, qCallback(tok, 1, 'qz')), ctx, g);
+  assert.equal(readOverride(dir), null);
+  assert.equal(syncs, 2);
+  assert.match(ctx.edits.at(-1).text, /Đã bật lại giờ im lặng/);
+  assert.ok(btn(ctx.edits.at(-1).rows, /Tắt giờ im lặng/));
+});
+
+test('RFC32 /q quiet button: an old board (another night\'s `until`, or a changed state) is refused; non-owner too; nothing is written', async () => {
+  const dir = tmpDir(); ticket(dir, 'A');
+  const deps = quietDeps();
+  const g = { ...deps, gather: gatherWith(deps) };
+  const ctx = fakeCtx(dir);
+  await startQ(ctx, g);
+  const { tok, entry } = boardOf(ctx);
+  ctx.buttonStore.set(tok, { ...entry, quiet: { ...entry.quiet, until: entry.quiet.until - 24 * 3600_000 } }); // yesterday's button
+  await qPress(cqFor(ctx, qCallback(tok, 0, 'qz')), ctx, g);
+  assert.match(ctx.edits.at(-1).text, /Bảng đã đổi — 🔄/);
+  assert.equal(readOverride(dir), null);
+  // state changed meanwhile (someone ran `quiet off` on the CLI): the on-board "Tắt" is stale
+  const { tok: t2, entry: e2 } = boardOf(ctx);
+  writeOverride(dir, { offUntil: entry.quiet.until, by: 'cli', at: NIGHT });
+  const rev = e2.rev;
+  await qPress(cqFor(ctx, qCallback(t2, rev, 'qz')), ctx, g);
+  assert.match(ctx.edits.at(-1).text, /Bảng đã đổi — 🔄/);
+  assert.ok(readOverride(dir), 'untouched');
+  clearOverride(dir);
+  const ctx2 = fakeCtx(dir);
+  await startQ(ctx2, g);
+  await qPress(cqFor(ctx2, qCallback(boardOf(ctx2).tok, 0, 'qz'), { from: 123 }), ctx2, g);
+  assert.match(ctx2.answers.at(-1), /Chỉ owner/);
+  assert.equal(readOverride(dir), null);
+});
+
+test('R5 /q: no CPU-gate note while the queue is paused', () => {
+  const dir = tmpDir(); holder(dir, 0);
+  setPolicy(dir, { paused: true });
+  const r = renderQ(gatherQ({ dir, slotsOf: () => 2, gate: () => ({ ok: false, reason: 'cpu', load1: 11.2, cores: 12 }) }), { tok: 'a'.repeat(12), rev: 0 });
+  assert.match(r.text, /TẠM DỪNG/);
+  assert.doesNotMatch(r.text, /chờ CPU/);
 });

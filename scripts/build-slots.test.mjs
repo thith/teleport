@@ -7,8 +7,10 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { acquireLock, lockPaths, readHolders, readQueue, readClaimed, resolveBuildSlots, slotsFor, MAX_SLOTS, TWO_SLOT_MIN_RAM, acquireHelperLock } from './machine-lock.mjs';
-import { blockingHolders, slotEnv, slotBlockers, holderBefore, isUnbounded, waitForSlotTurn, heldByAncestor, describeBusy, main as heavyMain, SCOPE_MEM_FRACTION, SCOPE_MEM_FRACTION_SHARED } from './heavy.mjs';
+import { acquireLock, lockPaths, readHolders, readQueue, readClaimed, resolveBuildSlots, slotsFor, MAX_SLOTS, TWO_SLOT_MIN_RAM, acquireHelperLock, secondSlotOk, secondSlotVerdict, gateText, defaultCpuGate, realCpuGate, effectiveSlots, hasFreeSlot, cpuGateNote, DEFAULT_LOCK_DIR } from './machine-lock.mjs';
+import { setPaused } from './queue-control.mjs';
+import { longBuildCandidates } from './long-build.mjs';
+import { blockingHolders, slotEnv, slotBlockers, holderBefore, isUnbounded, waitForSlotTurn, heldByAncestor, describeBusy, main as heavyMain, earlyPolicyCheck, SCOPE_MEM_FRACTION, SCOPE_MEM_FRACTION_SHARED } from './heavy.mjs';
 import { formatQueue, leave, setSlots, pruneSkipLines, shortCmd, parseArgs } from './lock-queue.mjs';
 import { notePruneSkip } from './cleanup.mjs';
 
@@ -271,7 +273,7 @@ test('heavy main, slot 1 of 2: own Gradle env, 30% cap declared to the holder, b
   assert.equal(code, 0);
   assert.match(runOpts.env.GRADLE_OPTS, /daemon-slot1/);
   assert.equal(pf.memMax, Math.floor(32 * GiB * SCOPE_MEM_FRACTION_SHARED / 4096) * 4096);
-  assert.deepEqual({ ...updates[0], unit: undefined }, { pending: undefined, memMax: pf.memMax, unit: undefined });
+  assert.deepEqual({ ...updates[0], unit: undefined }, { pending: undefined, scoped: true, memMax: pf.memMax, unit: undefined });
   assert.match(updates[0].unit, /^heavy-\d+-[a-z0-9]+\.scope$/, 'RFC 24: the unit is published with the cap');
   assert.equal(turn.me.slot, 1);
   assert.equal(turn.myMax, pf.memMax);
@@ -285,7 +287,7 @@ test('heavy main, slot 0 alone at N=1: env untouched, 45% cap; preflight failure
     run: async (c, o) => { runOpts = o; return 0; }, scopeOps: { ...OPS, preflight: (s) => { pf = s; return { ok: false, why: 'no bus' }; } } });
   assert.equal(runOpts.env.GRADLE_OPTS, undefined);
   assert.equal(pf.memMax, Math.floor(32 * GiB * SCOPE_MEM_FRACTION / 4096) * 4096);
-  assert.deepEqual(updates[0], { pending: undefined, unbounded: true });
+  assert.deepEqual(updates[0], { pending: undefined, scoped: false, unbounded: true });
 });
 
 test('heavy main: 30% even at N=1 when another build still holds a slot; sweep lock timeout → no run', async () => {
@@ -304,7 +306,7 @@ test('heavy main: 30% even at N=1 when another build still holds a slot; sweep l
 // ── display / owner commands ──
 
 const H = (o) => ({ alive: true, pid: 1, startedAt: 0, ...o });
-const fq = (holders, extra = {}) => formatQueue('build', { now: 6 * 60_000, struck: () => [], read: () => [], slots: 2,
+const fq = (holders, extra = {}) => formatQueue('build', { now: 6 * 60_000, struck: () => [], read: () => [], slots: 2, gate: () => ({ ok: true }),
   holderOf: (f) => holders[/build\.1\.holder/.test(f) ? 1 : 0] ?? null, ...extra });
 
 test('formatQueue layout: trống (0/N), 1/2 còn chỗ, 2/2 with ▶ lines and Chờ (k), cut commands, (chờ RAM), exclusive', () => {
@@ -512,4 +514,274 @@ test('heavy main: the build is marked admitted (waitingRam cleared) before it ru
     scopeOps: { ...OPS, slotTurn: waitForSlotTurn, holders: () => [] } });
   assert.equal(code, 1);
   assert.equal(ran, false);
+});
+
+// ── RFC 32: the CPU gate for the 2nd slot ──
+
+const CLOSED = (reason = 'cpu') => ({ ok: false, reason, load1: 11.2, cores: 12 });
+const OPEN = { ok: true, reason: null, load1: 1, cores: 12 };
+const runningFor = (ms, now = 1_000_000) => ({ running: true, runningSince: now - ms });
+const idleBusyGate = ({ busy }) => (busy > 0 ? CLOSED() : OPEN); // closed whenever another build exists
+
+test('RFC32 secondSlotOk: load 10/12 closed; low load but a 30 s old build closed; 120 s open; busy 0 open; unreadable load/cores open', () => {
+  const now = 1_000_000;
+  const base = { busy: 1, holders: [runningFor(120_000, now)], unnamed: 0, now, loadavg: [3, 3, 3], cores: 12 };
+  assert.equal(secondSlotOk({ ...base, loadavg: [10, 9, 8] }), false);
+  assert.equal(secondSlotVerdict({ ...base, loadavg: [10, 9, 8] }).reason, 'cpu');
+  assert.equal(secondSlotOk({ ...base, loadavg: [8.99, 9, 8] }), true, '0.75 × 12 = 9 is the line');
+  assert.equal(secondSlotOk({ ...base, holders: [runningFor(30_000, now)] }), false);
+  assert.equal(secondSlotVerdict({ ...base, holders: [runningFor(30_000, now)] }).reason, 'young');
+  assert.equal(secondSlotOk(base), true);
+  assert.equal(secondSlotOk({ ...base, busy: 0, holders: [], loadavg: [50, 50, 50] }), true, 'nobody running → the head of the queue always runs');
+  assert.equal(secondSlotOk({ ...base, loadavg: [0, 0, 0], holders: [runningFor(1, now)] }), true, 'Windows: loadavg [0,0,0] → RFC 23 behaviour');
+  assert.equal(secondSlotOk({ ...base, cores: 0, loadavg: [50, 50, 50] }), true);
+  assert.equal(secondSlotOk({ ...base, holders: [{ running: false }] }), false, 'a holder not yet running its command');
+  assert.equal(secondSlotOk({ ...base, holders: [{ running: true }] }), false, 'running without runningSince');
+  assert.equal(secondSlotOk({ ...base, holders: [], unnamed: 1, busy: 1 }), false, 'a claimed ticket with no holder yet');
+  // startedAt (lock taken, before sweep / RAM wait) is NOT the clock: only runningSince is
+  assert.equal(secondSlotOk({ ...base, holders: [{ running: true, runningSince: now - 10_000, startedAt: now - 600_000 }] }), false);
+});
+
+test('RFC32 quiet hours close the gate whenever a build runs, whatever the load; overridden → back to the CPU rules', () => {
+  const now = 1_000_000;
+  const q = { enabled: true, active: true, overridden: false, maxBuilds: 1 };
+  const base = { busy: 1, holders: [runningFor(300_000, now)], now, loadavg: [0.5, 0.5, 0.5], cores: 12, quiet: q };
+  const v = secondSlotVerdict(base);
+  assert.deepEqual([v.ok, v.reason], [false, 'quiet']);
+  assert.equal(secondSlotOk({ ...base, busy: 0, holders: [] }), true, 'an empty machine still starts the first build');
+  assert.equal(secondSlotOk({ ...base, quiet: { ...q, overridden: true } }), true);
+  assert.equal(secondSlotOk({ ...base, quiet: { ...q, active: false } }), true);
+  assert.equal(secondSlotOk({ ...base, quiet: { ...q, maxBuilds: 2 } }), true, 'maxBuilds 2 allows the 2nd');
+  assert.equal(secondSlotOk({ ...base, quiet: { ...q, overridden: true }, loadavg: [10, 10, 10] }), false, 'overridden: the §3.2 rules');
+  assert.equal(gateText(v), '🌙 giờ im lặng');
+  assert.equal(gateText(CLOSED('cpu')), 'chờ CPU (load 11.2/12)');
+  assert.equal(gateText(CLOSED('cpu'), 'wait'), 'CPU bận (load 11.2/12)');
+  assert.equal(gateText(CLOSED('young')), 'build kia mới chạy <90s');
+  assert.equal(gateText(OPEN), '');
+});
+
+test('RFC32 default gate: open for a test dir (the real one only for the default lock dir)', () => {
+  assert.equal(defaultCpuGate('/tmp/some-test-dir')({ busy: 1, holders: [], unnamed: 0, now: 0, dir: '/x' }).ok, true);
+  assert.equal(defaultCpuGate(DEFAULT_LOCK_DIR), realCpuGate);
+});
+
+test('RFC32 2 → 1 with slot 1 alive: A in slot 0 ends, B still runs in slot 1, CPU busy → C does NOT take slot 0; once B ends it does', async () => {
+  const dir = tmpDir();
+  const a = await acquireLock('build', { dir, waitSec: 0, slots: 2, label: 'A', convoId: null });
+  const b = await acquireLock('build', { dir, waitSec: 0, slots: 2, label: 'B', convoId: null });
+  assert.deepEqual([a.slot, b.slot], [0, 1]);
+  a.release();
+  const calls = [];
+  const gate = (x) => { calls.push(x.busy); return idleBusyGate(x); };
+  const c = await acquireLock('build', { dir, waitSec: 0.5, pollMs: 50, slots: 2, label: 'C', convoId: null, cpuGate: gate });
+  assert.equal(c.timeout, true, 'slot 0 is free, but another build runs and the gate is closed');
+  assert.ok(calls.length > 1 && calls.every((n) => n === 1), 'the head of the queue computes busy too');
+  assert.equal(probe(dir, 0), 'free');
+  let got = null;
+  const p = acquireLock('build', { dir, waitSec: 5, pollMs: 50, slots: 2, label: 'C2', convoId: null, cpuGate: idleBusyGate }).then((l) => { got = l; return l; });
+  await sleep(300);
+  assert.equal(got, null);
+  b.release();
+  const l = await p;
+  assert.equal(l.slot, 0);
+  l.release();
+});
+
+test('RFC32 MemoryMax does not follow the CPU gate: a build admitted after the gate closed then opened still gets N = 2 (30%)', async () => {
+  const dir = tmpDir();
+  const a = await acquireLock('build', { dir, waitSec: 0, slots: 2, label: 'A', convoId: null });
+  a.update({ running: true, runningSince: Date.now() - 200_000, memMax: Math.floor(0.3 * 32 * GiB) });
+  let n = 0;
+  let pf = null;
+  const code = await heavyMain(['--', 'cargo', 'b'], { env: {}, nested: () => false, log: () => {}, waitRam: async () => {},
+    acquire: (name, o) => acquireLock(name, { ...o, dir, slots: 2, convoId: null, label: 'B', pollMs: 30, cpuGate: () => (++n <= 3 ? CLOSED() : OPEN) }),
+    run: async () => 0,
+    scopeOps: { ...OPS, preflight: (s) => { pf = s; return { ok: true }; }, holders: () => readHolders('build', { dir }) } });
+  assert.equal(code, 0);
+  assert.ok(n > 3, 'it waited behind the closed gate');
+  assert.equal(pf.memMax, Math.floor(32 * GiB * SCOPE_MEM_FRACTION_SHARED / 4096) * 4096);
+  a.release();
+});
+
+test('RFC32 a build.slots file → the gate is never consulted', async () => {
+  const dir = tmpDir();
+  fs.writeFileSync(path.join(dir, 'build.slots'), '1\n');
+  let called = 0;
+  const gate = () => { called++; return CLOSED(); };
+  const a = await acquireLock('build', { dir, waitSec: 0, slots: 2, label: 'A', convoId: null, cpuGate: gate });
+  const b = await acquireLock('build', { dir, waitSec: 0, slots: 2, label: 'B', convoId: null, cpuGate: gate });
+  assert.deepEqual([a.slot, b.slot], [0, 1]);
+  assert.equal(called, 0);
+  assert.equal(effectiveSlots({ dir, N: 2, holders: [{}], gate }), 2);
+  assert.equal(called, 0);
+  a.release(); b.release();
+});
+
+test('RFC32 try-once: gate closed → timeout, slot given back; open → granted', async () => {
+  const dir = tmpDir();
+  const a = await acquireLock('build', { dir, waitSec: 0, slots: 2, label: 'A', convoId: null });
+  const r = await acquireLock('build', { dir, waitSec: 0, slots: 2, label: 'B', convoId: null, cpuGate: () => CLOSED() });
+  assert.equal(r.timeout, true);
+  assert.equal(probe(dir, 1), 'free', 'the slot we won to check is given back');
+  const ok = await acquireLock('build', { dir, waitSec: 0, slots: 2, label: 'B', convoId: null, cpuGate: () => OPEN });
+  assert.equal(ok.slot, 1);
+  ok.release(); a.release();
+});
+
+test('RFC32 fast path (policy, empty queue): gate closed → the ticket is queued instead of taking the slot; opens → granted', async () => {
+  const dir = tmpDir();
+  const a = await acquireLock('build', { dir, waitSec: 0, slots: 2, label: 'A', convoId: null });
+  let open = false;
+  let got = null;
+  const p = acquireLock('build', { dir, waitSec: 8, pollMs: 50, slots: 2, label: 'B', convoId: null, policy: true, cpuGate: () => (open ? OPEN : CLOSED()) }).then((l) => { got = l; return l; });
+  await queuedFor(dir, 'B');
+  await sleep(200);
+  assert.equal(got, null);
+  assert.equal(probe(dir, 1), 'free', 'slot 1 stays free while the gate is closed');
+  assert.equal(readClaimed('build', { dir }).length, 0);
+  open = true;
+  const l = await p;
+  assert.equal(l.slot, 1);
+  l.release(); a.release();
+});
+
+test('RFC32 paused (RFC 29) keeps its old behaviour with the gate present', async () => {
+  const dir = tmpDir();
+  await setPaused(dir, true);
+  const a = await acquireLock('build', { dir, waitSec: 0, slots: 2, label: 'A', convoId: null, cpuGate: () => OPEN });
+  assert.equal(a.timeout, true, 'paused → nobody gets a slot, gate or not');
+  const b = await acquireLock('build', { dir, waitSec: 0.3, pollMs: 50, slots: 2, label: 'B', convoId: null, policy: true, cpuGate: () => OPEN });
+  assert.equal(b.timeout, true);
+});
+
+test('RFC32 gate inputs: a holder that is not running yet, and a claimed ticket without holder, are reported', async () => {
+  const dir = tmpDir();
+  const a = await acquireLock('build', { dir, waitSec: 0, slots: 2, label: 'A', convoId: null });
+  const seen = [];
+  const spy = (x) => { seen.push({ busy: x.busy, unnamed: x.unnamed, running: x.holders.map((h) => h.running) }); return CLOSED(); };
+  await acquireLock('build', { dir, waitSec: 0, slots: 2, label: 'B', convoId: null, cpuGate: spy });
+  assert.deepEqual(seen[0], { busy: 1, unnamed: 0, running: [undefined] }, 'holder A has not published running: the real gate treats that as closed');
+  assert.equal(secondSlotOk({ busy: 1, holders: [{ label: 'A' }], now: 1, loadavg: [1, 1, 1], cores: 12 }), false);
+  const q = lockPaths('build', dir).queue;
+  fs.mkdirSync(q, { recursive: true });
+  fs.writeFileSync(path.join(q, '000000000000002-' + process.pid + '-bbbbbb.acq'), JSON.stringify({ pid: process.pid }));
+  a.release();
+  seen.length = 0;
+  await acquireLock('build', { dir, waitSec: 0, slots: 2, label: 'C', convoId: null, cpuGate: spy });
+  assert.equal(seen[0]?.unnamed, 1, 'the .acq without holder counts as busy: the gate is consulted with busy 1 though no holder file exists');
+});
+
+test('RFC32 race: two waiters that both see busy 0 → only the first to claim runs; the other is re-checked under build.gate and waits', async () => {
+  const dir = tmpDir();
+  const mk = (label) => acquireLock('build', { dir, waitSec: 1.2, pollMs: 40, slots: 2, label, convoId: null, cpuGate: idleBusyGate });
+  const [x, y] = await Promise.all([mk('X'), mk('Y')]);
+  const won = [x, y].filter((r) => !r.timeout);
+  assert.equal(won.length, 1, 'exactly one build starts');
+  assert.equal([x, y].filter((r) => r.timeout).length, 1);
+  assert.equal(readHolders('build', { dir }).length, 1);
+  won[0].release();
+});
+
+test('RFC32 build.gate is free again once the holder file names the winner', async () => {
+  const dir = tmpDir();
+  const a = await acquireLock('build', { dir, waitSec: 0, slots: 2, label: 'A', convoId: null, cpuGate: () => OPEN });
+  const rel = await acquireHelperLock('build.gate', { dir, waitMs: 500 });
+  assert.ok(rel, 'released after the holder write');
+  rel();
+  assert.ok(readHolders('build', { dir }).some((h) => h.label === 'A'));
+  a.release();
+});
+
+test('RFC32 effectiveSlots: gate closed → the builds running (min 1); open → N; long-build uses it so a stuck night build still gets its ⏹', () => {
+  const dir = tmpDir();
+  const h = { pid: 1, startedAt: 0, running: true, runningSince: 0, label: 'A' };
+  assert.equal(effectiveSlots({ dir, N: 2, holders: [h], gate: () => CLOSED() }), 1);
+  assert.equal(effectiveSlots({ dir, N: 2, holders: [h], gate: () => OPEN }), 2);
+  assert.equal(effectiveSlots({ dir, N: 2, holders: [], gate: () => CLOSED() }), 1);
+  assert.equal(effectiveSlots({ dir, N: 1, holders: [h], gate: () => CLOSED() }), 1);
+  const now = 60 * 60_000;
+  const queue = [{ status: 'live', createdAt: now - 20 * 60_000 }];
+  assert.equal(longBuildCandidates({ holders: [h], queue, slots: 2, now }).length, 0, 'with N = 2 and one holder there is still "a free slot"');
+  assert.equal(longBuildCandidates({ holders: [h], queue, slots: effectiveSlots({ dir, N: 2, holders: [h], gate: () => CLOSED('quiet') }), now }).length, 1);
+});
+
+test('RFC32 heavy earlyPolicyCheck: a closed gate means no free slot, so a full queue is refused up front', () => {
+  const dir = tmpDir();
+  fs.writeFileSync(path.join(dir, 'build.policy.json'), JSON.stringify({ v: 1, max: 0, lastMax: 4, retryMin: 10, paused: false, blocks: [], boosts: {} }));
+  const h = { pid: 1, startedAt: 0, label: 'A' };
+  const args = { dir, owner: 'convo:9', holders: [h], queue: [], slots: 2 };
+  assert.equal(earlyPolicyCheck({ ...args, gate: () => OPEN }), null, 'free slot + nobody waiting = the "build now" exception');
+  assert.equal(earlyPolicyCheck({ ...args, gate: () => CLOSED() })?.refused, 'full');
+});
+
+test('RFC32 display: cpuGateNote only for N = 2 with one build and a closed gate; ls header replaces the text; heavy wait notice shows the reason', async () => {
+  const dir = tmpDir();
+  const h = { pid: 1, startedAt: 0, label: 'A', running: true, runningSince: 0 };
+  const note = (o) => cpuGateNote({ dir, N: 2, holders: [h], claimed: [], ...o });
+  assert.equal(note({ gate: () => CLOSED() }), 'chờ CPU (load 11.2/12)');
+  assert.equal(note({ gate: () => CLOSED('quiet') }), '🌙 giờ im lặng');
+  assert.equal(note({ gate: () => CLOSED('young') }), 'build kia mới chạy <90s');
+  assert.equal(note({ gate: () => OPEN }), '');
+  assert.equal(note({ holders: [h, { ...h, pid: 2 }], gate: () => CLOSED() }), '', '2/2: no free slot to explain');
+  assert.equal(note({ holders: [], gate: () => CLOSED() }), '', 'idle machine');
+  assert.equal(note({ N: 1, gate: () => CLOSED() }), '');
+  const lines = fq([H({ label: 'Ma', cmd: 'x' })], { gate: () => CLOSED() });
+  assert.equal(lines[0], '🔒 build: đang chạy 1/2 — còn 1 chỗ — chờ CPU (load 11.2/12)');
+  assert.equal(fq([H({ label: 'Ma' })])[0], '🔒 build: đang chạy 1/2 — còn 1 chỗ trống');
+  const logs = [];
+  const lock = { release() {}, update: () => true, waitedMs: 0, slot: 1, slots: 2, startedAt: 7 };
+  await heavyMain(['--', 'cargo', 'b'], { env: {}, nested: () => false, log: (m) => logs.push(m), waitRam: async () => {},
+    acquire: async (name, o) => { o.onWait({ label: 'A', alive: true, startedAt: 0, pid: 1 }, 0, { position: 1, ahead: [], holders: [{ label: 'A', pid: 1 }], slots: 2, gate: CLOSED() }); return lock; },
+    run: async () => 0, scopeOps: OPS });
+  assert.ok(logs.some((m) => /CPU bận \(load 11\.2\/12\)/.test(m)), logs.join('\n'));
+});
+
+test('RFC32 heavy: syncs the quiet CPU limit before the scope exists and every syncEveryMs while the build runs; the holder says scoped', async () => {
+  const order = [];
+  const updates = [];
+  const lock = { release() {}, update: (f) => { updates.push(f); return true; }, waitedMs: 0, slot: 0, slots: 1, startedAt: 7 };
+  await heavyMain(['--', 'cargo', 'b'], { env: {}, nested: () => false, log: () => {}, waitRam: async () => {}, acquire: async () => lock,
+    run: async () => { order.push('run'); await sleep(120); return 0; },
+    scopeOps: { ...OPS, preflight: () => { order.push('preflight'); return { ok: true }; }, syncQuiet: () => order.push('sync'), syncEveryMs: 20 } });
+  assert.deepEqual(order.slice(0, 4), ['sync', 'preflight', 'sync', 'run'], 'a sync before the scope check and another right before spawn');
+  assert.ok(order.filter((x) => x === 'sync').length >= 3, `timer syncs while it runs: ${order.join(',')}`);
+  assert.equal(updates[0].scoped, true);
+  const order2 = [], up2 = [];
+  await heavyMain(['--no-scope', '--', 'cargo', 'b'], { env: {}, nested: () => false, log: () => {}, waitRam: async () => {}, acquire: async () => ({ ...lock, update: (f) => { up2.push(f); return true; } }),
+    run: async () => { await sleep(80); return 0; }, scopeOps: { ...OPS, syncQuiet: () => order2.push('sync'), syncEveryMs: 20 } });
+  assert.deepEqual(order2, [], '--no-scope: nothing to limit, no timer');
+  assert.equal(up2[0].scoped, false);
+  const code = await heavyMain(['--', 'cargo', 'b'], { env: {}, nested: () => false, log: () => {}, waitRam: async () => {}, acquire: async () => lock, run: async () => 0,
+    scopeOps: { ...OPS, syncQuiet: () => { throw new Error('boom'); } } });
+  assert.equal(code, 0, 'a sync that throws never fails the build');
+});
+
+test('R4 busy counts claimed (.acq) tickets and an exclusive holder; no misleading note when there is no free slot', () => {
+  const dir = tmpDir();
+  const h = { pid: 1, startedAt: 0, label: 'A', running: true, runningSince: 0 };
+  const claim = [{ ticket: 'x.json' }];
+  assert.equal(effectiveSlots({ dir, N: 2, holders: [], claimed: claim, gate: () => CLOSED() }), 1, 'one claim, no holder file yet → max(1, busy)');
+  assert.equal(effectiveSlots({ dir, N: 2, holders: [h], claimed: claim, gate: () => CLOSED() }), 2, 'holder + claim = both slots busy');
+  assert.equal(hasFreeSlot({ dir, N: 2, holders: [h], claimed: claim, gate: () => OPEN }), false);
+  assert.equal(hasFreeSlot({ dir, N: 2, holders: [h], claimed: [], gate: () => OPEN }), true);
+  assert.equal(hasFreeSlot({ dir, N: 2, holders: [h], claimed: [], gate: () => CLOSED() }), false);
+  const ex = { ...h, exclusive: true };
+  assert.equal(hasFreeSlot({ dir, N: 2, holders: [ex], claimed: [], gate: () => OPEN }), false, 'cleanup holds every slot');
+  assert.equal(cpuGateNote({ dir, N: 2, holders: [ex], claimed: [], gate: () => CLOSED('young') }), '');
+  assert.equal(cpuGateNote({ dir, N: 2, holders: [h], claimed: claim, gate: () => CLOSED('young') }), '', 'claim + holder: full');
+  // earlyPolicyCheck uses it: max 0, one holder + one claim, open gate → no "build now" exception
+  fs.writeFileSync(path.join(dir, 'build.policy.json'), JSON.stringify({ v: 1, max: 0, lastMax: 4, retryMin: 10, paused: false, blocks: [], boosts: {} }));
+  assert.equal(earlyPolicyCheck({ dir, owner: 'convo:9', holders: [h, ], queue: [], slots: 2, gate: () => OPEN }), null);
+  assert.equal(earlyPolicyCheck({ dir, owner: 'convo:9', holders: [ex], queue: [], slots: 2, gate: () => OPEN })?.refused, 'full');
+});
+
+test('R2 heavy syncs once more right before the scope is spawned (after the RAM wait / gradlew --stop)', async () => {
+  const order = [];
+  const lock = { release() {}, update: () => true, waitedMs: 0, slot: 0, slots: 1, startedAt: 7 };
+  await heavyMain(['--', './gradlew', 'b'], { env: {}, nested: () => false, log: () => {}, waitRam: async () => { order.push('ram'); }, acquire: async () => lock,
+    stopGradle: async () => { order.push('stop'); return 0; }, run: async (c) => { order.push('run'); return 0; },
+    scopeOps: { ...OPS, preflight: () => ({ ok: true }), syncQuiet: () => order.push('sync'), syncEveryMs: 1e9 } });
+  const iStop = order.indexOf('stop'), iRun = order.indexOf('run');
+  assert.ok(order.slice(iStop, iRun).includes('sync'), order.join(','));
+  assert.equal(order[iRun - 1], 'sync');
 });

@@ -50,6 +50,7 @@ import { peekPersona } from './persona-store.mjs';
 import { formatPersona } from './persona.mjs';
 import { shortConvoHash } from './convo-hash.mjs';
 import { readPolicy, blockOf, TICKET_V } from './build-policy.mjs';
+import { quietNow, quietApplies } from './quiet-hours.mjs';
 
 // $HOME, not $XDG_STATE_HOME: the daemon and the agents must agree on one file.
 export const LOCK_DIR = process.env.TELEPORT_LOCK_DIR || path.join(os.homedir(), '.local', 'state', 'teleport', 'locks');
@@ -68,7 +69,7 @@ export function lockPaths(name, dir = LOCK_DIR, slot = 0) {
 export const MAX_SLOTS = 2;
 const GiB = 1024 ** 3;
 export const TWO_SLOT_MIN_RAM = 28 * GiB;
-const DEFAULT_LOCK_DIR = path.join(os.homedir(), '.local', 'state', 'teleport', 'locks');
+export const DEFAULT_LOCK_DIR = path.join(os.homedir(), '.local', 'state', 'teleport', 'locks');
 
 /** Total RAM in bytes — the one source for both N and the build's MemoryMax. */
 export const memTotal = () => os.totalmem();
@@ -105,6 +106,90 @@ export function readHolders(name, { dir = LOCK_DIR, holderOf = readHolder } = {}
     if (h?.alive) out.push({ ...h, slot: h.slot ?? k });
   }
   return out;
+}
+
+// ── RFC 32: the CPU gate for the 2nd build slot ──
+// N is NOT touched (MemoryMax, the RAM budget, /q all keep using it). Instead, while the build count is auto and N = 2,
+// a build that would run beside another one is only admitted when the CPU has room: load1 < 0.75 × cores, and every
+// running build has been running its real command for ≥ 90 s (load1 is a ~60 s moving average, so it needs ~80 s to
+// show a build that eats every core). Night quiet hours (RFC 32 §4) close it whenever a build is running.
+
+export const CPU_LOAD_FRACTION = 0.75;
+export const CPU_SETTLE_MS = 90_000;
+
+/**
+ * Pure verdict for "may another build start beside the ones that exist?" → { ok, reason, load1, cores }.
+ * busy = live holders + claimed tickets without a holder yet (`unnamed`); busy 0 → always open.
+ * reason (when closed): 'quiet' | 'cpu' | 'young' (a build is not yet running its command, or < 90 s).
+ * Unreadable load (Windows [0,0,0]) / cores → the load rules are open (RFC 23 behaviour); quiet still applies.
+ */
+export function secondSlotVerdict({ busy, holders = [], unnamed = 0, now = Date.now(), loadavg = [0, 0, 0], cores = 0, quiet = null }) {
+  const load1 = Number(loadavg?.[0]) || 0;
+  const open = { ok: true, reason: null, load1, cores };
+  if (!(busy > 0)) return open;
+  if (quiet && quietApplies(quiet) && busy >= quiet.maxBuilds) return { ...open, ok: false, reason: 'quiet' };
+  if (!(cores > 0) || !(Array.isArray(loadavg) && loadavg.some((x) => x > 0))) return open;
+  if (load1 >= CPU_LOAD_FRACTION * cores) return { ...open, ok: false, reason: 'cpu' };
+  if (unnamed > 0 || holders.some((h) => h.running !== true || !(now - (h.runningSince ?? Infinity) >= CPU_SETTLE_MS))) return { ...open, ok: false, reason: 'young' };
+  return open;
+}
+export const secondSlotOk = (args) => secondSlotVerdict(args).ok;
+
+/** Why the gate is closed, as text. style 'wait' (heavy's notice) | 'head' (ls / /q header). '' when open. */
+export function gateText(v, style = 'head') {
+  if (!v || v.ok) return '';
+  if (v.reason === 'quiet') return '🌙 giờ im lặng';
+  if (v.reason === 'cpu') return `${style === 'wait' ? 'CPU bận' : 'chờ CPU'} (load ${v.load1.toFixed(1)}/${v.cores})`;
+  return 'build kia mới chạy <90s';
+}
+
+const openGate = () => ({ ok: true, reason: null, load1: 0, cores: 0 });
+/** The real gate (this machine's load, cores and quiet hours). Used only for the default lock dir. */
+export function realCpuGate({ busy, holders, unnamed, now, dir }) {
+  let quiet = null;
+  try { quiet = quietNow({ dir, now }); } catch {}
+  return secondSlotVerdict({ busy, holders, unnamed, now, loadavg: os.loadavg(), cores: os.availableParallelism?.() ?? os.cpus().length, quiet });
+}
+/** The gate for `dir`: the real one for the default lock dir, an open one for any other (tests inject their own). */
+export const defaultCpuGate = (dir) => (path.resolve(dir) === path.resolve(DEFAULT_LOCK_DIR) ? realCpuGate : openGate);
+
+/** Quiet state for `dir`: real for the default lock dir, off otherwise. */
+export function quietNowFor(dir, now = Date.now()) {
+  if (path.resolve(dir) !== path.resolve(DEFAULT_LOCK_DIR)) return { enabled: false, active: false, overridden: false, until: null };
+  try { return quietNow({ dir, now }); } catch { return { enabled: false, active: false, overridden: false, until: null }; }
+}
+
+/** Does the gate apply: build lock, more than 1 slot, and the count is auto (no build.slots file). */
+export const gateApplies = (name, N, dir) => name === 'build' && N > 1 && !fs.existsSync(path.join(dir, 'build.slots'));
+
+/**
+ * Slots that can really be handed out right now: N, or — gate closed — the builds already running (min 1).
+ * Used by long-build (a build stuck all night must still get its ⏹) and heavy's early check.
+ */
+export function gateState({ dir = LOCK_DIR, N = slotsFor('build', { dir }), holders = readHolders('build', { dir }), claimed = null, now = Date.now(), gate = defaultCpuGate(dir) } = {}) {
+  const named = new Set(holders.map((h) => h.ticket).filter(Boolean));
+  const unnamed = (claimed || readClaimed('build', { dir })).filter((c) => !named.has(c.ticket)).length;
+  // an exclusive holder (cleanup) holds every slot; a claimed ticket with no holder file yet is running too
+  const busy = (holders.some((h) => h.exclusive) ? Math.max(N, holders.length) : holders.length) + unnamed;
+  if (!gateApplies('build', N, dir)) return { applies: false, verdict: openGate(), busy };
+  return { applies: true, busy, verdict: gate({ busy, holders, unnamed, now, dir }) };
+}
+export function effectiveSlots(opts = {}) {
+  const dir = opts.dir ?? LOCK_DIR, N = opts.N ?? slotsFor('build', { dir }), holders = opts.holders ?? readHolders('build', { dir });
+  const g = gateState({ ...opts, dir, N, holders });
+  return g.applies && !g.verdict.ok ? Math.max(1, g.busy) : N;
+}
+/** Is a slot free right now (busy counts claimed tickets and an exclusive holder; a closed gate = none)? */
+export function hasFreeSlot(opts = {}) {
+  const dir = opts.dir ?? LOCK_DIR, N = opts.N ?? slotsFor('build', { dir }), holders = opts.holders ?? readHolders('build', { dir });
+  const g = gateState({ ...opts, dir, N, holders });
+  return g.busy < (g.applies && !g.verdict.ok ? Math.max(1, g.busy) : N);
+}
+/** Header note for ls / /q: '' unless N = 2, a build is running, a slot is free and the gate is closed. */
+export function cpuGateNote(opts = {}) {
+  const dir = opts.dir ?? LOCK_DIR, N = opts.N ?? slotsFor('build', { dir }), holders = opts.holders ?? readHolders('build', { dir });
+  const g = gateState({ ...opts, dir, N, holders });
+  return g.applies && g.busy > 0 && g.busy < N && !g.verdict.ok ? gateText(g.verdict, 'head') : '';
 }
 
 // ── RFC 21: the ticket queue ──
@@ -436,6 +521,9 @@ export async function withPolicyLock(dir, fn, { waitMs = 5000, pollMs = 50 } = {
  * RFC 29: with `policy: true` (heavy only; build lock) the owner's `build.policy.json` applies —
  * blocked / queue full are REFUSED before any ticket is written (see below); a waiter also
  * honours pause and a kick/block that lands while it waits.
+ * RFC 32: while the count is auto and N = 2, a build that would run beside another is admitted only when `cpuGate` says so
+ * (default: the real CPU / quiet-hours gate for the default lock dir, open for any other dir) — on every grant path, and
+ * re-checked under the `build.gate` flock just before the claim, held until the holder file is written.
  * → { release(), update(fields), waitedMs, slot, slots, startedAt }
  *   | { timeout: true, holder, holders, slots } | { timeout: true, left: true, kicked?: true, holder }
  *   | { refused: 'blocked', until } | { refused: 'full', max, retryMin } | { refused: 'busy' }   (policy callers only)
@@ -446,7 +534,7 @@ export async function withPolicyLock(dir, fn, { waitMs = 5000, pollMs = 50 } = {
 export async function acquireLock(name, {
   waitSec = Infinity, label = selfLabel(), cmd = '', onWait = () => {}, pollMs = 1000, noticeMs = 60000, dir = LOCK_DIR, now = Date.now,
   convoId = selfConvoId(), warn = (m) => console.error(m), stat = procStat, beforeClaim = null,
-  slots = null, exclusive = false, pending = false, worktree = worktreeOf(), owner = null, policy = false, policyWaitMs = 5000, afterWin = null,
+  slots = null, exclusive = false, pending = false, worktree = worktreeOf(), owner = null, policy = false, policyWaitMs = 5000, afterWin = null, cpuGate = null,
 } = {}) {
   const me0 = owner || ownerOf({ convoId, worktree, pid: process.pid }, { stat });
   const fair = name === 'build';
@@ -481,6 +569,22 @@ export async function acquireLock(name, {
   const dropTicket = () => { if (ticket) { for (const ext of ['.json', '.left', '.kicked', '.acq']) { try { fs.unlinkSync(ticket.replace(/\.(json|acq)$/, ext)); } catch {} } } };
   const done = () => { dropTicket(); EXIT_TICKETS.delete(dropTicket); };
   let slot = -1;
+  // ── RFC 32 helpers: the CPU gate ──
+  const gate = cpuGate || defaultCpuGate(dir);
+  const gateOn = () => !exclusive && gateApplies(name, N, dir);
+  // the gate's verdict on the world right now (busy counts every slot's holder + claimed tickets without a holder)
+  const gateNow = () => { const g = gateState({ dir, N, holders: holders(), claimed: readClaimed(name, { dir, stat }), now: now(), gate }); return g.verdict; };
+  let gateRel = null; // build.gate flock: held from the final check until the holder file names us
+  const gateOff = () => { const r = gateRel; gateRel = null; r?.(); };
+  // Take build.gate (always AFTER the policy lock: one order, no deadlock) and check again. false = closed / can't check.
+  const gateEnter = async () => {
+    if (!gateOn()) return true;
+    gateRel = await acquireHelperLock('build.gate', { dir, waitMs: 5000, pollMs: 25 });
+    if (!gateRel) return false;
+    if (gateNow().ok) return true;
+    gateOff();
+    return false;
+  };
   // ── RFC 29 helpers ──
   let corruptWarned = false;
   const polRead = () => { // the owner's policy right now (missing / corrupt → no restriction; corrupt warned once)
@@ -493,7 +597,7 @@ export async function acquireLock(name, {
   const lockPolicy = async () => {
     try { return await acquireHelperLock('build.policy', { dir, waitMs: policyWaitMs, pollMs: 50 }); } catch (e) { if (isNoFlock(e)) throw e; return null; }
   };
-  const refuse = (r) => { done(); close(); return r; };
+  const refuse = (r) => { gateOff(); done(); close(); return r; };
   let admitted = false; // RFC 29 "build now": slot won and ticket claimed inside the admission step
   let blockedUntil = null;
   try {
@@ -504,7 +608,7 @@ export async function acquireLock(name, {
       // — nobody is trying for the lock then — but still takes every flock.
       const pausedNow = () => name === 'build' && polRead().paused;
       const live = () => (exclusive && pausedNow() ? 0 : queued().filter((t) => t.status === 'live').length);
-      const busyOut = () => { close(); const hs = holders(); return { timeout: true, holder: first(hs), holders: hs, slots: N }; };
+      const busyOut = () => { gateOff(); close(); const hs = holders(); return { timeout: true, holder: first(hs), holders: hs, slots: N }; };
       let rel = null;
       try {
         if (usePolicy && !exclusive) {
@@ -520,6 +624,7 @@ export async function acquireLock(name, {
           for (let k = 0; k < nFiles; k++) { if (await tryFlock(fdOf(k)) !== 'acquired') return busyOut(); won.add(k); }
           slot = 0;
         } else if ((slot = await trySlots(N, false)) < 0) return busyOut();
+        else if (!await gateEnter()) return busyOut(); // RFC 32: CPU gate closed = no room
         if (live()) return busyOut();
         if (!exclusive && pausedNow()) return busyOut(); // paused while we were taking the flock
       } finally { rel?.(); }
@@ -542,7 +647,12 @@ export async function acquireLock(name, {
           const pol = polRead();
           const blk = myBlock(pol);
           if (blk) return refuse({ refused: 'blocked', until: blk.until });
+          let fast = false;
           if (!pol.paused && queued().length === 0 && (slot = await trySlots(N)) >= 0) {
+            if (await gateEnter()) fast = true; // RFC 32: closed → queue like everyone else
+            else { close(); slot = -1; }
+          }
+          if (fast) {
             // nobody waits and a slot is free: take THAT slot (fd + flock kept), ticket written and claimed right here
             try { writeTicket(); const acq = ticket.replace(/\.json$/, '.acq'); fs.renameSync(ticket, acq); ticket = acq; admitted = true; }
             catch { return refuse({ refused: 'busy' }); }
@@ -612,10 +722,16 @@ export async function acquireLock(name, {
           }
           mayTry = ahead.length < N - busy;
         }
+        // RFC 32: the CPU gate, for the head of the queue too (it computes busy as well)
+        let gateV = null;
+        if (mayTry && gateOn()) { gateV = gateNow(); if (!gateV.ok) mayTry = false; }
         if (mayTry && (slot = await trySlots(N)) >= 0) {
           // The atomic hand-off: WE rename our ticket to .acq, or `leave` / a kick renamed it away —
           // exactly one rename succeeds. Lost → give the slot straight back.
-          if (!ticket) break;
+          if (!ticket) { // (no ticket could be written: the old unordered wait) — still through the CPU gate
+            if (await gateEnter()) break;
+            close(); slot = -1; await sleep(pollMs); continue;
+          }
           if (afterWin) await afterWin(); // (test seam: the owner pauses / blocks right here, between the flock win and the final check)
           // RFC 29 final check, under the policy lock and BEFORE the claim: paused / blocked right now?
           let rel = null, again = false;
@@ -623,11 +739,14 @@ export async function acquireLock(name, {
             try { rel = await lockPolicy(); } catch (e) { close(); throw e; }
             if (!rel) { close(); slot = -1; again = true; } // can't check → don't run; next beat
           }
+          if (!again && gateOn()) { // RFC 32: the final check, under build.gate (after the policy lock), held through the claim and the holder write
+            try { if (!await gateEnter()) { rel?.(); rel = null; close(); slot = -1; again = true; } } catch (e) { rel?.(); close(); throw e; }
+          }
           if (!again) {
             try {
               const pol2 = usePolicy ? polRead() : null;
               const blk = pol2 ? myBlock(pol2) : null;
-              if (pol2?.paused) { close(); slot = -1; }
+              if (pol2?.paused) { gateOff(); close(); slot = -1; }
               else if (blk) return refuse({ refused: 'blocked', until: blk.until });
               else {
                 if (beforeClaim) await beforeClaim(ticket); // (test seam: strike / kick right here)
@@ -637,9 +756,9 @@ export async function acquireLock(name, {
                   if (e.code !== 'ENOENT') return refuse({ refused: 'busy' }); // policy caller: a failed claim never runs and never exits 1
                   const kicked = fs.existsSync(ticket.replace(/\.json$/, '.kicked')), left = fs.existsSync(ticket.replace(/\.json$/, '.left'));
                   if (usePolicy && !left) { const b2 = myBlock(polRead()); if (b2) return refuse({ refused: 'blocked', until: b2.until }); }
-                  if (kicked || left) { done(); close(); return { timeout: true, left: true, ...(kicked ? { kicked: true } : {}), holder: null }; }
+                  if (kicked || left) { gateOff(); done(); close(); return { timeout: true, left: true, ...(kicked ? { kicked: true } : {}), holder: null }; }
                   if (usePolicy) { // vanished without a marker: the claim FAILED → no run. Give the slot back, put the ticket back, retry next beat
-                    close(); slot = -1;
+                    gateOff(); close(); slot = -1;
                     try { writeJsonAtomic(ticket, body); restoreFails = 0; } catch { if (++restoreFails >= 3) return refuse({ refused: 'busy' }); }
                   } else break; // old callers: we won flock fair and square — keep it
                 }
@@ -648,16 +767,16 @@ export async function acquireLock(name, {
           }
         }
         const t = now(), hs = holders(), holder = first(hs);
-        const key = `${hs.map((h) => `${h.slot}:${h.pid}:${h.startedAt}`).join(',') || (holder ? `${holder.pid}:${holder.startedAt}` : '')}|${ahead.map((x) => x.name).join(',')}|${pol?.paused ? 'P' : ''}`;
+        const key = `${hs.map((h) => `${h.slot}:${h.pid}:${h.startedAt}`).join(',') || (holder ? `${holder.pid}:${holder.startedAt}` : '')}|${ahead.map((x) => x.name).join(',')}|${pol?.paused ? 'P' : ''}|${gateV && !gateV.ok ? gateV.reason : ''}`;
         if (key !== lastKey || t - lastNotice >= noticeMs) {
-          onWait(holder, t - start, { position: ahead.length + 1, ahead: ahead.map((x) => x.label || `pid ${x.pid}`), holders: hs, slots: N, paused: !!pol?.paused });
+          onWait(holder, t - start, { position: ahead.length + 1, ahead: ahead.map((x) => x.label || `pid ${x.pid}`), holders: hs, slots: N, paused: !!pol?.paused, gate: gateV && !gateV.ok ? gateV : null });
           lastNotice = t; lastKey = key;
         }
         if (t - start >= waitSec * 1000) { done(); close(); return { timeout: true, holder, holders: hs, slots: N }; }
         await sleep(pollMs);
       }
     }
-  } catch (e) { done(); close(); throw e; }
+  } catch (e) { gateOff(); done(); close(); throw e; }
   close(won); // fds of slots we tried but did not win
   const hp = P[slot].holder;
   // `ticket`: which of possibly several tickets of this process (daemon) holds the lock.
@@ -668,8 +787,9 @@ export async function acquireLock(name, {
   } catch (e) {
     // Display only — except on a machine that may run 2 builds (now, or after `slots auto`), where the other
     // build budgets RAM from our holder: no holder, no run.
-    if (name === 'build' && (N > 1 || memTotal() >= TWO_SLOT_MIN_RAM)) { done(); close(); throw new Error(`không ghi được holder ${path.basename(hp)} (${e.message}) — không chạy (build kia cần nó để tính RAM)`); }
+    if (name === 'build' && (N > 1 || memTotal() >= TWO_SLOT_MIN_RAM)) { gateOff(); done(); close(); throw new Error(`không ghi được holder ${path.basename(hp)} (${e.message}) — không chạy (build kia cần nó để tính RAM)`); }
   }
+  gateOff(); // the holder file now names us: the next build's gate check sees it
   if (fair && !exclusive) { markServed(name, me0, { dir, now: now() }); readServed(name, { dir, now: now(), prune: true }); } // RFC 24: last service of this owner
   done(); // holder names us → leave the queue
   let released = false;

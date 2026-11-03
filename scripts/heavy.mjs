@@ -62,8 +62,9 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
-import { acquireLock, describeHolder, readHolders, readQueue, slotsFor, ownerOf, selfConvoId, worktreeOf, acquireHelperLock, stopMarkerPath, procStat, memTotal, LOCK_DIR, TWO_SLOT_MIN_RAM } from './machine-lock.mjs';
+import { acquireLock, describeHolder, readHolders, readQueue, slotsFor, hasFreeSlot, gateText, DEFAULT_LOCK_DIR, ownerOf, selfConvoId, worktreeOf, acquireHelperLock, stopMarkerPath, procStat, memTotal, LOCK_DIR, TWO_SLOT_MIN_RAM } from './machine-lock.mjs';
 import { readPolicy, blockOf } from './build-policy.mjs';
+import { syncQuietCpu, QUIET_SLICE } from './quiet-hours.mjs';
 import { isMainModule } from './is-direct-run.mjs';
 import { shortCmd } from './lock-queue.mjs';
 
@@ -162,7 +163,7 @@ export function scopeMemMax(env = process.env, total = memTotal(), fraction = SC
 
 /** systemd-run argv putting `cmd` into its own scope. Pure. */
 export function scopeArgv({ unit, memMax }, cmd) {
-  return ['systemd-run', '--user', '--scope', '--quiet', '--collect', `--unit=${unit}`, '-p', 'TimeoutStopSec=10s',
+  return ['systemd-run', '--user', '--scope', '--quiet', '--collect', `--unit=${unit}`, `--slice=${QUIET_SLICE}`, '-p', 'TimeoutStopSec=10s',
     ...(memMax > 0 ? ['-p', `MemoryMax=${memMax}`, '-p', `MemorySwapMax=${SCOPE_SWAP_MAX}`] : []), '--', ...cmd];
 }
 
@@ -492,7 +493,7 @@ export function refusalExit(r, log) {
  * at `max` and no "build now" chance (not paused, nobody waiting, a free slot) → refused full. The authoritative
  * check is acquireLock's, under the policy lock. → a `refused` result or null. A corrupt policy = no restriction.
  */
-export function earlyPolicyCheck({ dir, owner, now = Date.now(), holders = null, queue = null, slots = null, startOf } = {}) {
+export function earlyPolicyCheck({ dir, owner, now = Date.now(), holders = null, queue = null, slots = null, gate, startOf } = {}) {
   const { policy, corrupt } = readPolicy(dir, { now, ...(startOf ? { startOf } : {}) });
   if (corrupt) return null;
   const blk = blockOf(policy, owner, { now, ...(startOf ? { startOf } : {}) });
@@ -501,7 +502,7 @@ export function earlyPolicyCheck({ dir, owner, now = Date.now(), holders = null,
   const waiting = (queue || readQueue('build', { dir })).filter((t) => t.status !== 'dead').length;
   if (waiting < policy.max) return null;
   const hs = holders || readHolders('build', { dir });
-  const free = hs.length < (slots ?? slotsFor('build', { dir }));
+  const free = hasFreeSlot({ dir, N: slots ?? slotsFor('build', { dir }), holders: hs, now, gate }); // RFC 32: a closed CPU gate = no free slot
   if (!policy.paused && waiting === 0 && free) return null; // the "build now" exception
   return { refused: 'full', max: policy.max, retryMin: policy.retryMin };
 }
@@ -510,6 +511,7 @@ const DEFAULT_SCOPE_OPS = {
   lockDir: null, hasFlock: () => { const r = spawnSync('flock', ['--version'], { stdio: 'ignore' }); return !(r.error && r.error.code === 'ENOENT'); }, selfOwner: () => ownerOf({ convoId: selfConvoId(), worktree: worktreeOf(), pid: process.pid }),
   preflight: scopePreflight, stop: stopScope, orphans: orphanScopes, oomKills: appSliceOomKills, jobsConfigured: cargoJobsConfigured, memTotal: memTotal(),
   holders: () => readHolders('build'),
+  syncQuiet: null, syncEveryMs: 60_000, // RFC 32 §4.2: set below (needs the lock dir); injectable
   admitLock: () => acquireHelperLock('build.admit', { waitMs: 10_000 }),
   sweepLock: () => acquireHelperLock('build.sweep', { waitMs: 60_000 }),
   slotTurn: waitForSlotTurn,
@@ -542,6 +544,10 @@ export async function main(argv, {
     // no flock binary: the queue and the policy cannot be enforced → fall through to the loud run-unlocked fallback
     if (early && scopeOps.hasFlock()) return refusalExit(early, log);
   }
+  // RFC 32 §4.2: keep the build slice's CPUQuota in step with the quiet hours. Only against the real lock dir (a test
+  // dir or an injected acquire never touches this machine's systemd); an injected scopeOps.syncQuiet always wins.
+  const syncQuiet = scopeOps.syncQuiet || (policyReadable && path.resolve(lockDir) === path.resolve(DEFAULT_LOCK_DIR) ? () => syncQuietCpu({ dir: lockDir, warn: log }) : () => {});
+  const trySync = () => { try { syncQuiet(); } catch { /* never fatal */ } };
   if (!isNested && a.ramWait) await waitRam({ minBytes: minFreeBytes(env), log });
   let lock;
   if (isNested) {
@@ -550,7 +556,7 @@ export async function main(argv, {
   } else try {
     lock = await acquire('build', {
       waitSec: a.waitSec, cmd: cmdText, pending: true, policy: true, dir: lockDir,
-      onWait: (h, waited, q) => log(`${q?.paused ? '⏸ owner tạm dừng phát chỗ build — ' : ''}⏳ ${describeBusy(h, q)}${q?.position > 1 ? ` — bạn đứng thứ ${q.position}, trước bạn: ${q.ahead.join(', ')}` : q ? ' — bạn đứng đầu hàng' : ''} — ${waited ? `đã chờ ${Math.round(waited / 60000)} phút, ` : ''}chờ tới lượt… (rời hàng: node ../teleport/scripts/lock-queue.mjs leave)`),
+      onWait: (h, waited, q) => log(`${q?.paused ? '⏸ owner tạm dừng phát chỗ build — ' : ''}⏳ ${describeBusy(h, q)}${q?.gate ? ` (chỗ thứ 2: ${gateText(q.gate, 'wait')})` : ''}${q?.position > 1 ? ` — bạn đứng thứ ${q.position}, trước bạn: ${q.ahead.join(', ')}` : q ? ' — bạn đứng đầu hàng' : ''} — ${waited ? `đã chờ ${Math.round(waited / 60000)} phút, ` : ''}chờ tới lượt… (rời hàng: node ../teleport/scripts/lock-queue.mjs leave)`),
     });
   } catch (e) {
     // Only a missing flock binary may run unlocked (as before); any other failure stops here.
@@ -595,6 +601,7 @@ export async function main(argv, {
   const postIgn = () => {};
   const groupAlive = () => !!pgid && scopeOps.groupAlive(pgid);
   const killGroup = (sig) => { if (groupAlive()) { try { process.kill(-pgid, sig); } catch {} } }; // (a live group keeps its id reserved)
+  let quietTimer = null;
   const watch = owned ? setInterval(() => {
     if (stopByOwner || !scopeOps.exists(marker)) return;
     if (phase === 'pre') { acceptStop(); abortWaits(); }
@@ -653,6 +660,7 @@ export async function main(argv, {
         const others = lock.startedAt ? scopeOps.holders().filter((h) => !(h.pid === me.pid && h.startedAt === me.startedAt)) : [];
         const fraction = (lock.slots ?? 1) >= 2 || others.length ? SCOPE_MEM_FRACTION_SHARED : SCOPE_MEM_FRACTION;
         if (a.scope && env.TELEPORT_HEAVY_SCOPE !== '0') {
+          trySync(); // before the scope exists: it is born into an already-limited slice
           const memMax = scopeMemMax(env, scopeOps.memTotal, fraction);
           const pf = scopeOps.preflight({ memMax });
           if (pf.ok) scope = { unit: `heavy-${process.pid}-${Math.random().toString(36).slice(2, 8)}.scope`, memMax };
@@ -661,7 +669,7 @@ export async function main(argv, {
         if (lock.startedAt) {
           // Declare our cap (the holder said `pending` until now), then wait for the builds before us.
           const unbounded = !scope || isUnbounded({ memMax: scope.memMax }, scopeOps.memTotal);
-          const declared = lock.update?.({ pending: undefined, ...(unbounded ? { unbounded: true } : { memMax: scope.memMax }), ...(scope ? { unit: scope.unit } : {}) });
+          const declared = lock.update?.({ pending: undefined, scoped: !!scope, ...(unbounded ? { unbounded: true } : { memMax: scope.memMax }), ...(scope ? { unit: scope.unit } : {}) });
           if (declared === false && ((lock.slots ?? 1) > 1 || scopeOps.memTotal >= TWO_SLOT_MIN_RAM)) { log('❌ heavy: không ghi được giới hạn RAM vào holder (build kia cần nó để tính RAM) — không chạy.'); return 1; }
           // (--no-ram-wait skips only the usual RAM waits; TELEPORT_HEAVY_MIN_FREE_MB=0 turns this gate off)
           const capable = (lock.slots ?? 1) > 1 || scopeOps.memTotal >= TWO_SLOT_MIN_RAM;
@@ -700,7 +708,10 @@ export async function main(argv, {
     const oomBefore = scope ? scopeOps.oomKills() : null;
     if (owned) { for (const s of SIGS) process.off(s, preSig); phase = 'run'; } // runForwarded forwards from here
     const onSpawn = (child) => { pgid = child.pid; lock.update?.({ running: true, runningSince: Date.now(), pgid, pgidStart: procStat(pgid)?.start ?? null }); };
+    if (scope) trySync(); // the RAM wait / gradlew --stop above can cross the start of the night: check again right before the scope is spawned
+    if (scope && !isNested) { quietTimer = setInterval(trySync, scopeOps.syncEveryMs); quietTimer.unref?.(); } // the night starts / ends while we run
     const code = await run(a.cmd, { env: childEnv, ...(scope ? { scope } : {}), ...(owned ? { onSpawn } : {}) });
+    clearInterval(quietTimer);
     if (owned) {
       phase = 'post'; // (the watcher stays on: a late stop is just acknowledged)
       for (const s of SIGS) process.on(s, postIgn); // cleaning up: a signal now would drop the lock mid-cleanup
@@ -724,7 +735,7 @@ export async function main(argv, {
     }
     return stopByOwner ? STOPPED_EXIT : code;
   } finally {
-    clearInterval(watch); clearTimeout(killTimer);
+    clearInterval(watch); clearInterval(quietTimer); clearTimeout(killTimer);
     for (const s of SIGS) process.off(s, preSig);
     // Leftovers (a daemon, a stray child) die BEFORE the next build may start.
     if (scope) {

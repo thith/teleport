@@ -1,11 +1,15 @@
-// `/health` — a daemon command: one-glance machine status for the owner.
-// CPU load + pressure (PSI), disk IO pressure, RAM / swap, disk, the running claude agents (screen vs terminal,
-// busy/idle), the biggest memory users, and warnings (low RAM / disk, an OOM
-// kill in the last 24h). Read-only. Pure formatting is unit-tested; the probes
+// `/health` — a daemon command: one-glance machine status for the owner (RFC 32 §4.5: short).
+// One machine line (load/cores, RAM, free disk), one ⚠️ line of warnings, the biggest memory users only when RAM is
+// tight, the locks, and "⚙️ Đang áp dụng" (the knobs in effect). Read-only. Pure formatting is unit-tested; the probes
 // below read /proc, df, ps and the user journal (best effort — a missing source
 // just drops that line).
 
-import { formatQueue, pruneSkipLines, LOCK_NAMES } from './lock-queue.mjs';
+import { pruneSkipLines } from './lock-queue.mjs';
+import { LOCK_DIR, readHolders, readQueue, slotsFor, cpuGateNote } from './machine-lock.mjs';
+import { readPolicy } from './build-policy.mjs';
+import { quietState, readOverrideStrict, cpuLimitSupported, buildRuleText } from './quiet-hours.mjs';
+import { autoMergeAllowlist, validRepoPattern, AUTOMERGE_STATE_FILE } from './merge-inbox.mjs';
+import { DEFAULT_PROJECTS_FILE } from './projects-config.mjs';
 import fs from 'node:fs';
 import os from 'node:os';
 import { execFileSync, execFile } from 'node:child_process';
@@ -71,54 +75,113 @@ export const IO_PSI_ALERT = 30;   // io full avg10 %: every task stalled on the 
 // Tappable next steps (Telegram turns a /command in the text into a link that sends it).
 export const HEALTH_SHORTCUTS = '/cswap   /q   /ls';
 
-export function formatHealth({ cores, load, mem, disk, agents, top, oomKills, locks = null, psi = null }) {
+const gbInt = (b) => Math.round(b / GB);
+const topSize = (mb) => (mb >= 1024 ? `${(mb / 1024).toFixed(1)}G` : `${mb}M`);
+export const RAM_TOP_SHOW_PCT = 80; // list the biggest RAM users only above this usage (or with a RAM / swap warning)
+
+/**
+ * RFC 32 §4.5: short, one line per fact. Machine line (load/N · RAM · free disk), ONE ⚠️ line joining every warning,
+ * the biggest RAM users only when RAM is tight, the locks (formatLocksShort), then "⚙️ Đang áp dụng" (formatInEffect).
+ * `extraWarn`: warnings the caller computed (e.g. builds running outside their scope).
+ */
+export function formatHealth({ cores, load, mem, disk, top, oomKills, locks = null, psi = null, inEffect = null, extraWarn = [] }) {
   const warn = [];
-  const lines = ['🩺 Tình trạng máy', ''];
+  const parts = [];
+  let ramWarn = false;
   const cpuPsi = psi?.cpu?.some ?? null;
   const ioPsi = psi?.io?.full ?? null;
   if (load) {
-    const pct = cores ? Math.round((load[0] / cores) * 100) : null;
-    lines.push(`💻 CPU: ${cores} nhân · load ${load.map((x) => x.toFixed(2)).join(' / ')}${pct != null ? ` (~${pct}%)` : ''}${cpuPsi ? ` · chờ CPU ${Math.round(cpuPsi.avg10)}%` : ''}`);
+    parts.push(`💻 load ${load[0].toFixed(1)}${cores ? `/${cores}` : ''}`); // load per core count, not a CPU % (a CPUQuota makes % misleading)
     if (cpuPsi) {
-      if (cpuPsi.avg10 >= CPU_PSI_ALERT) warn.push(`CPU quá tải (${Math.round(cpuPsi.avg10)}% thời gian có tiến trình chờ CPU)`);
+      if (cpuPsi.avg10 >= CPU_PSI_ALERT) warn.push(`CPU quá tải (${Math.round(cpuPsi.avg10)}% thời gian chờ CPU)`);
     } else if (cores && load[0] > cores) warn.push(`CPU quá tải (load ${load[0].toFixed(1)} > ${cores} nhân)`);
   }
-  if (ioPsi) {
-    lines.push(`💽 Disk IO: đứng chờ ổ đĩa ${Math.round(ioPsi.avg10)}% thời gian (TB 1 phút ${Math.round(ioPsi.avg60)}% · 5 phút ${Math.round(ioPsi.avg300)}%)`);
-    if (ioPsi.avg10 >= IO_PSI_ALERT) {
-      const highLoad = load && cores && load[0] > cores && !(cpuPsi && cpuPsi.avg10 >= CPU_PSI_ALERT);
-      warn.push(`Disk IO nghẽn: ${Math.round(ioPsi.avg10)}% thời gian mọi tiến trình đứng chờ ổ đĩa${highLoad ? ' (load cao là do chờ disk, không phải thiếu CPU)' : ''}`);
-    }
-  }
+  let usedPct = null;
   if (mem && mem.total) {
     const used = mem.total - (mem.available ?? 0);
-    lines.push(`🧠 RAM: dùng ${fmtGB(used)} / ${fmtGB(mem.total)} · còn khả dụng ${fmtGB(mem.available ?? 0)}`);
-    if (mem.available != null && mem.available / mem.total < 0.15) warn.push(`RAM sắp hết (còn ${fmtGB(mem.available)})`);
+    usedPct = (used / mem.total) * 100;
+    parts.push(`🧠 RAM ${gbInt(used)}/${gbInt(mem.total)} GB`);
+    if (mem.available != null && mem.available / mem.total < 0.15) { warn.push(`RAM sắp hết (còn ${fmtGB(mem.available)})`); ramWarn = true; }
     if (mem.swapTotal) {
       const swUsed = mem.swapTotal - (mem.swapFree ?? 0);
-      lines.push(`💤 Swap: ${fmtGB(swUsed)} / ${fmtGB(mem.swapTotal)}${swUsed / mem.swapTotal > 0.9 ? ' ⚠️ gần đầy' : ''}`);
+      if (swUsed / mem.swapTotal > 0.9) { warn.push(`Swap đầy ${gbInt(swUsed)}/${gbInt(mem.swapTotal)} GB`); ramWarn = true; }
     }
   }
+  if (ioPsi && ioPsi.avg10 >= IO_PSI_ALERT) warn.push(`đĩa nghẽn ${Math.round(ioPsi.avg10)}% thời gian`);
   if (disk) {
-    const pctFree = Math.round((disk.avail / disk.size) * 100);
-    lines.push(`💾 Disk ${disk.target}: còn trống ${fmtGB(disk.avail)} / ${fmtGB(disk.size)} (${pctFree}%)`);
-    if (diskLow(disk)) warn.push(`Disk sắp đầy (còn ${pctFree}%)`);
+    parts.push(`💾 đĩa trống ${gbInt(disk.avail)} GB`);
+    if (diskLow(disk)) warn.push(`đĩa sắp đầy (còn ${Math.round((disk.avail / disk.size) * 100)}%)`);
   }
-  if (agents) {
-    const screen = agents.filter((a) => a.screen).length;
-    const busy = agents.filter((a) => a.status === 'busy').length;
-    lines.push(`🤖 Agent claude: ${agents.length} đang chạy (📺 screen ${screen} · 💻 terminal ${agents.length - screen}) · busy ${busy}`);
+  if (oomKills) warn.push(`${oomKills} lần OOM-kill trong 24 giờ qua (xem /ls)`);
+  warn.push(...extraWarn);
+  const lines = ['🩺 Máy'];
+  if (parts.length) lines.push(parts.join(' · '));
+  if (warn.length) lines.push(`⚠️ ${warn.join(' · ')}`);
+  if (top && top.length && ((usedPct != null && usedPct > RAM_TOP_SHOW_PCT) || ramWarn)) {
+    lines.push(`🐘 ${top.slice(0, 5).map((t) => `${t.name}${t.count > 1 ? `×${t.count}` : ''} ${topSize(t.mb)}`).join(' · ')}`);
   }
-  if (top && top.length) {
-    lines.push('', 'Ăn RAM nhiều nhất:');
-    for (const t of top) lines.push(`• ${t.name}${t.count > 1 ? ` ×${t.count}` : ''}: ${t.mb >= 1024 ? `${(t.mb / 1024).toFixed(1)} GB` : `${t.mb} MB`}`);
-  }
-  // RFC 21: machine locks — who holds each, who waits (in order).
-  if (locks && locks.length) lines.push('', 'Hàng đợi lock:', ...locks);
-  if (oomKills) warn.push(`${oomKills} lần OOM-kill trong 24 giờ qua (systemd-oomd). Có thể có agent đã bị tắt, xem /ls`);
-  lines.push('', warn.length ? `⚠️ ${warn.join('\n⚠️ ')}` : '✅ Không có cảnh báo.');
+  if (locks && locks.length) lines.push(...locks);
+  if (inEffect && inEffect.length) lines.push('', '⚙️ Đang áp dụng', ...inEffect);
   lines.push('', HEALTH_SHORTCUTS);
   return lines.join('\n');
+}
+
+const labelOnly = (l) => String(l ?? '').replace(/\s#[a-z0-9]+$/i, '');
+
+/**
+ * RFC 32 §4.5: the locks, one line each. `build` always (holders with minutes, then waiting tickets); `merge` / `cleanup`
+ * only while held or waited for. locks = { build?: { N, holders: [{label, startedAt, exclusive}], waiting }, merge?, cleanup? }.
+ * A lock whose data could not be read is `null` → "?". Pure.
+ */
+export function formatLocksShort(locks, { now = Date.now() } = {}) {
+  const out = [];
+  for (const name of ['build', 'merge', 'cleanup']) {
+    const l = locks?.[name];
+    if (l === undefined) continue;
+    if (l === null) { out.push(`🔒 ${name}: ?`); continue; }
+    const hs = l.holders || [];
+    if (name !== 'build' && !hs.length && !l.waiting) continue;
+    const who = hs.map((h) => `▶ ${labelOnly(h.label) || 'pid ?'} (${Math.max(0, Math.round((now - h.startedAt) / 60000))}')${h.exclusive ? ' [giữ cả lock]' : ''}`);
+    const head = name === 'build' ? `🔒 build ${hs.length}/${l.N ?? 1}` : `🔒 ${name}`;
+    out.push(hs.length || name !== 'build' ? `${head}: ${[...who, `chờ ${l.waiting || 0}`].join(' · ')}` : `${head}: trống · chờ ${l.waiting || 0}`);
+  }
+  return out;
+}
+
+const hhmm = (ms) => new Date(ms).toTimeString().slice(0, 5);
+
+/**
+ * RFC 32 §4.5: "⚙️ Đang áp dụng" — only knobs teleport really has. Every input may be `undefined`/`null` = could not be
+ * read → that line prints `?`. Pure.
+ *   build   { slots, forced, gateNote }                    (forced = build.slots file)
+ *   quiet   a quietState() result, optionally { error }
+ *   policy  { max, paused, blocks: [{label, until}], boosts: k }
+ *   automerge { enabled, patterns }
+ */
+export function formatInEffect({ build, quiet, policy, automerge } = {}) {
+  const lines = [];
+  if (!build) lines.push('• Build: ?');
+  else {
+    const how = build.forced ? `đặt tay = ${build.slots} (lock-queue slots 1)` : `tự động theo RAM${build.slots > 1 ? '; chỗ thứ 2 chỉ cấp khi CPU rảnh' : ''}`;
+    lines.push(`• Build: ${build.slots} chỗ, ${how}${build.gateNote ? ` · chỗ thứ 2: ${build.gateNote}` : ''}`);
+  }
+  if (!quiet) lines.push('• 🌙 Giờ im lặng: ?');
+  else if (!quiet.enabled) lines.push(`• 🌙 Giờ im lặng: tắt${quiet.error ? ` (cấu hình hỏng: ${quiet.error})` : ''}`);
+  else {
+    const now = !quiet.active ? 'chưa tới giờ' : quiet.overridden ? `TẮT TẠM tới ${hhmm(quiet.until)}` : `đang áp tới ${hhmm(quiet.until)}`;
+    const rule = buildRuleText(quiet.maxBuilds);
+    lines.push(`• 🌙 Giờ im lặng ${quiet.from}–${quiet.to}: build ≤ ${quiet.cpuPercent}% CPU, ${rule} (bây giờ: ${now})${quiet.active && !quiet.overridden ? ' — bấm /q để tắt tạm' : ''}`);
+  }
+  if (!policy) lines.push('• Hàng /q: ?');
+  else {
+    const parts = [policy.max == null ? 'không giới hạn' : `max ${policy.max}`, policy.paused ? '⏸ tạm dừng' : 'không tạm dừng'];
+    parts.push(policy.blocks?.length ? `chặn: ${policy.blocks.map((b) => `${b.label} tới ${hhmm(b.until)}`).join(', ')}` : 'không chặn ai');
+    if (policy.boosts > 0) parts.push(`⬆ ưu tiên: ${policy.boosts} vé`);
+    lines.push(`• Hàng /q: ${parts.join(', ')}`);
+  }
+  if (!automerge) lines.push('• Automerge: ?');
+  else lines.push(`• Automerge: ${automerge.enabled ? 'bật' : 'tắt'}${automerge.patterns > 0 || automerge.enabled ? ` (${automerge.patterns} mẫu repo)` : ''}`);
+  return lines;
 }
 
 // ── Proactive watch (daemon heartbeat): early low-RAM warning + agent deaths ──
@@ -356,20 +419,61 @@ function tryRun(bin, args) {
   try { return String(execFileSync(bin, args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000, maxBuffer: 16 * 1024 * 1024 })); } catch { return null; }
 }
 
+/** Strict JSON read for /health: missing file → {} (nothing configured), any other failure throws (that line prints `?`). */
+const readJsonOrEmpty = (file) => { try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch (e) { if (e?.code === 'ENOENT') return {}; throw e; } };
+/** automerge-state.json, strictly: missing = the defaults; any other read / parse failure throws (the line prints `?`). */
+export function readAutoMergeStrict(file) {
+  let t;
+  try { t = fs.readFileSync(file, 'utf8'); } catch (e) { if (e?.code === 'ENOENT') return { enabled: false, repos: [] }; throw e; }
+  const j = JSON.parse(t);
+  return { enabled: j.enabled === true, repos: Array.isArray(j.repos) ? j.repos.filter(validRepoPattern).map((r) => r.toLowerCase()) : [] };
+}
+const tryOr = (f, fallback = null) => { try { return f(); } catch { return fallback; } };
+
+/**
+ * Read the state files for the locks lines and "Đang áp dụng". Every piece is independent: one that cannot be read is
+ * `null` (the line prints `?`), never an exception. Returns { locks, inEffect, extraWarn }. Injectable for tests.
+ * (health.mjs reads `_config.buildQuietHours`, never `_config.quietHours` — that one belongs to the heartbeat reminders.)
+ */
+export function gatherLocal({ dir = LOCK_DIR, now = Date.now(), projectsFile = DEFAULT_PROJECTS_FILE, readProjects = readJsonOrEmpty, readOverrideOf = readOverrideStrict, automergeFile = AUTOMERGE_STATE_FILE, supported = cpuLimitSupported, pruneLines = () => pruneSkipLines({ dir }) } = {}) {
+  const cfg = tryOr(() => readProjects(projectsFile));
+  const lockData = {};
+  const buildHolders = tryOr(() => readHolders('build', { dir }));
+  for (const name of ['build', 'merge', 'cleanup']) {
+    lockData[name] = tryOr(() => ({
+      N: slotsFor(name, { dir }), holders: name === 'build' && buildHolders ? buildHolders : readHolders(name, { dir }),
+      waiting: readQueue(name, { dir, now }).filter((t) => t.status !== 'dead').length,
+    }));
+  }
+  const quiet = cfg ? tryOr(() => quietState({ config: cfg._config?.buildQuietHours, now, override: readOverrideOf(dir) })) : null;
+  const inEffect = formatInEffect({
+    build: tryOr(() => { const N = slotsFor('build', { dir }); return { slots: N, forced: fs.existsSync(path.join(dir, 'build.slots')), gateNote: cpuGateNote({ dir, N, now }) }; }),
+    quiet,
+    policy: tryOr(() => { const r = readPolicy(dir, { now }); return r.corrupt ? null : { max: r.policy.max, paused: r.policy.paused, blocks: r.policy.blocks, boosts: Object.keys(r.policy.boosts || {}).length }; }),
+    automerge: cfg ? tryOr(() => { const st = readAutoMergeStrict(automergeFile); return { enabled: st.enabled, patterns: autoMergeAllowlist({ configPatterns: Array.isArray(cfg._config?.autoMergeRepos) ? cfg._config.autoMergeRepos : [], addedPatterns: st.repos }).patterns.length }; }) : null,
+  });
+  const extraWarn = [];
+  if (quiet?.error) extraWarn.push(`giờ im lặng: cấu hình hỏng (${quiet.error}) — đang tắt`);
+  if (quiet?.enabled && !tryOr(() => supported(), false)) extraWarn.push('giờ im lặng: máy này không giới hạn được CPU (thiếu systemd cpu)');
+  const outside = quiet?.enabled && buildHolders ? buildHolders.filter((h) => h.scoped === false && !h.exclusive && !h.pending).length : 0; // (holders still `pending` have not passed the scope preflight yet)
+  if (outside) extraWarn.push(`${outside} build đang chạy ngoài scope, không bị giới hạn CPU`);
+  for (const l of tryOr(() => pruneLines(), [])) extraWarn.push(l.replace(/^⚠️\s*/, ''));
+  return { locks: formatLocksShort(lockData, { now }), inEffect, extraWarn };
+}
+
 if (isMainModule(import.meta.url)) {
   let mem = null;
   try { mem = parseMeminfo(fs.readFileSync('/proc/meminfo', 'utf8')); } catch {}
   const dfOut = tryRun('df', ['-B1', '--output=size,avail,target', os.homedir()]);
   const psOut = tryRun('ps', ['-eo', 'comm=,rss=']);
   const journal = tryRun('journalctl', ['--user', '--since', '24 hours ago', '--no-pager', '-q']);
-  let agents = null;
-  try { agents = listClaudeProcs(); } catch {}
+  const local = gatherLocal();
   process.stdout.write(formatHealth({
     cores: os.cpus().length, load: os.loadavg(), mem,
     psi: (() => { const r = (k) => { try { return parsePressure(fs.readFileSync(`/proc/pressure/${k}`, 'utf8')); } catch { return null; } }; return { cpu: r('cpu'), io: r('io') }; })(),
-    disk: dfOut ? parseDf(dfOut) : null, agents,
+    disk: dfOut ? parseDf(dfOut) : null,
     top: psOut ? topMemory(psOut) : null, oomKills: journal ? countOomKills(journal) : 0,
-    locks: (() => { try { return [...LOCK_NAMES.flatMap((n) => formatQueue(n)), ...pruneSkipLines()]; } catch { return null; } })(),
+    ...local,
   }) + '\n');
 }
 
