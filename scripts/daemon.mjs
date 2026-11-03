@@ -57,7 +57,7 @@ import {
 } from './tele-listen.mjs';
 export { prLinksOnly, PR_LINK_RE };
 import { HASHTAG_RE } from './agent-target.mjs';
-import { loadCommands, resolveCommand, roleMeets, tokenizeArgs, splitAtBlocks, menuCommands, COMMANDS_FILE } from './commands.mjs';
+import { loadCommands, resolveCommand, roleMeets, tokenizeArgs, splitAtBlocks, COMMANDS_FILE } from './commands.mjs';
 import { canonicalPrUrl } from './merge.mjs';
 // Workspace paths live in workspace.mjs (merge.mjs needs them too — importing
 // daemon.mjs from there made a circular import that deadlocked merge.mjs).
@@ -238,12 +238,19 @@ export function daemonStatus(pidFile = PID_FILE) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-/** RFC 29: put the registry's commands in the owner's "/" menu (their DM only). Errors propagate to the caller, who logs. */
-export async function applyOwnerMenu(registry, ui) {
-  const commands = menuCommands(registry);
-  if (!commands.length || !ui?.setOwnerCommands) return commands;
-  await ui.setOwnerCommands(commands);
-  return commands;
+/** Every scope a "/" command menu can be set at; the owner's own chat is added when known. */
+export function menuScopes(daemonUserId) {
+  const scopes = [{ type: 'default' }, { type: 'all_private_chats' }, { type: 'all_group_chats' }, { type: 'all_chat_administrators' }];
+  if (daemonUserId) scopes.push({ type: 'chat', chat_id: Number(daemonUserId) });
+  return scopes;
+}
+
+/** Clear the bot's Telegram "/" menu at every scope (commands still work when typed). A failing scope is logged, the rest still run. */
+export async function clearBotMenus(ui, daemonUserId) {
+  for (const scope of menuScopes(daemonUserId)) {
+    try { await ui.deleteCommands(scope); }
+    catch (e) { console.error(`[daemon] deleteMyCommands ${JSON.stringify(scope)}: ${e?.message ?? e}`); }
+  }
 }
 
 // ── Main loop ─────────────────────────────────────────────────────────────────
@@ -324,14 +331,12 @@ async function main() {
     // Several rows of buttons (/type); edit = replace text AND keyboard (rows = [] removes it).
     sendButtonRows: (chatId, text, rows) => tg('sendMessage', { chat_id: chatId, text, reply_markup: { inline_keyboard: rows }, link_preview_options: { is_disabled: true } }),
     editButtonRows: (chatId, messageId, text, rows) => tg('editMessageText', { chat_id: chatId, message_id: messageId, text, reply_markup: { inline_keyboard: rows }, link_preview_options: { is_disabled: true } }).catch(() => {}),
-    // RFC 29: the "/" menu, shown only in the owner's own chat
-    setOwnerCommands: (commands) => tg('setMyCommands', { commands, scope: { type: 'chat', chat_id: Number(daemonUserId) } }),
+    // The bot has no "/" menu: cleared at startup (clearBotMenus).
+    deleteCommands: (scope) => tg('deleteMyCommands', { scope }),
     // (RFC 24 stop report: failures must be seen, to retry; "message is not modified" counts as done)
     editButtonRowsStrict: (chatId, messageId, text, rows) => tg('editMessageText', { chat_id: chatId, message_id: messageId, text, reply_markup: { inline_keyboard: rows }, link_preview_options: { is_disabled: true } }).catch((e) => { if (!/not modified/i.test(e?.message || '')) throw e; }),
   };
-  // RFC 29: the "/" menu for the owner (from commands.json); an API error is only logged.
-  const applyMenu = () => applyOwnerMenu(registry, linkMergeUi).catch((e) => console.error(`[daemon] setMyCommands: ${e?.message ?? e}`));
-  applyMenu();
+  clearBotMenus(linkMergeUi, daemonUserId);
   // Pending buttons (merge previews, manual cleanups) survive a restart.
   pendingMergeButtons = new PersistentMap();
   // RFC 24: owner-requested build stops run on their own short timer (not the 60 s heartbeat); jobs survive a restart.
@@ -353,7 +358,7 @@ async function main() {
       resolveOwner: (cfg) => resolveDaemonUserId(cfg, { env: process.env, envFile: env }),
       resolveCatchAll: (cfg) => parseAdminChatIds(resolveDefaultChatId(cfg, { env: process.env, envFile: env }) || ''),
     });
-    if (!r.error) { projectsConfig = r.projectsConfig; registry = r.registry; applyMenu(); }
+    if (!r.error) { projectsConfig = r.projectsConfig; registry = r.registry; }
     return r;
   };
 

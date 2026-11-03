@@ -11,8 +11,8 @@ import { defaultPolicy, readPolicy, writePolicy, TICKET_V } from './build-policy
 import { gatherQ, renderQ, qCallback, Q_BUTTON_RE, Q_PAGE_SIZE } from './q-panel.mjs';
 import { startQ, qPress, handleQButton, runQCommand, latestQ, queueTargetTiers } from './q-cmd.mjs';
 import { readNotices } from './queue-control.mjs';
-import { menuCommands, loadCommands, resolveCommand } from './commands.mjs';
-import { dispatchCommand, applyOwnerMenu, takeMergeButton, Q_COMMAND } from './daemon.mjs';
+import { loadCommands, resolveCommand } from './commands.mjs';
+import { dispatchCommand, clearBotMenus, takeMergeButton, Q_COMMAND } from './daemon.mjs';
 import {
   longBuildCandidates, createStopJob, buildKickNoticePrompt, longBuildWatch, retireLongBuildAlert, holderKey, STOP_BUTTON_RE,
 } from './long-build.mjs';
@@ -399,29 +399,22 @@ test('button store: setStrict throws and rolls back; a kind:q entry is never tak
   assert.ok(store.has('t1'), 'not consumed by the merge taker');
 });
 
-test('menu: aliases and desc-less entries dropped, first sentence ≤ 256, ≤ 100, valid names only; sent with the owner-chat scope; API error propagates for the caller to log', async () => {
-  const reg = {
-    q: { builtin: true, desc: 'Control the queue. More text.' },
-    w: { alias: 'whisper' },
-    nodesc: { run: 'x.mjs' },
-    long: { builtin: true, desc: 'x'.repeat(400) },
-    'bad-name': { builtin: true, desc: 'x' },
-    reload: { builtin: true, desc: 're-read commands.json + projects.json without restarting the daemon' },
-  };
-  const cmds = menuCommands(reg);
-  assert.deepEqual(cmds.map((c) => c.command), ['q', 'long', 'reload']);
-  assert.equal(cmds[0].description, 'Control the queue.');
-  assert.equal(cmds[1].description.length, 256);
-  assert.equal(cmds[2].description, 're-read commands.json + projects.json without restarting the daemon');
-  const big = Object.fromEntries(Array.from({ length: 130 }, (_, i) => [`c${i}`, { builtin: true, desc: 'd' }]));
-  assert.equal(menuCommands(big).length, 100);
-  const calls = [];
-  await applyOwnerMenu(reg, { setOwnerCommands: async (c) => { calls.push(c); } });
-  assert.equal(calls[0].length, 3);
-  await assert.rejects(applyOwnerMenu(reg, { setOwnerCommands: async () => { throw new Error('400 bad'); } }), /400 bad/);
-  const real = menuCommands(loadCommands());
-  assert.ok(real.some((c) => c.command === 'q'), 'the shipped registry has /q');
-  assert.ok(real.every((c) => c.description.length >= 1 && c.description.length <= 256));
+test('clearBotMenus: deleteCommands for every scope, including the owner chat', async () => {
+  const scopes = [];
+  await clearBotMenus({ deleteCommands: async (sc) => { scopes.push(sc); } }, '12345');
+  assert.deepEqual(scopes, [{ type: 'default' }, { type: 'all_private_chats' }, { type: 'all_group_chats' }, { type: 'all_chat_administrators' }, { type: 'chat', chat_id: 12345 }]);
+  const noOwner = [];
+  await clearBotMenus({ deleteCommands: async (sc) => { noOwner.push(sc); } }, '');
+  assert.equal(noOwner.length, 4);
+});
+
+test('clearBotMenus: continues after one scope throws', async () => {
+  const scopes = [];
+  const origErr = console.error; console.error = () => {};
+  try {
+    await clearBotMenus({ deleteCommands: async (sc) => { scopes.push(sc); if (sc.type === 'all_private_chats') throw new Error('400 bad'); } }, '7');
+  } finally { console.error = origErr; }
+  assert.equal(scopes.length, 5);
 });
 
 test('registry: /q is a builtin, admin-gated entry (no script to run); footers point to /q', () => {

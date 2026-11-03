@@ -134,25 +134,3 @@ export function roleMeets(role, minRole) {
   if (minRole == null || minRole === 'public') return true;
   return (COMMAND_ROLE_RANK[role] ?? -1) >= (COMMAND_ROLE_RANK[minRole] ?? 99);
 }
-
-export const MENU_MAX = 100;
-export const MENU_DESC_MAX = 256;
-
-/**
- * RFC 29: the Telegram "/" menu from the registry — [{ command, description }]. Aliases and entries without a `desc` are
- * left out; the description is the first sentence of `desc`, cut to 256 chars; at most 100 commands (Telegram's limit);
- * names Telegram would reject (it wants a-z, 0-9, _ and 1..32 chars) are skipped. Pure.
- */
-export function menuCommands(registry) {
-  const out = [];
-  for (const [name, c] of Object.entries(registry || {})) {
-    if (!c || typeof c !== 'object' || typeof c.alias === 'string' || typeof c.desc !== 'string' || !c.desc.trim()) continue;
-    if (!/^[a-z][a-z0-9_]{0,31}$/.test(name)) continue;
-    const desc = c.desc.trim();
-    const m = /^[\s\S]*?[.!?](?=\s|$)/.exec(desc);
-    const description = (m ? m[0] : desc).slice(0, MENU_DESC_MAX);
-    out.push({ command: name, description });
-    if (out.length >= MENU_MAX) break;
-  }
-  return out;
-}
