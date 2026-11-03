@@ -38,7 +38,7 @@ test('formatHealth: calm = no ⚠️ and no RAM top; several warnings = one ⚠�
   const hot = formatHealth({ ...base, mem: { total: 16 * GB, available: 2.5 * GB, swapTotal: 2 * GB, swapFree: 2 * GB } });
   assert.match(hot, /🐘 Ăn RAM nhiều nhất:\n {3}postgres ×74/, 'used > 80% shows the top even without a warning');
   assert.doesNotMatch(hot, /⚠️/);
-  assert.equal(formatHealth({ cores: 4, load: null, mem: null, disk: null, top: null, oomKills: 0 }), '🩺 Máy\n\n/cswap   /q   /ls', 'missing sources just drop pieces');
+  assert.equal(formatHealth({ cores: 4, load: null, mem: null, disk: null, top: null, oomKills: 0 }), '🩺 Máy\n💻 CPU: ?\n🧠 RAM: ?\n💾 Đĩa trống: ?\n\n/cswap   /q   /ls', 'a failed probe prints ?, never silently drops the line');
 });
 
 test('formatHealth: approved mock', () => {
@@ -67,7 +67,7 @@ test('formatLocksShort: build with 0 / 1 / 2 holders; merge / cleanup only when 
     ['🔒 Build 2/2 chỗ, chờ 0:', "   ▶ A (0')", "   ▶ B (1')"]);
   const l = formatLocksShort({ build: { N: 1, holders: [], waiting: 0 }, merge: { holders: [{ label: '🦊 Cáo #ab12', startedAt: now - 120_000 }], waiting: 1 }, cleanup: { holders: [], waiting: 3 } }, { now });
   assert.deepEqual(l, ['🔒 Build 0/1 chỗ, chờ 0', '🔒 Merge, chờ 1:', "   ▶ 🦊 Cáo (2')", '🔒 Cleanup, chờ 3']);
-  assert.deepEqual(formatLocksShort({ build: null }, { now }), ['🔒 Build: ?']);
+  assert.deepEqual(formatLocksShort({ build: null }, { now }), ['🔒 Build ?']);
   assert.deepEqual(formatLocksShort({ build: { N: 1, holders: [{ label: 'cleanup', startedAt: now, exclusive: true }], waiting: 0 } }, { now }), ['🔒 Build 1/1 chỗ, chờ 0:', "   ▶ cleanup (0') [giữ cả lock]"]);
 });
 
@@ -109,6 +109,32 @@ test('gatherLocal: reads buildQuietHours (not quietHours), shows 🌙 only in th
   const bad = gatherLocal({ dir, readProjects: () => ({ _config: { buildQuietHours: { from: 'x', to: 'y' } } }), supported: () => true, pruneLines: () => [] });
   assert.ok(bad.extraWarn.some((x) => /cấu hình hỏng/.test(x)));
   assert.equal(bad.inEffect.length, 2);
+});
+
+test('gatherLocal: unreadable build.slots / lock dir / queue dir print ? (ENOENT = normal), not a wrong value', (t) => {
+  if (process.getuid?.() === 0) return t.skip('root ignores permissions');
+  const mk = () => fs.mkdtempSync(path.join(os.tmpdir(), 'tp-health-'));
+  const opts = (dir) => ({ dir, readProjects: () => ({}), supported: () => true, pruneLines: () => [] });
+  // build.slots: missing = auto, present = manual, unreadable = ?
+  const d1 = mk();
+  assert.match(gatherLocal(opts(d1)).inEffect[0], /^• Max build: auto \(\d\)$/);
+  fs.writeFileSync(path.join(d1, 'build.slots'), '1\n');
+  assert.equal(gatherLocal(opts(d1)).inEffect[0], '• Max build: 1');
+  fs.chmodSync(path.join(d1, 'build.slots'), 0);
+  assert.equal(gatherLocal(opts(d1)).inEffect[0], '• Max build: ?');
+  fs.chmodSync(path.join(d1, 'build.slots'), 0o600);
+  // unreadable queue dir → that lock prints ? instead of looking idle; the others are unaffected
+  const d2 = mk();
+  fs.mkdirSync(path.join(d2, 'build.queue')); fs.mkdirSync(path.join(d2, 'merge.queue'));
+  fs.chmodSync(path.join(d2, 'merge.queue'), 0);
+  const l = gatherLocal(opts(d2)).locks;
+  assert.ok(l.some((x) => /^🔒 Build \d\/\d chỗ, chờ 0$/.test(x)), l.join('|'));
+  assert.ok(l.includes('🔒 Merge ?'), l.join('|'));
+  fs.chmodSync(path.join(d2, 'merge.queue'), 0o700);
+  // unreadable lock dir → every lock prints ?
+  const d3 = mk();
+  fs.chmodSync(d3, 0);
+  try { assert.deepEqual(gatherLocal(opts(d3)).locks, ['🔒 Build ?', '🔒 Merge ?', '🔒 Cleanup ?']); } finally { fs.chmodSync(d3, 0o700); }
 });
 
 test('PSI: parse /proc/pressure; warn on what tasks actually wait for, not raw load', () => {

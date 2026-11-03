@@ -5,7 +5,7 @@
 // just drops that line).
 
 import { pruneSkipLines } from './lock-queue.mjs';
-import { LOCK_DIR, readHolders, readQueue, slotsFor } from './machine-lock.mjs';
+import { LOCK_DIR, readHolders, readQueue, slotsFor, lockPaths } from './machine-lock.mjs';
 import { readPolicy } from './build-policy.mjs';
 import { quietState, readOverrideStrict, cpuLimitSupported } from './quiet-hours.mjs';
 import { DEFAULT_PROJECTS_FILE } from './projects-config.mjs';
@@ -94,7 +94,7 @@ export function formatHealth({ cores, load, mem, disk, top, oomKills, locks = nu
     if (cpuPsi) {
       if (cpuPsi.avg10 >= CPU_PSI_ALERT) warn.push(`CPU quá tải (${Math.round(cpuPsi.avg10)}% thời gian chờ CPU)`);
     } else if (cores && load[0] > cores) warn.push(`CPU quá tải (load ${load[0].toFixed(1)} > ${cores} nhân)`);
-  }
+  } else lines.push('💻 CPU: ?');
   let usedPct = null;
   if (mem && mem.total) {
     const used = mem.total - (mem.available ?? 0);
@@ -105,12 +105,12 @@ export function formatHealth({ cores, load, mem, disk, top, oomKills, locks = nu
       const swUsed = mem.swapTotal - (mem.swapFree ?? 0);
       if (swUsed / mem.swapTotal > 0.9) { warn.push(`Swap đầy ${gbInt(swUsed)}/${gbInt(mem.swapTotal)} GB`); ramWarn = true; }
     }
-  }
+  } else lines.push('🧠 RAM: ?');
   if (ioPsi && ioPsi.avg10 >= IO_PSI_ALERT) warn.push(`đĩa nghẽn ${Math.round(ioPsi.avg10)}% thời gian`);
   if (disk) {
     lines.push(`💾 Đĩa trống: ${gbInt(disk.avail)} GB`);
     if (diskLow(disk)) warn.push(`đĩa sắp đầy (còn ${Math.round((disk.avail / disk.size) * 100)}%)`);
-  }
+  } else lines.push('💾 Đĩa trống: ?');
   if (oomKills) warn.push(`${oomKills} lần OOM-kill trong 24 giờ qua (xem /ls)`);
   warn.push(...extraWarn);
   lines.push(...warn.map((w) => `⚠️ ${w}`));
@@ -137,7 +137,7 @@ export function formatLocksShort(locks, { now = Date.now() } = {}) {
     const l = locks?.[name];
     if (l === undefined) continue;
     const title = name[0].toUpperCase() + name.slice(1);
-    if (l === null) { out.push(`🔒 ${title}: ?`); continue; }
+    if (l === null) { out.push(`🔒 ${title} ?`); continue; }
     const hs = l.holders || [];
     if (name !== 'build' && !hs.length && !l.waiting) continue;
     const head = `🔒 ${title}${name === 'build' ? ` ${hs.length}/${l.N ?? 1} chỗ` : ''}, chờ ${l.waiting || 0}`;
@@ -403,6 +403,16 @@ function tryRun(bin, args) {
 
 /** Strict JSON read for /health: missing file → {} (nothing configured), any other failure throws (that line prints `?`). */
 const readJsonOrEmpty = (file) => { try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch (e) { if (e?.code === 'ENOENT') return {}; throw e; } };
+/** /health only: readdir that tolerates a missing dir (nothing there yet) but not an unreadable one (EACCES…) → throws. */
+const readdirStrict = (d) => { try { return fs.readdirSync(d); } catch (e) { if (e?.code === 'ENOENT') return []; throw e; } };
+/** /health only: a lock whose dir or queue dir cannot be listed would look idle through the swallowing readers → throw so it prints `?`. */
+function assertLockReadable(name, dir) { readdirStrict(dir); readdirStrict(lockPaths(name, dir).queue); }
+/** /health only: build.slots present → manual; missing → auto; any other read error throws (the line prints `?`). */
+function buildSlotsStrict(dir) {
+  let forced = true;
+  try { fs.readFileSync(path.join(dir, 'build.slots'), 'utf8'); } catch (e) { if (e?.code !== 'ENOENT') throw e; forced = false; }
+  return { slots: slotsFor('build', { dir }), forced };
+}
 const tryOr = (f, fallback = null) => { try { return f(); } catch { return fallback; } };
 
 /**
@@ -415,14 +425,14 @@ export function gatherLocal({ dir = LOCK_DIR, now = Date.now(), projectsFile = D
   const lockData = {};
   const buildHolders = tryOr(() => readHolders('build', { dir }));
   for (const name of ['build', 'merge', 'cleanup']) {
-    lockData[name] = tryOr(() => ({
+    lockData[name] = tryOr(() => { assertLockReadable(name, dir); return {
       N: slotsFor(name, { dir }), holders: name === 'build' && buildHolders ? buildHolders : readHolders(name, { dir }),
       waiting: readQueue(name, { dir, now }).filter((t) => t.status !== 'dead').length,
-    }));
+    }; });
   }
   const quiet = cfg ? tryOr(() => quietState({ config: cfg._config?.buildQuietHours, now, override: readOverrideOf(dir) })) : null;
   const inEffect = formatInEffect({
-    build: tryOr(() => ({ slots: slotsFor('build', { dir }), forced: fs.existsSync(path.join(dir, 'build.slots')) })),
+    build: tryOr(() => buildSlotsStrict(dir)),
     quiet,
     policy: tryOr(() => { const r = readPolicy(dir, { now }); return r.corrupt ? null : { max: r.policy.max }; }),
   });
