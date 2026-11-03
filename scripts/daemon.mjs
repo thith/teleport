@@ -853,6 +853,26 @@ export function clipPrBlock(text, max) {
   return `${head}${body}${tail}`;
 }
 
+/**
+ * Clip each result to an even share of `max` (separators counted; at least 400 chars, status + URL
+ * kept), then pack them in order into groups whose joined text fits `max`: one prompt normally,
+ * more only when long titles/URLs overflow. Pure.
+ */
+export function packPrBlocks(results, max) {
+  const n = results.length;
+  const each = Math.min(max, Math.max(400, Math.floor((max - 2 * (n - 1)) / n)));
+  const groups = [];
+  let cur = [], len = 0;
+  for (const r of results) {
+    const text = clipPrBlock(r.text, each).slice(-max);
+    const add = (cur.length ? 2 : 0) + text.length;
+    if (cur.length && len + add > max) { groups.push(cur); cur = []; len = 0; }
+    cur.push({ text, kind: r.kind }); len += (cur.length > 1 ? 2 : 0) + text.length;
+  }
+  if (cur.length) groups.push(cur);
+  return groups;
+}
+
 const prNum = (url) => `#${url.match(/\/pull\/(\d+)/)[1]}`;
 
 /**
@@ -876,9 +896,11 @@ export async function notifyPrOwners(results, {
     const lines = [];
     for (const [convoId, list] of byOwner) {
       try {
-        const each = Math.floor((MERGE_NOTIFY_MAX - 2 * (list.length - 1)) / list.length); // '\n\n' separators count too
-        const text = list.map((r) => clipPrBlock(r.text, each)).join('\n\n');
-        await deliver({ convoId, text, mode: 'manual', merged: list.some((r) => r.kind === 'merged') });
+        // Each PR block is clipped on its own, then blocks are packed into prompts of ≤ MERGE_NOTIFY_MAX
+        // (usually one): no PR result is ever cut off by the prompt's own 3000-char slice.
+        for (const chunk of packPrBlocks(list, MERGE_NOTIFY_MAX)) {
+          await deliver({ convoId, text: chunk.map((b) => b.text).join('\n\n'), mode: 'manual', merged: chunk.some((b) => b.kind === 'merged') });
+        }
         const p = persona(convoId);
         lines.push(`→ đã gửi kết quả cho ${p ? `${formatPersona(p)} ` : ''}(#${shortConvoHash(convoId)}): ${list.map((r) => prNum(r.url)).join(', ')}`);
       } catch (e) { lines.push(`→ lỗi khi báo agent #${shortConvoHash(convoId)}: ${e?.message ?? e}`); }

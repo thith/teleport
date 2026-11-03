@@ -20,12 +20,12 @@ export const PR_OWNERS_LOCK = 'pr-owners';
 export const PR_OWNERS_LOCK_WAIT_MS = 2000;
 const PR_URL_RE = /https?:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/pull\/\d+/gi;
 
-/** Every PR URL in `text` (up to the PR number), lower-cased and de-duplicated. Pure. */
 /** Ledger key: lowercased, always https (GitHub's own pr.url is https; a typed http:// link is the same PR). Pure. */
 export const prKey = (u) => String(u).toLowerCase().replace(/^http:\/\//, 'https://');
 
+/** Every PR URL in `text` (up to the PR number), keyed by prKey, de-duplicated. MarkdownV2 escapes (`--raw`: `github\.com`, `my\-repo`) are undone first. Pure. */
 export function extractPrUrls(text) {
-  return [...new Set((String(text ?? '').match(PR_URL_RE) || []).map(prKey))];
+  return [...new Set((String(text ?? '').replace(/\\([_*[\]()~`>#+\-=|{}.!\\])/g, '$1').match(PR_URL_RE) || []).map(prKey))];
 }
 
 const readLedger = (file) => {

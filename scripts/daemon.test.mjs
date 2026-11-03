@@ -1038,9 +1038,24 @@ test('RFC 31: 20 PRs with 256-char titles all keep status + URL within the 3000-
   const { notifyPrOwners } = await import('./daemon.mjs');
   const results = Array.from({ length: 20 }, (_, i) => ({ url: `https://github.com/o/r/pull/${i + 1}`, kind: 'merged',
     text: `✅ merged PR o/r#${i + 1} "${'T'.repeat(256)}" into main (squash).\n🧹 deleted branch b${i}.\nhttps://github.com/o/r/pull/${i + 1}` }));
-  let sent = null;
-  await notifyPrOwners(results, { store: {}, find: () => ({ convoId: '123' }), deliver: async (r) => { sent = r; }, persona: () => null });
-  assert.ok(sent.text.length <= 3000, `len ${sent.text.length}`);
-  for (let i = 1; i <= 20; i++) assert.ok(sent.text.includes(`https://github.com/o/r/pull/${i}\n`) || sent.text.endsWith(`https://github.com/o/r/pull/${i}`), `PR ${i} URL kept`);
-  assert.equal((sent.text.match(/^✅ merged PR/gm) || []).length, 20);
+  const sent = [];
+  await notifyPrOwners(results, { store: {}, find: () => ({ convoId: '123' }), deliver: async (r) => { sent.push(r); }, persona: () => null });
+  for (const s of sent) assert.ok(s.text.length <= 3000, `len ${s.text.length}`);
+  const all = sent.map((s) => s.text).join('\n\n');
+  for (let i = 1; i <= 20; i++) assert.ok(new RegExp(`https://github\\.com/o/r/pull/${i}(\\n|$)`).test(all), `PR ${i} URL kept`);
+  assert.equal((all.match(/^✅ merged PR/gm) || []).length, 20);
+});
+
+test('RFC 31: very long owner/repo URLs → several prompts, each ≤ 3000, every status line kept', async () => {
+  const { notifyPrOwners } = await import('./daemon.mjs');
+  const repo = `${'o'.repeat(39)}/${'r'.repeat(100)}`;
+  const results = Array.from({ length: 20 }, (_, i) => ({ url: `https://github.com/${repo}/pull/${i + 1}`, kind: i === 0 ? 'merged' : 'error',
+    text: `${i === 0 ? '✅ merged' : '❌'} PR ${repo}#${i + 1} "${'T'.repeat(256)}"\nhttps://github.com/${repo}/pull/${i + 1}` }));
+  const sent = [];
+  await notifyPrOwners(results, { store: {}, find: () => ({ convoId: '123' }), deliver: async (r) => { sent.push(r); }, persona: () => null });
+  assert.ok(sent.length > 1);
+  for (const s of sent) assert.ok(s.text.length <= 3000, `len ${s.text.length}`);
+  const all = sent.map((s) => s.text).join('\n\n');
+  assert.equal((all.match(/^(✅ merged|❌) PR/gm) || []).length, 20);
+  assert.deepEqual(sent.map((s) => s.merged), [true, ...Array(sent.length - 1).fill(false)]);
 });

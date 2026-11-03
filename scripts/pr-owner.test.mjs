@@ -79,3 +79,8 @@ test('http:// and https:// links are the same ledger key', async () => {
   assert.equal(prKey('http://GitHub.com/O/R/pull/7'), 'https://github.com/o/r/pull/7');
   assert.deepEqual((await import('./pr-owner.mjs')).extractPrUrls('see http://github.com/o/r/pull/7.'), ['https://github.com/o/r/pull/7']);
 });
+
+test('--raw MarkdownV2-escaped links are still found', async () => {
+  const { extractPrUrls } = await import('./pr-owner.mjs');
+  assert.deepEqual(extractPrUrls('PR: https://github\\.com/o/my\\-repo/pull/77 xong\\.'), ['https://github.com/o/my-repo/pull/77']);
+});
