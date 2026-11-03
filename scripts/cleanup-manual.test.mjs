@@ -9,7 +9,7 @@ import zlib from 'node:zlib';
 import { execFile, execFileSync, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { acquireLock } from './machine-lock.mjs';
-import { probeManual, manualRemove, writeBackup, verifyBackup, readTgz, buildRestoreScript, manualCommand, listKept, findNestedRepo } from './cleanup-manual.mjs';
+import { probeManual, manualRemove, writeBackup, verifyBackup, readTgz, buildRestoreScript, manualCommand, listKept, findNestedRepo, resolveManualTarget } from './cleanup-manual.mjs';
 import {
   handleCleanupButton, startCleanupList, startManualFor, parseCleanupCommand, formatManualTable, renderCleanupList, manualDigest, manualEntryMatchesMessage,
   baseOf, manualInFlight, CLEANUP_BUTTON_RE, childManual,
@@ -652,6 +652,11 @@ test('parseCleanupCommand: none → list; run / --dry-run → the old launcher; 
   assert.deepEqual(parseCleanupCommand(' sứa '), { kind: 'search', word: 'sứa' });
   assert.deepEqual(parseCleanupCommand(' /w/my dir/wt '), { kind: 'target', target: '/w/my dir/wt' });
   assert.deepEqual(parseCleanupCommand('~/p/wt'), { kind: 'target', target: '~/p/wt' });
+});
+
+test('resolveManualTarget: ~/… expands to the home dir (a path, never a branch)', async () => {
+  assert.deepEqual(await resolveManualTarget('~/p/wt', { home: '/h/u', deps: { exec: async () => { throw new Error('no git'); } } }), { path: '/h/u/p/wt' });
+  assert.deepEqual(await resolveManualTarget('~', { home: '/h/u' }), { path: '/h/u' });
 });
 
 test('/cleanup <word>: filters the kept list, renumbers 1..k, header names the word, 🗑 n points at the right path', async () => {

@@ -741,6 +741,6 @@ export function parseCleanupCommand(rest) {
   if (!toks.length) return { kind: 'list' };
   if (toks.every((t) => t === '--dry-run' || t === 'run')) return { kind: 'launch' };
   const t = String(rest).trim();
-  if (t.startsWith('/') || t.startsWith('~')) return { kind: 'target', target: t }; // a path
+  if (t.startsWith('/') || t === '~' || t.startsWith('~/')) return { kind: 'target', target: t }; // a path
   return { kind: 'search', word: t }; // a word: filter the kept list (no match → the old exact target)
 }

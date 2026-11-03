@@ -11,6 +11,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+import os from 'node:os';
 import crypto from 'node:crypto';
 import zlib from 'node:zlib';
 import { spawn } from 'node:child_process';
@@ -594,10 +595,11 @@ export async function manualRemove(target, { expectFingerprint, backupDir = MANU
  * `/cleanup <path | branch>` → { path } | { reason } | { ambiguous: [path] }. A branch is looked up in EVERY managed repo
  * (not via the daemon's cwd). Does not use cleanup-request's resolveTarget.
  */
-export async function resolveManualTarget(text, { parentDir = PARENT_DIR, deps: injected = {} } = {}) {
+export async function resolveManualTarget(text, { parentDir = PARENT_DIR, deps: injected = {}, home = os.homedir() } = {}) {
   const deps = { ...defaultDeps(), ...injected };
-  const t = String(text || '').trim();
-  if (!t) return { reason: 'thiếu đường dẫn hoặc tên nhánh' };
+  const raw = String(text || '').trim();
+  if (!raw) return { reason: 'thiếu đường dẫn hoặc tên nhánh' };
+  const t = raw === '~' || raw.startsWith('~/') ? path.join(home, raw.slice(1)) : raw; // `~/…` is a path, like cleanup-request.mjs
   if (path.isAbsolute(t)) return { path: t };
   const linked = await listLinkedWorktrees(parentDir, deps);
   const hits = linked.filter((L) => L.wt.branch === `refs/heads/${t}`);
