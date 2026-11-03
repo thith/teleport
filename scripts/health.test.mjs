@@ -80,7 +80,6 @@ test('formatInEffect: Max build auto/manual, Max chờ auto/n, 🌙 only while a
   assert.equal(formatInEffect({ build: { slots: 2, forced: false }, policy: { max: null }, quiet: { ...q, active: true, overridden: true } })[2], '• 🌙 tắt tạm tới 06:00');
   assert.equal(formatInEffect({ build: { slots: 2, forced: false }, policy: { max: null }, quiet: { ...q, active: false, overridden: false } }).length, 2, 'inactive → no 🌙 line');
   assert.equal(formatInEffect({ build: { slots: 2 }, policy: { max: null }, quiet: { enabled: false, error: 'x' } }).length, 2, 'not configured → no 🌙 line');
-  assert.equal(formatInEffect({ build: { slots: 2 }, policy: { max: null }, quiet: { ...q, active: true, overridden: false }, cpuUnsupported: true })[2], '• 🌙 tới 06:00 (máy không giới hạn được CPU)');
   assert.deepEqual(formatInEffect({}), ['• Max build: ?', '• Max chờ: ?', '• 🌙 ?']);
 });
 
@@ -105,7 +104,7 @@ test('gatherLocal: reads buildQuietHours (not quietHours), shows 🌙 only in th
   assert.ok(w.extraWarn.some((x) => /không giới hạn được CPU/.test(x)));
   assert.ok(w.extraWarn.some((x) => /^1 build đang chạy ngoài scope/.test(x)));
   assert.ok(w.extraWarn.includes('cargo cache chưa prune được 5 lần'));
-  assert.equal(w.inEffect[2], '• 🌙 tới 06:00 (máy không giới hạn được CPU)');
+  assert.equal(w.inEffect[2], '• 🌙 tới 06:00', 'the CPU limitation is only in the ⚠️ warning');
   assert.equal(w.locks[0], '🔒 Build 1/' + w.locks[0].match(/1\/(\d)/)[1] + ' chỗ, chờ 0:');
   const bad = gatherLocal({ dir, readProjects: () => ({ _config: { buildQuietHours: { from: 'x', to: 'y' } } }), supported: () => true, pruneLines: () => [] });
   assert.ok(bad.extraWarn.some((x) => /cấu hình hỏng/.test(x)));

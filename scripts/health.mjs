@@ -154,15 +154,14 @@ const hhmm = (ms) => new Date(ms).toTimeString().slice(0, 5);
  *   build   { slots, forced }          (forced = a build.slots file; otherwise `slots` is the auto value from RAM)
  *   quiet   a quietState() result, optionally { error }; the 🌙 line shows ONLY while quiet hours are active
  *   policy  { max }                    (the /q policy; no max = auto)
- *   cpuUnsupported  true when quiet hours are configured but the machine cannot apply the CPU limit
  */
-export function formatInEffect({ build, quiet, policy, cpuUnsupported = false } = {}) {
+export function formatInEffect({ build, quiet, policy, } = {}) {
   const lines = [];
   lines.push(!build ? '• Max build: ?' : build.forced ? `• Max build: ${build.slots}` : `• Max build: auto (${build.slots})`);
   lines.push(!policy ? '• Max chờ: ?' : policy.max == null ? '• Max chờ: auto' : `• Max chờ: ${policy.max}`);
   if (!quiet) lines.push('• 🌙 ?');
   else if (quiet.enabled && quiet.active) {
-    lines.push(`• 🌙 ${quiet.overridden ? 'tắt tạm tới' : 'tới'} ${hhmm(quiet.until)}${cpuUnsupported ? ' (máy không giới hạn được CPU)' : ''}`);
+    lines.push(`• 🌙 ${quiet.overridden ? 'tắt tạm tới' : 'tới'} ${hhmm(quiet.until)}`);
   }
   return lines;
 }
@@ -422,16 +421,14 @@ export function gatherLocal({ dir = LOCK_DIR, now = Date.now(), projectsFile = D
     }));
   }
   const quiet = cfg ? tryOr(() => quietState({ config: cfg._config?.buildQuietHours, now, override: readOverrideOf(dir) })) : null;
-  const cpuUnsupported = !!quiet?.enabled && !tryOr(() => supported(), false);
   const inEffect = formatInEffect({
     build: tryOr(() => ({ slots: slotsFor('build', { dir }), forced: fs.existsSync(path.join(dir, 'build.slots')) })),
     quiet,
     policy: tryOr(() => { const r = readPolicy(dir, { now }); return r.corrupt ? null : { max: r.policy.max }; }),
-    cpuUnsupported,
   });
   const extraWarn = [];
   if (quiet?.error) extraWarn.push(`giờ im lặng: cấu hình hỏng (${quiet.error}) — đang tắt`);
-  if (cpuUnsupported) extraWarn.push('giờ im lặng: máy này không giới hạn được CPU (thiếu systemd cpu)');
+  if (quiet?.enabled && !tryOr(() => supported(), false)) extraWarn.push('giờ im lặng: máy này không giới hạn được CPU (thiếu systemd cpu)');
   const outside = quiet?.enabled && buildHolders ? buildHolders.filter((h) => h.scoped === false && !h.exclusive && !h.pending).length : 0; // (holders still `pending` have not passed the scope preflight yet)
   if (outside) extraWarn.push(`${outside} build đang chạy ngoài scope, không bị giới hạn CPU`);
   for (const l of tryOr(() => pruneLines(), [])) extraWarn.push(l.replace(/^⚠️\s*/, ''));
