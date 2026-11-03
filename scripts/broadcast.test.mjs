@@ -46,7 +46,8 @@ test('doBroadcast: durable fan-out — a hard write failure on one topic is coun
   assert.equal(r.skipped, 1);   // 1 hard failure
   assert.equal(r.total, 2);
   assert.ok(written[0].includes('prompt-convo-111.json'));
-  assert.match(r.message, /sent 1, failed 1/);
+  assert.match(r.message, /^📢 broadcast — 2 session\n\n✅ Đã gửi\n.*#t111\n\n❌ Lỗi\n.*#t222 — không ghi được hàng đợi$/);
+  assert.doesNotMatch(r.message, /bỏ qua/);
 });
 
 test('doBroadcast: --chat limits scope; no live topics → ok:false', async () => {
@@ -93,21 +94,27 @@ test('doBroadcast raw: a disguised --chat (quotes inside the flag) is refused �
   }
 });
 
-test('doBroadcast: topics not in the /ls set are skipped and counted', async () => {
+test('doBroadcast: topics not in the /ls set are not sent', async () => {
   const written = [];
   const only111 = () => new Set([shortConvoHash(111).toUpperCase()]);   // case-insensitive
-  const r = await doBroadcast(['hi'], { from: {}, config: CFG, store: STORE, writePrompt: async (o, f) => { written.push(f); }, env: {}, envFile: {}, lsHashtags: only111 });
+  const r = await doBroadcast(['hi'], { from: {}, config: CFG, store: STORE, writePrompt: async (o, f) => { written.push(f); }, env: {}, envFile: {}, lsHashtags: only111, personaOf: () => null });
   assert.equal(r.ok, true);
-  assert.equal(r.sent, 1); assert.equal(r.total, 1); assert.equal(r.notRunning, 1);
+  assert.equal(r.sent, 1); assert.equal(r.total, 1);
   assert.equal(written.length, 1); assert.ok(written[0].includes('prompt-convo-111.json'));
-  assert.match(r.message, /sent 1, failed 0 \/ 1 topic\(s\) đang chạy \(\/ls\) — bỏ qua 1 không chạy/);
+  assert.equal(r.message, '📢 broadcast — 1 session\n\n✅ Đã gửi\n#t111');
+});
+
+test('doBroadcast: /ls order, persona names (best-effort), no skipped count', async () => {
+  const personaOf = (c) => { if (String(c) === '222') throw new Error('boom'); return '🪼 Sứa'; };
+  const rows = () => [shortConvoHash(222), { convoId: '111', hashtag: shortConvoHash(111) }];   // /ls lists 222 first
+  const r = await doBroadcast(['hi'], { from: {}, config: CFG, store: STORE, writePrompt: async () => {}, env: {}, envFile: {}, lsHashtags: rows, personaOf });
+  assert.equal(r.message, `📢 broadcast — 2 session\n\n✅ Đã gửi\n#${shortConvoHash(222)}\n🪼 Sứa #${shortConvoHash(111)}`);
 });
 
 test('doBroadcast: empty /ls set → ok:false, nothing written, skipped count in message', async () => {
   const r = await doBroadcast(['hi'], { from: {}, config: CFG, store: STORE, writePrompt: () => { throw new Error('must not send'); }, env: {}, envFile: {}, lsHashtags: () => new Set() });
   assert.equal(r.ok, false);
-  assert.match(r.message, /\/ls trống/);
-  assert.match(r.message, /bỏ qua 2/);
+  assert.equal(r.message, '📢 broadcast — không có session nào đang chạy (/ls trống), không gửi gì.');
 });
 
 test('doBroadcast: /ls listing throws → fail closed (ok:false, nothing written)', async () => {
@@ -128,8 +135,7 @@ test('doBroadcast: hashtag collision — a convoId row matches only its own topi
   };
   const byConvo = await run(() => [{ convoId: String(A), hashtag: shortConvoHash(A) }]);
   assert.equal(byConvo.written.length, 1); assert.ok(byConvo.written[0].includes(`convo-${A}.json`));
-  assert.equal(byConvo.r.notRunning, 1);
   const byTag = await run(() => [{ convoId: null, hashtag: shortConvoHash(A) }]);   // empty screen: ambiguous
   assert.equal(byTag.r.ok, false); assert.equal(byTag.written.length, 0);
-  assert.match(byTag.r.message, /bỏ qua 2/);
+  assert.match(byTag.r.message, /\/ls trống/);
 });
