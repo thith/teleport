@@ -84,7 +84,7 @@ export function renderQ(g, { tok, rev, page = 0, view = 'main', pin = null, stop
   }
 
   const busy = g.holders.some((h) => h.exclusive) ? Math.max(g.N, g.holders.length) : g.holders.length;
-  const lines = [`🔒 build ${busy}/${g.N} · chờ ${g.tickets.length} · max ${pol.max == null ? 'tắt' : `${pol.max} (thử lại sau ${pol.retryMin}')`}${pol.paused ? ' · ⏸ TẠM DỪNG phát chỗ' : ''}${g.gateNote ? ` · ${g.gateNote}` : ''}`];
+  const lines = [`🔒 build ${busy}/${g.N} · chờ ${g.tickets.length} · max ${pol.max == null ? 'tắt' : `${pol.max} (thử lại sau ${pol.retryMin}')`}${pol.paused ? ' · ⏸' : ''}${g.gateNote ? ` · ${g.gateNote}` : ''}`];
   if (g.corrupt) lines.unshift(`⚠️ build.policy.json hỏng (${clean(g.error)}) — hạn chế của owner đang bị bỏ qua; mọi thao tác ghi bị từ chối.`);
   if (pol.paused && g.oldCode) lines.push(`⏸ (còn ${g.oldCode} vé code cũ không theo pause)`);
   if (g.preBoost) lines.push('⬆ tạm tắt: còn người chờ chạy code cũ — chờ họ xong');
@@ -116,7 +116,7 @@ export function renderQ(g, { tok, rev, page = 0, view = 'main', pin = null, stop
   rows.push([{ text: 'Max −', callback_data: cb('m-') }, { text: pol.max == null ? 'Max tắt' : `Max ${pol.max}`, callback_data: cb('mt') }, { text: 'Max +', callback_data: cb('m+') }]);
   // RFC 32 §4.4: switch the night rules off until the window ends / back on. The state is checked against the stored board on press.
   if (g.quiet?.active) rows.push([{ text: g.quiet.overridden ? '🌙 Bật lại' : `⏩ Tắt giờ im lặng tới ${hhmm(g.quiet.until)}`, callback_data: cb('qz') }]);
-  rows.push([{ text: pol.paused ? '▶ Tiếp tục' : '⏸ Dừng phát chỗ', callback_data: cb('p') }, { text: '🔄', callback_data: cb('r') }]);
+  rows.push([{ text: pol.paused ? '▶' : '⏸', callback_data: cb('p') }, { text: '🔄', callback_data: cb('r') }]);
   if (g.corrupt) rows.push([{ text: 'Ghi lại policy mặc định', callback_data: cb('rs') }]);
   return { view: 'main', text: lines.join('\n'), rows, maps, page: pg };
 }

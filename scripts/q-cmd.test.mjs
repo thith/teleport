@@ -82,13 +82,13 @@ test('renderQ: header, running + waiting lines, buttons (⬆ only live; ⬆✓ b
   assert.ok(btn(r.rows, /^✖ 3$/) && btn(r.rows, /^⛔ 3$/), 'but kick/block yes');
   assert.ok(btn(r.rows, /^⏹ Tuộc$/));
   assert.ok(btn(r.rows, /^Max −$/) && btn(r.rows, /^Max 4$/) && btn(r.rows, /^Max \+$/));
-  assert.ok(btn(r.rows, /Dừng phát chỗ/) && btn(r.rows, /🔄/) && btn(r.rows, /Bỏ chặn 1/));
+  assert.ok(btn(r.rows, /^⏸$/) && btn(r.rows, /🔄/) && btn(r.rows, /Bỏ chặn 1/));
   void a;
   // max off, paused
   setPolicy(dir, { paused: true });
   const r2 = renderQ(gatherQ({ dir }), { tok: 'a'.repeat(12), rev: 0 });
-  assert.match(r2.text, /max tắt/); assert.match(r2.text, /TẠM DỪNG/);
-  assert.ok(btn(r2.rows, /Max tắt/) && btn(r2.rows, /Tiếp tục/));
+  assert.match(r2.text, /max tắt/); assert.match(r2.text, / · ⏸/);
+  assert.ok(btn(r2.rows, /Max tắt/) && btn(r2.rows, /^▶$/));
   // rev is base36 in the callback
   assert.equal(qCallback('a'.repeat(12), 35, 'k', 2), `q:${'a'.repeat(12)}:z:k:2`);
 });
@@ -723,6 +723,6 @@ test('R5 /q: no CPU-gate note while the queue is paused', () => {
   const dir = tmpDir(); holder(dir, 0);
   setPolicy(dir, { paused: true });
   const r = renderQ(gatherQ({ dir, slotsOf: () => 2, gate: () => ({ ok: false, reason: 'cpu', load1: 11.2, cores: 12 }) }), { tok: 'a'.repeat(12), rev: 0 });
-  assert.match(r.text, /TẠM DỪNG/);
+  assert.match(r.text, / · ⏸/);
   assert.doesNotMatch(r.text, /chờ CPU/);
 });
