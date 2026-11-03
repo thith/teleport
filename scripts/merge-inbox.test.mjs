@@ -207,3 +207,22 @@ test('--keep-branch: parsed anywhere, stored only when set, validated as boolean
   assert.deepEqual(validRequest({ links: [L1], convoId: '1', keepBranch: false }), { links: [L1], convoId: '1' });
   for (const bad of ['true', 1, null, {}]) assert.equal(validRequest({ links: [L1], convoId: '1', keepBranch: bad }), null);
 });
+
+test('buildMergeResultPrompt manual: /m header + ownership closing line; cleanup hint from the merged flag, not the text', () => {
+  const m = buildMergeResultPrompt({ convoId: 1, chatId: -1, mode: 'manual', merged: true, text: '✅ merged PR o/r#3 "x"\nhttps://github.com/o/r/pull/3' });
+  assert.match(m.text, /kết quả merge-request \(owner tự merge\/đóng bằng \/m\)\./);
+  assert.match(m.text, /→ Bạn được báo vì bạn đã gửi link\/merge-request PR này\. Kể NGẮN cho user trong topic\. Nếu không phải PR của bạn: bỏ qua\./);
+  assert.doesNotMatch(m.text, /Nếu bạn có gửi merge-request này/);
+  assert.match(m.text, /PR đã merge: worktree/);
+  assert.equal(m.mergeResult.mode, 'manual');
+  const refused = buildMergeResultPrompt({ convoId: 1, chatId: -1, mode: 'manual', merged: false, text: '✅ merged PR o/r#3 looks merged but flag says no' });
+  assert.doesNotMatch(refused.text, /PR đã merge/);
+  const flagOnly = buildMergeResultPrompt({ convoId: 1, chatId: -1, mode: 'manual', merged: true, text: '…truncated status' });
+  assert.match(flagOnly.text, /PR đã merge/);
+});
+
+test('buildMergeResultPrompt: auto/ask output unchanged by the manual mode', () => {
+  const a = buildMergeResultPrompt({ convoId: 1, chatId: -1, mode: 'ask', text: 'x' }).text;
+  assert.match(a, /\(owner đã bấm nút\)/);
+  assert.match(a, /→ Nếu bạn có gửi merge-request này: tự kể NGẮN cho user trong topic\. Nếu không phải của bạn: bỏ qua\.$/);
+});

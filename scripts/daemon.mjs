@@ -32,6 +32,7 @@
 // pass (moved here from tele-listen).
 
 import fs from 'node:fs';
+import os from 'node:os';
 import crypto from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -68,6 +69,8 @@ import {
   AUTOMERGE_STATE_FILE,
 } from './merge-inbox.mjs';
 import { peekPersona } from './persona-store.mjs';
+import { findPrOwner, recordPrOwners } from './pr-owner.mjs';
+import { readTopicsStore } from './topics-store.mjs';
 import { machineWatch } from './health.mjs';
 import { longBuildWatch, handleLongBuildButton, stopTick, STOP_BUTTON_RE, STOP_TICK_MS, buildKickNoticePrompt } from './long-build.mjs';
 import { Q_BUTTON_RE } from './q-panel.mjs';
@@ -724,7 +727,7 @@ export async function handleMergeButton(cq, ctx, { take = takeMergeButton, dispa
       await deliver({ convoId: entry.requester.convoId, text: t, mode: 'ask' }).catch(() => {});
     }
     : ctx.sendText;
-  await dispatch({ cmd: 'merge', rest: entry.links.join(' ') + (closing ? ' --close' : pinArgs + (entry.keepBranch === true ? ' --keep-branch' : '')) }, cq.from || {}, { ...ctx, registry, sendText });
+  await dispatch({ cmd: 'merge', rest: entry.links.join(' ') + (closing ? ' --close' : pinArgs + (entry.keepBranch === true ? ' --keep-branch' : '')) }, cq.from || {}, { ...ctx, registry, sendText, notifyOwners: !entry.requester });
 }
 
 // ── Agent merge requests (file inbox; see merge-request.mjs / merge-inbox.mjs) ─
@@ -772,7 +775,7 @@ function requesterLabel(convoId) {
 export async function processMergeRequests(ctx, {
   claim = claimRequests, autoEnabled = readAutoMerge, allowed = (cfg) => buildAllowlist(cfg),
   runner = execFileP, deliver = deliverResult, audit = auditAutoMerge, prLinks = handlePrLinks, remove = (f) => { try { fs.unlinkSync(f); } catch {} },
-  scriptsDir = __dirname, label = requesterLabel,
+  scriptsDir = __dirname, label = requesterLabel, record = recordPrOwners,
 } = {}) {
   const { daemonUserId, projectsConfig, registry, sendText, secretEnvKeys = [] } = ctx;
   for (const { file, body } of claim()) {
@@ -780,6 +783,7 @@ export async function processMergeRequests(ctx, {
       const req = validRequest(body);
       if (!req) { console.error(`[daemon] dropped malformed/stale merge request ${path.basename(file)}`); continue; }
       const who = label(req.convoId);
+      try { await record(req.links, req.convoId, 'request'); } catch {} // RFC 31: owner of these PRs, before auto/ask
       const spec = resolveCommand('merge', registry);
       if (!spec) { await deliver({ convoId: req.convoId, text: '❌ /merge is not configured on the daemon.', mode: 'ask' }); continue; }
       const on = autoEnabled();
@@ -818,6 +822,69 @@ export async function processMergeRequests(ctx, {
   }
 }
 
+// ── Telling the PR's agent about an owner's /m (RFC 31) ────────────────────────
+
+const MERGE_RESULT_KINDS = new Set(['merged', 'closed', 'skipped', 'error']);
+const MERGE_NOTIFY_MAX = 3000;
+
+/** Parse merge.mjs's TELE_MERGE_RESULTS file → [{url, kind, text}] ([] on any problem). */
+export function readMergeResults(file) {
+  try {
+    const j = JSON.parse(fs.readFileSync(file, 'utf8'));
+    return (Array.isArray(j) ? j : []).filter((r) => r && typeof r.url === 'string' && /^https:\/\/github\.com\/[^/\s]+\/[^/\s]+\/pull\/\d+$/.test(r.url)
+      && MERGE_RESULT_KINDS.has(r.kind) && typeof r.text === 'string');
+  } catch { return []; }
+}
+
+/** Shrink a PR block to `max` chars, always keeping its first (status) line and its URL line. Pure. */
+export function clipPrBlock(text, max) {
+  const t = String(text);
+  if (t.length <= max) return t;
+  const lines = t.split('\n');
+  const head = lines[0];
+  const hasUrl = lines.length > 1 && /^https?:\/\/github\.com\//i.test(lines[lines.length - 1]);
+  const url = hasUrl ? lines[lines.length - 1] : null;
+  const mid = lines.slice(1, hasUrl ? -1 : undefined).join('\n').trim();
+  const room = max - head.length - (url ? url.length + 1 : 0) - 2;
+  const body = room > 1 && mid ? `\n${mid.slice(0, room - 1)}…` : '';
+  return `${head}${body}${url ? `\n${url}` : ''}`;
+}
+
+const prNum = (url) => `#${url.match(/\/pull\/(\d+)/)[1]}`;
+
+/**
+ * Group the results by PR owner and deliver each owner ONE result (mode 'manual').
+ * → reply lines for the admin. Never throws: any failure becomes a `→ lỗi khi báo agent` line.
+ */
+export async function notifyPrOwners(results, {
+  find = findPrOwner, deliver = deliverResult, store = null, persona = peekPersona,
+} = {}) {
+  try {
+    const rs = results.filter((r) => r.kind !== 'skipped');
+    if (!rs.length) return [];
+    const st = store ?? readTopicsStore();
+    const byOwner = new Map(), unknown = [];
+    for (const r of rs) {
+      const o = find(r.url, { store: st });
+      if (!o) { unknown.push(r); continue; }
+      if (!byOwner.has(o.convoId)) byOwner.set(o.convoId, []);
+      byOwner.get(o.convoId).push(r);
+    }
+    const lines = [];
+    for (const [convoId, list] of byOwner) {
+      try {
+        const each = Math.floor(MERGE_NOTIFY_MAX / list.length);
+        const text = list.map((r) => clipPrBlock(r.text, each)).join('\n\n');
+        await deliver({ convoId, text, mode: 'manual', merged: list.some((r) => r.kind === 'merged') });
+        const p = persona(convoId);
+        lines.push(`→ đã gửi kết quả cho ${p ? `${formatPersona(p)} ` : ''}(#${shortConvoHash(convoId)}): ${list.map((r) => prNum(r.url)).join(', ')}`);
+      } catch (e) { lines.push(`→ lỗi khi báo agent #${shortConvoHash(convoId)}: ${e?.message ?? e}`); }
+    }
+    if (unknown.length) lines.push(`→ ${unknown.map((r) => prNum(r.url)).join(', ')}: không rõ agent nào, chưa báo ai`);
+    return lines;
+  } catch (e) { return [`→ lỗi khi báo agent: ${e?.message ?? e}`]; }
+}
+
 // Generic registry dispatcher. Resolves `/cmd` to a command spec, gates by
 // minRole, then runs `node scripts/<run> [...spec.args] [...rest]` with:
 //   • cwd     = the project folder (positional first token) when needsProject,
@@ -831,7 +898,7 @@ export async function processMergeRequests(ctx, {
 export async function dispatchCommand(parsed, from, {
   daemonUserId, projectsConfig, registry, sendText, secretEnvKeys = [],
   runner = execFileP, scriptsDir = __dirname, parentDir = PARENT_DIR, reload = null,
-  automergeStateFile = AUTOMERGE_STATE_FILE, ...extra
+  automergeStateFile = AUTOMERGE_STATE_FILE, notifyOwners = true, notifyDeps = {}, ...extra
 }, replyText = null, messageId = null) {
   if (parsed.tapError) { await sendText(daemonUserId, parsed.tapError); return; }
   // Built-in: handled in-process, never via the registry (a `_commands` entry
@@ -921,19 +988,39 @@ export async function dispatchCommand(parsed, from, {
     // value in the daemon's own env never reaches a child. Not a privilege input.
     TELE_RAW_ARGS: spec.rawText ? String(parsed.rest ?? '') : '',
   });
+  // RFC 31: merge.mjs reports its per-PR results here so the PRs' agents can be told.
+  delete env.TELE_MERGE_RESULTS;
+  let resultsDir = null, resultsFile = null;
+  if (spec.run === 'merge.mjs' && notifyOwners !== false) {
+    try {
+      resultsDir = fs.mkdtempSync(path.join(notifyDeps.tmpDir || os.tmpdir(), 'tele-merge-'));
+      resultsFile = path.join(resultsDir, 'results.json');
+      env.TELE_MERGE_RESULTS = resultsFile;
+    } catch { resultsDir = resultsFile = null; }
+  }
+  let tailOnce = null; // notify at most once even if sending the reply throws into the catch below
+  const notifyTail = () => tailOnce ||= (async () => {
+    if (!resultsFile) return '';
+    const lines = await notifyPrOwners(readMergeResults(resultsFile), notifyDeps);
+    return lines.length ? `\n\n${lines.join('\n')}` : '';
+  })();
   try {
     const { stdout, stderr } = await runner(process.execPath, argv, {
       cwd, env, timeout: COMMAND_TIMEOUT_MS, maxBuffer: COMMAND_MAX_BUFFER,
     });
     const out = ((stdout || '') + (stderr ? `\n[stderr]\n${stderr}` : '')).trim();
-    if (spec.splitBlocks && out) { for (const part of splitAtBlocks(out)) await sendText(daemonUserId, part); return; } // one at a time, in order
-    await sendText(daemonUserId, out || '✅ (no output)');
+    const tail = await notifyTail();
+    if (spec.splitBlocks && out) { for (const part of splitAtBlocks(out + tail)) await sendText(daemonUserId, part); return; } // one at a time, in order
+    await sendText(daemonUserId, (out || '✅ (no output)') + tail);
   } catch (e) {
     // execFile rejects on non-zero exit / timeout / ENOENT — surface the child's
     // own output (scripts print their own ❌ messages) before falling back.
     const body = ((e.stdout || '') + (e.stderr ? `\n[stderr]\n${e.stderr}` : '') + (e.killed ? '\n[killed: timeout]' : '')).trim();
-    if (spec.splitBlocks && body) { for (const part of splitAtBlocks(body)) await sendText(daemonUserId, part); return; }
-    await sendText(daemonUserId, body || `❌ /${parsed.cmd} failed: ${e.message || e}`);
+    const tail = await notifyTail();
+    if (spec.splitBlocks && body) { for (const part of splitAtBlocks(body + tail)) await sendText(daemonUserId, part); return; }
+    await sendText(daemonUserId, (body || `❌ /${parsed.cmd} failed: ${e.message || e}`) + tail);
+  } finally {
+    if (resultsDir) { try { fs.rmSync(resultsDir, { recursive: true, force: true }); } catch {} }
   }
 }
 

@@ -145,4 +145,8 @@ node ../teleport/scripts/cleanup-request.mjs <đường dẫn worktree | tên nh
 - `❌ PR #N "…": <lý do>` (đã đóng / draft / conflict / check fail / check đang chạy). Không có gì bị thay đổi.
 - `❌ đang có merge khác chạy quá 180s: <ai đang giữ>`: chưa đụng gì tới GitHub, gửi lại sau.
 
+## Báo agent của PR (owner `/m`)
+
+Khi owner merge/đóng bằng `/m` (hoặc bấm nút của link DM), daemon gửi kết quả của từng PR cho agent chủ PR đó: agent đầu tiên đã gửi link PR vào topic của nó, hoặc gửi `merge-request.mjs` (ghi sớm nhất thắng, không ghi đè). Tin trả owner có thêm dòng `→ đã gửi kết quả cho <agent> (#hashtag): #77` hoặc `→ #79: không rõ agent nào, chưa báo ai`. `--preview` và PR đã merge từ trước (`--skip-merged`) không báo ai.
+
 Build nặng (Gradle, cargo, CI local) thì có lock riêng: xem [build-guide.md](build-guide.md).

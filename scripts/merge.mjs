@@ -241,7 +241,7 @@ const ghError = (e) => String(e?.stderr || e?.message || e).trim().split('\n').s
 export async function mergeOne(target, { method, keepBranch, force, preview = false, skipMerged = false, expectHeads = null, expectBases = null }, {
   gh, sleep = (ms) => new Promise((r) => setTimeout(r, ms)), unknownTries = 5, unknownWaitMs = 2000,
   pendingWaitMs = PENDING_WAIT_MS, pendingPollMs = PENDING_POLL_MS,
-  mergedHeads = [],
+  mergedHeads = [], note = null, onMerged = null,
 }) {
   const { number, repo = null } = typeof target === 'number' ? { number: target } : target;
   const c = repoCtx(repo);
@@ -260,6 +260,7 @@ export async function mergeOne(target, { method, keepBranch, force, preview = fa
   }
   // Never act on a different PR than the one asked for (e.g. a CLI fallback).
   if (pr.number !== number) return { error: true, text: `❌ asked for PR ${c.label}${number} but GitHub returned #${pr.number} — refusing.` };
+  if (note) note.url = pr.url; // RFC 31: GitHub's own URL, never scraped from text
   // --skip-merged (daemon retries of an interrupted request): a PR that is
   // already merged counts as done instead of stopping the batch.
   // The owner pressed Merge on a preview of a specific commit: anything pushed
@@ -271,7 +272,7 @@ export async function mergeOne(target, { method, keepBranch, force, preview = fa
   const expectedBase = expectBases?.[`${String(repo || '').toLowerCase()}#${number}`];
   if (expectBases && !expectedBase) return { error: true, text: `❌ PR ${c.label}${pr.number}: không có nhánh đích đã ghim cho PR này — không merge.\n${pr.url}` };
   if (expectedBase && pr.baseRefName !== expectedBase) return { error: true, text: `❌ PR ${c.label}${pr.number} "${pr.title}": đã đổi nhánh đích sau khi preview (${expectedBase} → ${pr.baseRefName}) — không merge. Gửi lại link / merge-request để xem preview mới.\n${pr.url}` };
-  if (skipMerged && pr.state === 'MERGED') return { ok: true, head: null, text: `ℹ️ PR ${c.label}${pr.number} "${pr.title}" was already merged — skipped.\n${pr.url}` };
+  if (skipMerged && pr.state === 'MERGED') return { ok: true, head: null, skipped: true, text: `ℹ️ PR ${c.label}${pr.number} "${pr.title}" was already merged — skipped.\n${pr.url}` };
   // Checks GitHub refused to START (Actions billing) are "not run", like a repo
   // without CI (which the owner allows) — only real failures block.
   pr.statusCheckRollup = markBillingNotStarted(pr.statusCheckRollup, (id) =>
@@ -311,6 +312,8 @@ export async function mergeOne(target, { method, keepBranch, force, preview = fa
     gh(['api', '-X', 'PUT', `${c.api}/pulls/${pr.number}/merge`,
       '-f', `merge_method=${method}`, '-f', `sha=${pr.headRefOid}`]);
   } catch (e) { return { error: true, text: `❌ merge of PR ${c.label}${pr.number} failed: ${ghError(e)}\n${pr.url}` }; }
+  const mergedText = (extra = '') => `✅ merged PR ${c.label}${pr.number} "${pr.title}" into ${pr.baseRefName} (${method}).${ciNote}${extra}\n${pr.url}`;
+  onMerged?.(mergedText()); // before the branch clean-up: a kill during it must still report this merge
   let branchNote = '';
   if (!keepBranch && !pr.isCrossRepository) {
     let defaultBranch = null, openPrs = null;
@@ -326,7 +329,7 @@ export async function mergeOne(target, { method, keepBranch, force, preview = fa
     }
   }
   // Only same-repo heads can be the base of another PR here (a fork's `main` is not ours).
-  return { ok: true, head: pr.isCrossRepository ? null : `${repo || ''}:${pr.headRefName}`, text: `✅ merged PR ${c.label}${pr.number} "${pr.title}" into ${pr.baseRefName} (${method}).${ciNote}${branchNote}\n${pr.url}` };
+  return { ok: true, head: pr.isCrossRepository ? null : `${repo || ''}:${pr.headRefName}`, text: mergedText(branchNote) };
 }
 
 /**
@@ -357,29 +360,46 @@ export function canonicalizeTargets(targets, resolveRepo) {
  * Close one PR WITHOUT merging (`--close`): it must be open; its branch is kept
  * so it can be reopened. `preview` checks only. Returns { ok, text } | { error, text }.
  */
-export async function closeOne(target, { preview = false }, { gh }) {
+export async function closeOne(target, { preview = false }, { gh, note = null, onMerged = null }) {
   const { number, repo = null } = typeof target === 'number' ? { number: target } : target;
   const c = repoCtx(repo);
   let pr;
   try { pr = JSON.parse(gh(['pr', 'view', String(number), ...c.R, '--json', 'number,title,url,state'])); }
   catch (e) { return { error: true, text: `❌ cannot read PR ${c.label}${number}: ${ghError(e)}` }; }
   if (pr.number !== number) return { error: true, text: `❌ asked for PR ${c.label}${number} but GitHub returned #${pr.number} — refusing.` };
+  if (note) note.url = pr.url;
   if (pr.state !== 'OPEN') return { error: true, text: `❌ PR ${c.label}${pr.number} "${pr.title}": PR is ${String(pr.state).toLowerCase()}, not open.\n${pr.url}` };
   if (preview) return { ok: true, text: `🔎 PR ${c.label}${pr.number} "${pr.title}" is open — can be closed.\n${pr.url}` };
   try { gh(['api', '-X', 'PATCH', `${c.api}/pulls/${pr.number}`, '-f', 'state=closed']); }
   catch (e) { return { error: true, text: `❌ closing PR ${c.label}${pr.number} failed: ${ghError(e)}\n${pr.url}` }; }
-  return { ok: true, text: `🚫 closed PR ${c.label}${pr.number} "${pr.title}" without merging (branch kept).\n${pr.url}` };
+  const text = `🚫 closed PR ${c.label}${pr.number} "${pr.title}" without merging (branch kept).\n${pr.url}`;
+  onMerged?.(text);
+  return { ok: true, text };
 }
 
-/** Merge (or --close) PRs in order; stop at the first failure and say what was / wasn't done. */
+/**
+ * Merge (or --close) PRs in order; stop at the first failure and say what was / wasn't done.
+ * `deps.writeResults(results)` (RFC 31) gets [{url, kind, text}] for the attempted targets —
+ * right after each merge/close API call succeeds, when the target finishes, and after an error.
+ */
 export async function mergeMany(args, deps) {
   const lines = [], merged = [], mergedHeads = [];
   const targets = args.targets || args.prs.map((number) => ({ repo: null, number }));
   const name = (t) => `${repoCtx(t.repo).label}${t.number}`;
+  const results = [];
+  const flush = () => { if (deps.writeResults && !args.preview) { try { deps.writeResults(results); } catch {} } };
   for (const [i, t] of targets.entries()) {
-    const r = args.close ? await closeOne(t, args, deps) : await mergeOne(t, args, { ...deps, mergedHeads });
+    const note = {};
+    const url = () => String(note.url || (t.repo ? `https://github.com/${t.repo}/pull/${t.number}` : '')).toLowerCase();
+    const entry = { url: null, kind: null, text: '' };
+    let added = false;
+    const put = (kind, text) => { entry.url = url(); entry.kind = kind; entry.text = text; if (!added && entry.url) { results.push(entry); added = true; } flush(); };
+    const kind = args.close ? 'closed' : 'merged';
+    const r = args.close ? await closeOne(t, args, { ...deps, note, onMerged: (text) => put(kind, text) })
+      : await mergeOne(t, args, { ...deps, mergedHeads, note, onMerged: (text) => put(kind, text) });
     if (r.head) mergedHeads.push(r.head);
     lines.push(r.text);
+    if (!args.preview) put(r.error ? 'error' : r.skipped ? 'skipped' : kind, r.text);
     if (r.error) {
       const rest = targets.slice(i + 1);
       if (targets.length > 1) lines.push(args.preview
@@ -390,6 +410,13 @@ export async function mergeMany(args, deps) {
     merged.push(t);
   }
   return { ok: true, text: lines.join('\n\n') };
+}
+
+/** Atomic JSON write (temp + rename) of the per-PR results file. */
+export function writeResultsFile(file, results) {
+  const tmp = `${file}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(results));
+  fs.renameSync(tmp, file);
 }
 
 const ghCli = (cwd) => (args) => String(execFileSync('gh', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], cwd }));
@@ -429,7 +456,8 @@ if (isMainModule(import.meta.url)) {
     if (lock.left) { console.log('⏹ đã rời hàng đợi merge — không merge.'); process.exit(1); }
     if (lock.timeout) { console.log(`❌ đang có merge khác chạy quá ${waitSec}s: ${describeHolder(lock.holder)} — thử lại sau.`); process.exit(1); }
   }
-  const r = await mergeMany({ ...args, targets: canon.targets }, { gh });
+  const resultsFile = !args.preview && process.env.TELE_MERGE_RESULTS ? process.env.TELE_MERGE_RESULTS : null;
+  const r = await mergeMany({ ...args, targets: canon.targets }, { gh, ...(resultsFile ? { writeResults: (res) => writeResultsFile(resultsFile, res) } : {}) });
   lock?.release();
   console.log(r.text);
   process.exit(r.ok ? 0 : 1);

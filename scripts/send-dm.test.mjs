@@ -97,3 +97,17 @@ test('buildDmSignedBody: raw mode escapes MarkdownV2 specials in the tag', () =>
   // from the delivered text (simulate by removing escape backslashes).
   assert.equal((out.replace(/\\(.)/g, '$1').match(/#[A-Za-z0-9]+/) || [])[0], `#${DM_HASH}`);
 });
+
+// RFC 31: the PR-owner hook sits only on the topic send paths (after a successful send),
+// never on the --dm / instruct-whisper DM-redirect branches.
+test('send-telegram: PR-owner recording is wired after the topic sends only', async () => {
+  const fs = await import('node:fs');
+  const src = fs.readFileSync(new URL('./send-telegram.mjs', import.meta.url), 'utf8');
+  const calls = [...src.matchAll(/recordPrOwnersFromText\(/g)].map((m) => m.index);
+  assert.equal(calls.length, 2, 'file caption + text');
+  const docCall = src.indexOf("await recordPrOwnersFromText(rawCaption");
+  const textCall = src.indexOf("await recordPrOwnersFromText(rawMessage");
+  assert.ok(docCall > src.indexOf('document sent to ${chatId}') && textCall > src.indexOf('[send-telegram] sent to ${chatId}'));
+  assert.ok(docCall > src.indexOf('routed to sender DM') && textCall > src.indexOf('routed to sender DM'), 'after the DM redirect branch');
+  assert.ok(docCall > src.indexOf('args.dm') && textCall > src.indexOf('args.dm'));
+});

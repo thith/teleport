@@ -8,7 +8,7 @@ import {
   validateDaemonConfig, resolveSenderRole, acquireSingleton, releaseSingleton, daemonStatus,
   reloadDaemonState, readJsonStrict,
   prLinksOnly, takeMergeButton, handlePrLinks, handleMergeButton, startupGreeting, gitShortHead,
-  processMergeRequests, formatAutoMergeStatus, buildAllowlist, expectHeadArgs, MERGE_BUTTON_TTL_MS,
+  processMergeRequests, formatAutoMergeStatus, buildAllowlist, expectHeadArgs, MERGE_BUTTON_TTL_MS, clipPrBlock, notifyPrOwners, readMergeResults,
 } from './daemon.mjs';
 
 test('parseDaemonCommand: extracts command + rest, strips @botname, lowercases', () => {
@@ -626,7 +626,7 @@ const reqCtx = (sent) => ({ daemonUserId: '1', projectsConfig: OWNER_CFG, regist
 test('processMergeRequests AUTO: merge.mjs as the owner, result to the agent, FYI to the owner, audited, file removed', async () => {
   const sent = [], runs = [], delivered = [], audits = [], removed = [];
   await processMergeRequests(reqCtx(sent), {
-    claim: () => [{ file: '/inbox/1-aa.json.processing', body: { links: [RQ], convoId: '42', createdAt: Date.now() } }],
+    record: async () => 0, claim: () => [{ file: '/inbox/1-aa.json.processing', body: { links: [RQ], convoId: '42', createdAt: Date.now() } }],
     autoEnabled: () => true, allowed: () => new Set(['icetea-labs/umipay-hub']),
     runner: async (bin, argv, opts) => { runs.push({ argv, opts }); return { stdout: '✅ merged PR icetea-labs/umipay-hub#5' }; },
     deliver: async (r) => delivered.push(r), audit: (a) => audits.push(a), remove: (f) => removed.push(f),
@@ -645,7 +645,7 @@ test('processMergeRequests ASK: switch off (or repo outside the auto-merge list)
   let ran = false;
   for (const [autoEnabled, allowed] of [[() => false, () => new Set(['icetea-labs/umipay-hub'])], [() => true, () => new Set()]]) {
     await processMergeRequests(reqCtx(sent), {
-      claim: () => [{ file: 'f', body: { links: [RQ], convoId: '42', createdAt: Date.now() } }],
+      record: async () => 0, claim: () => [{ file: 'f', body: { links: [RQ], convoId: '42', createdAt: Date.now() } }],
       autoEnabled, allowed, runner: async () => { ran = true; return {}; }, deliver: async () => {}, audit: () => {}, remove: () => {},
       prLinks: async (links, msg, c) => asked.push({ links, chat: msg.chat.id, requester: c.requester, header: c.header }), label: () => 'Giun',
     });
@@ -661,7 +661,7 @@ test('processMergeRequests ASK: switch off (or repo outside the auto-merge list)
 test('processMergeRequests: malformed request dropped (removed), nothing run or delivered', async () => {
   const removed = []; let touched = false;
   await processMergeRequests(reqCtx([]), {
-    claim: () => [{ file: 'bad', body: { links: ['x'], convoId: '1' } }, { file: 'unreadable', body: null }],
+    record: async () => 0, claim: () => [{ file: 'bad', body: { links: ['x'], convoId: '1' } }, { file: 'unreadable', body: null }],
     autoEnabled: () => true, allowed: () => new Set(), runner: async () => { touched = true; }, deliver: async () => { touched = true; },
     audit: () => {}, remove: (f) => removed.push(f), prLinks: async () => { touched = true; },
   });
@@ -702,7 +702,7 @@ test('button audit: a partly failed batch is not ok; owner-unreachable ASK tells
   assert.equal(audits[0].ok, false);
   const delivered = [];
   await processMergeRequests(reqCtx([]), {
-    claim: () => [{ file: 'f', body: { links: [RQ], convoId: '42', createdAt: Date.now() } }],
+    record: async () => 0, claim: () => [{ file: 'f', body: { links: [RQ], convoId: '42', createdAt: Date.now() } }],
     autoEnabled: () => false, allowed: () => new Set(), deliver: async (r) => delivered.push(r), audit: () => {}, remove: () => {},
     prLinks: async () => { throw new Error('Telegram 502'); }, label: () => 'G',
   });
@@ -749,7 +749,7 @@ test('/automerge as admin: add / remove / on / off / status through dispatchComm
 test('processMergeRequests: the allowlist is re-read per request (a mid-pass remove applies to the next request)', async () => {
   const sent = []; let allowedNow = true; const modes = [];
   await processMergeRequests(reqCtx(sent), {
-    claim: () => [{ file: 'a', body: { links: [RQ], convoId: '1', createdAt: Date.now() } }, { file: 'b', body: { links: [RQ], convoId: '2', createdAt: Date.now() } }],
+    record: async () => 0, claim: () => [{ file: 'a', body: { links: [RQ], convoId: '1', createdAt: Date.now() } }, { file: 'b', body: { links: [RQ], convoId: '2', createdAt: Date.now() } }],
     autoEnabled: () => true, allowed: () => (allowedNow ? new Set(['icetea-labs/umipay-hub']) : new Set()),
     runner: async () => { allowedNow = false; modes.push('auto'); return { stdout: '✅' }; },
     deliver: async () => {}, audit: () => {}, remove: () => {}, prLinks: async () => { modes.push('ask'); }, label: () => 'x',
@@ -859,11 +859,11 @@ test('keepBranch request: --keep-branch reaches merge.mjs on the AUTO path, and 
   const sent = [], runs = [], asked = [];
   const base = { autoEnabled: () => true, allowed: () => new Set(['icetea-labs/umipay-hub']), deliver: async () => {}, audit: () => {}, remove: () => {}, label: () => 'Giun', scriptsDir: '/s' };
   await processMergeRequests(reqCtx(sent), { ...base,
-    claim: () => [{ file: 'f', body: { links: [RQ], convoId: '42', keepBranch: true, createdAt: Date.now() } }],
+    record: async () => 0, claim: () => [{ file: 'f', body: { links: [RQ], convoId: '42', keepBranch: true, createdAt: Date.now() } }],
     runner: async (bin, argv) => { runs.push(argv); return { stdout: 'ok' }; } });
   assert.deepEqual(runs[0], ['/s/merge.mjs', RQ, '--skip-merged', '--keep-branch']);
   await processMergeRequests(reqCtx(sent), { ...base, autoEnabled: () => false,
-    claim: () => [{ file: 'f', body: { links: [RQ], convoId: '42', keepBranch: true, createdAt: Date.now() } }],
+    record: async () => 0, claim: () => [{ file: 'f', body: { links: [RQ], convoId: '42', keepBranch: true, createdAt: Date.now() } }],
     prLinks: async (links, msg, c) => asked.push(c) });
   assert.equal(asked[0].keepBranch, true);
   assert.match(asked[0].header, /giữ nhánh nguồn/);
@@ -893,4 +893,143 @@ test('entryMatchesMessage: stored keepBranch must agree with what the owner saw'
   assert.equal(entryMatchesMessage({ links: [L] }, plain), true, 'old entries without the flag still match');
   assert.equal(entryMatchesMessage({ links: [L] }, shown), false, 'flag stripped from store → refuse');
   assert.equal(entryMatchesMessage({ links: [L], keepBranch: true }, plain), false, 'flag added to store → refuse');
+});
+
+// ── RFC 31: owner's /m tells the PRs' agents ──────────────────────────────────
+const PU = (n) => `https://github.com/o/r/pull/${n}`;
+const RES = (n, kind, extra = '') => ({ url: PU(n), kind, text: `${kind === 'merged' ? '✅ merged PR o/r#' : '❌ PR o/r#'}${n} "t"${extra}\n${PU(n)}` });
+// A runner standing in for merge.mjs: writes the results file it was given, then exits ok / non-zero.
+const fakeMerge = (results, { fail = false, seen = {} } = {}) => async (bin, argv, opts) => {
+  seen.file = opts.env.TELE_MERGE_RESULTS;
+  if (results && seen.file) fs.writeFileSync(seen.file, JSON.stringify(results));
+  if (fail) throw Object.assign(new Error('exit 1'), { stdout: '⏹ stopped.', stderr: '' });
+  return { stdout: 'merge output', stderr: '' };
+};
+const mctx = (runner, sent, deps) => ({ daemonUserId: '1', projectsConfig: OWNER_CFG, registry: MREG, sendText: async (c, t) => sent.push(t), runner, parentDir: '/w', scriptsDir: '/s', notifyDeps: deps });
+const OWNERS = { [PU(77)]: '42', [PU(78)]: '42', [PU(80)]: '43' };
+const deps = (delivered, over = {}) => ({
+  find: (url) => (OWNERS[url] ? { convoId: OWNERS[url], src: 'topic' } : null),
+  deliver: async (r) => { delivered.push(r); }, store: {}, persona: () => null, ...over,
+});
+
+test('/m: one deliver per owner convo with only its own PR blocks; reply lists who was told and who is unknown', async () => {
+  const sent = [], delivered = [], seen = {};
+  const results = [RES(77, 'merged'), RES(78, 'merged'), RES(79, 'merged'), RES(80, 'error')];
+  await dispatchCommand({ cmd: 'merge', rest: `${PU(77)} ${PU(78)} ${PU(79)} ${PU(80)}` }, { id: '1' }, mctx(fakeMerge(results, { seen }), sent, deps(delivered)));
+  assert.equal(delivered.length, 2);
+  const d42 = delivered.find((d) => d.convoId === '42'), d43 = delivered.find((d) => d.convoId === '43');
+  assert.equal(d42.mode, 'manual');
+  assert.equal(d42.merged, true);
+  assert.match(d42.text, /o\/r#77[\s\S]*o\/r#78/);
+  assert.doesNotMatch(d42.text, /#79|#80/);
+  assert.equal(d43.merged, false, 'owner of the failed PR gets no cleanup reminder');
+  assert.match(d43.text, /^❌ PR o\/r#80/);
+  assert.match(sent[0], /^merge output/);
+  assert.match(sent[0], /→ đã gửi kết quả cho \(#\w+\): #77, #78/);
+  assert.match(sent[0], /→ đã gửi kết quả cho \(#\w+\): #80/);
+  assert.match(sent[0], /→ #79: không rõ agent nào, chưa báo ai/);
+  assert.equal(fs.existsSync(path.dirname(seen.file)), false, 'temp results dir removed');
+});
+
+test('/m: skipped results notify nobody; persona label shown when known', async () => {
+  const sent = [], delivered = [];
+  await dispatchCommand({ cmd: 'merge', rest: PU(77) }, { id: '1' }, mctx(fakeMerge([RES(77, 'skipped')]), sent, deps(delivered)));
+  assert.equal(delivered.length, 0);
+  assert.doesNotMatch(sent[0], /→/);
+  const sent2 = [];
+  await dispatchCommand({ cmd: 'merge', rest: PU(77) }, { id: '1' }, mctx(fakeMerge([RES(77, 'merged')]), sent2, deps([], { persona: () => ({ name: 'Tiên', emoji: '🧚' }) })));
+  assert.match(sent2[0], /→ đã gửi kết quả cho .*Tiên.* \(#\w+\): #77/);
+});
+
+test('/m: merge.mjs fails (exit 1) after merging → the catch branch still notifies from the file; param error (no file) notifies nobody', async () => {
+  const sent = [], delivered = [];
+  await dispatchCommand({ cmd: 'merge', rest: PU(77) }, { id: '1' }, mctx(fakeMerge([RES(77, 'merged')], { fail: true }), sent, deps(delivered)));
+  assert.equal(delivered.length, 1);
+  assert.match(sent[0], /⏹ stopped\.[\s\S]*→ đã gửi kết quả/);
+  const sent2 = [], delivered2 = [];
+  await dispatchCommand({ cmd: 'merge', rest: '--squash --rebase 1' }, { id: '1' }, mctx(fakeMerge(null, { fail: true }), sent2, deps(delivered2)));
+  assert.equal(delivered2.length, 0);
+  assert.equal(sent2.length, 1);
+});
+
+test('/m: a notify failure never blocks the owner reply and is shown on its own line; a corrupt file notifies nobody', async () => {
+  const sent = [];
+  await dispatchCommand({ cmd: 'merge', rest: PU(77) }, { id: '1' }, mctx(fakeMerge([RES(77, 'merged')]), sent, deps([], { deliver: async () => { throw new Error('queue full'); } })));
+  assert.match(sent[0], /^merge output/);
+  assert.match(sent[0], /→ lỗi khi báo agent #\w+: queue full/);
+  const sent2 = [];
+  await dispatchCommand({ cmd: 'merge', rest: PU(77) }, { id: '1' }, mctx(fakeMerge(null), sent2, deps([], { find: () => { throw new Error('boom'); } })));
+  assert.equal(sent2[0], 'merge output');
+  const sent3 = [];
+  await dispatchCommand({ cmd: 'merge', rest: PU(77) }, { id: '1' }, mctx(fakeMerge([RES(77, 'merged')]), sent3, deps([], { find: () => { throw new Error('boom'); } })));
+  assert.match(sent3[0], /→ lỗi khi báo agent: boom/);
+});
+
+test('/m: notifyOwners:false → no results file requested, nobody notified; other commands never get one', async () => {
+  const sent = [], delivered = [];
+  let env;
+  await dispatchCommand({ cmd: 'merge', rest: PU(77) }, { id: '1' }, { ...mctx(async (b, a, o) => { env = o.env; return { stdout: 'ok' }; }, sent, deps(delivered)), notifyOwners: false });
+  assert.equal(env.TELE_MERGE_RESULTS, undefined);
+  assert.equal(delivered.length, 0);
+  process.env.TELE_MERGE_RESULTS = '/stray';
+  try {
+    await dispatchCommand({ cmd: 'run', rest: 'x' }, { id: '1' }, { ...mctx(async (b, a, o) => { env = o.env; return { stdout: 'ok' }; }, sent, deps(delivered)), registry: { run: { run: 'run.mjs', args: [], needsProject: false, minRole: 'admin' } } });
+    assert.equal(env.TELE_MERGE_RESULTS, undefined, 'a stray inherited value never reaches other children');
+  } finally { delete process.env.TELE_MERGE_RESULTS; }
+});
+
+test('handleMergeButton: notifyOwners = no requester (requester buttons keep their own deliver wrapper)', async () => {
+  const run = async (entry) => {
+    const store = new Map([['aaaaaaaaaaaaaaaa', { links: [L1], createdAt: Date.now(), ...entry }]]);
+    let passed;
+    const ctx = { registry: MREG, answerButton: async () => {}, editButtonsMessage: async () => {}, sendText: async () => {} };
+    await handleMergeButton({ id: 'q', data: 'mg:aaaaaaaaaaaaaaaa', from: { id: 1 }, message: { chat: { id: 1 }, message_id: 5, text: SHOWN } }, ctx,
+      { take: (t) => takeMergeButton(t, { store }), dispatch: async (p, f, c) => { passed = c.notifyOwners; } });
+    return passed;
+  };
+  assert.equal(await run({}), true);
+  assert.equal(await run({ requester: { convoId: '42', label: 'x' } }), false);
+});
+
+test('clipPrBlock: keeps the status and URL lines; each block gets floor(3000/n) in notifyPrOwners', async () => {
+  const big = `✅ merged PR o/r#1 "t"\n${'detail '.repeat(300)}\n${PU(1)}`;
+  const c = clipPrBlock(big, 100);
+  assert.ok(c.length <= 100 + 2);
+  assert.ok(c.startsWith('✅ merged PR o/r#1 "t"') && c.endsWith(PU(1)));
+  assert.equal(clipPrBlock('short\nhttps://github.com/o/r/pull/2', 100), 'short\nhttps://github.com/o/r/pull/2');
+  const delivered = [];
+  const rs = [1, 2, 3].map((n) => ({ url: PU(n), kind: 'merged', text: `✅ merged PR o/r#${n} "t"\n${'x'.repeat(5000)}\n${PU(n)}` }));
+  await notifyPrOwners(rs, { find: () => ({ convoId: '42' }), deliver: async (r) => delivered.push(r), store: {}, persona: () => null });
+  assert.equal(delivered.length, 1);
+  assert.ok(delivered[0].text.length <= 3000 + 4);
+  for (const n of [1, 2, 3]) assert.ok(delivered[0].text.includes(PU(n)) && delivered[0].text.includes(`✅ merged PR o/r#${n}`));
+});
+
+test('readMergeResults: tolerant of missing / corrupt / malformed entries', () => {
+  const f = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'mr-')), 'r.json');
+  assert.deepEqual(readMergeResults(f), []);
+  fs.writeFileSync(f, '{oops');
+  assert.deepEqual(readMergeResults(f), []);
+  fs.writeFileSync(f, JSON.stringify([{ url: PU(1), kind: 'merged', text: 'a' }, { url: 'evil', kind: 'merged', text: 'b' }, { url: PU(2), kind: 'weird', text: 'c' }, null]));
+  assert.deepEqual(readMergeResults(f).map((r) => r.url), [PU(1)]);
+});
+
+test('processMergeRequests: records the request convo as owner of every link BEFORE the auto/ask decision', async () => {
+  const order = [], rec = [];
+  await processMergeRequests(reqCtx([]), {
+    claim: () => [{ file: 'f', body: { links: [RQ], convoId: '42', createdAt: Date.now() } }],
+    record: async (urls, convoId, src) => { order.push('record'); rec.push([urls, convoId, src]); },
+    autoEnabled: () => { order.push('decide'); return false; }, allowed: () => new Set(),
+    prLinks: async () => {}, deliver: async () => {}, remove: () => {}, label: () => 'x',
+  });
+  assert.deepEqual(order, ['record', 'decide']);
+  assert.deepEqual(rec, [[[RQ], '42', 'request']]);
+  // a recording failure never blocks the request
+  const asked = [];
+  await processMergeRequests(reqCtx([]), {
+    claim: () => [{ file: 'f', body: { links: [RQ], convoId: '42', createdAt: Date.now() } }],
+    record: async () => { throw new Error('lock'); }, autoEnabled: () => false, allowed: () => new Set(),
+    prLinks: async (l) => asked.push(l), deliver: async () => {}, remove: () => {}, label: () => 'x',
+  });
+  assert.equal(asked.length, 1);
 });

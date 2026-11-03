@@ -439,3 +439,70 @@ test('mergeOne: checks still running → re-read for up to 15 s (billing jobs fa
   r = await mergeOne(9, ARGS([9], { force: true }), { gh: f3.gh, sleep: async (ms) => { slept3.push(ms); } });
   assert.deepEqual(slept3, []);
 });
+
+// ── RFC 31: per-PR results for the daemon (TELE_MERGE_RESULTS) ────────────────
+const RT = (n, extra = {}) => ({ repo: 'o/r', number: n, ...extra });
+const PRU = (n, extra = {}) => PR(n, { url: `https://github.com/O/R/pull/${n}`, ...extra });
+const collect = () => { const writes = []; return { writes, writeResults: (r) => writes.push(JSON.parse(JSON.stringify(r))) }; };
+
+test('results: only attempted targets; exit-1 batch keeps the earlier merge; kinds + lower-cased GitHub url', async () => {
+  const f = fakeGh({ 1: PRU(1), 2: PRU(2, { isDraft: true }), 3: PRU(3) });
+  const c = collect();
+  const r = await mergeMany({ ...ARGS([1, 2, 3]), targets: [RT(1), RT(2), RT(3)] }, { gh: f.gh, sleep: async () => {}, writeResults: c.writeResults });
+  assert.equal(r.ok, false);
+  const last = c.writes.at(-1);
+  assert.deepEqual(last.map((x) => [x.url, x.kind]), [['https://github.com/o/r/pull/1', 'merged'], ['https://github.com/o/r/pull/2', 'error']]);
+  assert.match(last[0].text, /^✅ merged PR o\/r#1/);
+  assert.match(last[1].text, /^❌ PR o\/r#2/);
+  assert.equal(last.some((x) => /pull\/3$/.test(x.url)), false, 'not-attempted target absent');
+});
+
+test('results: written right after the merge API call, before the branch clean-up', async () => {
+  const f = fakeGh({ 1: PRU(1) });
+  const c = collect();
+  let atDelete = null;
+  const gh = (args) => { if (args[2] === 'DELETE') atDelete = c.writes.at(-1); return f.gh(args); };
+  await mergeMany({ ...ARGS([1]), targets: [RT(1)] }, { gh, sleep: async () => {}, writeResults: c.writeResults });
+  assert.deepEqual(atDelete?.map((x) => x.kind), ['merged'], 'a kill during the branch delete would still leave the merge reported');
+  assert.match(c.writes.at(-1)[0].text, /deleted branch/, 'rewritten with the final text when the target finishes');
+  assert.equal(new Set(c.writes.map((w) => w.length)).size, 1, 'one entry, updated in place');
+});
+
+test('results: --preview writes nothing', async () => {
+  const f = fakeGh({ 1: PRU(1) });
+  const c = collect();
+  await mergeMany({ ...ARGS([1]), targets: [RT(1)], preview: true }, { gh: f.gh, writeResults: c.writeResults });
+  assert.equal(c.writes.length, 0);
+});
+
+test('results: --skip-merged on an already-merged PR → kind skipped', async () => {
+  const f = fakeGh({ 1: PRU(1, { state: 'MERGED' }), 2: PRU(2) });
+  const c = collect();
+  await mergeMany({ ...ARGS([1, 2]), targets: [RT(1), RT(2)], skipMerged: true }, { gh: f.gh, sleep: async () => {}, writeResults: c.writeResults });
+  assert.deepEqual(c.writes.at(-1).map((x) => x.kind), ['skipped', 'merged']);
+});
+
+test('results: --close → closed; unreadable PR → error with url built from repo + number', async () => {
+  const f = fakeGh({ 5: PRU(5) });
+  const c = collect();
+  await mergeMany({ ...ARGS([5, 6]), targets: [RT(5), RT(6)], close: true }, { gh: f.gh, writeResults: c.writeResults });
+  assert.deepEqual(c.writes.at(-1).map((x) => [x.url, x.kind]), [['https://github.com/o/r/pull/5', 'closed'], ['https://github.com/o/r/pull/6', 'error']]);
+});
+
+test('results: a URL inside the PR title never becomes the url', async () => {
+  const f = fakeGh({ 1: PRU(1, { title: 'see https://github.com/evil/repo/pull/9' }) });
+  const c = collect();
+  await mergeMany({ ...ARGS([1]), targets: [RT(1)] }, { gh: f.gh, sleep: async () => {}, writeResults: c.writeResults });
+  assert.deepEqual(c.writes.at(-1).map((x) => x.url), ['https://github.com/o/r/pull/1']);
+});
+
+test('merge.mjs CLI: TELE_MERGE_RESULTS is not created on a usage error', async () => {
+  const fs = await import('node:fs'); const os = await import('node:os'); const path = await import('node:path');
+  const { spawnSync } = await import('node:child_process');
+  const { fileURLToPath } = await import('node:url');
+  const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'mres-')), 'r.json');
+  const script = fileURLToPath(new URL('./merge.mjs', import.meta.url));
+  const r = spawnSync(process.execPath, [script, '--squash', '--rebase', '1'], { encoding: 'utf8', timeout: 15000, env: { ...process.env, TELE_MERGE_RESULTS: file } });
+  assert.equal(r.status, 1);
+  assert.equal(fs.existsSync(file), false);
+});

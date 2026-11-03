@@ -40,6 +40,7 @@ import {
 import { CONVO_HASH_LONG_LEN, shortConvoHash as _shortConvoHash } from './convo-hash.mjs';
 import { formatPersona, personaForConvo } from './persona.mjs';
 import { resolvePersonaInGroup, peekPersona } from './persona-store.mjs';
+import { recordPrOwnersFromText } from './pr-owner.mjs';
 import { readProjectsConfig, resolveProjectConfig, resolveProjectRouting, adminIdsFrom, resolveDefaultChatId, resolveDaemonUserId, assertChatIdKind, resolveSendOnly } from './projects-config.mjs';
 
 // Re-export so existing imports of `shortConvoHash` from send-telegram keep
@@ -2005,6 +2006,7 @@ async function main() {
         if (messageId) parts.push(`messageId: ${messageId}`);
         const note = parts.length > 0 ? ` (${parts.join(', ')})` : '';
         console.log(`[send-telegram] document sent to ${chatId}${note}`);
+        await recordPrOwnersFromText(rawCaption, convoIdForSend, 'topic'); // RFC 31: first PR link sent from a topic = its owner
         emitConvoLine({ convoId: recordedConvoId, messageId });
       } catch (error) {
         failures++;
@@ -2076,6 +2078,7 @@ async function main() {
       if (messageId) parts.push(`messageId: ${messageId}`);
       const note = parts.length > 0 ? ` (${parts.join(', ')})` : '';
       console.log(`[send-telegram] sent to ${chatId}${note}`);
+      await recordPrOwnersFromText(rawMessage, convoIdForSend, 'topic'); // RFC 31
       emitConvoLine({ convoId: recordedConvoId, messageId });
     } catch (error) {
       failures++;
