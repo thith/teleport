@@ -1,5 +1,6 @@
 // `/broadcast <text>` — a daemon command (no project). Injects ONE system message
-// into EVERY live topic's prompt-queue (whisper × all). Use-case: tell every running
+// into every topic that `/ls` shows (running agent: claude proc or tele-* screen) — dead
+// topics are skipped and counted . Use-case: tell every running
 // agent "reload the telegram guide, rules changed". Nothing posted to a group; each
 // agent picks it up as a prompt with `broadcast:true` and applies it (may ack briefly).
 // Admin-only (gated by commands.json minRole). Identity from the daemon via TELE_FROM_*.
@@ -16,6 +17,8 @@ import { fileURLToPath } from 'node:url';
 import { isMainModule } from './is-direct-run.mjs';
 import { readTopicsStore } from './topics-store.mjs';
 import { listLiveTopics } from './handover.mjs';
+import { lsHashtagSet, personaByHashtag } from './spawn.mjs';
+import { formatPersona } from './persona.mjs';
 import { durableWrite } from './steer.mjs';
 import { DEFAULT_TMP_DIR } from './tele-listen.mjs';
 import { readProjectsConfig, resolveDefaultChatId, projectEntries } from './projects-config.mjs';
@@ -93,6 +96,8 @@ export async function doBroadcast(argv, {
   from = {}, config = readProjectsConfig(), store = readTopicsStore(),
   tmpDir = DEFAULT_TMP_DIR, writePrompt = durableWrite, env = process.env, envFile = {},
   raw = process.env.TELE_RAW_ARGS, // the daemon's untokenized text; unset/'' → argv
+  lsHashtags = lsHashtagSet,       // () => /ls rows ({convoId,hashtag} | hashtag); throws → fail closed
+  personaOf = null,                // (hashtag) → name; default = /ls's lookup (personaByHashtag + formatPersona)
 } = {}) {
   const args = raw ? parseBroadcastRaw(raw) : parseBroadcastArgs(argv);
   if (args.error) return { ok: false, message: args.error };
@@ -102,12 +107,45 @@ export async function doBroadcast(argv, {
     return { ok: false, message: `--chat phải đứng đầu, không trong ngoặc — ${USAGE}` };
   }
   const chatIds = args.chat ? [String(args.chat)] : groupChatIds(config, { env, envFile });
-  const live = listLiveTopics(store, chatIds);
-  if (!live.length) return { ok: false, message: '📢 broadcast: no live topics found (nothing sent).' };
+  const all = listLiveTopics(store, chatIds);
+  if (!all.length) return { ok: false, message: '📢 broadcast: no live topics found (nothing sent).' };
+  // Only topics /ls shows (running agents). Fail closed if the listing itself breaks.
+  // Entries are `{convoId, hashtag}` (a bare string = hashtag only). A convoId matches exactly; a
+  // hashtag-only row matches only when that hashtag belongs to ONE candidate topic (short hashes can
+  // collide across convoIds — ambiguous → skipped, counted as not running).
+  let entries;
+  try { entries = [...(await lsHashtags())]; }
+  catch (e) { return { ok: false, message: `📢 broadcast: không liệt kê được agent đang chạy (${e?.message || e}) — nothing sent.` }; }
+  const norm = (h) => String(h).replace(/^#/, '').toLowerCase();
+  const tagCount = new Map();
+  // Uniqueness is store-wide (every chat), not just the --chat scope: a hashtag-only row may belong to
+  // a topic in another chat. Distinct convoIds only.
+  const seenConvo = new Set();
+  for (const t of listLiveTopics(store, Object.keys(store || {}))) {
+    if (seenConvo.has(t.convoId)) continue;
+    seenConvo.add(t.convoId);
+    tagCount.set(norm(t.hashtag), (tagCount.get(norm(t.hashtag)) || 0) + 1);
+  }
+  // Position of a topic in /ls order (first matching row), or -1.
+  const lsIndex = (t) => entries.findIndex((e) => {
+    const isObj = e && typeof e === 'object';
+    if (isObj && e.convoId != null) return String(e.convoId) === String(t.convoId);
+    const h = isObj ? e.hashtag : e;
+    return !!h && norm(h) === norm(t.hashtag) && tagCount.get(norm(t.hashtag)) === 1;
+  });
+  const live = all.map((t) => ({ t, i: lsIndex(t) })).filter((x) => x.i >= 0).sort((x, y) => x.i - y.i).map((x) => x.t);
+  if (!live.length) return { ok: false, total: 0, message: '📢 broadcast — không có session nào đang chạy (/ls trống), không gửi gì.' };
 
   // RFC 03 §5.1: durable coalesce/spool into each topic — a busy topic no longer
   // bounces, so nothing is skipped; a hard write/lock failure (rare) is surfaced.
-  let sent = 0; const failed = [];
+  const label = (t) => {
+    let p = null;
+    try { p = personaOf(t.hashtag); } catch { /* hashtag only */ }
+    return `${p ? `${p} ` : ''}#${t.hashtag}`;
+  };
+  let pmap = {};
+  if (!personaOf) { try { pmap = personaByHashtag(store); } catch { /* hashtag only */ } personaOf = (h) => (pmap[h] ? formatPersona(pmap[h]) : null); }
+  let sent = 0; const okLines = []; const failLines = [];
   for (const t of live) {
     const prompt = buildBroadcastPrompt({
       targetConvoId: t.convoId, targetChatId: t.chatId,
@@ -116,13 +154,14 @@ export async function doBroadcast(argv, {
     const promptFile = path.join(tmpDir, `prompt-convo-${t.convoId}.json`);
     try {
       await writePrompt(prompt, promptFile);
-      sent++;
+      sent++; okLines.push(label(t));
     } catch (e) {
-      failed.push(t.hashtag);   // real write/lock failure (not busy) → count + continue fan-out
+      failLines.push(`${label(t)} — không ghi được hàng đợi`);   // real write/lock failure (not busy) → continue fan-out
     }
   }
-  const msg = `📢 broadcast: sent ${sent}, failed ${failed.length}${failed.length ? ` (${failed.map((h) => `#${h}`).join(', ')})` : ''} / ${live.length} live topic(s) — durable.`;
-  return { ok: true, sent, skipped: failed.length, total: live.length, message: msg };
+  const msg = [`📢 broadcast — ${live.length} session`, '', '✅ Đã gửi', ...okLines,
+    ...(failLines.length ? ['', '❌ Lỗi', ...failLines] : [])].join('\n');
+  return { ok: true, sent, skipped: failLines.length, total: live.length, message: msg };
 }
 
 if (isMainModule(import.meta.url)) {

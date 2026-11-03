@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { shortConvoHash } from './convo-hash.mjs';
 import { parseBroadcastArgs, parseBroadcastRaw, buildBroadcastPrompt, groupChatIds, doBroadcast } from './broadcast.mjs';
 
 test('parseBroadcastArgs: text join; --chat (space/=) extracted; empty → usage error', () => {
@@ -23,7 +24,7 @@ test('buildBroadcastPrompt: broadcast field, non-privileged role, injected (mess
 
 test('groupChatIds: distinct group ids from _default + dedicated projects', () => {
   const cfg = { _default: { chatId: '-100' }, a: { chatId: '-200' }, b: { chatId: '-200' }, c: { chatId: '' }, _config: {} };
-  const ids = groupChatIds(cfg, { env: {}, envFile: {} });
+  const ids = groupChatIds(cfg, { env: {}, envFile: {}, lsHashtags: ALL_LS });
   assert.deepEqual(new Set(ids), new Set(['-100', '-200']));   // deduped; empty skipped
 });
 
@@ -31,6 +32,7 @@ test('groupChatIds: distinct group ids from _default + dedicated projects', () =
 // write failure is counted (as `failed`, still surfaced via the `skipped` field).
 const STORE = { '-100': { '111': 5, '222': 6, _ts: {} } };
 const CFG = { _default: { chatId: '-100' }, _config: {} };
+const ALL_LS = () => new Set(['111', '222'].map((c) => shortConvoHash(Number(c))));   // both topics running in /ls
 
 test('doBroadcast: durable fan-out — a hard write failure on one topic is counted, others still sent', async () => {
   const written = [];
@@ -38,17 +40,18 @@ test('doBroadcast: durable fan-out — a hard write failure on one topic is coun
     if (file.includes('222')) throw new Error('disk full'); // 222 fails hard (NOT busy — busy coalesces)
     written.push(file);
   };
-  const r = await doBroadcast(['reload', 'guide'], { from: { id: '144', role: 'admin', name: 'Alice' }, config: CFG, store: STORE, writePrompt, env: {}, envFile: {} });
+  const r = await doBroadcast(['reload', 'guide'], { from: { id: '144', role: 'admin', name: 'Alice' }, config: CFG, store: STORE, writePrompt, env: {}, envFile: {}, lsHashtags: ALL_LS });
   assert.equal(r.ok, true);
   assert.equal(r.sent, 1);
   assert.equal(r.skipped, 1);   // 1 hard failure
   assert.equal(r.total, 2);
   assert.ok(written[0].includes('prompt-convo-111.json'));
-  assert.match(r.message, /sent 1, failed 1/);
+  assert.match(r.message, /^📢 broadcast — 2 session\n\n✅ Đã gửi\n.*#t111\n\n❌ Lỗi\n.*#t222 — không ghi được hàng đợi$/);
+  assert.doesNotMatch(r.message, /bỏ qua/);
 });
 
 test('doBroadcast: --chat limits scope; no live topics → ok:false', async () => {
-  const r = await doBroadcast(['--chat', '-999', 'hi'], { from: {}, config: CFG, store: STORE, writePrompt: () => {}, env: {}, envFile: {} });
+  const r = await doBroadcast(['--chat', '-999', 'hi'], { from: {}, config: CFG, store: STORE, writePrompt: () => {}, env: {}, envFile: {}, lsHashtags: ALL_LS });
   assert.equal(r.ok, false);
   assert.match(r.message, /no live topics/);
 });
@@ -75,10 +78,10 @@ test('parseBroadcastRaw: a LEADING --chat (space or =) is split off; the message
 
 test('doBroadcast: raw (TELE_RAW_ARGS) wins over argv; --chat still scopes it', async () => {
   const writes = [];
-  const r = await doBroadcast(['x'], { from: {}, config: CFG, store: STORE, writePrompt: (p) => writes.push(p), env: {}, envFile: {}, raw: `line 1\n"line 2"` });
+  const r = await doBroadcast(['x'], { from: {}, config: CFG, store: STORE, writePrompt: (p) => writes.push(p), env: {}, envFile: {}, lsHashtags: ALL_LS, raw: `line 1\n"line 2"` });
   assert.equal(r.ok, true);
   assert.ok(writes.length > 0 && writes.every((p) => p.text === `line 1\n"line 2"`));
-  const none = await doBroadcast(['--chat', '-999', 'hi'], { from: {}, config: CFG, store: STORE, writePrompt: () => {}, env: {}, envFile: {}, raw: '--chat -999 hi' });
+  const none = await doBroadcast(['--chat', '-999', 'hi'], { from: {}, config: CFG, store: STORE, writePrompt: () => {}, env: {}, envFile: {}, lsHashtags: ALL_LS, raw: '--chat -999 hi' });
   assert.match(none.message, /no live topics/);
 });
 
@@ -89,4 +92,60 @@ test('doBroadcast raw: a disguised --chat (quotes inside the flag) is refused �
     assert.equal(r.ok, false, raw);
     assert.match(r.message, /đứng đầu/);
   }
+});
+
+test('doBroadcast: topics not in the /ls set are not sent', async () => {
+  const written = [];
+  const only111 = () => new Set([shortConvoHash(111).toUpperCase()]);   // case-insensitive
+  const r = await doBroadcast(['hi'], { from: {}, config: CFG, store: STORE, writePrompt: async (o, f) => { written.push(f); }, env: {}, envFile: {}, lsHashtags: only111, personaOf: () => null });
+  assert.equal(r.ok, true);
+  assert.equal(r.sent, 1); assert.equal(r.total, 1);
+  assert.equal(written.length, 1); assert.ok(written[0].includes('prompt-convo-111.json'));
+  assert.equal(r.message, '📢 broadcast — 1 session\n\n✅ Đã gửi\n#t111');
+});
+
+test('doBroadcast: /ls order, persona names (best-effort), no skipped count', async () => {
+  const personaOf = (h) => { if (h === shortConvoHash(222)) throw new Error('boom'); return '🪼 Sứa'; };
+  const rows = () => [shortConvoHash(222), { convoId: '111', hashtag: shortConvoHash(111) }];   // /ls lists 222 first
+  const r = await doBroadcast(['hi'], { from: {}, config: CFG, store: STORE, writePrompt: async () => {}, env: {}, envFile: {}, lsHashtags: rows, personaOf });
+  assert.equal(r.message, `📢 broadcast — 2 session\n\n✅ Đã gửi\n#${shortConvoHash(222)}\n🪼 Sứa #${shortConvoHash(111)}`);
+});
+
+test('doBroadcast: empty /ls set → ok:false, nothing written, skipped count in message', async () => {
+  const r = await doBroadcast(['hi'], { from: {}, config: CFG, store: STORE, writePrompt: () => { throw new Error('must not send'); }, env: {}, envFile: {}, lsHashtags: () => new Set() });
+  assert.equal(r.ok, false);
+  assert.equal(r.message, '📢 broadcast — không có session nào đang chạy (/ls trống), không gửi gì.');
+});
+
+test('doBroadcast: /ls listing throws → fail closed (ok:false, nothing written)', async () => {
+  const r = await doBroadcast(['hi'], { from: {}, config: CFG, store: STORE, writePrompt: () => { throw new Error('must not send'); }, env: {}, envFile: {}, lsHashtags: () => { throw new Error('ps failed'); } });
+  assert.equal(r.ok, false);
+  assert.match(r.message, /ps failed/);
+  assert.match(r.message, /nothing sent/);
+});
+
+test('doBroadcast: hashtag collision — a convoId row matches only its own topic; a hashtag-only row is skipped when ambiguous', async () => {
+  const A = 1205483045424020, B = 2205483045424020;
+  assert.equal(shortConvoHash(A), shortConvoHash(B));
+  const store = { '-100': { [A]: 5, [B]: 6, _ts: {} } };
+  const run = async (lsHashtags) => {
+    const written = [];
+    const r = await doBroadcast(['hi'], { from: {}, config: CFG, store, writePrompt: async (o, f) => { written.push(f); }, env: {}, envFile: {}, lsHashtags });
+    return { r, written };
+  };
+  const byConvo = await run(() => [{ convoId: String(A), hashtag: shortConvoHash(A) }]);
+  assert.equal(byConvo.written.length, 1); assert.ok(byConvo.written[0].includes(`convo-${A}.json`));
+  const byTag = await run(() => [{ convoId: null, hashtag: shortConvoHash(A) }]);   // empty screen: ambiguous
+  assert.equal(byTag.r.ok, false); assert.equal(byTag.written.length, 0);
+  assert.match(byTag.r.message, /\/ls trống/);
+});
+
+test('doBroadcast --chat: a hashtag-only row is ambiguous if another chat holds a topic with the same hashtag', async () => {
+  const A = 1205483045424020, B = 2205483045424020;
+  const store = { '-100': { [A]: 5, _ts: {} }, '-200': { [B]: 6, _ts: {} } };
+  const cfg = { _default: { chatId: '-100' }, p: { chatId: '-200' }, _config: {} };
+  const run = (argv) => doBroadcast(argv, { from: {}, config: cfg, store, writePrompt: () => { throw new Error('must not send'); }, env: {}, envFile: {}, lsHashtags: () => [{ convoId: null, hashtag: shortConvoHash(A) }] });
+  const r = await run(['--chat', '-100', 'hi']);
+  assert.equal(r.ok, false);
+  assert.match(r.message, /\/ls trống/);
 });

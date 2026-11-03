@@ -1464,3 +1464,36 @@ test('attach window count comes from the screen\'s own window list: 2 windows (o
   assert.match(resolveAttachTarget('780', sessions, mk(() => { throw new Error('boom'); })).error, /\? windows/);
   assert.equal(resolveAttachTarget('tele-f4451780', sessions, mk(() => { throw new Error('boom'); })).name, 'tele-f4451780');
 });
+
+test('lsHashtagSet: occupant identity for a screen with a claude, label only for an empty screen; no screen binary → procs only; proc failure throws', async () => {
+  const { lsHashtagSet } = await import('./spawn.mjs');
+  const sid = '11111111-2222-4333-8444-555555555555';
+  const { uuidToConvoInt } = await import('./convo-registry.mjs');
+  const { hashtagForSession } = await import('./claude-procs.mjs');
+  const screens = [{ pid: 1, name: 'tele-AbC123' }, { pid: 2, name: 'tele-label9' }, { pid: 3, name: 'other' }];
+  const procs = [{ screen: 'tele-label9', sessionId: sid, hashtag: hashtagForSession(sid) }, { screen: null, sessionId: null, hashtag: null }];
+  const got = lsHashtagSet({ listScreens: () => screens, listProcs: () => procs, hasScreen: () => true });
+  assert.deepEqual(got, [
+    { convoId: null, hashtag: 'abc123' },                                         // empty screen (listed first)
+    { convoId: String(uuidToConvoInt(sid)), hashtag: hashtagForSession(sid) },   // occupant, NOT 'label9'
+  ]);
+  assert.ok(!got.some((e) => e.hashtag === 'label9'));
+  const noScreen = lsHashtagSet({ listScreens: () => { throw new Error('no'); }, listProcs: () => procs, hasScreen: () => false });
+  assert.equal(noScreen.length, 1);
+  assert.throws(() => lsHashtagSet({ listScreens: () => [], listProcs: () => { throw new Error('ps'); }, hasScreen: () => true }), /ps/);
+});
+
+test('lsIdentities order matches formatAgentList for mixed screens + procs', async () => {
+  const { lsIdentities, formatAgentList, hashtagForSession } = await import('./claude-procs.mjs');
+  const S = (n) => `0000000${n}-2222-4333-8444-555555555555`;
+  const screens = [{ pid: 1, name: 'tele-emptyaa' }, { pid: 2, name: 'tele-zz9' }, { pid: 3, name: 'tele-bb2' }];
+  const procs = [
+    { pid: 10, screen: null, sessionId: S(1), hashtag: hashtagForSession(S(1)) },        // terminal
+    { pid: 11, screen: 'tele-bb2', sessionId: S(2), hashtag: hashtagForSession(S(2)) },
+    { pid: 12, screen: 'tele-unlisted', sessionId: null, hashtag: null },                // STY only
+    { pid: 13, screen: 'tele-zz9', sessionId: S(3), hashtag: hashtagForSession(S(3)) },
+  ];
+  const text = formatAgentList({ screens, procs, full: false });
+  const shown = text.split('\n\n').map((b) => (b.split('\n')[0].match(/(?:#|tele-)([a-z0-9]+)/i) || [])[1].toLowerCase());
+  assert.deepEqual(lsIdentities({ screens, procs }).map((e) => e.hashtag), shown);
+});
