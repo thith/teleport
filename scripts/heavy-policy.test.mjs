@@ -140,3 +140,14 @@ test('main + the REAL acquireLock: blocked → 79; policy lock unavailable → r
   const dir3 = tmpDir();
   assert.equal(await heavyMain(['--', 'true'], mk(viaLock(), dir3)), 0, 'no policy: runs');
 });
+
+test('R6 no flock binary: the early 78/79 refusal is skipped so the loud run-unlocked fallback happens; with flock it still refuses', async () => {
+  const dir = tmpDir();
+  setPolicy(dir, { max: 0, paused: true });
+  const logs = [];
+  const noFlock = Object.assign(new Error('spawn flock ENOENT'), { code: 'ENOENT', syscall: 'spawn flock', path: 'flock' });
+  const mk = (hasFlock) => ({ env: {}, nested: () => false, log: (s) => logs.push(s), waitRam: async () => {}, acquire: async () => { throw noFlock; }, run: async () => 0, stopGradle: async () => 0, scopeOps: { ...OPS, lockDir: dir, hasFlock: () => hasFlock } });
+  assert.equal(await heavyMain(['--', 'true'], mk(false)), 0);
+  assert.ok(logs.some((l) => /KHÔNG khoá/.test(l) && /policy/.test(l)));
+  assert.equal(await heavyMain(['--', 'true'], mk(true)), 78, 'flock present: fail-closed as before');
+});

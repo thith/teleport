@@ -409,3 +409,28 @@ test('no flock binary: the policy lock error propagates (heavy then runs unlocke
     await assert.rejects(acquireLock('build', { dir, label: 'N', convoId: 'N', waitSec: 5, ...base }), (e) => e.code === 'ENOENT' && (e.syscall === 'spawn flock' || e.path === 'flock'));
   } finally { process.env.PATH = saved; }
 });
+
+test('R1 claim failure: a ticket that vanishes between mineState and the claim does NOT run; slot given back; ticket restored; policy caller never throws', async () => {
+  const dir = tmpDir();
+  const h = await acquireLock('build', { dir, waitSec: 0, convoId: 'H', slots: 1 });
+  let n = 0;
+  const w = acquireLock('build', { dir, label: 'V', convoId: 'V', waitSec: 20, ...base, beforeClaim: async (ticket) => { if (n++ === 0) fs.unlinkSync(ticket); } });
+  await queued(dir, 1);
+  h.release();
+  const l = await w; // 1st claim fails (ENOENT, no marker) → no run, restored, 2nd beat claims properly
+  assert.ok(l.release, 'ran only after a successful claim');
+  assert.ok(n >= 2, 'the failed claim was retried, not run');
+  l.release();
+  // if it can never be restored → busy, not a run
+  const dir2 = tmpDir();
+  const h2 = await acquireLock('build', { dir: dir2, waitSec: 0, convoId: 'H', slots: 1 });
+  const q2 = lockPaths('build', dir2).queue;
+  const w2 = acquireLock('build', { dir: dir2, label: 'V2', convoId: 'V2', waitSec: 20, ...base, beforeClaim: async (ticket) => { try { fs.unlinkSync(ticket); } catch {} fs.chmodSync(q2, 0o500); } });
+  await queued(dir2, 1);
+  h2.release();
+  try {
+    if (process.getuid?.() === 0) return;
+    assert.deepEqual(await w2, { refused: 'busy' });
+    assert.equal(probe(dir2), 'free');
+  } finally { fs.chmodSync(q2, 0o700); }
+});

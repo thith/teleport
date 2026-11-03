@@ -32,7 +32,7 @@ const NOT_SAVED = '⏳ bận (policy đang được cập nhật), thử lại';
  * `{ error }` (nothing written) or a value. `write:false` = it only renames tickets (kick): allowed even when the
  * policy file is corrupt. → { ok: true, value, policy } | { ok: false, why: 'busy'|'corrupt'|'invalid'|'rejected'|'noflock', message }.
  */
-export async function updatePolicy(dir, mutate, { now = Date.now(), write = true, waitMs = 5000, queueNames = null } = {}) {
+export async function updatePolicy(dir, mutate, { now = Date.now(), write = true, waitMs = 5000, queueNames = null, after = null } = {}) {
   let res;
   try {
     res = await withPolicyLock(dir, () => {
@@ -45,7 +45,9 @@ export async function updatePolicy(dir, mutate, { now = Date.now(), write = true
       if (write) {
         try { writePolicy(dir, pol, { now }); } catch (e) { return { ok: false, why: 'invalid', message: `❌ ${e.message}` }; }
       }
-      return { ok: true, value: out, policy: pol };
+      // `after` runs once the policy is on disk, still under the lock (block: strike tickets only AFTER the block exists)
+      const extra = after ? after(pol, { dir, now }) : null;
+      return { ok: true, value: extra ? { ...out, ...extra } : out, policy: pol };
     }, { waitMs });
   } catch (e) {
     return { ok: false, why: 'noflock', message: `❌ không lấy được policy lock (${e?.message ?? e})` };
@@ -201,10 +203,8 @@ export const blockOwner = (dir, { owner, label, until, ident = null }, opts = {}
   p.blocks = p.blocks.filter((b) => b.owner !== owner);
   if (p.blocks.length >= MAX_BLOCKS) return { error: `❌ tối đa ${MAX_BLOCKS} mục chặn` };
   p.blocks.push({ owner, label: label || owner, until, at: now, ...(ident ? { ident } : {}) });
-  const struck = strike(dir, (t) => recordOwner(t) === owner, { kind: 'blocked', until, now });
-  for (const t of struck) delete p.boosts[t.name];
-  return { struck };
-}, opts);
+  return {};
+}, { ...opts, after: (p, { now }) => ({ struck: strike(dir, (t) => recordOwner(t) === owner, { kind: 'blocked', until, now }) }) });
 
 export const unblockOwner = (dir, owner, opts = {}) => updatePolicy(dir, (p) => {
   const before = p.blocks.length;

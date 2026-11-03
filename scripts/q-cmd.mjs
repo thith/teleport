@@ -18,6 +18,7 @@ import { shortConvoHash } from './convo-hash.mjs';
 import { peekPersona } from './persona-store.mjs';
 import { formatPersona } from './persona.mjs';
 import { uuidToConvoInt } from './convo-registry.mjs';
+import { readTopicsStore } from './topics-store.mjs';
 
 const hhmm = (ms) => new Date(ms).toTimeString().slice(0, 5);
 const dirOf = (ctx, deps) => deps.dir ?? ctx.lockDir ?? LOCK_DIR;
@@ -61,6 +62,10 @@ export async function qStop(ctx, runEntry, deps = {}) {
   const text = `⏹ đang dừng ${h.label || `pid ${h.pid}`} pid ${h.pid}…`;
   let sent = null;
   try { sent = await ctx.sendButtonRows(ctx.daemonUserId, text, []); } catch (e) { return `không gửi được tin trạng thái: ${e?.message ?? e}`; }
+  if (store.has(`stop:${key}`)) { // a job appeared while we awaited the send: keep it (never reset its phase / deadline)
+    await ctx.editButtonRows?.(ctx.daemonUserId, sent?.message_id, `${text}\n\n⏳ đang dừng rồi.`, []);
+    return 'đang dừng rồi';
+  }
   try { store.setStrict(`stop:${key}`, createStopJob(h, { chatId: ctx.daemonUserId, statusMessageId: sent?.message_id ?? null, text, now })); }
   catch { await ctx.editButtonRows?.(ctx.daemonUserId, sent?.message_id, `${text}\n\n❌ không lưu được lệnh dừng — không làm gì.`, []); return 'không lưu được lệnh dừng'; }
   try { await (deps.retire ?? retireLongBuildAlert)(key, ctx); } catch (e) { console.error(`[q] retire alert: ${e?.message ?? e}`); }
@@ -99,14 +104,14 @@ export async function qPress(cq, ctx, deps = {}) {
   // the target must still be what the board showed
   let row = null, run = null, owner = null;
   if (['k', 't', 'b', 'bd'].includes(op)) {
-    row = entry.rows?.[idx];
+    row = op === 'bd' ? (String(entry.view || '').startsWith('b:') ? entry.pin : null) : entry.rows?.[idx]; // a confirmation acts on the PINNED ticket, never on a re-numbered one
     const cur = row ? (deps.readQ ?? readQueue)('build', { dir, now }).find((t) => sameTicket(t, row)) : null;
     if (!cur) { op = 'r'; note = 'Vé đã đổi hoặc đã chạy — đã làm mới.'; row = null; } else row = { ...row, ...(op === 'bd' ? { v: cur.v, cur } : {}) };
   } else if (op === 'u') {
     owner = entry.blocks?.[idx];
     if (!owner) { op = 'r'; note = 'Mục chặn đã đổi — đã làm mới.'; }
   } else if (op === 's' || op === 'sy') {
-    run = entry.running?.[idx];
+    run = op === 'sy' ? (String(entry.view || '').startsWith('s:') ? entry.pin : null) : entry.running?.[idx];
     const v = run ? (deps.verify ?? verifyHolder)(run, { dir }) : { why: 'build đó không còn' };
     if (!v.holder) { op = 'r'; note = `Không dừng: ${v.why}.`; run = null; }
   }
@@ -114,7 +119,7 @@ export async function qPress(cq, ctx, deps = {}) {
   const next = { ...entry, rev: entry.rev + 1, createdAt: now };
   try { store.setStrict(tok, next); } catch { await ctx.answerButton(cq.id, '❌ không lưu được trạng thái nút — gõ /q lại.'); return; }
 
-  let view = 'main', page = entry.page ?? 0;
+  let view = 'main', page = entry.page ?? 0, pin = null;
   const res = async (p) => { const r = await p; if (!r.ok) note = r.message; return r; };
   switch (op) {
     case 'r': break;
@@ -126,7 +131,7 @@ export async function qPress(cq, ctx, deps = {}) {
     case 'p': await res(updatePolicy(dir, (p) => { p.paused = !p.paused; return { paused: p.paused }; }, { now })); break;
     case 'k': { const r = await res(kickTicket(dir, { name: row.file, pid: row.pid, procStart: row.procStart }, { now })); if (r.ok) note = `Đã kick ${row.label} (vé chưa chạy, agent được báo).`; break; }
     case 't': { const r = await res(topTicket(dir, { name: row.file, pid: row.pid, procStart: row.procStart, toggle: true }, { now })); if (r.ok) note = r.value.boosted ? `${row.label} lên đầu hàng.` : `Bỏ ưu tiên ${row.label}.`; break; }
-    case 'b': view = `b:${idx}`; break;
+    case 'b': view = `b:${idx}`; pin = entry.rows[idx]; break;
     case 'bd': {
       const d = parseDuration(arg === 'td' ? 'today' : arg, { now });
       if (d.error) { note = d.error; break; }
@@ -136,7 +141,7 @@ export async function qPress(cq, ctx, deps = {}) {
       break;
     }
     case 'u': { const r = await res(unblockOwner(dir, owner, { now })); if (r.ok) note = 'Đã bỏ chặn.'; break; }
-    case 's': view = `s:${idx}`; break;
+    case 's': view = `s:${idx}`; pin = run; break;
     case 'sy': note = await qStop(ctx, run, deps); break;
     case 'rs': view = 'rs'; break;
     case 'rsy': { const r = await res(resetPolicy(dir, { now })); if (r.ok) note = 'Đã ghi lại policy mặc định.'; break; }
@@ -144,9 +149,9 @@ export async function qPress(cq, ctx, deps = {}) {
   }
 
   const g = (deps.gather ?? gatherQ)({ dir, now });
-  const r = renderQ(g, { tok, rev: next.rev, page, view, stoppingKeys: stoppingKeysOf(store) });
+  const r = renderQ(g, { tok, rev: next.rev, page, view, pin, stoppingKeys: stoppingKeysOf(store) });
   const text = note ? `ℹ️ ${note}\n${r.text}` : r.text;
-  const final = entryFor(g, r, { ...next, view, page: r.page ?? page });
+  const final = entryFor(g, r, { ...next, view: r.view ?? view, pin: r.view && r.view !== 'main' ? pin : null, page: r.page ?? page });
   const edit = ctx.editButtonRowsStrict || ctx.editButtonRows;
   try { store.setStrict(tok, final); } catch {
     try { await edit(chatId, messageId, `${text}\n\n❌ không lưu được trạng thái nút — gõ /q lại.`, []); } catch {}
@@ -179,6 +184,16 @@ export function queueTargetTiers({ dir = LOCK_DIR, now = Date.now(), procs = () 
   const t3 = [];
   try { for (const cid of topics()) t3.push({ convoId: String(cid), names: [personaName(cid)].filter(Boolean), hashtag: shortConvoHash(cid) }); } catch {}
   return [t1, t2, t3];
+}
+
+/** Every convo id in topics.json (production source for `/q block <persona|#hash>` of an idle agent). */
+export function topicConvoIds(store = readTopicsStore()) {
+  const out = new Set();
+  for (const entry of Object.values(store ?? {})) {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) continue;
+    for (const k of Object.keys(entry)) if (!k.startsWith('_')) out.add(k);
+  }
+  return [...out];
 }
 
 const MAN_USAGE = 'usage: /q  ·  /q max <n|off>  ·  /q retry <phút>  ·  /q kick <số>  ·  /q top <số>  ·  /q block <số|persona|#hash> <30m|1h|2h30m|today>  ·  /q unblock <số|persona|#hash>  ·  /q pause|resume';

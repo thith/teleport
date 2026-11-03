@@ -507,7 +507,7 @@ export function earlyPolicyCheck({ dir, owner, now = Date.now(), holders = null,
 }
 
 const DEFAULT_SCOPE_OPS = {
-  lockDir: null, selfOwner: () => ownerOf({ convoId: selfConvoId(), worktree: worktreeOf(), pid: process.pid }),
+  lockDir: null, hasFlock: () => { const r = spawnSync('flock', ['--version'], { stdio: 'ignore' }); return !(r.error && r.error.code === 'ENOENT'); }, selfOwner: () => ownerOf({ convoId: selfConvoId(), worktree: worktreeOf(), pid: process.pid }),
   preflight: scopePreflight, stop: stopScope, orphans: orphanScopes, oomKills: appSliceOomKills, jobsConfigured: cargoJobsConfigured, memTotal: memTotal(),
   holders: () => readHolders('build'),
   admitLock: () => acquireHelperLock('build.admit', { waitMs: 10_000 }),
@@ -539,7 +539,8 @@ export async function main(argv, {
   if (!isNested && policyReadable) {
     let early = null;
     try { early = earlyPolicyCheck({ dir: lockDir, owner: scopeOps.selfOwner() }); } catch { /* unreadable: the authoritative check decides */ }
-    if (early) return refusalExit(early, log);
+    // no flock binary: the queue and the policy cannot be enforced → fall through to the loud run-unlocked fallback
+    if (early && scopeOps.hasFlock()) return refusalExit(early, log);
   }
   if (!isNested && a.ramWait) await waitRam({ minBytes: minFreeBytes(env), log });
   let lock;

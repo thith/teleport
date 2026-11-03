@@ -633,11 +633,15 @@ export async function acquireLock(name, {
                 if (beforeClaim) await beforeClaim(ticket); // (test seam: strike / kick right here)
                 try { fs.renameSync(ticket, ticket.replace(/\.json$/, '.acq')); ticket = ticket.replace(/\.json$/, '.acq'); break; }
                 catch (e) {
-                  if (e.code !== 'ENOENT') throw e;
+                  if (e.code !== 'ENOENT' && !usePolicy) throw e;
+                  if (e.code !== 'ENOENT') return refuse({ refused: 'busy' }); // policy caller: a failed claim never runs and never exits 1
                   const kicked = fs.existsSync(ticket.replace(/\.json$/, '.kicked')), left = fs.existsSync(ticket.replace(/\.json$/, '.left'));
                   if (usePolicy && !left) { const b2 = myBlock(polRead()); if (b2) return refuse({ refused: 'blocked', until: b2.until }); }
                   if (kicked || left) { done(); close(); return { timeout: true, left: true, ...(kicked ? { kicked: true } : {}), holder: null }; }
-                  break; // vanished without a marker (a pruner misjudged us dead): we won flock fair and square — keep it
+                  if (usePolicy) { // vanished without a marker: the claim FAILED → no run. Give the slot back, put the ticket back, retry next beat
+                    close(); slot = -1;
+                    try { writeJsonAtomic(ticket, body); restoreFails = 0; } catch { if (++restoreFails >= 3) return refuse({ refused: 'busy' }); }
+                  } else break; // old callers: we won flock fair and square — keep it
                 }
               }
             } finally { rel?.(); }

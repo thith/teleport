@@ -112,10 +112,10 @@ test('renderQ: block menu shows the scope (git: = WHOLE repo warning) and 4 dura
   holder(dir, 0, { label: '🐙 Tuộc #c4' });
   ticket(dir, 'G', { owner: 'git:/x/proj/.git', convoId: null });
   const g = gatherQ({ dir });
-  const bm = renderQ(g, { tok: 'c'.repeat(12), rev: 2, view: 'b:1' });
+  const bm = renderQ(g, { tok: 'c'.repeat(12), rev: 2, view: 'b:1', pin: renderQ(g, { tok: 'c'.repeat(12), rev: 2 }).maps.rows['1'] });
   assert.match(bm.text, /⚠️ vé không có convo — chặn CẢ REPO proj/);
   assert.deepEqual(bm.rows[0].map((x) => x.text), ["30'", '1h', '3h', 'Hết hôm nay', '✖']);
-  const sm = renderQ(g, { tok: 'c'.repeat(12), rev: 2, view: 's:1' });
+  const sm = renderQ(g, { tok: 'c'.repeat(12), rev: 2, view: 's:1', pin: renderQ(g, { tok: 'c'.repeat(12), rev: 2 }).maps.running['1'] });
   assert.equal(sm.rows[0][0].text, `✅ Dừng 🐙 Tuộc pid ${me}`);
   const dir2 = tmpDir();
   for (let i = 0; i < 10; i++) ticket(dir2, `T${i}`);
@@ -309,11 +309,13 @@ test('press: ⏹ asks first, then creates a SEPARATE status message + one stop j
   ({ tok, entry } = boardOf(ctx));
   const jobsBefore = [...ctx.buttonStore.keys()].filter((k) => k.startsWith('stop:')).length;
   await qPress(cqFor(ctx, qCallback(tok, entry.rev, 'sy', 1)), ctx, deps);
-  assert.match(ctx.edits.at(-1).text, /đang dừng rồi/);
+  assert.match(ctx.edits.at(-1).text, /đang dừng/); // (the confirmation is single-use: a repeat just refreshes, showing "⏳ đang dừng")
   assert.equal([...ctx.buttonStore.keys()].filter((k) => k.startsWith('stop:')).length, jobsBefore, 'no duplicate job (phase/deadline not reset)');
   // verification fails (another holder in the slot) → refresh with the reason, no job
   const ctx2 = fakeCtx(dir);
   await startQ(ctx2);
+  ({ tok, entry } = boardOf(ctx2));
+  await qPress(cqFor(ctx2, qCallback(tok, entry.rev, 's', 1)), ctx2, deps);
   ({ tok, entry } = boardOf(ctx2));
   await qPress(cqFor(ctx2, qCallback(tok, entry.rev, 'sy', 1)), ctx2, { verify: () => ({ why: 'chỗ đã đổi người' }) });
   assert.match(ctx2.edits.at(-1).text, /Không dừng: chỗ đã đổi người/);
@@ -479,4 +481,72 @@ test('long-build: the alert entry now stores its text; retireLongBuildAlert stri
   await longBuildWatch(ctx2, { dir, state: { read: () => st2, write: (o) => { st2 = o; } }, slots: () => 1, paused: () => true });
   assert.equal(ctx2.sent.length, 0);
   assert.ok(STOP_BUTTON_RE && holderKey);
+});
+
+// ── review round 1 regressions ──
+
+test('R2 blockOwner: the block is on disk BEFORE any ticket is struck (a waiter seeing .kicked finds the block → 79); a failed persist kicks nothing', async () => {
+  const dir = tmpDir();
+  const a = ticket(dir, 'A');
+  const q = lockPaths('build', dir).queue;
+  const seen = [];
+  const realRename = fs.renameSync;
+  fs.renameSync = (from, to) => { if (String(to).endsWith('.kicked')) seen.push(readPolicy(dir).policy.blocks.map((b) => b.owner)); return realRename(from, to); };
+  try { assert.equal((await (await import('./queue-control.mjs')).blockOwner(dir, { owner: 'convo:A', label: 'A', until: Date.now() + 60_000 })).ok, true); }
+  finally { fs.renameSync = realRename; }
+  assert.deepEqual(seen, [['convo:A']], 'block persisted first');
+  // persistence fails (policy dir read-only trick: an invalid block → writePolicy throws) → nothing struck
+  const b = ticket(dir, 'B');
+  const { blockOwner } = await import('./queue-control.mjs');
+  const r = await blockOwner(dir, { owner: 'convo:B', label: 'B', until: Date.now() + 60_000, ident: { pid: 'x' } });
+  assert.equal(r.ok, false);
+  assert.ok(fs.existsSync(path.join(q, b)), 'ticket untouched');
+  void a;
+});
+
+test('R3 qStop: a stop job that appears while the status message is being sent is preserved', async () => {
+  const dir = tmpDir();
+  const ctx = fakeCtx(dir);
+  const holderObj = { pid: me, procStart: myStart, startedAt: 5, slot: 0, label: 'T', cmd: 'c', convoId: '7' };
+  const key = holderKey(holderObj);
+  const orig = ctx.sendButtonRows;
+  ctx.sendButtonRows = async (...a) => { const r = await orig(...a); ctx.buttonStore.set(`stop:${key}`, { kind: 'stop', key, phase: 'waitExit', deadline: 123 }); return r; };
+  const { qStop } = await import('./q-cmd.mjs');
+  const note = await qStop(ctx, { slot: 0, pid: me, startedAt: 5, procStart: myStart }, { verify: () => ({ holder: holderObj }), retire: async () => {} });
+  assert.match(note, /đang dừng rồi/);
+  assert.equal(ctx.buttonStore.get(`stop:${key}`).phase, 'waitExit');
+  assert.equal(ctx.buttonStore.get(`stop:${key}`).deadline, 123);
+});
+
+test('R4 daemon wiring: /q block <persona> reaches the live-process + topics providers', async () => {
+  const dir = tmpDir();
+  const ctx = fakeCtx(dir);
+  const base = { daemonUserId: '9', projectsConfig: {}, registry: {}, sendText: ctx.sendText, lockDir: dir, sendButtonRows: ctx.sendButtonRows, editButtonRows: ctx.editButtonRows, buttonStore: ctx.buttonStore };
+  await dispatchCommand({ cmd: 'q', rest: 'block 🦉 Cú 1h' }, { id: 9 }, { ...base, qDeps: { procs: () => [], topics: () => ['321'], peek: (id) => (id === '321' ? { name: 'Cú', emoji: '🦉' } : null) } });
+  assert.match(ctx.texts.at(-1), /không thấy|đã kick|chặn/);
+  const { topicConvoIds } = await import('./q-cmd.mjs');
+  assert.deepEqual(topicConvoIds({ chat1: { 5: {}, _x: {}, 6: {} }, chat2: { 6: {}, 7: {} } }).sort(), ['5', '6', '7']);
+});
+
+test('R5 ⛔ / ⏹ confirmations are pinned to the pressed ticket/build, even if the numbering changes meanwhile', async () => {
+  const dir = tmpDir();
+  const a = ticket(dir, 'A'); ticket(dir, 'B');
+  const ctx = fakeCtx(dir);
+  await startQ(ctx);
+  let { tok, entry } = boardOf(ctx);
+  const rowA = Object.entries(entry.rows).find(([, r]) => r.file === a)[0];
+  // the order changes before the press lands: B is boosted → A is no longer "1"
+  const { topTicket } = await import('./queue-control.mjs');
+  const bName = Object.values(entry.rows).find((r) => r.label === 'B').file;
+  await topTicket(dir, { name: bName, pid: me });
+  await qPress(cqFor(ctx, qCallback(tok, entry.rev, 'b', rowA)), ctx);
+  assert.match(ctx.edits.at(-1).text, /chặn A \(convo A\)/, 'the menu is for A, not for whoever is now at that number');
+  ({ tok, entry } = boardOf(ctx));
+  assert.equal(entry.pin.label, 'A');
+  await qPress(cqFor(ctx, qCallback(tok, entry.rev, 'bd', rowA, '1h')), ctx);
+  assert.deepEqual(readPolicy(dir).policy.blocks.map((b) => b.owner), ['convo:A']);
+  // a duration press without a pinned menu refreshes instead of acting
+  ({ tok, entry } = boardOf(ctx));
+  await qPress(cqFor(ctx, qCallback(tok, entry.rev, 'bd', 1, '1h')), ctx);
+  assert.equal(readPolicy(dir).policy.blocks.length, 1);
 });

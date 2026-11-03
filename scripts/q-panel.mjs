@@ -52,7 +52,7 @@ const shortName = (label) => clean(String(label).replace(/\s#[a-z0-9]+$/i, ''));
  * The board for `view`: 'main' | 's:<i>' (ask to stop running #i) | 'b:<i>' (pick a block length for ticket #i) | 'rs' (ask to reset a corrupt policy).
  * → { text, rows, maps: { rows, running, blocks } }. `stoppingKeys`: holder keys (pid:startedAt) that already have a stop job.
  */
-export function renderQ(g, { tok, rev, page = 0, view = 'main', stoppingKeys = new Set() } = {}) {
+export function renderQ(g, { tok, rev, page = 0, view = 'main', pin = null, stoppingKeys = new Set() } = {}) {
   const { policy: pol, now } = g;
   const cb = (op, idx, arg) => qCallback(tok, rev, op, idx, arg);
   const maps = { rows: {}, running: {}, blocks: {} };
@@ -63,21 +63,21 @@ export function renderQ(g, { tok, rev, page = 0, view = 'main', stoppingKeys = n
   pol.blocks.forEach((b, i) => { maps.blocks[String(i + 1)] = b.owner; });
 
   if (view.startsWith('s:')) {
-    const r = maps.running[view.slice(2)];
-    if (r) return { text: `⏹ Dừng build của ${clean(r.label)} (pid ${r.pid})?\n${clean(shortCmd(r.cmd))}\nBuild bị dừng thoát exit 77; agent được báo đừng tự chạy lại.`, rows: [[{ text: `✅ Dừng ${shortName(r.label)} pid ${r.pid}`, callback_data: cb('sy', view.slice(2)) }, { text: '✖', callback_data: cb('x') }]], maps };
+    const r = pin; // the build the owner pressed ⏹ on (identity, not a number that may have moved)
+    if (r) return { view, text: `⏹ Dừng build của ${clean(r.label)} (pid ${r.pid})?\n${clean(shortCmd(r.cmd))}\nBuild bị dừng thoát exit 77; agent được báo đừng tự chạy lại.`, rows: [[{ text: `✅ Dừng ${shortName(r.label)} pid ${r.pid}`, callback_data: cb('sy', view.slice(2)) }, { text: '✖', callback_data: cb('x') }]], maps };
   }
   if (view.startsWith('b:')) {
-    const r = maps.rows[view.slice(2)];
+    const r = pin;
     if (r) {
       const plan = blockPlan(r);
       return {
         text: `⛔ ${plan.scope}\nChọn thời hạn (vé đang chờ của họ bị kick luôn):`,
-        rows: [[...Object.entries(Q_DURATIONS).map(([k, label]) => ({ text: label, callback_data: cb('bd', view.slice(2), k) })), { text: '✖', callback_data: cb('x') }]], maps,
+        view, rows: [[...Object.entries(Q_DURATIONS).map(([k, label]) => ({ text: label, callback_data: cb('bd', view.slice(2), k) })), { text: '✖', callback_data: cb('x') }]], maps,
       };
     }
   }
   if (view === 'rs') {
-    return { text: '⚠️ Ghi đè build.policy.json bằng policy mặc định (max tắt, không chặn, không tạm dừng)?', rows: [[{ text: '✅ Ghi lại', callback_data: cb('rsy') }, { text: '✖', callback_data: cb('x') }]], maps };
+    return { view, text: '⚠️ Ghi đè build.policy.json bằng policy mặc định (max tắt, không chặn, không tạm dừng)?', rows: [[{ text: '✅ Ghi lại', callback_data: cb('rsy') }, { text: '✖', callback_data: cb('x') }]], maps };
   }
 
   const busy = g.holders.some((h) => h.exclusive) ? Math.max(g.N, g.holders.length) : g.holders.length;
@@ -113,5 +113,5 @@ export function renderQ(g, { tok, rev, page = 0, view = 'main', stoppingKeys = n
   rows.push([{ text: 'Max −', callback_data: cb('m-') }, { text: pol.max == null ? 'Max tắt' : `Max ${pol.max}`, callback_data: cb('mt') }, { text: 'Max +', callback_data: cb('m+') }]);
   rows.push([{ text: pol.paused ? '▶ Tiếp tục' : '⏸ Dừng phát chỗ', callback_data: cb('p') }, { text: '🔄', callback_data: cb('r') }]);
   if (g.corrupt) rows.push([{ text: 'Ghi lại policy mặc định', callback_data: cb('rs') }]);
-  return { text: lines.join('\n'), rows, maps, page: pg };
+  return { view: 'main', text: lines.join('\n'), rows, maps, page: pg };
 }

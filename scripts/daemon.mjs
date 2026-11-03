@@ -71,7 +71,7 @@ import { peekPersona } from './persona-store.mjs';
 import { machineWatch } from './health.mjs';
 import { longBuildWatch, handleLongBuildButton, stopTick, STOP_BUTTON_RE, STOP_TICK_MS, buildKickNoticePrompt } from './long-build.mjs';
 import { Q_BUTTON_RE } from './q-panel.mjs';
-import { handleQButton, runQCommand } from './q-cmd.mjs';
+import { handleQButton, runQCommand, topicConvoIds } from './q-cmd.mjs';
 import { deliverNotices } from './queue-control.mjs';
 import { LOCK_DIR } from './machine-lock.mjs';
 import { recordFetchOk, startListenWatchdog } from './listen-watch.mjs';
@@ -863,7 +863,7 @@ export async function dispatchCommand(parsed, from, {
   if (parsed.cmd === Q_COMMAND) {
     // Owner only: it kicks / blocks other agents' builds and stops running ones.
     if (String(from?.id) !== String(daemonUserId)) { await sendText(daemonUserId, `❌ /${Q_COMMAND} chỉ owner dùng được.`); return; }
-    await runQCommand(parsed.rest, { daemonUserId, projectsConfig, sendText, ...extra });
+    await runQCommand(parsed.rest, { daemonUserId, projectsConfig, sendText, ...extra }, { procs: () => listClaudeProcs(), topics: () => topicConvoIds(), ...(extra.qDeps || {}) });
     return;
   }
   if (parsed.cmd === COMPACT_COMMAND || parsed.cmd === NUDGE_COMMAND || (parsed.cmd === 'kill' && parsed.tapped)) {
