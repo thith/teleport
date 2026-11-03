@@ -349,6 +349,25 @@ export function listSpawnSessions(exec = execFileSync, { onWiped = () => {} } = 
 }
 
 /**
+ * The hashtags `/ls` shows: claude procs' `.hashtag` + `tele-<hashtag>` screen names (lowercased).
+ * Throws if the process listing fails (callers needing fail-closed rely on that); a missing
+ * `screen` binary just contributes no screens. `listScreens`/`listProcs`/`hasScreen` injectable.
+ */
+export function lsHashtagSet({
+  listScreens = () => listSpawnSessions(), listProcs = () => listClaudeProcs({ strict: true }),
+  hasScreen = () => hasBinary('screen'),
+} = {}) {
+  const set = new Set();
+  const screens = hasScreen() ? listScreens() : [];
+  for (const s of screens) {
+    const m = String(s?.name ?? '').match(/^tele-(.+)$/);
+    if (m) set.add(m[1].toLowerCase());
+  }
+  for (const p of listProcs()) if (p?.hashtag) set.add(String(p.hashtag).replace(/^#/, '').toLowerCase());
+  return set;
+}
+
+/**
  * Build `{ <hashtag>: persona }` from the topics store so `--list` can show the
  * persona name beside each `tele-<hashtag>` session ("kill Cú" → which hashtag).
  * The screen name carries only the (lossy) hashtag, so persona — which is

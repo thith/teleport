@@ -1464,3 +1464,12 @@ test('attach window count comes from the screen\'s own window list: 2 windows (o
   assert.match(resolveAttachTarget('780', sessions, mk(() => { throw new Error('boom'); })).error, /\? windows/);
   assert.equal(resolveAttachTarget('tele-f4451780', sessions, mk(() => { throw new Error('boom'); })).name, 'tele-f4451780');
 });
+
+test('lsHashtagSet: union of tele-* screen hashtags and claude proc hashtags; no screen binary → procs only; proc failure throws', async () => {
+  const { lsHashtagSet } = await import('./spawn.mjs');
+  const screens = [{ pid: 1, name: 'tele-AbC123' }, { pid: 2, name: 'other' }];
+  const procs = [{ hashtag: 'dead01' }, { hashtag: null }];
+  assert.deepEqual([...lsHashtagSet({ listScreens: () => screens, listProcs: () => procs, hasScreen: () => true })].sort(), ['abc123', 'dead01']);
+  assert.deepEqual([...lsHashtagSet({ listScreens: () => { throw new Error('no'); }, listProcs: () => procs, hasScreen: () => false })], ['dead01']);
+  assert.throws(() => lsHashtagSet({ listScreens: () => [], listProcs: () => { throw new Error('ps'); }, hasScreen: () => true }), /ps/);
+});

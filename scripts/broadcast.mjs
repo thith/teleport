@@ -1,5 +1,6 @@
 // `/broadcast <text>` — a daemon command (no project). Injects ONE system message
-// into EVERY live topic's prompt-queue (whisper × all). Use-case: tell every running
+// into every topic that `/ls` shows (running agent: claude proc or tele-* screen) — dead
+// topics are skipped and counted (whisper × all). Use-case: tell every running
 // agent "reload the telegram guide, rules changed". Nothing posted to a group; each
 // agent picks it up as a prompt with `broadcast:true` and applies it (may ack briefly).
 // Admin-only (gated by commands.json minRole). Identity from the daemon via TELE_FROM_*.
@@ -16,6 +17,7 @@ import { fileURLToPath } from 'node:url';
 import { isMainModule } from './is-direct-run.mjs';
 import { readTopicsStore } from './topics-store.mjs';
 import { listLiveTopics } from './handover.mjs';
+import { lsHashtagSet } from './spawn.mjs';
 import { durableWrite } from './steer.mjs';
 import { DEFAULT_TMP_DIR } from './tele-listen.mjs';
 import { readProjectsConfig, resolveDefaultChatId, projectEntries } from './projects-config.mjs';
@@ -93,6 +95,7 @@ export async function doBroadcast(argv, {
   from = {}, config = readProjectsConfig(), store = readTopicsStore(),
   tmpDir = DEFAULT_TMP_DIR, writePrompt = durableWrite, env = process.env, envFile = {},
   raw = process.env.TELE_RAW_ARGS, // the daemon's untokenized text; unset/'' → argv
+  lsHashtags = lsHashtagSet,       // () => Set<hashtag> of what /ls shows; throws → fail closed
 } = {}) {
   const args = raw ? parseBroadcastRaw(raw) : parseBroadcastArgs(argv);
   if (args.error) return { ok: false, message: args.error };
@@ -102,8 +105,15 @@ export async function doBroadcast(argv, {
     return { ok: false, message: `--chat phải đứng đầu, không trong ngoặc — ${USAGE}` };
   }
   const chatIds = args.chat ? [String(args.chat)] : groupChatIds(config, { env, envFile });
-  const live = listLiveTopics(store, chatIds);
-  if (!live.length) return { ok: false, message: '📢 broadcast: no live topics found (nothing sent).' };
+  const all = listLiveTopics(store, chatIds);
+  if (!all.length) return { ok: false, message: '📢 broadcast: no live topics found (nothing sent).' };
+  // Only topics /ls shows (running agents). Fail closed if the listing itself breaks.
+  let running;
+  try { running = new Set([...(await lsHashtags())].map((h) => String(h).replace(/^#/, '').toLowerCase())); }
+  catch (e) { return { ok: false, message: `📢 broadcast: không liệt kê được agent đang chạy (${e?.message || e}) — nothing sent.` }; }
+  const live = all.filter((t) => running.has(String(t.hashtag).toLowerCase()));
+  const notRunning = all.length - live.length;
+  if (!live.length) return { ok: false, skippedNotRunning: notRunning, message: `📢 broadcast: không có topic nào đang chạy (/ls trống) — nothing sent, bỏ qua ${notRunning} không chạy.` };
 
   // RFC 03 §5.1: durable coalesce/spool into each topic — a busy topic no longer
   // bounces, so nothing is skipped; a hard write/lock failure (rare) is surfaced.
@@ -121,8 +131,8 @@ export async function doBroadcast(argv, {
       failed.push(t.hashtag);   // real write/lock failure (not busy) → count + continue fan-out
     }
   }
-  const msg = `📢 broadcast: sent ${sent}, failed ${failed.length}${failed.length ? ` (${failed.map((h) => `#${h}`).join(', ')})` : ''} / ${live.length} live topic(s) — durable.`;
-  return { ok: true, sent, skipped: failed.length, total: live.length, message: msg };
+  const msg = `📢 broadcast: sent ${sent}, failed ${failed.length}${failed.length ? ` (${failed.map((h) => `#${h}`).join(', ')})` : ''} / ${live.length} topic(s) đang chạy (/ls) — bỏ qua ${notRunning} không chạy — durable.`;
+  return { ok: true, sent, skipped: failed.length, total: live.length, notRunning, message: msg };
 }
 
 if (isMainModule(import.meta.url)) {
