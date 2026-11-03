@@ -36,7 +36,7 @@ import { resolveConvoIdFromEnv, validateConvoIdString, readRows as readConvoRows
 /** True iff `s` is a convoId the listener can actually watch (positive,
  * safe-integer, no leading zero) — i.e. `prompt-convo-<s>.json` is a path some
  * `tele-listen --convo <s>` resolves to. */
-function isWatchableConvoId(s) {
+export function isWatchableConvoId(s) {
   try { validateConvoIdString(String(s)); return true; } catch { return false; }
 }
 import { buildCombinedPromptData, resyncPromptSegments, DEFAULT_TMP_DIR, mergeOrSpoolPrompt } from './tele-listen.mjs';

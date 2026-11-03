@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { splitRawTarget, matchSteerName, resolveSteerTargetRaw, resolveSteerTarget, doSteer } from './steer.mjs';
+import { splitRawTarget, matchSteerName, resolveSteerTargetRaw, resolveSteerTarget, resolveSingleSteerTarget, doSteer } from './steer.mjs';
 import { shortConvoHash } from './send-telegram.mjs';
 
 const row = (convoId, name, extra = {}) => ({ chatId: '-100', convoId, threadId: 1, ts: 0, persona: name ? { emoji: '🐉', name } : null, hashtag: shortConvoHash(convoId), ...extra });
@@ -78,4 +78,18 @@ test('resolveSteerTargetRaw (RFC 28): `convo:<id>` is explicit like #hash; a bar
   assert.equal(resolveSteerTargetRaw('780 hi', { live, replyText: rep, usage: 'U' }).match.convoId, C);
   assert.equal(resolveSteerTargetRaw('780 hi', { live, replyText: rep, usage: 'U' }).text, '780 hi');
   assert.equal(resolveSteerTarget(['999', 'x'], { live, usage: 'U' }).error, 'target 999 not found among live topics.');
+});
+
+test('resolveSingleSteerTarget: one string → one topic; name (multi-word, quoted), #hash, convoId; not found / ambiguous / bad convo: error', () => {
+  const mk = (convoId, name, hashtag) => ({ convoId: String(convoId), hashtag, persona: { emoji: '🪼', name }, source: 'topic', ts: 1 });
+  const live = [mk(111, 'Sứa', shortConvoHash(111)), mk(222, 'Sứa 2', 'a1'), mk(333, 'Mèo', 'b1'), mk(444, 'Mèo', 'b2')];
+  assert.equal(resolveSingleSteerTarget('Sứa', live).match.convoId, '111');
+  assert.equal(resolveSingleSteerTarget('Sứa 2', live).match.convoId, '222');
+  assert.equal(resolveSingleSteerTarget('“Sứa 2”', live).match.convoId, '222');
+  assert.equal(resolveSingleSteerTarget('#' + shortConvoHash(111), live).match.convoId, '111');
+  assert.equal(resolveSingleSteerTarget('111', live).match.convoId, '111');
+  assert.match(resolveSingleSteerTarget('Nobody', live).error, /not found/);
+  assert.match(resolveSingleSteerTarget('Mèo', live).error, /ambiguous \(#b1, #b2\) — dùng #hashtag/);
+  assert.ok(resolveSingleSteerTarget('convo:', live).error);
+  assert.ok(resolveSingleSteerTarget('  ', live).error);
 });

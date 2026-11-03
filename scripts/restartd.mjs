@@ -13,7 +13,22 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
+import crypto from 'node:crypto';
+import { fileURLToPath } from 'node:url';
 import { isMainModule } from './is-direct-run.mjs';
+import { acquireHelperLock } from './machine-lock.mjs';
+import { unquoteTarget } from './agent-target.mjs';
+import { readTopicsStore } from './topics-store.mjs';
+import { readProjectsConfig } from './projects-config.mjs';
+import { listSteerableTargets } from './handover.mjs';
+import { resolveSingleSteerTarget, groupChatIds } from './steer.mjs';
+import { loadEnvFromFile } from './send-telegram.mjs';
+import { formatPersona } from './persona.mjs';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const ENV_FILE = path.join(__dirname, '..', '.env');
+/** The one-shot "tell this agent the daemon is back" request (daemon.mjs `takeRestartNotify`). */
+export const RESTARTD_NOTIFY_FILE = path.join(__dirname, 'tmp', 'restartd-notify.json');
 
 /** The service leaf + cgroup path of a /proc/<pid>/cgroup body, or null. Pure. */
 export function serviceFromCgroup(text) {
@@ -62,6 +77,7 @@ export function claudesInCgroup(cgroupPath, { root = '/sys/fs/cgroup', procDir =
 export function runRestartd({
   force = false, ppid = process.ppid,
   readFile = read, exec = execFileSync, listClaudes = (cg) => claudesInCgroup(cg),
+  beforeRestart = null, onRestartFailed = null, // RFC 33: write / roll back the notify file
 } = {}) {
   const svc = serviceFromCgroup(readFile(`/proc/${ppid}/cgroup`) || readFile('/proc/self/cgroup'));
   if (!svc) return { error: 'the daemon is not running as a systemd service — restart it by hand (node scripts/daemon.mjs --stop, then start it again).' };
@@ -73,16 +89,79 @@ export function runRestartd({
   }
   const safe = checkRestartSafety({ killMode, claudes: claudes || [], force });
   if (safe.error) return safe;
+  try { if (beforeRestart) beforeRestart(); } catch (e) { return { error: `cannot record the restart notice: ${e?.message ?? e}` }; }
   try {
     exec('systemctl', ['--user', '--no-block', 'restart', svc.unit], { stdio: 'ignore' });
   } catch (e) {
-    return { error: `systemctl restart ${svc.unit} failed: ${e?.message ?? e}` };
+    let cleanup = '';
+    try { if (onRestartFailed) onRestartFailed(); } catch (c) { cleanup = ` · không xoá được file báo: ${c?.message ?? c}`; }
+    return { error: `systemctl restart ${svc.unit} failed: ${e?.message ?? e}${cleanup}` };
   }
   return { ok: true, message: `🔄 restarting ${svc.unit} (KillMode=${killMode || '?'})… check with /help or /ls in a few seconds.` };
 }
 
+/** `--force` anywhere; the rest (joined, outer quotes off) is ONE target; any other `-…` token is an error. Pure. */
+export function parseRestartdArgs(argv) {
+  let force = false;
+  const words = [];
+  for (const a of argv) {
+    if (a === '--force') force = true;
+    else if (String(a).startsWith('-')) return { error: `cờ lạ ${a} — dùng /restartd [<đích>] [--force].` };
+    else words.push(a);
+  }
+  return { force, target: unquoteTarget(words.join(' ').trim()) };
+}
+
+const REAL_FS = { readFileSync: fs.readFileSync, writeFileSync: fs.writeFileSync, renameSync: fs.renameSync, unlinkSync: fs.unlinkSync, mkdirSync: fs.mkdirSync };
+
+/**
+ * The whole `/restartd` command (RFC 33). Everything is injectable; returns { ok, message } | { error }.
+ */
+export async function restartdCommand(argv, {
+  fsx = REAL_FS, notifyFile = RESTARTD_NOTIFY_FILE, now = Date.now, newId = () => crypto.randomBytes(8).toString('hex'),
+  acquireLock = () => acquireHelperLock('restartd', { waitMs: 0 }),
+  loadLive = () => listSteerableTargets(readTopicsStore(), groupChatIds(readProjectsConfig(), loadEnvFromFile(ENV_FILE))),
+  gitHead = (exec = execFileSync) => { try { return String(exec('git', ['-C', path.join(__dirname, '..'), 'rev-parse', '--short', 'HEAD'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })).trim() || null; } catch { return null; } },
+  ...run
+} = {}) {
+  const args = parseRestartdArgs(argv);
+  if (args.error) return { error: args.error };
+  const release = await acquireLock();
+  if (!release) return { error: 'đang có /restartd khác.' };
+  try {
+    let match = null;
+    if (args.target) {
+      const r = resolveSingleSteerTarget(args.target, loadLive());
+      if (r.error) return { error: r.error };
+      match = r.match;
+    }
+    // Every /restartd drops a stale request first, so an old intent is never picked up.
+    try { fsx.unlinkSync(notifyFile); } catch (e) { if (e?.code !== 'ENOENT') return { error: `không xoá được file notify cũ (${e?.message ?? e}) — không restart.` }; }
+    const id = newId();
+    const hooks = !match ? {} : {
+      beforeRestart: () => {
+        fsx.mkdirSync(path.dirname(notifyFile), { recursive: true });
+        const tmp = `${notifyFile}.${process.pid}.tmp`;
+        fsx.writeFileSync(tmp, JSON.stringify({ id, convoId: Number(match.convoId), at: now(), fromCommit: gitHead() }), { mode: 0o600 });
+        fsx.renameSync(tmp, notifyFile);
+      },
+      onRestartFailed: () => { // only our own request: a later /restartd may have replaced the file
+        let mine = false;
+        try { mine = JSON.parse(fsx.readFileSync(notifyFile, 'utf8')).id === id; } catch { /* gone or replaced by junk: not ours to delete */ }
+        if (!mine) return;
+        try { fsx.unlinkSync(notifyFile); } catch (e) { if (e?.code !== 'ENOENT') throw e; }
+      },
+    };
+    const r = runRestartd({ force: args.force, ...hooks, ...run });
+    if (r.error || !match) return r;
+    const label = `${match.persona ? `${formatPersona(match.persona)} ` : ''}(#${match.hashtag})`;
+    return { ...r, message: `${r.message} · sẽ báo ${label} ở lần khởi động tới` };
+  } finally { release(); }
+}
+
 if (isMainModule(import.meta.url)) {
-  const r = runRestartd({ force: process.argv.includes('--force') });
+  // The daemon tokenizes the command text; a multi-word target arrives as several tokens and is re-joined here.
+  const r = await restartdCommand(process.argv.slice(2));
   console.log(r.error ? `❌ ${r.error}` : r.message);
   process.exit(r.error ? 1 : 0);
 }
