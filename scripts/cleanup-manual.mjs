@@ -215,6 +215,7 @@ export async function probeManual(target, {
     const statusV1 = await git(['status', '--porcelain=v1', '-z', '--untracked-files=all', '--ignored=matching', '--no-renames']);
     const st = parseStatusEntries(statusV1);
     const trackedPaths = [...new Set(st.tracked.map((t) => t.p))];
+    if (trackedPaths.length > maxFiles) return { ok: false, limit: true, path: shown, reason: `phần cần sao lưu quá lớn (${trackedPaths.length} file đã track bị sửa) — xử lý tay` };
     const blocks = await hardBlocks(L, deps, { realParent, nested: true, maxEntries, trackedPaths });
     if (headNow !== wt.head) blocks.push('HEAD vừa đổi');
     if (blocks.length) return { ok: false, hard: true, path: shown, reason: blocks.join('; '), blocks };
@@ -515,6 +516,18 @@ export async function verifyBackup(dir, p, deps) {
 
 // ── remove (§2.3) ────────────────────────────────────────────────────────────
 
+export const REMOVING_MARKER = 'removing.json';
+/** The backup dir (under `root`) whose removal of `wtPath` started but never reported → its path, or null. */
+export function findRemovingBackup(root, wtPath) {
+  try {
+    for (const e of fs.readdirSync(root, { withFileTypes: true })) {
+      if (!e.isDirectory()) continue;
+      try { const m = JSON.parse(fs.readFileSync(path.join(root, e.name, REMOVING_MARKER), 'utf8')); if (m?.path === wtPath) return path.join(root, e.name); } catch {}
+    }
+  } catch {}
+  return null;
+}
+
 const rmDir = (d) => { try { fs.rmSync(d, { recursive: true, force: true }); } catch {} };
 
 /**
@@ -535,15 +548,25 @@ export async function manualRemove(target, { expectFingerprint, backupDir = MANU
     // the late probe: fast (no gh / du), immediately before the removal
     const p2 = await probeManual(target, { ...probeOpts, deps, fast: true });
     if (!p2.ok) { rmDir(dir); return slim(p2); }
-    if (p2.fingerprint !== p1.fingerprint) { rmDir(dir); return { ok: false, changed: true, path: p2.path, probe: slim(p2), note: '⚠️ worktree đã thay đổi trong lúc sao lưu' }; }
+    if (p2.fingerprint !== p1.fingerprint) {
+      rmDir(dir); dir = null;
+      // the fast probe has no inventory: the table the owner sees again must come from a FULL probe
+      const full = await probeManual(target, { ...probeOpts, deps });
+      if (!full.ok) return slim(full);
+      return { ok: false, changed: true, path: full.path, probe: slim(full), note: '⚠️ worktree đã thay đổi trong lúc sao lưu' };
+    }
   } catch (e) {
     if (dir) rmDir(dir);
     return { ok: false, path: p1.path, backupFailed: true, reason: `sao lưu lỗi, chưa xoá gì: ${firstLine(e)}` };
   }
+  // If this process is killed mid-removal, this marker tells the daemon which backup belongs to the half-removed tree.
+  const marker = path.join(dir, REMOVING_MARKER);
+  try { fs.writeFileSync(marker, JSON.stringify({ path: p1.path, at: Date.now() }), { mode: 0o600 }); } catch {}
   try {
     await deps.exec('git', ['-C', p1.main, 'worktree', 'remove', '--force', p1.path]);
     try { await deps.exec('git', ['-C', p1.main, 'worktree', 'prune']); } catch {}
-  } catch (e) { return { ok: false, removeFailed: true, path: p1.path, backupDir: dir, reason: `git worktree remove lỗi: ${firstLine(e)}` }; }
+  } catch (e) { try { fs.rmSync(marker, { force: true }); } catch {} return { ok: false, removeFailed: true, path: p1.path, backupDir: dir, reason: `git worktree remove lỗi: ${firstLine(e)}` }; }
+  try { fs.rmSync(marker, { force: true }); } catch {}
   deps.log(`removed ${p1.path} (manual, backup ${dir})`);
   return { ok: true, path: p1.path, branch: p1.branch, backupDir: dir, bytes: p1.bytes };
 }

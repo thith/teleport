@@ -27,8 +27,8 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { claimRequests, deliverResult } from './merge-inbox.mjs';
 import { CLEANUP_REQUEST_DIR } from './cleanup-request.mjs';
-import { cleanupRequested, fmtGB, CLEANUP_OFFER_DIR } from './cleanup.mjs';
-import { manualCommand } from './cleanup-manual.mjs';
+import { cleanupRequested, fmtGB, CLEANUP_OFFER_DIR, MANUAL_BACKUP_DIR } from './cleanup.mjs';
+import { manualCommand, findRemovingBackup } from './cleanup-manual.mjs';
 import { launchCleanup } from './cleanup-launch.mjs';
 import { acquireLock, LOCK_DIR } from './machine-lock.mjs';
 
@@ -603,6 +603,10 @@ async function confirmRemove(c) {
       ...(o.acquire ? { acquire: o.acquire } : {}),
     });
   } catch (e) { v = { ok: false, childError: true, reason: String(e?.message ?? e) }; }
+  if (v?.childError) { // killed / crashed: if it was already inside `git worktree remove`, the tree may be half gone — point at the backup
+    const bk = findRemovingBackup(o.backupDir ?? MANUAL_BACKUP_DIR, entry.path);
+    if (bk) { v = { ok: false, removeFailed: true, backupDir: bk, reason: `tiến trình xoá bị dừng giữa chừng (${v.reason || 'lỗi'})` }; }
+  }
   if (v?.busy || v?.childError) { await retryButtons(c, busyNote, confirmButtons); return; }
   const deliver = o.deliver ?? deliverResult;
   const tell = async (text, ok) => entry.convoId && deliver({ convoId: entry.convoId, text, ok, path: entry.path }, { build: buildCleanupResultPrompt }).catch(() => {});

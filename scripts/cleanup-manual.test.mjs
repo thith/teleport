@@ -959,3 +959,72 @@ test('R11: git worktree remove failing after the backup → the message names th
   assert.ok(fs.readdirSync(w.backups).length === 1, 'the backup is kept');
   assert.match(h.delivered.at(-1).cleanupResult.text, /restore\.sh/);
 });
+
+// ── code review round 2 ─────────────────────────────────────────────────────
+
+test('R2-1: a change after the backup re-offers a table with the REAL inventory (full probe, not the fast one)', async () => {
+  const w = world();
+  const a = w.add('feat-late');
+  write(path.join(a.path, 'n.txt'), 'one');
+  write(path.join(a.path, 'b.txt'), 'edited');
+  const p = await probe(w, a.path);
+  const r = await manualRemove(a.path, { parentDir: w.parent, deps: deps(), expectFingerprint: p.fingerprint, backupDir: w.backups,
+    hooks: { afterBackup: () => write(path.join(a.path, 'n2.txt'), 'two') } });
+  assert.equal(r.changed, true);
+  assert.match(r.note, /trong lúc sao lưu/);
+  assert.equal(r.probe.tracked.count, 1);
+  assert.equal(r.probe.entryCount, 2);
+  assert.ok(r.probe.bytes > 0);
+  const t = formatManualTable(r.probe, { mode: 'manual', stage: 'confirm', path: r.probe.path, branch: 'feat-late', createdAt: 1 });
+  assert.match(t, /• 1 file đã track bị sửa: b\.txt/);
+  assert.match(t, /• 2 mục ngoài git: n\.txt, n2\.txt/);
+  assert.doesNotMatch(t, /không mất gì|sao lưu 0 B/);
+  assert.deepEqual(fs.readdirSync(w.backups), []);
+});
+
+test('R2-2: tracked changes alone over the limit → limit, no tar entries needed', async () => {
+  const w = world();
+  const a = w.add('feat-trk');
+  write(path.join(a.path, 'a.txt'), 'x'); write(path.join(a.path, 'b.txt'), 'y'); write(path.join(a.path, 'README.md'), 'z');
+  assert.equal((await probe(w, a.path, { maxFiles: 3 })).ok, true);
+  const r = await probe(w, a.path, { maxFiles: 2 });
+  assert.equal(r.limit, true);
+  assert.match(r.reason, /quá lớn/);
+});
+
+test('R2-3: the child dies during git worktree remove → the owner is pointed at the backup + restore.sh, no buttons', async () => {
+  const w = world();
+  const a = w.add('feat-kill');
+  write(path.join(a.path, 'n.txt'));
+  const h = harness(w);
+  const d = deps();
+  let markerSeen = false;
+  // the remove "hangs": the marker must already be on disk then; the injected runManual reports a watchdog kill afterwards
+  const killing = { ...d, exec: async (cmd, args, o) => {
+    if (cmd === 'git' && args.includes('remove')) { markerSeen = fs.readdirSync(w.backups).some((n) => fs.existsSync(path.join(w.backups, n, 'removing.json'))); throw Object.assign(new Error('killed'), { killed: true }); }
+    return d.exec(cmd, args, o);
+  } };
+  const { tok, text } = seedCm(h, a);
+  await handleCleanupButton(press(`cm:${tok}`, text), h.ctx, h.o);
+  const t1 = h.edits.at(-1);
+  // run the real manual-remove with the killing exec, but leave the marker in place and report a child error (as the watchdog does)
+  const runner = async (cmd, target, opts) => {
+    await manualCommand(cmd, target, { ...opts, deps: killing });
+    const bk = path.join(w.backups, fs.readdirSync(w.backups)[0]);
+    fs.writeFileSync(path.join(bk, 'removing.json'), JSON.stringify({ path: a.path, at: Date.now() })); // the real run killed before it could delete it
+    return { ok: false, childError: true, reason: 'quá thời gian, đã dừng tiến trình' };
+  };
+  await handleCleanupButton(press(t1.rows[0][0].callback_data, t1.t), h.ctx, { ...h.o, runManual: runner });
+  assert.equal(markerSeen, true, 'removing.json is written before git worktree remove');
+  const last = h.edits.at(-1);
+  assert.match(last.t, /worktree có thể đã bị xoá một phần\. Sao lưu: .* · khôi phục: bash .*restore\.sh/);
+  assert.deepEqual(last.rows, []);
+  assert.doesNotMatch(last.t, /bấm lại/);
+  // and on a normal success the marker is gone
+  const b = w.add('feat-ok2');
+  write(path.join(b.path, 'm.txt'));
+  const pb = await probe(w, b.path);
+  const ok = await manualRemove(b.path, { parentDir: w.parent, deps: deps(), expectFingerprint: pb.fingerprint, backupDir: w.backups });
+  assert.equal(ok.ok, true, ok.reason);
+  assert.equal(fs.existsSync(path.join(ok.backupDir, 'removing.json')), false);
+});
