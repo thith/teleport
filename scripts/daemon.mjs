@@ -238,16 +238,24 @@ export function daemonStatus(pidFile = PID_FILE) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-/** Every scope a "/" command menu can be set at; the owner's own chat is added when known. */
-export function menuScopes(daemonUserId) {
+/**
+ * Every scope a "/" command menu can be set at: the 4 broad ones, the owner's own chat, and each configured group
+ * (chat + chat_administrators, which override the broad scopes). Telegram can't list per-chat overrides, so groups we
+ * don't know are out of reach; teleport never set per-language menus, so language_code is not swept.
+ */
+export function menuScopes(daemonUserId, groupIds = []) {
   const scopes = [{ type: 'default' }, { type: 'all_private_chats' }, { type: 'all_group_chats' }, { type: 'all_chat_administrators' }];
   if (daemonUserId) scopes.push({ type: 'chat', chat_id: Number(daemonUserId) });
+  for (const g of new Set((groupIds || []).map(String))) {
+    if (!/^-\d+$/.test(g)) continue;
+    scopes.push({ type: 'chat', chat_id: Number(g) }, { type: 'chat_administrators', chat_id: Number(g) });
+  }
   return scopes;
 }
 
 /** Clear the bot's Telegram "/" menu at every scope (commands still work when typed). A failing scope is logged, the rest still run. */
-export async function clearBotMenus(ui, daemonUserId) {
-  for (const scope of menuScopes(daemonUserId)) {
+export async function clearBotMenus(ui, daemonUserId, groupIds = []) {
+  for (const scope of menuScopes(daemonUserId, groupIds)) {
     try { await ui.deleteCommands(scope); }
     catch (e) { console.error(`[daemon] deleteMyCommands ${JSON.stringify(scope)}: ${e?.message ?? e}`); }
   }
@@ -336,7 +344,7 @@ async function main() {
     // (RFC 24 stop report: failures must be seen, to retry; "message is not modified" counts as done)
     editButtonRowsStrict: (chatId, messageId, text, rows) => tg('editMessageText', { chat_id: chatId, message_id: messageId, text, reply_markup: { inline_keyboard: rows }, link_preview_options: { is_disabled: true } }).catch((e) => { if (!/not modified/i.test(e?.message || '')) throw e; }),
   };
-  clearBotMenus(linkMergeUi, daemonUserId);
+  clearBotMenus(linkMergeUi, daemonUserId, groupAdminIds);
   // Pending buttons (merge previews, manual cleanups) survive a restart.
   pendingMergeButtons = new PersistentMap();
   // RFC 24: owner-requested build stops run on their own short timer (not the 60 s heartbeat); jobs survive a restart.

@@ -406,6 +406,9 @@ test('clearBotMenus: deleteCommands for every scope, including the owner chat', 
   const noOwner = [];
   await clearBotMenus({ deleteCommands: async (sc) => { noOwner.push(sc); } }, '');
   assert.equal(noOwner.length, 4);
+  const withGroups = [];
+  await clearBotMenus({ deleteCommands: async (sc) => { withGroups.push(sc); } }, '12345', ['-100777', '-100777', 'junk']);
+  assert.deepEqual(withGroups.slice(5), [{ type: 'chat', chat_id: -100777 }, { type: 'chat_administrators', chat_id: -100777 }], 'each configured group once; non-group ids skipped');
 });
 
 test('clearBotMenus: continues after one scope throws', async () => {
