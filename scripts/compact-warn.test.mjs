@@ -4,7 +4,7 @@ import path from 'node:path';
 import fs from 'node:fs';
 import os from 'node:os';
 import {
-  compactWindowFor, compactWarnNeed, compactWarnTick, buildCompactWarnPrompt, createWarnStore, makeSettingsReader, COMPACT_WARN_PCT, WARNED_TTL_MS,
+  compactWindowFor, compactWarnNeed, compactWarnTick, buildCompactWarnPrompt, createWarnStore, makeSettingsReader, COMPACT_WARN_MARGIN, AUTO_COMPACT_RESERVE, warnAt, WARNED_TTL_MS,
 } from './compact-warn.mjs';
 import { uuidToConvoInt } from './convo-registry.mjs';
 
@@ -21,7 +21,11 @@ const HOME = '/home/u';
 const gset = (o) => ({ [`${HOME}/.claude/settings.json`]: JSON.stringify(o) });
 const win = (files, a = {}) => compactWindowFor({ home: HOME, fsx: memFs(files), model: 'claude-opus-4-5', cwd: '/w/proj', hashtag: 'ab12', ...a });
 
-test('threshold constant is 94%', () => assert.equal(COMPACT_WARN_PCT, 0.94));
+test('threshold constants: warn at window − 40k, reserve 33k', () => {
+  assert.equal(COMPACT_WARN_MARGIN, 40_000);
+  assert.equal(AUTO_COMPACT_RESERVE, 33_000);
+  assert.equal(warnAt(250_000), 210_000);
+});
 
 test('compactWindowFor: teleport override wins (hashtag, #hashtag, model); out of range ignored', () => {
   const cfg = { _config: { compactWindows: { '#ab12': 250000 } } };
@@ -76,22 +80,30 @@ test('makeSettingsReader caches by mtime', () => {
   m = 2; r('/f'); assert.equal(reads, 2);
 });
 
-test('compactWarnNeed: once at >=94%, reset on compacted or <80%, unknown x/y changes nothing', () => {
+test('compactWarnNeed: once at >= window−40k, reset on compacted or < 0.8·warnAt, unknown x/y changes nothing', () => {
   const y = 250000;
   const n = (o) => compactWarnNeed({ y, ...o });
-  assert.deepEqual(n({ x: 0.93 * y }), { warn: false, clear: false });
-  assert.deepEqual(n({ x: 0.94 * y }), { warn: true, clear: false });
-  assert.deepEqual(n({ x: 0.99 * y, warned: true }), { warn: false, clear: false }, 'only once');
-  assert.deepEqual(n({ x: 0.85 * y, warned: true }), { warn: false, clear: false }, 'between 80% and 94% keeps the mark');
-  assert.deepEqual(n({ x: 0.79 * y, warned: true }), { warn: false, clear: true });
+  assert.deepEqual(n({ x: 209_999 }), { warn: false, clear: false });
+  assert.deepEqual(n({ x: 210_000 }), { warn: true, clear: false });
+  assert.deepEqual(n({ x: 240_000, warned: true }), { warn: false, clear: false }, 'only once');
+  assert.deepEqual(n({ x: 170_000, warned: true }), { warn: false, clear: false }, 'above 0.8·210k=168k keeps the mark');
+  assert.deepEqual(n({ x: 167_000, warned: true }), { warn: false, clear: true });
   assert.deepEqual(n({ x: 8000, compacted: true, warned: true }), { warn: false, clear: true });
   assert.deepEqual(n({ x: null, warned: true }), { warn: false, clear: false });
-  assert.deepEqual(n({ x: 0.99 * y, y: null }), { warn: false, clear: false });
+  assert.deepEqual(n({ x: 240_000, y: null }), { warn: false, clear: false });
+});
+
+test('compactWarnNeed: small window (100k) warns at 60k and does not clear at 70k once warned', () => {
+  const n = (o) => compactWarnNeed({ y: 100_000, ...o });
+  assert.deepEqual(n({ x: 59_999 }), { warn: false, clear: false });
+  assert.deepEqual(n({ x: 60_000 }), { warn: true, clear: false });
+  assert.deepEqual(n({ x: 70_000, warned: true }), { warn: false, clear: false });
+  assert.deepEqual(n({ x: 47_000, warned: true }), { warn: false, clear: true });
 });
 
 test('buildCompactWarnPrompt: exact wording, daemon-framed, infoOnly', () => {
   const p = buildCompactWarnPrompt({ convoId: 7, chatId: -1, x: 238000, y: 250000 });
-  assert.equal(p.text, '🤖 Teleport daemon: context ~238k/250k, sắp auto compact (sẽ compact khi context chạm 250k). Lưu lại state cần thiết.');
+  assert.equal(p.text, '🤖 Teleport daemon: context ~238k/250k, sắp auto compact (sẽ compact khi context chạm ~217k). Lưu lại state cần thiết.');
   assert.equal(p.infoOnly, true);
   assert.equal(p.fromRole, 'daemon');
   assert.equal(p.messageId, null);
