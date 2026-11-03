@@ -39,7 +39,7 @@ import { fileURLToPath } from 'node:url';
 import { isMainModule } from './is-direct-run.mjs';
 import { uuidToConvoInt } from './convo-registry.mjs';
 import { shortConvoHash } from './convo-hash.mjs';
-import { normalizeAgentName, parseAgentTarget, unquoteTarget, resolveTail, HASHTAG_RE } from './agent-target.mjs';
+import { normalizeAgentName, filterByAgentName, parseAgentTarget, unquoteTarget, resolveTail, HASHTAG_RE } from './agent-target.mjs';
 import { createListenerStatus } from './listener-status.mjs';
 import { countUnread } from './mailbox.mjs';
 import { typeTargets, lsLinks, screenWindowCount } from './type-cmd.mjs';
@@ -117,7 +117,7 @@ Manage sessions (interactive/screen only):
                      then EVERY claude process of this user (pid, cwd, tty, uptime,
                      screen or terminal, session id + #hashtag) — incl. hand-opened ones.
                      Add --short for one line per agent (what \`teleport ls\` runs).
-  --attach [<id>]    re-attach; <id> = 3-char tail (116), #hashtag, persona name, or tele-name.
+  --attach [<id>]    re-attach; <id> = 3-digit tail (116), #hashtag, persona name, or tele-name.
     (--resume)       Omit <id> when exactly one session is live. Detach: Ctrl-A D.
   --kill <id>        send /exit, wait up to ${KILL_GRACE_MS / 1000}s, then force-quit.
     (--quit)         Needs the FULL hashtag (no shortcuts — it's destructive).
@@ -601,10 +601,10 @@ const liveList = (ids) => liveScreens(ids).map(identityLabel).join(', ');
  * Resolve `--attach <raw>` against the LIVE sessions (convenience, RFC 03 follow-up; RFC 28):
  *  1. NO id → attach iff exactly ONE session is live. With ≥2 → require an id.
  *  2. `tele-…` = a SCREEN address: the exact screen name (case-insensitive), which must be ONE screen.
- *  3. Any other ADDRESS (`#x`, a hashtag shape, or exactly 3 chars `[A-Za-z0-9]`) = an AGENT address,
+ *  3. Any other ADDRESS (`#x`, a hashtag shape, or exactly 3 digits) = an AGENT address,
  *     resolved on the claude INSIDE each screen (agentIdentities) and never falling back to names:
  *     3 digits → resolveTail (no exact-hashtag shortcut: a screen `tele-780` must not shadow agent
- *     `#a1234780`); other 3 chars → an exact hashtag wins (Gemini `t12`), else the tail.
+ *     `#a1234780`); a short hashtag such as Gemini `t12` remains an exact hashtag.
  *  4. Anything else is a NAME (`Sứa`, `Robot 2`, `giun`): an exact screen name (`tele-<raw>` / `<raw>`)
  *     ∪ sessions whose persona (their own convo's) matches. ≥ 2 different → refuse and list.
  * A *given* id is always validated — a wrong id never silently attaches to the lone survivor.
@@ -626,7 +626,7 @@ export function resolveAttachTarget(raw, sessions, { personaOf = () => null, pro
   // (1) NO id → exactly one live session (a lone survivor), else require an id.
   if (!id) {
     if (sessions.length === 1) return { ok: true, name: sessions[0].name, pid: String(sessions[0].pid) };
-    return { error: `${sessions.length} live sessions — give an id (3-char tail, #hashtag or name): ${liveList(ids) || formatSessionList(sessions)}` };
+    return { error: `${sessions.length} live sessions — give an id (3-digit tail, #hashtag or name): ${liveList(ids) || formatSessionList(sessions)}` };
   }
 
   // (2) a screen address — never an agent lookup.
@@ -637,7 +637,7 @@ export function resolveAttachTarget(raw, sessions, { personaOf = () => null, pro
     if (hits.length > 1) return { error: `"${id}" matches ${hits.length} screens (${hits.map((s) => `${s.pid}.${s.name}`).join(', ')}) — rename one, or kill the stale one.` };
     return { ok: true, name: hits[0].name, pid: String(hits[0].pid) };
   }
-  const isAddress = id.startsWith('#') || HASHTAG_RE.test(id) || /^[A-Za-z0-9]{3}$/.test(id);
+  const isAddress = id.startsWith('#') || HASHTAG_RE.test(id) || /^\d{3}$/.test(id);
   const needProcs = () => (procsError ? { error: `cannot read the process list (${procsError}) — can't tell who is inside each screen. Use the exact screen name: tele-<hashtag>.` } : null);
 
   // (3) an agent address.
@@ -648,13 +648,7 @@ export function resolveAttachTarget(raw, sessions, { personaOf = () => null, pro
     const bare = id.replace(/^#/, '');
     const lid = bare.toLowerCase();
     let tag = lid;
-    if (!hashed && /^[A-Za-z0-9]{3}$/.test(bare) && !/^\d{3}$/.test(bare) && !ids.some((x) => x.hashtag === lid)) {
-      // 3 letters/digits that are no hashtag: an exact custom screen name (tele-bot) still answers to them.
-      const sc = sessions.filter((s) => s.name.toLowerCase() === `tele-${lid}`);
-      if (sc.length > 1) return { error: `"${bare}" matches ${sc.length} screens (${sc.map((s) => `${s.pid}.${s.name}`).join(', ')}) — rename one, or kill the stale one.` };
-      if (sc.length === 1) return done({ screen: sc[0].name, screenPid: String(sc[0].pid) });
-    }
-    if (!hashed && (/^\d{3}$/.test(bare) || (/^[A-Za-z0-9]{3}$/.test(bare) && !ids.some((x) => x.hashtag === lid)))) {
+    if (!hashed && /^\d{3}$/.test(bare)) {
       const t = resolveTail(lid, ids, identityLabel);
       if (t.error) return { error: t.error.replace('gõ hashtag đầy đủ', 'gõ #hashtag đầy đủ (hoặc tele-<tên screen>)') };
       if (t.none) return { error: `no session matching "${bare}". ${listing()}` };
@@ -1216,7 +1210,7 @@ export function matchProcsByName(name, rows, personaOf = () => null) {
   }
   const q = normalizeAgentName(name);
   if (!q) return { error: 'empty name.' };
-  const hits = rows.filter((r) => [r.name, personaOf(r)].some((n) => n && normalizeAgentName(n) === q));
+  const hits = filterByAgentName(name, rows, { persona: personaOf, session: (r) => r.name });
   const label = (r) => `PID ${r.pid}${r.name ? ` (${r.name})` : ''}`;
   if (hits.length === 1) return { pid: hits[0].pid, start: hits[0].procStart ?? null };
   if (!hits.length) return { error: `no claude process named "${name}" (see /ls for names).` };
@@ -1646,7 +1640,7 @@ if (isDirectRun) {
     try { name = normalizeSessionName(kill.raw); }
     catch (e) { console.error(`[spawn] ${e.message}`); process.exit(1); }
     if (!screenSessionExists(name)) {
-      console.error(`[spawn] no screen session "${name}" (try: teleport ls). NB: --kill needs the FULL hashtag — the 3-char tail / no-id shortcuts are --attach only (destructive, so kill stays explicit).`);
+      console.error(`[spawn] no screen session "${name}" (try: teleport ls). NB: --kill needs the FULL hashtag — the 3-digit tail / no-id shortcuts are --attach only (destructive, so kill stays explicit).`);
       process.exit(1);
     }
     // The screen's NAME is not proof of who is inside it: check the occupant first.

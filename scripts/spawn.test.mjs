@@ -488,7 +488,7 @@ test('resolveAttachTarget: ambiguous 3-char suffix → error listing matches', (
 
 test('resolveAttachTarget: 3-char suffix with no match → error', () => {
   const r = resolveAttachTarget('xyz', [S('c8630116'), S('a1234999')]);
-  assert.ok(r.error); assert.match(r.error, /no session matching "xyz"/);
+  assert.ok(r.error); assert.match(r.error, /no live session named "xyz"/);
 });
 
 test('resolveAttachTarget: full hashtag/#/tele- still works among many', () => {
@@ -1226,14 +1226,14 @@ test('resolveAttachTarget: persona names go through the real resolver — `Sứa
   assert.match(resolveAttachTarget('Cú', sessions, o).error, /no live session named "Cú"/, 'a 2-char Vietnamese name is a name, not an invalid id');
 });
 
-test('resolveAttachTarget: addresses never fall to a name — `#Ong`, `tele-Sứa`, `#`, and a 3-ASCII-char name is an address', () => {
+test('resolveAttachTarget: addresses never fall to a name — `#Ong`, `tele-Sứa`, `#`, and three-letter names stay names', () => {
   const sessions = [scr('f4451780', 10)];
   const o = { personaOf: (r) => (r.hashtag === 'ong' ? '🐝 Ong' : '🐝 Ong'), procs: [inRow('f4451780', 10)] };
   assert.match(resolveAttachTarget('#Ong', sessions, o).error, /no (live )?session/);
   assert.match(resolveAttachTarget('tele-Sứa', sessions, o).error, /invalid session id/);
   assert.match(resolveAttachTarget('tele-Ong', sessions, o).error, /no live session "tele-Ong"/);
   assert.match(resolveAttachTarget('#', [...sessions, scr('b2222222', 20)], o).error, /no (live )?session/, '`#` alone is never "no id"');
-  assert.match(resolveAttachTarget('Ong', sessions, o).error, /no session matching "Ong"/, '3 ASCII chars = address (hashtag/tail), even though Ong is the persona');
+  assert.equal(resolveAttachTarget('Ong', sessions, o).name, 'tele-f4451780', 'three letters match the persona name');
   assert.equal(resolveAttachTarget('Giun', sessions, { ...o, personaOf: () => '🪱 Giun' }).ok, true, '4+ chars: a name');
 });
 
@@ -1262,7 +1262,8 @@ test('resolveAttachTarget: `#x` is an EXACT hashtag — `#780` never selects #a1
   assert.match(resolveAttachTarget('#780', sessions, { procs }).error, /no live session "780"/);
   assert.equal(resolveAttachTarget('780', sessions, { procs }).name, 'tele-a1234780');
   assert.match(resolveAttachTarget('#abc', sessions, { procs }).error, /no live session "abc"/);
-  assert.equal(resolveAttachTarget('abc', sessions, { procs }).name, 'tele-c1111abc');
+  assert.match(resolveAttachTarget('abc', sessions, { procs }).error, /no live session named "abc"/, 'alphabetic suffixes are not shortcuts');
+  assert.match(resolveAttachTarget('1ab', [scr('c11111ab', 20)], {}).error, /no live session named "1ab"/, 'mixed alphanumeric suffixes are not shortcuts');
 });
 
 test('resolveKillTail: the pool is EVERY live claude row — a `claude -p` child on a colliding tail makes /kill refuse instead of picking the parent', () => {

@@ -8,11 +8,23 @@
 // exact address: callers never fall back to name matching on it. Real convoIds are ~16 digits, so a
 // bare 3-digit string is always a tail; `convo:780` names a short convoId explicitly.
 
+import { readFileSync } from 'node:fs';
+
+const PERSONA_ALIASES = JSON.parse(readFileSync(new URL('./persona-aliases.json', import.meta.url), 'utf8'));
+
 export const HASHTAG_RE = /^(?:[a-j]\d{7}|t\d+)$/i;
 
-/** Name → comparable form: drop emoji/symbols, collapse spaces, lowercase. */
-export function normalizeAgentName(s) {
+/** Name → comparable form WITHOUT alias expansion (session names, which are free text). */
+export function plainAgentName(s) {
   return String(s ?? '').normalize('NFC').replace(/[^\p{L}\p{N}\s]/gu, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+/** Persona name → comparable form, including ASCII persona aliases and numbered variants. */
+export function normalizeAgentName(s) {
+  const name = plainAgentName(s);
+  const [, base, ordinal = ''] = name.match(/^(.*?)( \d+)?$/);
+  // Only registered persona aliases are expanded; arbitrary session names keep their spelling.
+  return Object.hasOwn(PERSONA_ALIASES, base) ? PERSONA_ALIASES[base].toLowerCase() + ordinal : name;
 }
 
 /** Outer quotes (ASCII or a phone's curly ones) off a whole-rest target. Pure. */
@@ -61,4 +73,19 @@ export function resolveTail(value, identities, label = (x) => `#${x.hashtag}`) {
   if (tags.length === 1) return { hashtag: tags[0] };
   const names = [...new Set(hits.map(label))];
   return { error: `"${value}" khớp ${tags.length} agent: ${names.join(', ')} — gõ hashtag đầy đủ.` };
+}
+
+/**
+ * Rows `query` names, in two tiers: an exact (plain) match on the persona or the free-text session
+ * name wins; only if none, persona names compare through the ASCII aliases ("Tuoc" = "Tuộc"). A
+ * session name is never alias-expanded, so a session called "nam" never answers to the persona
+ * "Nấm", and `nam` still picks that session rather than going ambiguous. Pure.
+ */
+export function filterByAgentName(query, rows, { persona = (r) => r.persona, session = (r) => r.name } = {}) {
+  const q = plainAgentName(query);
+  if (!q) return [];
+  const exact = rows.filter((r) => [persona(r), session(r)].some((n) => n && plainAgentName(String(n).replace(/^[^\p{L}\p{N}]+\s*/u, '')) === q));
+  if (exact.length) return exact;
+  const nq = normalizeAgentName(query);
+  return rows.filter((r) => { const p = persona(r); return Boolean(p && normalizeAgentName(p) === nq); });
 }

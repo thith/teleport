@@ -18,7 +18,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { listClaudeProcs, parseSessionFile, inspectPid, SESSIONS_DIR } from './claude-procs.mjs';
-import { parseAgentTarget, normalizeAgentName, unquoteTarget, resolveTail } from './agent-target.mjs';
+import { parseAgentTarget, filterByAgentName, unquoteTarget, resolveTail } from './agent-target.mjs';
 export { unquoteTarget };
 import { createListenerStatus } from './listener-status.mjs';
 import { countUnread } from './mailbox.mjs';
@@ -181,10 +181,10 @@ export function findTypeTarget(query, rows, personaOf = () => null) {
   // Names: over the agents we can type into (a terminal namesake must not shadow a screen one).
   const names = (r) => [r.name, personaOf(r)].filter(Boolean);
   const strip = (s) => String(s).trim().replace(/^[^\p{L}\p{N}]+\s*/u, '').toLowerCase();
-  const lit = strip(t.value), norm = normalizeAgentName(String(t.value).replace(/_+/g, ' '));
+  const lit = strip(t.value), qName = String(t.value).replace(/_+/g, ' ');
   const byName = (pool) => {
     const a = pool.filter((r) => names(r).some((n) => strip(n) === lit));
-    return a.length ? a : pool.filter((r) => names(r).some((n) => normalizeAgentName(n) === norm));
+    return a.length ? a : filterByAgentName(qName, pool, { persona: personaOf, session: (r) => r.name });
   };
   const hits = byName(reachable);
   // A name hit still answers to its hashtag: a live twin anywhere (e.g. a terminal copy) → refuse.

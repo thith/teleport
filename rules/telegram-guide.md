@@ -252,6 +252,16 @@ Khi prompt có `instruct: true` → **MUST**:
 > **`instruct` (trả lời) ≠ `whisper` (im lặng).** Cùng inject-vào-topic-kín-với-nhóm, nhưng
 > whisper thì bạn *giấu & không đáp*, instruct thì bạn *đáp qua DM*. Đừng nhầm hai flag.
 
+## Persona names without Vietnamese accents
+
+Anywhere a command accepts a Vietnamese persona name, its ASCII alias also works:
+`sau` = `Sâu`, `soi` = `Sói`, `tien` = `Tiên`, `ca rong` = `Cà Rồng`.
+The 110 aliases live in `scripts/persona-aliases.json`; name matching is shared through
+`scripts/agent-target.mjs`. Numbered personas keep their suffix (`tien 2` = `Tiên 2`).
+Quote multi-word names where the command requires it. English translations are not aliases.
+Hashtags, three-digit suffixes, group scope, ambiguity checks, and command-specific
+restrictions still apply. The suffix shortcut is exactly three digits, never letters.
+
 ## ASK — hỏi/đáp giữa agent (RFC 10)
 
 Primitive inter-agent **thứ 3** (sau whisper, handover): **2 agent LIVE hỏi-đáp nhau để LẤY THÔNG TIN**, do **user kích**. Không chuyển việc, **không nâng quyền**. Đây là **ngoại lệ được phép** của rule "no cross-write" — kênh chính thức thay cho việc tự ý đọc/ghi topic khác.

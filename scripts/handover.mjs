@@ -41,7 +41,7 @@ function isWatchableConvoId(s) {
 }
 import { buildCombinedPromptData, resyncPromptSegments, DEFAULT_TMP_DIR, mergeOrSpoolPrompt } from './tele-listen.mjs';
 import { loadEnvFromFile, parseAdminChatIds, extractBotId } from './send-telegram.mjs';
-import { parseAgentTarget, resolveTail } from './agent-target.mjs';
+import { parseAgentTarget, resolveTail, normalizeAgentName } from './agent-target.mjs';
 import { buildSpawnPlan, runSpawn, genSessionSeed, listSpawnSessions, hasBinary } from './spawn.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -249,13 +249,11 @@ export function matchTarget(target, liveTopics) {
   } else if (target.kind === 'convoId') {
     hits = liveTopics.filter((t) => String(t.convoId) === target.value);
   } else {
-    // Persona names have ASCII initials, so plain toLowerCase() is correct and
-    // ICU-independent (and matches the hashtag casing rule in normalizeTarget).
     // RFC 14: skip alive-only (topic-less) entries here — persona names are
     // reused across the ~40-pair pool, so a name could resolve the wrong DM-only
     // session. Alive-only targets are reachable by hashtag/convoId (unique) only.
-    const want = target.value.toLowerCase();
-    hits = liveTopics.filter((t) => t.source !== 'alive' && t.persona && t.persona.name.toLowerCase() === want);
+    const want = normalizeAgentName(target.value);
+    hits = liveTopics.filter((t) => t.source !== 'alive' && t.persona && normalizeAgentName(t.persona.name) === want);
   }
   if (hits.length === 0) return { status: 'not_found' };
   if (hits.length === 1) return { status: 'found', match: hits[0] };

@@ -53,7 +53,7 @@ import { resolveConvoIdFromEnv, uuidToConvoInt, CONVO_ID_RE } from './convo-regi
 import { personaForConvo, formatPersona } from './persona.mjs';
 import { peekPersona } from './persona-store.mjs';
 import { shortConvoHash } from './convo-hash.mjs';
-import { parseAgentTarget, resolveTail } from './agent-target.mjs';
+import { parseAgentTarget, resolveTail, normalizeAgentName } from './agent-target.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -295,12 +295,13 @@ export function resolveRecipient(target, agents, { self = null } = {}) {
   }
 
   const isHashtag = t.kind === 'hashtag';
-  const want = String(t.kind === 'pid' ? raw : t.value).toLowerCase();
+  const name = t.kind === 'pid' ? raw : t.value;
+  const want = isHashtag ? String(name).toLowerCase() : normalizeAgentName(name);
   // A display name is `<emoji> <name>` ("🪱 Giun"); humans type the name alone, so
   // compare against both forms rather than depending on the `persona` object being
   // present on every row (registry rows carry it, transcript rows may not).
   const nameForms = (a) => [a.name, String(a.name ?? '').replace(/^\S+\s+/, ''), a.persona?.name]
-    .filter(Boolean).map((v) => String(v).toLowerCase());
+    .filter(Boolean).map(normalizeAgentName);
   const hits = isHashtag
     ? agents.filter((a) => String(a.hashtag ?? '').toLowerCase() === want)
     : agents.filter((a) => nameForms(a).includes(want));
