@@ -109,7 +109,7 @@ node ../teleport/scripts/cleanup-request.mjs <đường dẫn worktree | tên nh
 
 ## Xoá tay worktree (owner, RFC 30)
 
-Khi cleanup-request bị từ chối, tin DM cho owner có một nút **[🗑 Xoá tay]** (không có thì lý do nằm ở danh sách chặn cứng bên dưới). `/cleanup` (chỉ owner) cũng liệt kê mọi worktree dọn hằng ngày đang giữ lại, mỗi dòng một nút `[🗑 n]`; `/cleanup <đường dẫn | nhánh>` đi thẳng vào bước 1; `/cleanup run` và `/cleanup --dry-run` vẫn là lệnh dọn cũ (nút `[🧹 Dọn ngay]` cũng vậy).
+Khi cleanup-request bị từ chối, tin DM cho owner có một nút **[🗑 Xoá tay]** (không có thì lý do nằm ở danh sách chặn cứng bên dưới). `/cleanup` (chỉ owner) cũng liệt kê mọi worktree dọn hằng ngày đang giữ lại, mỗi dòng một nút `[🗑 n]`; `/cleanup <từ khoá>` chỉ hiện các dòng khớp (repo, thư mục hoặc nhánh, không phân biệt hoa thường; không khớp dòng nào thì tra đúng tên nhánh như cũ, cũng không có thì báo "Không có worktree nào khớp"); `/cleanup </đường dẫn | ~đường dẫn>` đi thẳng vào bước 1; `/cleanup run` và `/cleanup --dry-run` vẫn là lệnh dọn cũ (nút `[🧹 Dọn ngay]` cũng vậy).
 
 1. **Bấm nút:** daemon kiểm worktree (chỉ đọc, dưới lock `cleanup`) rồi sửa tin thành bảng "sẽ mất gì": thay đổi đã track (stage / chưa stage), file ngoài git, nhánh chưa push, dung lượng sao lưu, kèm dấu vân tay nội dung `🔑`.
 2. **Bấm ✅ Xoá:** daemon kiểm lại (vân tay đổi thì không xoá, hiện bảng mới), sao lưu vào `~/.local/state/teleport/cleanup-backups/<repo>-<nhánh>-<ngày giờ>-<hex>/` (giữ 7 ngày: `staged.patch`, `unstaged.patch`, `untracked.tgz`, `restore.sh`, `info.json`), kiểm lại bản sao lưu, kiểm muộn lần nữa, rồi `git worktree remove --force`. **Nhánh luôn giữ nguyên.** Khôi phục: `bash <thư mục sao lưu>/restore.sh`.

@@ -1044,7 +1044,7 @@ export async function dispatchCommand(parsed, from, {
       if (String(from?.id) !== String(daemonUserId)) { await sendText(daemonUserId, `❌ /${CLEANUP_COMMAND} chỉ owner dùng được.`); return; }
       const c = { daemonUserId, projectsConfig, sendText, secretEnvKeys, ...extra };
       const o = { parentDir, ...(extra.cleanupOpts || {}) };
-      if (cc.kind === 'list') await startCleanupList(c, o); else await startManualFor(cc.target, c, o);
+      if (cc.kind === 'list') await startCleanupList(c, o); else if (cc.kind === 'search') await startCleanupList(c, { ...o, search: cc.word }); else await startManualFor(cc.target, c, o);
       return;
     }
   }

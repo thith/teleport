@@ -9,7 +9,7 @@ import zlib from 'node:zlib';
 import { execFile, execFileSync, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { acquireLock } from './machine-lock.mjs';
-import { probeManual, manualRemove, writeBackup, verifyBackup, readTgz, buildRestoreScript, manualCommand, listKept, findNestedRepo } from './cleanup-manual.mjs';
+import { probeManual, manualRemove, writeBackup, verifyBackup, readTgz, buildRestoreScript, manualCommand, listKept, findNestedRepo, resolveManualTarget } from './cleanup-manual.mjs';
 import {
   handleCleanupButton, startCleanupList, startManualFor, parseCleanupCommand, formatManualTable, renderCleanupList, manualDigest, manualEntryMatchesMessage,
   baseOf, manualInFlight, CLEANUP_BUTTON_RE, childManual,
@@ -648,8 +648,50 @@ test('parseCleanupCommand: none → list; run / --dry-run → the old launcher; 
   assert.deepEqual(parseCleanupCommand('  '), { kind: 'list' });
   assert.deepEqual(parseCleanupCommand('run'), { kind: 'launch' });
   assert.deepEqual(parseCleanupCommand('--dry-run'), { kind: 'launch' });
-  assert.deepEqual(parseCleanupCommand('feat/x'), { kind: 'target', target: 'feat/x' });
+  assert.deepEqual(parseCleanupCommand('feat/x'), { kind: 'search', word: 'feat/x' });
+  assert.deepEqual(parseCleanupCommand(' sứa '), { kind: 'search', word: 'sứa' });
   assert.deepEqual(parseCleanupCommand(' /w/my dir/wt '), { kind: 'target', target: '/w/my dir/wt' });
+  assert.deepEqual(parseCleanupCommand('~/p/wt'), { kind: 'target', target: '~/p/wt' });
+});
+
+test('resolveManualTarget: ~/… expands to the home dir (a path, never a branch)', async () => {
+  assert.deepEqual(await resolveManualTarget('~/p/wt', { home: '/h/u', deps: { exec: async () => { throw new Error('no git'); } } }), { path: '/h/u/p/wt' });
+  assert.deepEqual(await resolveManualTarget('~', { home: '/h/u' }), { path: '/h/u' });
+});
+
+test('/cleanup <word>: filters the kept list, renumbers 1..k, header names the word, 🗑 n points at the right path', async () => {
+  const w = world();
+  w.add('feat-alpha'); const b = w.add('feat-Beta-one'); const c = w.add('fix-beta-two'); w.add('feat-gamma');
+  const h = harness(w);
+  await startCleanupList(h.ctx, { ...h.o, search: '  BETA ' });
+  assert.equal(h.sent.length, 1);
+  const m = h.sent[0];
+  assert.match(m.t, /^🧹 Worktree đang giữ, khớp "BETA" \(2\):/);
+  assert.match(m.t, /\n1\. repo\/repo-feat-Beta-one/);
+  assert.match(m.t, /\n2\. repo\/repo-fix-beta-two/);
+  assert.ok(!/alpha|gamma/.test(m.t.split('\n').slice(0, 4).join('\n')));
+  const [tok, entry] = [...h.store.entries()][0];
+  assert.deepEqual(Object.keys(entry.rows), ['1', '2']);
+  assert.equal(entry.rows[1].path, b.path);
+  assert.equal(entry.rows[2].path, c.path);
+  await handleCleanupButton(press(`cw:${tok}:2`, m.t), h.ctx, h.o);
+  assert.match(h.sent[1].t, /^🗑 Xoá tay .*repo-fix-beta-two /);
+});
+
+test('/cleanup <word>: no match in the list → the old exact target; no match anywhere → "Không có worktree nào khớp"', async () => {
+  const w = world();
+  w.add('feat-alpha');
+  const h = harness(w);
+  await startCleanupList(h.ctx, { ...h.o, search: 'zzz' });
+  assert.deepEqual(h.dms, ['🧹 Không có worktree nào khớp "zzz".']);
+  assert.equal(h.sent.length, 0);
+  // not in the kept list (stubbed list is empty) but an exact branch → the old table
+  const x = w.add('feat-exact');
+  const runManual = (c, t, o) => c === 'manual-list' ? Promise.resolve({ ok: true, rows: [], errors: [] }) : manualCommand(c, t, { ...o, deps: h.o.deps });
+  await startCleanupList(h.ctx, { ...h.o, runManual, search: 'feat-exact' });
+  assert.match(h.sent.at(-1).t, /^🗑 Xoá tay .*repo-feat-exact /);
+  assert.equal(h.store.size, 1);
+  assert.ok([...h.store.values()][0].path === x.path);
 });
 
 test('/cleanup list: the kept worktrees with their reason, §2.4 rows without a button, paging, [🧹 Dọn ngay]', async () => {
@@ -780,7 +822,9 @@ test('dispatchCommand /cleanup: the list and <target> are owner-only; run / --dr
   assert.match(h.dms.at(-1), /chỉ owner dùng được/);
   await dispatchCommand({ cmd: 'cleanup', rest: '' }, { id: 1 }, { ...base, runner });       // the owner → the list
   assert.match(h.sent.at(-1).t, /Worktree đang được giữ lại/);
-  await dispatchCommand({ cmd: 'cleanup', rest: 'feat-d' }, { id: 1 }, { ...base, runner });  // the owner → the table
+  await dispatchCommand({ cmd: 'cleanup', rest: 'feat-d' }, { id: 1 }, { ...base, runner });  // the owner, a word → the filtered list
+  assert.match(h.sent.at(-1).t, /giữ, khớp "feat-d" \(1\)/);
+  await dispatchCommand({ cmd: 'cleanup', rest: path.join(w.parent, 'repo-feat-d') }, { id: 1 }, { ...base, runner });  // a path → the table
   assert.match(h.sent.at(-1).t, /^🗑 Xoá tay /);
   assert.deepEqual(ran, []);
   await dispatchCommand({ cmd: 'cleanup', rest: 'run' }, { id: 2 }, { ...base, runner });     // the old launcher, any admin

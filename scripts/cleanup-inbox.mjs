@@ -453,7 +453,7 @@ export function renderCleanupList(e, tok) {
     const i = (e.info || {})[n] || {};
     return `${n}. ${esc(i.repo, 40)}/${esc(i.name, 60)} · ${esc(i.branch ?? '?', 60)} — ${esc(i.reason, 120)}${i.blocked ? ` · 🚫 không xoá tay được: ${esc(i.blocked, 120)}` : ''}`;
   });
-  const head = nums.length ? `🧹 Worktree đang được giữ lại (${nums.length})${pages > 1 ? ` — trang ${page + 1}/${pages}` : ''}:` : '🧹 Không có worktree nào đang được giữ lại.';
+  const head = nums.length ? `🧹 Worktree đang ${e.search ? `giữ, khớp "${esc(e.search, 60)}"` : 'được giữ lại'} (${nums.length})${pages > 1 ? ` — trang ${page + 1}/${pages}` : ''}:` : '🧹 Không có worktree nào đang được giữ lại.';
   const text = [head, ...lines, ...(slice.some((n) => !(e.info || {})[n]?.blocked) ? ['', 'Bấm 🗑 <số> để xem bảng "sẽ mất gì" trước khi xoá.'] : []), ...(e.errors || []).map((x) => `⚠️ ${esc(x, 200)}`), `🔑 ${manualDigest(e)}`].join('\n');
   const keys = slice.filter((n) => !(e.info || {})[n]?.blocked).map((n) => ({ text: `🗑 ${n}`, callback_data: `cw:${tok}:${n}` }));
   const rows = [];
@@ -705,12 +705,15 @@ export async function startCleanupList(ctx, o = {}) {
   const parentDir = o.parentDir;
   const r = await underLock(o, 'teleport daemon (cleanup list)', 'cleanup list', () => runManual('manual-list', null, { ...(parentDir ? { parentDir } : {}) }));
   if (r.busy || r.value?.childError || !r.value?.ok) { await sendText(daemonUserId, `⌛ /cleanup: ${r.value?.reason && !r.value.childError ? escapeControls(r.value.reason) : 'đang bận (đợt dọn khác đang chạy) — gõ lại sau'}`); return; }
+  const word = String(o.search ?? '').trim().toLowerCase();
+  const all = r.value.rows.filter((x) => !word || [x.repo, x.name, x.branch].some((v) => String(v ?? '').toLowerCase().includes(word)));
+  if (word && !all.length) { await startManualFor(String(o.search).trim(), ctx, { ...o, search: undefined, searchWord: String(o.search).trim() }); return; } // nothing in the list → the old exact target
   const rows = {}, info = {};
-  r.value.rows.slice(0, CLEANUP_LIST_MAX).forEach((x, i) => {
+  all.slice(0, CLEANUP_LIST_MAX).forEach((x, i) => {
     rows[i + 1] = { path: x.path, head: x.head };
     info[i + 1] = { repo: x.repo, name: x.name, branch: x.branch, reason: x.reason, blocked: x.blocked || null };
   });
-  const entry = { kind: 'cleanup', mode: 'list', rows, info, page: 0, createdAt: (o.now ?? Date.now)(), errors: (r.value.errors || []).slice(0, 5).map((x) => cut(x, 200)) };
+  const entry = { kind: 'cleanup', mode: 'list', rows, info, page: 0, createdAt: (o.now ?? Date.now)(), errors: (r.value.errors || []).slice(0, 5).map((x) => cut(x, 200)), ...(word ? { search: cut(String(o.search).trim(), 60) } : {}) };
   sweepCleanupEntries(buttonStore, entry.createdAt);
   const tok = newTok();
   const { text, rows: kb } = renderCleanupList(entry, tok);
@@ -728,13 +731,16 @@ export async function startManualFor(target, ctx, o = {}) {
   const r = await underLock(o, 'teleport daemon (cleanup manual)', `cleanup probe ${target}`,
     () => runManual('manual-probe', target, { resolve: true, ...(parentDir ? { parentDir } : {}) }));
   if (r.busy || r.value?.childError) { await sendText(daemonUserId, '⌛ /cleanup: đang bận (đợt dọn khác đang chạy) — gõ lại sau'); return; }
+  if (o.searchWord && !r.value?.ok && /^không thấy nhánh/.test(String(r.value?.reason ?? ''))) { await sendText(daemonUserId, `🧹 Không có worktree nào khớp "${escapeControls(o.searchWord)}".`); return; }
   await showProbe({ ctx, o, store: buttonStore, mode: 'new', base: { path: target, convoId: null, who: '/cleanup' }, audit: o.audit ?? auditCleanupRequest }, r.value);
 }
 
-/** `/cleanup` text after the command → 'list' | 'launch' (the old run / dry-run) | the target text. */
+/** `/cleanup` text after the command → 'list' | 'launch' (the old run / dry-run) | 'target' (a path: / or ~) | 'search' (a word). */
 export function parseCleanupCommand(rest) {
   const toks = String(rest || '').trim().split(/\s+/).filter(Boolean);
   if (!toks.length) return { kind: 'list' };
   if (toks.every((t) => t === '--dry-run' || t === 'run')) return { kind: 'launch' };
-  return { kind: 'target', target: String(rest).trim() };
+  const t = String(rest).trim();
+  if (t.startsWith('/') || t === '~' || t.startsWith('~/')) return { kind: 'target', target: t }; // a path
+  return { kind: 'search', word: t }; // a word: filter the kept list (no match → the old exact target)
 }
