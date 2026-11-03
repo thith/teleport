@@ -555,6 +555,28 @@ test('✅ on a reserved pid is refused (no kill); ✅ marks the kill pending whi
   assert.equal(runner.killsPending.size, 0);
 });
 
+test('a second ✅ while the first kill is still running is refused (one kill per pid)', async () => {
+  const { io } = qIo();
+  const runner = qRunner(io);
+  const text = '💀 #c2383556 · PID 644406 · rảnh\n\nKill';
+  const killed = [];
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  const kill = async (t) => { killed.push(t.pid); await gate; return 'ok'; };
+  const a = ui(), b = ui();
+  a.ctx.buttonStore.set('e'.repeat(16), { kind: 'type', target: TQ, chatId: 42, messageId: 100, createdAt: Date.now(), ops: ['y', 'x'] });
+  b.ctx.buttonStore.set('f'.repeat(16), { kind: 'type', target: TQ, chatId: 42, messageId: 100, createdAt: Date.now(), ops: ['y', 'x'] });
+  const first = handleTypeButton(cq(`ty:${'e'.repeat(16)}:y`, text), a.ctx, { runner, io, kill });
+  await new Promise((r) => setImmediate(r));
+  await handleTypeButton(cq(`ty:${'f'.repeat(16)}:y`, text), b.ctx, { runner, io, kill });
+  assert.match(b.calls.at(-1)[1], /đang kill bởi lần bấm khác/);
+  assert.equal(runner.reserve?.(TQ, 'q1') == null ? 'reserved' : 'refused', 'refused', 'q cannot reserve while a kill is pending');
+  release();
+  await first;
+  assert.deepEqual(killed, [644406]);
+  assert.equal(runner.killsPending.size, 0);
+});
+
 test('a second q while the first is still waiting is refused (one compact can\'t satisfy two watchers); reservation held through the wait', async () => {
   let release;
   const gate = new Promise((r) => { release = r; });

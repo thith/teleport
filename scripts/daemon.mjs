@@ -1479,6 +1479,12 @@ export async function handleTypeButton(cq, ctx, { runner = getTypeRunner(), list
       await ctx.editButtonRows(chatId, messageId, `${base}\n\n❌ agent đã đổi (${bad}) — không kill. Gõ /type lại.`, []);
       return;
     }
+    if (runner.killsPending?.has(t.pid)) { // a ✅ for this pid is already running — one at a time
+      audit('refused', { reason: 'kill-pending' });
+      await ctx.answerButton(cq.id, 'Đang kill rồi.');
+      await ctx.editButtonRows(chatId, messageId, `${base}\n\n⏳ đang kill bởi lần bấm khác — không làm gì.`, []);
+      return;
+    }
     if (runner.reserved?.has(t.pid)) { // RFC 35: a 🗜️→💀 owns this pid
       audit('refused', { reason: 'reserved' });
       await ctx.answerButton(cq.id, 'Đang compact→kill — không kill.');
@@ -1489,7 +1495,7 @@ export async function handleTypeButton(cq, ctx, { runner = getTypeRunner(), list
     try {
       audit('kill');
       await ctx.answerButton(cq.id, 'Đang kill…');
-      await ctx.editButtonRows(chatId, messageId, `${base}\n\n⏳ đang kill PID ${entry.target.pid}…`, []);
+      await ctx.editButtonRows(chatId, messageId, `${base}\n\n⏳ đang kill PID ${entry.target.pid}…`, []).catch(() => {});
       const out = await kill(entry.target, cq.from, ctx);
       await ctx.editButtonRows(chatId, messageId, `${base}\n\n${out}`, []);
     } finally { runner.killsPending?.delete(t.pid); }
