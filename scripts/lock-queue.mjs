@@ -3,6 +3,14 @@
 //   node ../teleport/scripts/lock-queue.mjs ls [--lock build]
 //   node ../teleport/scripts/lock-queue.mjs leave [--lock build] [--all | --pid N]
 //   node ../teleport/scripts/lock-queue.mjs slots [1|auto]     (owner: build slots, RFC 23)
+//   node ../teleport/scripts/lock-queue.mjs ls --ids            (also each ticket's file name + owner)
+//   node ../teleport/scripts/lock-queue.mjs max <n|off> | retry <phút> | kick <vé> | top <vé>
+//        | block <owner|vé> <30m|1h|2h30m|today> | unblock <owner> | pause | resume   (owner's queue control, RFC 29)
+//
+// RFC 29 — the owner's build-queue controls (also on Telegram: /q). These subcommands are for an
+// agent acting on the OWNER's word: the caller checks its own role (admin/maintainer), like `leave --pid`.
+// <vé> = a ticket file name from `ls --ids`; <owner> = `convo:<id>` (or a ticket name → its owner).
+// Exit 0 done, 1 refused/failed.
 //
 // `leave` strikes waiting tickets (renames them to `.left`): by default the
 // tickets of THIS agent's convo started in THIS worktree (subagents share the
@@ -17,14 +25,16 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { LOCK_DIR, readQueue, readHolder, readHolders, queueOrder, readServed, hasLegacyWaiter, cancelTickets, selfConvoId, describeHolder, readStruck, readClaimed, worktreeOf, slotsFor, slotFiles, memTotal, TWO_SLOT_MIN_RAM } from './machine-lock.mjs';
+import { LOCK_DIR, readQueue, readHolder, readHolders, queueOrder, readServed, hasLegacyWaiter, cancelTickets, selfConvoId, describeHolder, readStruck, readClaimed, worktreeOf, slotsFor, slotFiles, memTotal, TWO_SLOT_MIN_RAM, recordOwner } from './machine-lock.mjs';
+import { readPolicy, parseDuration, MAX_QUEUE_LIMIT } from './build-policy.mjs';
+import { setMax, setRetry, setPaused, kickTicket, topTicket, blockOwner, unblockOwner, blockPlan } from './queue-control.mjs';
 import { isMainModule } from './is-direct-run.mjs';
 
 export const LOCK_NAMES = ['build', 'merge', 'cleanup'];
 export const LIST_MAX = 10;
 
 const mins = (ms) => Math.max(0, Math.round(ms / 60000));
-const STATUS_TEXT = { live: 'chờ', stalled: 'kẹt (mất nhịp tim)', stopped: 'bị dừng (ctrl-Z)', left: 'đã gạch (đang rời)' };
+const STATUS_TEXT = { live: 'chờ', stalled: 'kẹt (mất nhịp tim)', stopped: 'bị dừng (ctrl-Z)', left: 'đã gạch (đang rời)', kicked: 'bị kick (đang rời)' };
 
 export const CMD_MAX = 80;
 /**
@@ -47,33 +57,61 @@ export function shortCmd(cmd, max = CMD_MAX) {
  * One lock's running jobs + queue as text lines (read-only). RFC 23: one layout
  * for 1 or 2 slots — "đang chạy x/N", one ▶ line per running job, "Chờ (k):".
  */
-export function formatQueue(name, { dir = LOCK_DIR, now = Date.now(), max = LIST_MAX, read = readQueue, struck = readStruck, holderOf = readHolder, slots = null, claimedOf = readClaimed, servedOf = readServed } = {}) {
+export function formatQueue(name, { dir = LOCK_DIR, now = Date.now(), max = LIST_MAX, read = readQueue, struck = readStruck, holderOf = readHolder, slots = null, claimedOf = readClaimed, servedOf = readServed, policyOf = (d) => readPolicy(d, { now }).policy, ids = false } = {}) {
   const N = slotsFor(name, { slots, dir });
   const hs = readHolders(name, { dir, holderOf }).sort((a, b) => a.startedAt - b.startedAt || a.slot - b.slot);
   // RFC 24: the order waiters use (fair for build, FIFO otherwise); the non-live come last, unnumbered
-  const tickets = [...read(name, { dir, now }).filter((t) => t.status !== 'dead'), ...struck(name, { dir }).map((t) => ({ ...t, status: 'left' }))];
+  const tickets = [...read(name, { dir, now }).filter((t) => t.status !== 'dead'), ...struck(name, { dir }).map((t) => ({ ...t, status: t.status === 'kicked' ? 'kicked' : 'left' }))];
+  const pol = name === 'build' ? policyOf(dir) : null; // RFC 29: paused, boosts
   const fair = name === 'build' && !hasLegacyWaiter(tickets); // (FIFO while a pre-RFC 24 waiter is in line, like the waiters)
   const named = new Set(hs.map((h) => h.ticket).filter(Boolean));
   const running = fair ? [...hs.filter((h) => !h.exclusive), ...claimedOf(name, { dir }).filter((c) => !named.has(c.ticket))] : [];
-  const q = queueOrder(tickets, { fair, running, served: fair ? servedOf(name, { dir, now }) : {} });
+  const q = queueOrder(tickets, { fair, running, served: fair ? servedOf(name, { dir, now }) : {}, boosts: pol?.boosts || {} });
   const head = q.find((t) => t.status === 'live');
   // an exclusive holder (cleanup) holds every slot; a build in a slot N no longer grants still counts (x may exceed N for a while)
   const busy = hs.some((h) => h.exclusive) ? Math.max(N, hs.length) : hs.length;
-  const lines = [busy
-    ? `🔒 ${name}: đang chạy ${busy}/${N}${busy < N ? ` — còn ${N - busy} chỗ trống` : ''}`
-    : `🔒 ${name}: trống (0/${N})${head ? ` — ${head.label || `pid ${head.pid}`} đang nhận lock` : ''}`];
+  const lines = [pol?.paused
+    ? `🔒 ${name}: ${busy ? `đang chạy ${busy}/${N}` : `trống (0/${N})`} — ⏸ tạm dừng phát chỗ (owner)`
+    : busy
+      ? `🔒 ${name}: đang chạy ${busy}/${N}${busy < N ? ` — còn ${N - busy} chỗ trống` : ''}`
+      : `🔒 ${name}: trống (0/${N})${head ? ` — ${head.label || `pid ${head.pid}`} đang nhận lock` : ''}`];
   for (const h of hs) {
     lines.push(`  ▶ ${describeHolder({ ...h, label: who(h), cmd: shortCmd(h.cmd) }, now)}${h.exclusive ? ` (giữ cả ${slotFiles(name)} chỗ)` : ''}${h.waitingRam ? ' (chờ RAM)' : ''}`);
   }
   if (q.length) lines.push(`  Chờ (${q.length}):`);
   let n = 0;
-  q.slice(0, max).forEach((t) => lines.push(`  ${t.status === 'live' ? `${++n}.` : '–'} ${who(t)}${t.cmd ? ` — ${shortCmd(t.cmd)}` : ''} — ${STATUS_TEXT[t.status] || t.status} ${mins(now - t.createdAt)} phút`));
+  q.slice(0, max).forEach((t) => {
+    lines.push(`  ${t.status === 'live' ? `${++n}.` : '–'} ${who(t)}${t.cmd ? ` — ${shortCmd(t.cmd)}` : ''} — ${STATUS_TEXT[t.status] || t.status} ${mins(now - t.createdAt)} phút`);
+    if (ids) lines.push(`      ${t.name} · ${recordOwner(t)}`);
+  });
   if (q.length > max) lines.push(`  … và ${q.length - max} vé nữa`);
   return lines;
 }
 
+const CONTROL_USAGE = 'max <n|off> | retry <phút> | kick <vé> | top <vé> | block <owner|vé> <30m|1h|2h30m|today> | unblock <owner> | pause | resume';
 export function parseArgs(argv) {
-  const o = { cmd: argv[0], lock: null, pid: null, all: false };
+  const o = { cmd: argv[0], lock: null, pid: null, all: false, ids: false };
+  if (['max', 'retry', 'kick', 'top', 'block', 'unblock', 'pause', 'resume'].includes(o.cmd)) {
+    const a = argv.slice(1);
+    const bad = { error: `usage: lock-queue.mjs ${CONTROL_USAGE}` };
+    if (o.cmd === 'pause' || o.cmd === 'resume') return a.length ? bad : { cmd: o.cmd };
+    if (o.cmd === 'max') {
+      if (a.length !== 1) return bad;
+      if (a[0] === 'off') return { cmd: 'max', value: null };
+      const n = /^\d+$/.test(a[0]) ? Number(a[0]) : NaN;
+      return n >= 0 && n <= MAX_QUEUE_LIMIT ? { cmd: 'max', value: n } : { error: `max phải là off hoặc 0..${MAX_QUEUE_LIMIT}` };
+    }
+    if (o.cmd === 'retry') {
+      const n = a.length === 1 && /^\d+$/.test(a[0]) ? Number(a[0]) : NaN;
+      return n >= 1 && n <= 120 ? { cmd: 'retry', value: n } : { error: 'retry <phút> với phút 1..120' };
+    }
+    if (o.cmd === 'block') {
+      if (a.length < 2) return bad;
+      const d = parseDuration(a[a.length - 1]);
+      return d.error ? { error: d.error } : { cmd: 'block', target: a.slice(0, -1).join(' '), duration: a[a.length - 1] };
+    }
+    return a.length === 1 ? { cmd: o.cmd, target: a[0] } : bad; // kick | top | unblock
+  }
   if (o.cmd === 'slots') {
     if (argv.length > 2 || (argv[1] != null && !['1', 'auto'].includes(argv[1]))) return { error: 'usage: lock-queue.mjs slots [1|auto]' };
     return { cmd: 'slots', value: argv[1] ?? null };
@@ -81,6 +119,7 @@ export function parseArgs(argv) {
   for (let i = 1; i < argv.length; i++) {
     if (argv[i] === '--lock') o.lock = argv[++i];
     else if (argv[i] === '--all') o.all = true;
+    else if (argv[i] === '--ids') o.ids = true;
     else if (argv[i] === '--pid') { o.pid = Number(argv[++i]); if (!Number.isSafeInteger(o.pid) || o.pid <= 0) return { error: '--pid cần một số' }; }
     else return { error: `không hiểu: ${argv[i]}` };
   }
@@ -115,6 +154,44 @@ export function leave({ lock = null, pid = null, all = false }, { dir = LOCK_DIR
   return { code: struck ? 0 : 1, lines };
 }
 
+/** RFC 29: max / retry / kick / top / block / unblock / pause / resume → { lines, code }. */
+export async function control(a, { dir = LOCK_DIR, now = Date.now(), read = readQueue } = {}) {
+  const fail = (r) => ({ code: 1, lines: [r.message || '❌ không làm được'] });
+  const ticketOf = (name) => read('build', { dir, now }).find((t) => t.name === name && t.status !== 'dead');
+  let r;
+  switch (a.cmd) {
+    case 'max': r = await setMax(dir, a.value, { now }); return r.ok ? { code: 0, lines: [a.value == null ? '✅ max hàng chờ: tắt (không giới hạn)' : `✅ max hàng chờ: ${a.value}`] } : fail(r);
+    case 'retry': r = await setRetry(dir, a.value, { now }); return r.ok ? { code: 0, lines: [`✅ thử lại sau: ${a.value} phút`] } : fail(r);
+    case 'pause': case 'resume': r = await setPaused(dir, a.cmd === 'pause', { now }); return r.ok ? { code: 0, lines: [a.cmd === 'pause' ? '✅ đã tạm dừng phát chỗ build (build đang chạy chạy nốt)' : '✅ đã tiếp tục phát chỗ build'] } : fail(r);
+    case 'kick': {
+      const t = ticketOf(a.target);
+      if (!t) return { code: 1, lines: ['❌ không thấy vé đó đang chờ (xem: lock-queue.mjs ls --ids)'] };
+      r = await kickTicket(dir, { name: t.name, pid: t.pid, procStart: t.procStart }, { now });
+      return r.ok ? { code: 0, lines: [`✅ đã kick ${t.label || `pid ${t.pid}`}`] } : fail(r);
+    }
+    case 'top': {
+      const t = ticketOf(a.target);
+      if (!t) return { code: 1, lines: ['❌ không thấy vé đó đang chờ (xem: lock-queue.mjs ls --ids)'] };
+      r = await topTicket(dir, { name: t.name, pid: t.pid, procStart: t.procStart }, { now });
+      return r.ok ? { code: 0, lines: [`✅ ${t.label || `pid ${t.pid}`} lên đầu hàng`] } : fail(r);
+    }
+    case 'block': {
+      const t = ticketOf(a.target);
+      const plan = t ? blockPlan(t) : /^(convo|git|sid|pid):\S+$/.test(a.target) ? { owner: a.target, label: a.target, ident: null, scope: `chặn ${a.target}` } : null;
+      if (!plan) return { code: 1, lines: ['❌ <owner|vé> là tên vé (lock-queue.mjs ls --ids) hoặc convo:<id> / git:<…> / sid:<n> / pid:<n>'] };
+      const until = parseDuration(a.duration, { now }).until;
+      r = await blockOwner(dir, { owner: plan.owner, label: plan.label, until, ident: plan.ident }, { now });
+      return r.ok ? { code: 0, lines: [`✅ ${plan.scope} tới ${new Date(until).toTimeString().slice(0, 5)}; đã kick ${r.value.struck.length} vé đang chờ`] } : fail(r);
+    }
+    case 'unblock': {
+      const t = ticketOf(a.target);
+      r = await unblockOwner(dir, t ? recordOwner(t) : a.target, { now });
+      return r.ok ? { code: 0, lines: ['✅ đã bỏ chặn'] } : fail(r);
+    }
+    default: return { code: 1, lines: ['❌ lệnh không hiểu'] };
+  }
+}
+
 export const PRUNE_SKIP_WARN = 5;
 /** /health warning when the daily cargo-cache prune was skipped ≥ 5 times in a row (builds always running). */
 export function pruneSkipLines({ dir = LOCK_DIR } = {}) {
@@ -138,8 +215,13 @@ if (isMainModule(import.meta.url)) {
   if (a.error) { console.error(a.error); process.exit(2); }
   if (a.cmd === 'slots') { console.log(setSlots(a.value).join('\n')); process.exit(0); }
   if (a.cmd === 'ls') {
-    for (const name of a.lock ? [a.lock] : LOCK_NAMES) console.log(formatQueue(name).join('\n'));
+    for (const name of a.lock ? [a.lock] : LOCK_NAMES) console.log(formatQueue(name, { ids: a.ids }).join('\n'));
     process.exit(0);
+  }
+  if (!['leave'].includes(a.cmd)) {
+    const r = await control(a);
+    console.log(r.lines.join('\n'));
+    process.exit(r.code);
   }
   const r = leave(a);
   console.log(r.lines.join('\n'));
