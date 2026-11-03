@@ -48,6 +48,28 @@ export class PersistentMap extends Map {
   }
 
   /**
+   * Like set(), but a write failure THROWS and memory is put back (RFC 29: /q consumes a revision before acting —
+   * no revision may stay valid after a restart that never saw its consumption). The cap sweep still applies.
+   */
+  setStrict(k, v, { remove = [] } = {}) { // `remove`: keys dropped in the SAME flush (one transaction)
+    const had = super.has(k), prev = super.get(k);
+    const before = new Map(this);
+    for (const key of remove) if (key !== k) super.delete(key);
+    super.set(k, v);
+    if (this.size > this.cap) {
+      const oldest = [...this.entries()].filter(([key, e]) => key !== k && e?.kind !== 'stop').sort((a, b) => (a[1].createdAt || 0) - (b[1].createdAt || 0));
+      for (const [key] of oldest.slice(0, this.size - this.cap)) super.delete(key);
+    }
+    try { this.flush(); } catch (e) {
+      super.clear();
+      for (const [key, val] of before) super.set(key, val);
+      if (!had) super.delete(k); else super.set(k, prev);
+      throw e;
+    }
+    return this;
+  }
+
+  /**
    * Swap a one-shot button for its follow-up record in ONE flush (RFC 24 stop job). Throws if it can't be
    * written — memory is then put back, and the caller must not act.
    */

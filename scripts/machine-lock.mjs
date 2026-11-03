@@ -49,6 +49,7 @@ import { resolveConvoIdFromEnv } from './convo-registry.mjs';
 import { peekPersona } from './persona-store.mjs';
 import { formatPersona } from './persona.mjs';
 import { shortConvoHash } from './convo-hash.mjs';
+import { readPolicy, blockOf, TICKET_V } from './build-policy.mjs';
 
 // $HOME, not $XDG_STATE_HOME: the daemon and the agents must agree on one file.
 export const LOCK_DIR = process.env.TELEPORT_LOCK_DIR || path.join(os.homedir(), '.local', 'state', 'teleport', 'locks');
@@ -167,23 +168,24 @@ export function readQueue(name, { dir = LOCK_DIR, now = Date.now(), stat = procS
  * first wins. A struck ticket can never run; its waiter exits on its next poll.
  * → the tickets struck (each one definitely will not run).
  */
-export function cancelTickets(name, match, { dir = LOCK_DIR, stat = procStat } = {}) {
+export function cancelTickets(name, match, { dir = LOCK_DIR, stat = procStat, ext = 'left' } = {}) {
   const struck = [];
   for (const t of readQueue(name, { dir, stat })) {
     if (t.status === 'dead' || !match(t)) continue;
-    try { fs.renameSync(t.file, t.file.replace(/\.json$/, '.left')); struck.push(t); } catch {}
+    const e = typeof ext === 'function' ? ext(t) : ext; // RFC 29: a kick strikes as `.kicked` (or `.left` for a pre-RFC 29 waiter)
+    try { fs.renameSync(t.file, t.file.replace(/\.json$/, `.${e}`)); struck.push({ ...t, struckAs: e }); } catch {}
   }
   return struck;
 }
 
-/** Struck tickets still waiting for their owner to notice (`.left` of a live process), oldest first. */
+/** Struck tickets still waiting for their owner to notice (`.left` / RFC 29 `.kicked` of a live process), oldest first. status = 'left' | 'kicked'. */
 export function readStruck(name, { dir = LOCK_DIR, stat = procStat } = {}) {
   const q = lockPaths(name, dir).queue;
   let files = [];
-  try { files = fs.readdirSync(q).filter((f) => /^\d{15}-\d+-[a-z0-9]+\.left$/.test(f)).sort(); } catch { return []; }
+  try { files = fs.readdirSync(q).filter((f) => /^\d{15}-\d+-[a-z0-9]+\.(left|kicked)$/.test(f)).sort(); } catch { return []; }
   const out = [];
   for (const f of files) {
-    try { const t = JSON.parse(fs.readFileSync(path.join(q, f), 'utf8')); if (ticketStatus(t, Date.now(), { stat }) !== 'dead') out.push({ ...t, name: f }); } catch {}
+    try { const t = JSON.parse(fs.readFileSync(path.join(q, f), 'utf8')); if (ticketStatus(t, Date.now(), { stat }) !== 'dead') out.push({ ...t, name: f, status: f.endsWith('.kicked') ? 'kicked' : 'left' }); } catch {}
   }
   return out;
 }
@@ -205,13 +207,13 @@ function pruneHolderTmp(dir, now = Date.now()) {
   for (const f of files) { try { const file = path.join(dir, f); if (now - fs.statSync(file).mtimeMs > 60_000) fs.unlinkSync(file); } catch {} }
 }
 
-/** Housekeeping: `.left` / `.acq` files of dead owners, and `.tmp` files older than a minute (writer died mid-write). */
+/** Housekeeping: `.left` / `.kicked` / `.acq` files of dead owners, and `.tmp` files older than a minute (writer died mid-write). */
 function pruneLeft(q, stat, now = Date.now()) {
   let files = [];
   try { files = fs.readdirSync(q); } catch { return; }
   for (const f of files) {
     const file = path.join(q, f);
-    if (/^\d{15}-(\d+)-[a-z0-9]+\.(left|acq)$/.test(f)) {
+    if (/^\d{15}-(\d+)-[a-z0-9]+\.(left|kicked|acq)$/.test(f)) {
       let t = null;
       try { t = JSON.parse(fs.readFileSync(file, 'utf8')); } catch {}
       // same "dead" rule as tickets: gone, zombie, or the pid now belongs to another process
@@ -356,22 +358,32 @@ export function readServed(name, { dir = LOCK_DIR, now = Date.now(), prune = fal
 /** A live ticket written by pre-RFC 24 code (no `owner`): its waiter is FIFO, so the queue must be too. */
 export const hasLegacyWaiter = (tickets) => tickets.some((t) => t.status === 'live' && !t.owner);
 
+/** RFC 29: a live ticket written before boosts existed (no `v ≥ 29`): its waiter ignores boosts, so nobody may use them. */
+export const hasPreBoostWaiter = (tickets) => tickets.some((t) => t.status === 'live' && !(t.v >= TICKET_V));
+
 /**
  * The queue in service order. Live tickets first: FIFO by name, or for a fair lock
  * by (rank, owner's last service, name) with rank = the owner's running builds +
  * its older live tickets. Then the non-live (stalled / stopped / left) by name.
+ * RFC 29: live tickets with a boost (`boosts[<ticket name>]` = when) go before all of
+ * those, newest boost first (equal: by name) — unless a pre-boost waiter is in line.
  * → [{ ...ticket, owner, rank }]. Pure given its inputs.
  */
-export function queueOrder(tickets, { fair = false, running = [], served = {} } = {}) {
+export function queueOrder(tickets, { fair = false, running = [], served = {}, boosts = {} } = {}) {
   const byName = (a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
   const withOwner = tickets.map((t) => ({ ...t, owner: recordOwner(t) }));
-  const live = withOwner.filter((t) => t.status === 'live').sort(byName);
+  let live = withOwner.filter((t) => t.status === 'live').sort(byName);
   const rest = withOwner.filter((t) => t.status !== 'live').sort(byName);
-  if (!fair) return [...live, ...rest];
-  const count = {};
-  for (const r of running) { const o = recordOwner(r); count[o] = (count[o] || 0) + 1; }
-  for (const t of live) { t.rank = count[t.owner] || 0; count[t.owner] = t.rank + 1; }
-  live.sort((a, b) => a.rank - b.rank || (served[a.owner] || 0) - (served[b.owner] || 0) || byName(a, b));
+  if (fair) {
+    const count = {};
+    for (const r of running) { const o = recordOwner(r); count[o] = (count[o] || 0) + 1; }
+    for (const t of live) { t.rank = count[t.owner] || 0; count[t.owner] = t.rank + 1; }
+    live.sort((a, b) => a.rank - b.rank || (served[a.owner] || 0) - (served[b.owner] || 0) || byName(a, b));
+  }
+  if (boosts && Object.keys(boosts).length && !hasPreBoostWaiter(withOwner)) {
+    const boosted = live.filter((t) => Number.isFinite(boosts[t.name])).sort((a, b) => boosts[b.name] - boosts[a.name] || byName(a, b));
+    if (boosted.length) live = [...boosted, ...live.filter((t) => !Number.isFinite(boosts[t.name]))];
+  }
   return [...live, ...rest];
 }
 
@@ -400,28 +412,45 @@ function armExitHandler() {
   process.on('exit', () => { for (const f of EXIT_TICKETS) { try { f(); } catch {} } });
 }
 
+const isNoFlock = (e) => e?.code === 'ENOENT' && (e.syscall === 'spawn flock' || e.path === 'flock');
+
+/**
+ * RFC 29: run `fn` while holding the `build.policy` helper lock (max 5 s wait). → { value } | { busy: true }.
+ * Throws only when flock itself can't run (no binary / flock error): the caller then decides.
+ */
+export async function withPolicyLock(dir, fn, { waitMs = 5000, pollMs = 50 } = {}) {
+  const release = await acquireHelperLock('build.policy', { dir, waitMs, pollMs });
+  if (!release) return { busy: true };
+  try { return { value: await fn() }; } finally { release(); }
+}
+
 /**
  * Take lock `name`, waiting up to `waitSec` (Infinity = forever) in FIFO order
- * (RFC 21). While waiting, `onWait(holder, waitedMs, { position, ahead, holders, slots })`
+ * (RFC 21). While waiting, `onWait(holder, waitedMs, { position, ahead, holders, slots, paused })`
  * is called at once, then every `noticeMs` or when a holder / the position changes.
  * Never blocks the event loop.
  * RFC 23: the build lock has `slots` (default slotsFor) slots; position 0 always
  * tries every granted slot, position i ≥ 1 only while i < N − busy. `exclusive`
  * (try-once only) takes ALL slots files or none. `pending` marks the holder as
  * not yet having declared its memory (heavy then calls update()).
+ * RFC 29: with `policy: true` (heavy only; build lock) the owner's `build.policy.json` applies —
+ * blocked / queue full are REFUSED before any ticket is written (see below); a waiter also
+ * honours pause and a kick/block that lands while it waits.
  * → { release(), update(fields), waitedMs, slot, slots, startedAt }
- *   | { timeout: true, holder, holders, slots } | { timeout: true, left: true, holder }
- * (left = struck via lock-queue.mjs leave; `timeout` stays set so old callers just stop;
+ *   | { timeout: true, holder, holders, slots } | { timeout: true, left: true, kicked?: true, holder }
+ *   | { refused: 'blocked', until } | { refused: 'full', max, retryMin } | { refused: 'busy' }   (policy callers only)
+ * (left = struck via lock-queue.mjs leave / kicked by the owner; `timeout` stays set so old callers just stop;
  * `holder` = the first live holder, for old callers).
  * Throws if flock can't run.
  */
 export async function acquireLock(name, {
   waitSec = Infinity, label = selfLabel(), cmd = '', onWait = () => {}, pollMs = 1000, noticeMs = 60000, dir = LOCK_DIR, now = Date.now,
   convoId = selfConvoId(), warn = (m) => console.error(m), stat = procStat, beforeClaim = null,
-  slots = null, exclusive = false, pending = false, worktree = worktreeOf(), owner = null,
+  slots = null, exclusive = false, pending = false, worktree = worktreeOf(), owner = null, policy = false, policyWaitMs = 5000, afterWin = null,
 } = {}) {
   const me0 = owner || ownerOf({ convoId, worktree, pid: process.pid }, { stat });
   const fair = name === 'build';
+  const usePolicy = !!policy && name === 'build';
   let N = slotsFor(name, { slots, dir }); // re-read every poll while waiting: `lock-queue slots 1` applies to queued waiters too
   const nFiles = slotFiles(name);
   const P = Array.from({ length: nFiles }, (_, k) => lockPaths(name, dir, k));
@@ -449,47 +478,108 @@ export async function acquireLock(name, {
   if (exclusive && waitSec > 0) throw new Error('exclusive is try-once only (waitSec 0)');
   const queued = (mine = null) => readQueue(name, { dir, prune: true, stat }).filter((t) => t.file !== mine && t.status !== 'dead');
   let ticket = null;
-  const dropTicket = () => { if (ticket) { for (const ext of ['.json', '.left', '.acq']) { try { fs.unlinkSync(ticket.replace(/\.(json|acq)$/, ext)); } catch {} } } };
+  const dropTicket = () => { if (ticket) { for (const ext of ['.json', '.left', '.kicked', '.acq']) { try { fs.unlinkSync(ticket.replace(/\.(json|acq)$/, ext)); } catch {} } } };
   const done = () => { dropTicket(); EXIT_TICKETS.delete(dropTicket); };
   let slot = -1;
+  // ── RFC 29 helpers ──
+  let corruptWarned = false;
+  const polRead = () => { // the owner's policy right now (missing / corrupt → no restriction; corrupt warned once)
+    const r = readPolicy(dir, { now: now() });
+    if (r.corrupt && !corruptWarned) { corruptWarned = true; warn('⚠️ build.policy.json hỏng — bỏ qua hạn chế của owner'); }
+    return r.policy;
+  };
+  const myBlock = (pol) => blockOf(pol, me0, { now: now() });
+  // The policy lock, bounded. null = could not get it. A missing flock binary propagates (heavy runs unlocked then, loudly).
+  const lockPolicy = async () => {
+    try { return await acquireHelperLock('build.policy', { dir, waitMs: policyWaitMs, pollMs: 50 }); } catch (e) { if (isNoFlock(e)) throw e; return null; }
+  };
+  const refuse = (r) => { done(); close(); return r; };
+  let admitted = false; // RFC 29 "build now": slot won and ticket claimed inside the admission step
+  let blockedUntil = null;
   try {
     if (!(waitSec > 0)) {
       // Try-once: never jump the queue (stalled / leaving waiters still count), and never write a holder we give back.
       // (only LIVE waiters count: a stopped / stalled one must not block try-once callers forever)
-      const live = () => queued().filter((t) => t.status === 'live').length;
+      // RFC 29: while the owner PAUSED the queue, a plain try-once is busy; the exclusive one (cleanup) ignores waiters instead
+      // — nobody is trying for the lock then — but still takes every flock.
+      const pausedNow = () => name === 'build' && polRead().paused;
+      const live = () => (exclusive && pausedNow() ? 0 : queued().filter((t) => t.status === 'live').length);
       const busyOut = () => { close(); const hs = holders(); return { timeout: true, holder: first(hs), holders: hs, slots: N }; };
-      if (live()) return busyOut();
-      if (exclusive) {
-        // every slot file (not just 0..N−1: a build may still run in a slot N no longer grants)
-        for (let k = 0; k < nFiles; k++) { if (await tryFlock(fdOf(k)) !== 'acquired') return busyOut(); won.add(k); }
-        slot = 0;
-      } else if ((slot = await trySlots(N, false)) < 0) return busyOut();
-      if (live()) return busyOut();
+      let rel = null;
+      try {
+        if (usePolicy && !exclusive) {
+          rel = await lockPolicy();
+          if (!rel) return refuse({ refused: 'busy' });
+          const blk = myBlock(polRead());
+          if (blk) return refuse({ refused: 'blocked', until: blk.until });
+        }
+        if (!exclusive && pausedNow()) return busyOut();
+        if (live()) return busyOut();
+        if (exclusive) {
+          // every slot file (not just 0..N−1: a build may still run in a slot N no longer grants)
+          for (let k = 0; k < nFiles; k++) { if (await tryFlock(fdOf(k)) !== 'acquired') return busyOut(); won.add(k); }
+          slot = 0;
+        } else if ((slot = await trySlots(N, false)) < 0) return busyOut();
+        if (live()) return busyOut();
+        if (!exclusive && pausedNow()) return busyOut(); // paused while we were taking the flock
+      } finally { rel?.(); }
     } else {
       // Ticket FIRST (before any try); deleted only AFTER the holder file names us.
-      const body = { pid: process.pid, procStart: stat(process.pid)?.start ?? null, label, cmd, worktree, owner: me0, convoId: convoId == null ? null : String(convoId), createdAt: now() };
-      try {
+      const body = { v: TICKET_V, pid: process.pid, procStart: stat(process.pid)?.start ?? null, label, cmd, worktree, owner: me0, convoId: convoId == null ? null : String(convoId), createdAt: now() };
+      const writeTicket = () => {
         fs.mkdirSync(p.queue, { recursive: true, mode: 0o700 });
         const file = path.join(p.queue, `${String(Date.now()).padStart(15, '0')}-${process.pid}-${Math.random().toString(36).slice(2, 8)}.json`);
         writeJsonAtomic(file, body);
         ticket = file;
         armExitHandler();
         EXIT_TICKETS.add(dropTicket);
-      } catch (e) { warn(`⚠️ lock ${name}: không ghi được vé hàng đợi (${e.message}) — chờ kiểu cũ, không theo thứ tự.`); }
-      let lastNotice = -Infinity, lastKey = null;
-      // Read every poll (not only at the head): struck (renamed to .left) = leave. Vanished WITHOUT a
-      // .left (e.g. pruned by a process that misjudged us dead) = not a leave: put it back, same place.
+      };
+      if (usePolicy) {
+        // RFC 29 admission, ONE step under the policy lock: blocked? "build now"? queue full? write the ticket.
+        const rel = await lockPolicy();
+        if (!rel) return refuse({ refused: 'busy' });
+        try {
+          const pol = polRead();
+          const blk = myBlock(pol);
+          if (blk) return refuse({ refused: 'blocked', until: blk.until });
+          if (!pol.paused && queued().length === 0 && (slot = await trySlots(N)) >= 0) {
+            // nobody waits and a slot is free: take THAT slot (fd + flock kept), ticket written and claimed right here
+            try { writeTicket(); const acq = ticket.replace(/\.json$/, '.acq'); fs.renameSync(ticket, acq); ticket = acq; admitted = true; }
+            catch { return refuse({ refused: 'busy' }); }
+          } else {
+            slot = -1;
+            if (pol.max != null && queued().length >= pol.max) return refuse({ refused: 'full', max: pol.max, retryMin: pol.retryMin });
+            try { writeTicket(); } catch { return refuse({ refused: 'busy' }); }
+          }
+        } finally { rel(); }
+      } else {
+        try { writeTicket(); } catch (e) { warn(`⚠️ lock ${name}: không ghi được vé hàng đợi (${e.message}) — chờ kiểu cũ, không theo thứ tự.`); }
+      }
+      let lastNotice = -Infinity, lastKey = null, restoreFails = 0;
+      // Read every poll (not only at the head): struck (renamed to .left) = leave; `.kicked` (RFC 29) = the owner kicked us.
+      // Vanished WITHOUT either (e.g. pruned by a process that misjudged us dead) = not a leave: put it back, same place
+      // — unless the owner has blocked us meanwhile. → 'ok' | 'left' | 'kicked' | 'blocked' | 'busy'
       const mineState = () => {
         if (!ticket) return 'ok';
         try { fs.accessSync(ticket); return 'ok'; } catch (e) { if (e.code !== 'ENOENT') return 'ok'; }
-        if (fs.existsSync(ticket.replace(/\.json$/, '.left'))) return 'left';
-        try { writeJsonAtomic(ticket, body); warn(`⚠️ lock ${name}: vé hàng đợi bị xoá (không phải leave) — đã ghi lại đúng chỗ cũ.`); } catch {}
+        const kicked = fs.existsSync(ticket.replace(/\.json$/, '.kicked')), left = fs.existsSync(ticket.replace(/\.json$/, '.left'));
+        if (usePolicy && !left) { const blk = myBlock(polRead()); if (blk) { blockedUntil = blk.until; return 'blocked'; } } // block first
+        if (kicked) return 'kicked';
+        if (left) return 'left';
+        try { writeJsonAtomic(ticket, body); restoreFails = 0; warn(`⚠️ lock ${name}: vé hàng đợi bị xoá (không phải leave) — đã ghi lại đúng chỗ cũ.`); }
+        catch { if (usePolicy && ++restoreFails >= 3) return 'busy'; }
         return 'ok';
       };
-      for (;;) {
+      if (!admitted) for (;;) {
         const ms = mineState();
-        if (ms !== 'ok') { done(); close(); return { timeout: true, left: true, holder: readHolder(p.holder) }; } // struck (.left) — a vanished ticket without .left was put back by mineState
+        if (ms !== 'ok') {
+          done(); close();
+          if (ms === 'blocked') return { refused: 'blocked', until: blockedUntil };
+          if (ms === 'busy') return { refused: 'busy' };
+          return { timeout: true, left: true, ...(ms === 'kicked' ? { kicked: true } : {}), holder: readHolder(p.holder) }; // struck — a vanished ticket without a marker was put back by mineState
+        }
         if (ticket) { try { const tt = new Date(); fs.utimesSync(ticket, tt, tt); } catch {} }
+        const pol = name === 'build' ? polRead() : null; // RFC 29: every beat (boosts, pause)
         const others = ticket ? queued(ticket) : [];
         // RFC 24: one ordering of the whole live queue (ourselves included) — the same one /health shows.
         let ahead = [], running = null;
@@ -504,15 +594,15 @@ export async function acquireLock(name, {
           // A live ticket without `owner` belongs to a waiter on the pre-RFC 24 code, which waits in FIFO order: while
           // one exists the whole queue is FIFO (one total order everyone agrees on — mixing the two can form a cycle).
           const fairNow = fair && !hasLegacyWaiter(others);
-          const order = queueOrder([...others, { name: myName, status: 'live', pid: process.pid, owner: me0 }], { fair: fairNow, running: running || [], served: fairNow ? readServed(name, { dir, now: now() }) : {} });
+          const order = queueOrder([...others, { name: myName, status: 'live', pid: process.pid, owner: me0, v: TICKET_V }], { fair: fairNow, running: running || [], served: fairNow ? readServed(name, { dir, now: now() }) : {}, boosts: pol?.boosts || {} });
           ahead = order.slice(0, order.findIndex((t) => t.name === myName)).filter((t) => t.status === 'live');
         }
         // Position 0 always tries (never gated by holder files, which may be stale). Position i ≥ 1
         // only while i < N − busy, busy = live holders of every slot + claimed (.acq) tickets that have
         // no holder yet. A wrong count costs order, never exclusion (flock decides).
         if (slots == null && name === 'build') N = slotsFor(name, { dir });
-        let mayTry = !ahead.length;
-        if (!mayTry && N > 1) {
+        let mayTry = !ahead.length && !pol?.paused; // RFC 29: paused → nobody tries, build.lock stays free for cleanup
+        if (!pol?.paused && !mayTry && N > 1) {
           let busy;
           if (running) busy = running.length + holders().filter((h) => h.exclusive).length;
           else {
@@ -523,21 +613,44 @@ export async function acquireLock(name, {
           mayTry = ahead.length < N - busy;
         }
         if (mayTry && (slot = await trySlots(N)) >= 0) {
-          // The atomic hand-off: WE rename our ticket to .acq, or `leave` renamed it to .left —
+          // The atomic hand-off: WE rename our ticket to .acq, or `leave` / a kick renamed it away —
           // exactly one rename succeeds. Lost → give the slot straight back.
           if (!ticket) break;
-          if (beforeClaim) await beforeClaim(ticket); // (test seam: strike right here)
-          try { fs.renameSync(ticket, ticket.replace(/\.json$/, '.acq')); ticket = ticket.replace(/\.json$/, '.acq'); break; }
-          catch (e) {
-            if (e.code !== 'ENOENT') throw e;
-            if (fs.existsSync(ticket.replace(/\.json$/, '.left'))) { done(); close(); return { timeout: true, left: true, holder: null }; }
-            break; // vanished without a .left (a pruner misjudged us dead): we won flock fair and square — keep it
+          if (afterWin) await afterWin(); // (test seam: the owner pauses / blocks right here, between the flock win and the final check)
+          // RFC 29 final check, under the policy lock and BEFORE the claim: paused / blocked right now?
+          let rel = null, again = false;
+          if (usePolicy) {
+            try { rel = await lockPolicy(); } catch (e) { close(); throw e; }
+            if (!rel) { close(); slot = -1; again = true; } // can't check → don't run; next beat
+          }
+          if (!again) {
+            try {
+              const pol2 = usePolicy ? polRead() : null;
+              const blk = pol2 ? myBlock(pol2) : null;
+              if (pol2?.paused) { close(); slot = -1; }
+              else if (blk) return refuse({ refused: 'blocked', until: blk.until });
+              else {
+                if (beforeClaim) await beforeClaim(ticket); // (test seam: strike / kick right here)
+                try { fs.renameSync(ticket, ticket.replace(/\.json$/, '.acq')); ticket = ticket.replace(/\.json$/, '.acq'); break; }
+                catch (e) {
+                  if (e.code !== 'ENOENT' && !usePolicy) throw e;
+                  if (e.code !== 'ENOENT') return refuse({ refused: 'busy' }); // policy caller: a failed claim never runs and never exits 1
+                  const kicked = fs.existsSync(ticket.replace(/\.json$/, '.kicked')), left = fs.existsSync(ticket.replace(/\.json$/, '.left'));
+                  if (usePolicy && !left) { const b2 = myBlock(polRead()); if (b2) return refuse({ refused: 'blocked', until: b2.until }); }
+                  if (kicked || left) { done(); close(); return { timeout: true, left: true, ...(kicked ? { kicked: true } : {}), holder: null }; }
+                  if (usePolicy) { // vanished without a marker: the claim FAILED → no run. Give the slot back, put the ticket back, retry next beat
+                    close(); slot = -1;
+                    try { writeJsonAtomic(ticket, body); restoreFails = 0; } catch { if (++restoreFails >= 3) return refuse({ refused: 'busy' }); }
+                  } else break; // old callers: we won flock fair and square — keep it
+                }
+              }
+            } finally { rel?.(); }
           }
         }
         const t = now(), hs = holders(), holder = first(hs);
-        const key = `${hs.map((h) => `${h.slot}:${h.pid}:${h.startedAt}`).join(',') || (holder ? `${holder.pid}:${holder.startedAt}` : '')}|${ahead.map((x) => x.name).join(',')}`;
+        const key = `${hs.map((h) => `${h.slot}:${h.pid}:${h.startedAt}`).join(',') || (holder ? `${holder.pid}:${holder.startedAt}` : '')}|${ahead.map((x) => x.name).join(',')}|${pol?.paused ? 'P' : ''}`;
         if (key !== lastKey || t - lastNotice >= noticeMs) {
-          onWait(holder, t - start, { position: ahead.length + 1, ahead: ahead.map((x) => x.label || `pid ${x.pid}`), holders: hs, slots: N });
+          onWait(holder, t - start, { position: ahead.length + 1, ahead: ahead.map((x) => x.label || `pid ${x.pid}`), holders: hs, slots: N, paused: !!pol?.paused });
           lastNotice = t; lastKey = key;
         }
         if (t - start >= waitSec * 1000) { done(); close(); return { timeout: true, holder, holders: hs, slots: N }; }

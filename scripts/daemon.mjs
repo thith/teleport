@@ -56,7 +56,7 @@ import {
 } from './tele-listen.mjs';
 export { prLinksOnly, PR_LINK_RE };
 import { HASHTAG_RE } from './agent-target.mjs';
-import { loadCommands, resolveCommand, roleMeets, tokenizeArgs, splitAtBlocks, COMMANDS_FILE } from './commands.mjs';
+import { loadCommands, resolveCommand, roleMeets, tokenizeArgs, splitAtBlocks, menuCommands, COMMANDS_FILE } from './commands.mjs';
 import { canonicalPrUrl } from './merge.mjs';
 // Workspace paths live in workspace.mjs (merge.mjs needs them too — importing
 // daemon.mjs from there made a circular import that deadlocked merge.mjs).
@@ -69,7 +69,11 @@ import {
 } from './merge-inbox.mjs';
 import { peekPersona } from './persona-store.mjs';
 import { machineWatch } from './health.mjs';
-import { longBuildWatch, handleLongBuildButton, stopTick, STOP_BUTTON_RE, STOP_TICK_MS } from './long-build.mjs';
+import { longBuildWatch, handleLongBuildButton, stopTick, STOP_BUTTON_RE, STOP_TICK_MS, buildKickNoticePrompt } from './long-build.mjs';
+import { Q_BUTTON_RE } from './q-panel.mjs';
+import { handleQButton, runQCommand, topicConvoIds } from './q-cmd.mjs';
+import { deliverNotices } from './queue-control.mjs';
+import { LOCK_DIR } from './machine-lock.mjs';
 import { recordFetchOk, startListenWatchdog } from './listen-watch.mjs';
 import { launchCleanup, startCleanupScheduler } from './cleanup-launch.mjs';
 import { autoNudgeTick } from './auto-nudge.mjs';
@@ -124,6 +128,7 @@ export function parseDaemonCommand(text) {
 // auto-attaches a .md document when it's too long for one Telegram message.
 export const COMMAND_TIMEOUT_MS = 5 * 60 * 1000;
 export const RELOAD_COMMAND = 'reload';
+export const Q_COMMAND = 'q'; // RFC 29: the owner's build-queue board
 export const COMMAND_MAX_BUFFER = 8 * 1024 * 1024;
 
 // The whisperer's advisory role, looked up across the catch-all roster
@@ -230,6 +235,14 @@ export function daemonStatus(pidFile = PID_FILE) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+/** RFC 29: put the registry's commands in the owner's "/" menu (their DM only). Errors propagate to the caller, who logs. */
+export async function applyOwnerMenu(registry, ui) {
+  const commands = menuCommands(registry);
+  if (!commands.length || !ui?.setOwnerCommands) return commands;
+  await ui.setOwnerCommands(commands);
+  return commands;
+}
+
 // ── Main loop ─────────────────────────────────────────────────────────────────
 
 async function main() {
@@ -308,9 +321,14 @@ async function main() {
     // Several rows of buttons (/type); edit = replace text AND keyboard (rows = [] removes it).
     sendButtonRows: (chatId, text, rows) => tg('sendMessage', { chat_id: chatId, text, reply_markup: { inline_keyboard: rows }, link_preview_options: { is_disabled: true } }),
     editButtonRows: (chatId, messageId, text, rows) => tg('editMessageText', { chat_id: chatId, message_id: messageId, text, reply_markup: { inline_keyboard: rows }, link_preview_options: { is_disabled: true } }).catch(() => {}),
+    // RFC 29: the "/" menu, shown only in the owner's own chat
+    setOwnerCommands: (commands) => tg('setMyCommands', { commands, scope: { type: 'chat', chat_id: Number(daemonUserId) } }),
     // (RFC 24 stop report: failures must be seen, to retry; "message is not modified" counts as done)
     editButtonRowsStrict: (chatId, messageId, text, rows) => tg('editMessageText', { chat_id: chatId, message_id: messageId, text, reply_markup: { inline_keyboard: rows }, link_preview_options: { is_disabled: true } }).catch((e) => { if (!/not modified/i.test(e?.message || '')) throw e; }),
   };
+  // RFC 29: the "/" menu for the owner (from commands.json); an API error is only logged.
+  const applyMenu = () => applyOwnerMenu(registry, linkMergeUi).catch((e) => console.error(`[daemon] setMyCommands: ${e?.message ?? e}`));
+  applyMenu();
   // Pending buttons (merge previews, manual cleanups) survive a restart.
   pendingMergeButtons = new PersistentMap();
   // RFC 24: owner-requested build stops run on their own short timer (not the 60 s heartbeat); jobs survive a restart.
@@ -332,7 +350,7 @@ async function main() {
       resolveOwner: (cfg) => resolveDaemonUserId(cfg, { env: process.env, envFile: env }),
       resolveCatchAll: (cfg) => parseAdminChatIds(resolveDefaultChatId(cfg, { env: process.env, envFile: env }) || ''),
     });
-    if (!r.error) { projectsConfig = r.projectsConfig; registry = r.registry; }
+    if (!r.error) { projectsConfig = r.projectsConfig; registry = r.registry; applyMenu(); }
     return r;
   };
 
@@ -356,6 +374,7 @@ async function main() {
   let lastHeartbeat = 0;
   let mergeInboxBusy = false;
   let cleanupInboxBusy = false;
+  let noticesBusy = false;
   const watchState = {}; // machineWatch memory (previous agent list, last RAM alert)
   // eslint-disable-next-line no-constant-condition
   while (true) {
@@ -397,8 +416,8 @@ async function main() {
       const presses = updates.filter((u) => u.callback_query && String(u.callback_query.from?.id) === daemonUserId);
       for (const u of presses) {
         const data = String(u.callback_query.data || '');
-        const handler = STOP_BUTTON_RE.test(data) ? handleLongBuildButton : TYPE_BUTTON_RE.test(data) ? handleTypeButton : CLEANUP_BUTTON_RE.test(data) ? handleCleanupButton : handleMergeButton;
-        handler(u.callback_query, ctx, handler === handleLongBuildButton ? { kick: () => { stopTick(stopCtx, { deliver: deliverResult }).catch(() => {}); } } : undefined).catch((e) => console.error(`[daemon] button: ${e?.message ?? e}`));
+        const handler = Q_BUTTON_RE.test(data) ? handleQButton : STOP_BUTTON_RE.test(data) ? handleLongBuildButton : TYPE_BUTTON_RE.test(data) ? handleTypeButton : CLEANUP_BUTTON_RE.test(data) ? handleCleanupButton : handleMergeButton;
+        handler(u.callback_query, ctx, handler === handleLongBuildButton || handler === handleQButton ? { kick: () => { stopTick(stopCtx, { deliver: deliverResult }).catch(() => {}); } } : undefined).catch((e) => console.error(`[daemon] button: ${e?.message ?? e}`));
       }
       // Agent merge requests (file inbox) — one pass at a time.
       if (!mergeInboxBusy) {
@@ -410,6 +429,11 @@ async function main() {
       if (!cleanupInboxBusy) {
         cleanupInboxBusy = true;
         processCleanupRequests(ctx, { label: requesterLabel }).then(() => processCleanupOffers(ctx)).catch((e) => console.error(`[daemon] cleanup inbox: ${e?.message ?? e}`)).finally(() => { cleanupInboxBusy = false; });
+      }
+      // RFC 29: kick / block notices that `/q` or `lock-queue.mjs` left in the outbox → the agent's convo.
+      if (!noticesBusy) {
+        noticesBusy = true;
+        deliverNotices({ dir: LOCK_DIR, deliver: deliverResult, build: buildKickNoticePrompt }).catch((e) => console.error(`[daemon] notices: ${e?.message ?? e}`)).finally(() => { noticesBusy = false; });
       }
       if (updates.length) writeOffset(Math.max(...updates.map((u) => u.update_id)), daemonOffsetFile);
 
@@ -834,6 +858,12 @@ export async function dispatchCommand(parsed, from, {
     // Owner only (not just admin): it types keys into another agent's session.
     if (String(from?.id) !== String(daemonUserId)) { await sendText(daemonUserId, `❌ /${TYPE_COMMAND} chỉ owner dùng được.`); return; }
     await startType(parsed.rest, { daemonUserId, projectsConfig, sendText, ...extra });
+    return;
+  }
+  if (parsed.cmd === Q_COMMAND) {
+    // Owner only: it kicks / blocks other agents' builds and stops running ones.
+    if (String(from?.id) !== String(daemonUserId)) { await sendText(daemonUserId, `❌ /${Q_COMMAND} chỉ owner dùng được.`); return; }
+    await runQCommand(parsed.rest, { daemonUserId, projectsConfig, sendText, ...extra }, { procs: () => listClaudeProcs(), topics: () => topicConvoIds(), ...(extra.qDeps || {}) });
     return;
   }
   if (parsed.cmd === COMPACT_COMMAND || parsed.cmd === NUDGE_COMMAND || (parsed.cmd === 'kill' && parsed.tapped)) {

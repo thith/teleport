@@ -4,6 +4,9 @@
 //
 //   node ../teleport/scripts/heavy.mjs [--no-stop] [--no-scope] [--wait <minutes>] [--no-ram-wait] -- <command> [args…]
 //
+// Exit codes that are the OWNER's call (RFC 29; 75 timeout, 76 left/kicked, 77 stopped, 78 queue full or busy
+// updating, 79 blocked — see docs/build-guide.md): the build never ran, and the agent must not retry blindly.
+//
 // Busy → prints who holds it ("⏳ build đang bận: 🧛 Ma #c2383556 — ./gradlew …")
 // and waits (forever by default; --wait N gives up after N minutes, exit 75,
 // command never run). The command runs in its own process group; SIGINT/
@@ -59,13 +62,16 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
-import { acquireLock, describeHolder, readHolders, acquireHelperLock, stopMarkerPath, procStat, memTotal, LOCK_DIR, TWO_SLOT_MIN_RAM } from './machine-lock.mjs';
+import { acquireLock, describeHolder, readHolders, readQueue, slotsFor, ownerOf, selfConvoId, worktreeOf, acquireHelperLock, stopMarkerPath, procStat, memTotal, LOCK_DIR, TWO_SLOT_MIN_RAM } from './machine-lock.mjs';
+import { readPolicy, blockOf } from './build-policy.mjs';
 import { isMainModule } from './is-direct-run.mjs';
 import { shortCmd } from './lock-queue.mjs';
 
 export const WAIT_TIMEOUT_EXIT = 75;
 export const LEFT_QUEUE_EXIT = 76; // RFC 21: cancelled with lock-queue.mjs leave while waiting
 export const STOPPED_EXIT = 77; // RFC 24: stopped by the owner (daemon button) — not a build failure, don't retry
+export const QUEUE_FULL_EXIT = 78; // RFC 29: queue full / busy updating — do other work, retry after the printed minutes
+export const BLOCKED_EXIT = 79; // RFC 29: the owner blocked this agent from the queue until the printed time — don't retry before
 export const STOP_GRACE_MS = 15_000; // RFC 24: TERM → KILL of the build's process group
 export const STOP_POLL_MS = 2000;
 export const HELD_ENV = 'TELEPORT_HEAVY_HELD';
@@ -472,7 +478,36 @@ export function describeBusy(h, q) {
   return `build đang bận (${hs.length}/${q.slots}): ${hs.map((x) => `${x.label || `pid ${x.pid}`}${x.cmd ? ` — ${shortCmd(x.cmd, 40)}` : ''}`).join(', ')}`;
 }
 
+const hhmm = (ms) => new Date(ms).toTimeString().slice(0, 5);
+
+/** RFC 29: print the refusal an acquireLock({ policy:true }) gave and → heavy's exit code (78 full/busy, 79 blocked). Pure but for `log`. */
+export function refusalExit(r, log) {
+  if (r.refused === 'blocked') { log(`⛔ Owner chặn bạn khỏi hàng build tới ${hhmm(r.until)}. Đừng thử lại trước giờ đó.`); return BLOCKED_EXIT; }
+  if (r.refused === 'full') { log(`⛔ Hàng build đã đủ ${r.max} vé chờ. Thử lại sau ${r.retryMin} phút; trong lúc đó làm việc khác.`); return QUEUE_FULL_EXIT; }
+  log('⏳ hàng build đang bận cập nhật — thử lại sau 1 phút'); return QUEUE_FULL_EXIT;
+}
+
+/**
+ * RFC 29 early check, read-only and lock-free, BEFORE the RAM wait: blocked → refused blocked; queue already
+ * at `max` and no "build now" chance (not paused, nobody waiting, a free slot) → refused full. The authoritative
+ * check is acquireLock's, under the policy lock. → a `refused` result or null. A corrupt policy = no restriction.
+ */
+export function earlyPolicyCheck({ dir, owner, now = Date.now(), holders = null, queue = null, slots = null, startOf } = {}) {
+  const { policy, corrupt } = readPolicy(dir, { now, ...(startOf ? { startOf } : {}) });
+  if (corrupt) return null;
+  const blk = blockOf(policy, owner, { now, ...(startOf ? { startOf } : {}) });
+  if (blk) return { refused: 'blocked', until: blk.until };
+  if (policy.max == null) return null;
+  const waiting = (queue || readQueue('build', { dir })).filter((t) => t.status !== 'dead').length;
+  if (waiting < policy.max) return null;
+  const hs = holders || readHolders('build', { dir });
+  const free = hs.length < (slots ?? slotsFor('build', { dir }));
+  if (!policy.paused && waiting === 0 && free) return null; // the "build now" exception
+  return { refused: 'full', max: policy.max, retryMin: policy.retryMin };
+}
+
 const DEFAULT_SCOPE_OPS = {
+  lockDir: null, hasFlock: () => { const r = spawnSync('flock', ['--version'], { stdio: 'ignore' }); return !(r.error && r.error.code === 'ENOENT'); }, selfOwner: () => ownerOf({ convoId: selfConvoId(), worktree: worktreeOf(), pid: process.pid }),
   preflight: scopePreflight, stop: stopScope, orphans: orphanScopes, oomKills: appSliceOomKills, jobsConfigured: cargoJobsConfigured, memTotal: memTotal(),
   holders: () => readHolders('build'),
   admitLock: () => acquireHelperLock('build.admit', { waitMs: 10_000 }),
@@ -497,6 +532,16 @@ export async function main(argv, {
   // ancestor's lock (overwriting it with ours deadlocked depth 3).
   const childEnv = { ...env, [HELD_ENV]: isNested ? env[HELD_ENV] : String(process.pid) };
   if (!childEnv.CARGO_BUILD_JOBS && !isNested && !scopeOps.jobsConfigured({ env })) childEnv.CARGO_BUILD_JOBS = DEFAULT_CARGO_JOBS;
+  // RFC 29: the owner's rules live in <lockDir>/build.policy.json. An injected `acquire` (tests) without an explicit
+  // lock dir never reads the machine's real policy.
+  const lockDir = scopeOps.lockDir || env.TELEPORT_LOCK_DIR || LOCK_DIR;
+  const policyReadable = !!(scopeOps.lockDir || env.TELEPORT_LOCK_DIR) || acquire === acquireLock;
+  if (!isNested && policyReadable) {
+    let early = null;
+    try { early = earlyPolicyCheck({ dir: lockDir, owner: scopeOps.selfOwner() }); } catch { /* unreadable: the authoritative check decides */ }
+    // no flock binary: the queue and the policy cannot be enforced → fall through to the loud run-unlocked fallback
+    if (early && scopeOps.hasFlock()) return refusalExit(early, log);
+  }
   if (!isNested && a.ramWait) await waitRam({ minBytes: minFreeBytes(env), log });
   let lock;
   if (isNested) {
@@ -504,15 +549,17 @@ export async function main(argv, {
     lock = { release() {}, waitedMs: 0 };
   } else try {
     lock = await acquire('build', {
-      waitSec: a.waitSec, cmd: cmdText, pending: true,
-      onWait: (h, waited, q) => log(`⏳ ${describeBusy(h, q)}${q?.position > 1 ? ` — bạn đứng thứ ${q.position}, trước bạn: ${q.ahead.join(', ')}` : q ? ' — bạn đứng đầu hàng' : ''} — ${waited ? `đã chờ ${Math.round(waited / 60000)} phút, ` : ''}chờ tới lượt… (rời hàng: node ../teleport/scripts/lock-queue.mjs leave)`),
+      waitSec: a.waitSec, cmd: cmdText, pending: true, policy: true, dir: lockDir,
+      onWait: (h, waited, q) => log(`${q?.paused ? '⏸ owner tạm dừng phát chỗ build — ' : ''}⏳ ${describeBusy(h, q)}${q?.position > 1 ? ` — bạn đứng thứ ${q.position}, trước bạn: ${q.ahead.join(', ')}` : q ? ' — bạn đứng đầu hàng' : ''} — ${waited ? `đã chờ ${Math.round(waited / 60000)} phút, ` : ''}chờ tới lượt… (rời hàng: node ../teleport/scripts/lock-queue.mjs leave)`),
     });
   } catch (e) {
     // Only a missing flock binary may run unlocked (as before); any other failure stops here.
     if (!(e?.code === 'ENOENT' && (e.syscall === 'spawn flock' || e.path === 'flock'))) { log(`❌ heavy: lỗi build lock (${e?.message ?? e}) — không chạy.`); return 1; }
-    log(`⚠️ heavy: không lấy được build lock (${e.message}) — chạy KHÔNG khoá.`);
+    log(`⚠️ heavy: không lấy được build lock (${e.message}) — chạy KHÔNG khoá. Máy không có flock: hàng đợi VÀ policy của owner (max hàng chờ, chặn, tạm dừng) đều KHÔNG được áp dụng.`);
     lock = { release() {}, waitedMs: 0 };
   }
+  if (lock.refused) return refusalExit(lock, log); // (before `timeout`: a refusal never started waiting)
+  if (lock.left && lock.kicked) { log('⛔ Owner đã kick vé này khỏi hàng build. Đừng xếp lại ngay; hỏi owner nếu cần.'); return LEFT_QUEUE_EXIT; }
   if (lock.left) { log('⏹ heavy: đã rời hàng đợi build — không chạy.'); return LEFT_QUEUE_EXIT; }
   if (lock.timeout) { log(`❌ heavy: chờ quá ${a.waitSec / 60} phút, ${describeBusy(lock.holder, lock).replace(/^build đang bận/, 'build vẫn bận')} — không chạy.`); return WAIT_TIMEOUT_EXIT; }
   if (lock.waitedMs > 1000) log(`▶️ tới lượt (đã chờ ${Math.round(lock.waitedMs / 1000)}s): ${cmdText}`);

@@ -69,7 +69,7 @@ export const IO_PSI_ALERT = 30;   // io full avg10 %: every task stalled on the 
 
 /** Build the /health message. All inputs passed in → pure. */
 // Tappable next steps (Telegram turns a /command in the text into a link that sends it).
-export const HEALTH_SHORTCUTS = '/cswap   /type   /ls';
+export const HEALTH_SHORTCUTS = '/cswap   /q   /ls';
 
 export function formatHealth({ cores, load, mem, disk, agents, top, oomKills, locks = null, psi = null }) {
   const warn = [];
