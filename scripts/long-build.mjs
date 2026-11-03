@@ -22,7 +22,7 @@ import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { execFile } from 'node:child_process';
-import { LOCK_DIR, readHolders, readQueue, slotsFor, procStat, stopMarkerPath, STOP_MARKER_RE } from './machine-lock.mjs';
+import { LOCK_DIR, readHolders, readQueue, effectiveSlots, procStat, stopMarkerPath, STOP_MARKER_RE } from './machine-lock.mjs';
 import { shortCmd } from './lock-queue.mjs';
 import { escapeControls } from './cleanup-inbox.mjs';
 import { cgroupPopulated } from './heavy.mjs';
@@ -109,7 +109,7 @@ const stopJobs = (store) => [...store.entries()].filter(([, e]) => e && e.kind =
 /** Heartbeat pass: send / repeat / retire alerts; prune orphan stop markers. */
 export async function longBuildWatch(ctx, {
   now = Date.now(), dir = LOCK_DIR, holders = () => readHolders('build', { dir }), queue = () => readQueue('build', { dir }),
-  slots = () => slotsFor('build', { dir }), state = alertStateIO(), rand = () => crypto.randomBytes(8).toString('hex'),
+  slots = () => effectiveSlots({ dir, now }), state = alertStateIO(), rand = () => crypto.randomBytes(8).toString('hex'),
   paused = () => readPolicy(dir, { now }).policy.paused,
 } = {}) {
   const store = ctx.buttonStore, chatId = ctx.daemonUserId;

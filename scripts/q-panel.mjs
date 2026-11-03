@@ -4,7 +4,7 @@
 
 import path from 'node:path';
 import {
-  LOCK_DIR, readHolders, readQueue, readClaimed, readServed, queueOrder, hasLegacyWaiter, hasPreBoostWaiter, slotsFor,
+  LOCK_DIR, readHolders, readQueue, readClaimed, readServed, queueOrder, hasLegacyWaiter, hasPreBoostWaiter, slotsFor, cpuGateNote, quietNowFor,
 } from './machine-lock.mjs';
 import { readPolicy, TICKET_V } from './build-policy.mjs';
 import { shortCmd, ticketWorktree } from './lock-queue.mjs';
@@ -25,7 +25,7 @@ const clean = (s) => escapeControls(String(s ?? ''));
 const wtName = (t) => { const w = ticketWorktree(t); return w ? ` · ${clean(path.basename(w))}` : ''; };
 
 /** Read everything the board shows. */
-export function gatherQ({ dir = LOCK_DIR, now = Date.now(), read = readQueue, holdersOf = readHolders, claimedOf = readClaimed, servedOf = readServed, policyOf = readPolicy, slotsOf = slotsFor } = {}) {
+export function gatherQ({ dir = LOCK_DIR, now = Date.now(), read = readQueue, holdersOf = readHolders, claimedOf = readClaimed, servedOf = readServed, policyOf = readPolicy, slotsOf = slotsFor, gate, quietOf = quietNowFor } = {}) {
   const pr = policyOf(dir, { now });
   const holders = holdersOf('build', { dir }).sort((a, b) => a.startedAt - b.startedAt || a.slot - b.slot);
   const tickets = read('build', { dir, now }).filter((t) => t.status !== 'dead');
@@ -33,8 +33,11 @@ export function gatherQ({ dir = LOCK_DIR, now = Date.now(), read = readQueue, ho
   const named = new Set(holders.map((h) => h.ticket).filter(Boolean));
   const running = fair ? [...holders.filter((h) => !h.exclusive), ...claimedOf('build', { dir }).filter((c) => !named.has(c.ticket))] : [];
   const order = queueOrder(tickets, { fair, running, served: fair ? servedOf('build', { dir, now }) : {}, boosts: pr.policy.boosts });
+  const N = slotsOf('build', { dir });
   return {
-    now, policy: pr.policy, corrupt: pr.corrupt, error: pr.error ?? null, holders, tickets: order, N: slotsOf('build', { dir }),
+    gateNote: cpuGateNote({ dir, N, holders, claimed: claimedOf('build', { dir }), now, gate }), // RFC 32: why a free slot is not handed out
+    quiet: (({ active, overridden, until }) => ({ active: !!active, overridden: !!overridden, until: until ?? null }))(quietOf(dir, now)),
+    now, policy: pr.policy, corrupt: pr.corrupt, error: pr.error ?? null, holders, tickets: order, N,
     preBoost: hasPreBoostWaiter(tickets), oldCode: tickets.filter((t) => t.status === 'live' && !(t.v >= TICKET_V)).length,
   };
 }
@@ -55,7 +58,7 @@ const shortName = (label) => clean(String(label).replace(/\s#[a-z0-9]+$/i, ''));
 export function renderQ(g, { tok, rev, page = 0, view = 'main', pin = null, stoppingKeys = new Set() } = {}) {
   const { policy: pol, now } = g;
   const cb = (op, idx, arg) => qCallback(tok, rev, op, idx, arg);
-  const maps = { rows: {}, running: {}, blocks: {} };
+  const maps = { rows: {}, running: {}, blocks: {}, quiet: g.quiet || null };
   // every non-dead waiting ticket gets a number (stalled / stopped count toward max too)
   g.tickets.forEach((t, i) => { maps.rows[String(i + 1)] = ticketRow(t); });
   const runnable = g.holders.filter((h) => !h.exclusive);
@@ -81,7 +84,7 @@ export function renderQ(g, { tok, rev, page = 0, view = 'main', pin = null, stop
   }
 
   const busy = g.holders.some((h) => h.exclusive) ? Math.max(g.N, g.holders.length) : g.holders.length;
-  const lines = [`🔒 build ${busy}/${g.N} · chờ ${g.tickets.length} · max ${pol.max == null ? 'tắt' : `${pol.max} (thử lại sau ${pol.retryMin}')`}${pol.paused ? ' · ⏸ TẠM DỪNG phát chỗ' : ''}`];
+  const lines = [`🔒 build ${busy}/${g.N} · chờ ${g.tickets.length} · max ${pol.max == null ? 'tắt' : `${pol.max} (thử lại sau ${pol.retryMin}')`}${pol.paused ? ' · ⏸ TẠM DỪNG phát chỗ' : ''}${g.gateNote ? ` · ${g.gateNote}` : ''}`];
   if (g.corrupt) lines.unshift(`⚠️ build.policy.json hỏng (${clean(g.error)}) — hạn chế của owner đang bị bỏ qua; mọi thao tác ghi bị từ chối.`);
   if (pol.paused && g.oldCode) lines.push(`⏸ (còn ${g.oldCode} vé code cũ không theo pause)`);
   if (g.preBoost) lines.push('⬆ tạm tắt: còn người chờ chạy code cũ — chờ họ xong');
@@ -111,6 +114,8 @@ export function renderQ(g, { tok, rev, page = 0, view = 'main', pin = null, stop
   }
   if (pages > 1) rows.push([{ text: '‹', callback_data: cb('pg', Math.max(0, pg - 1)) }, { text: `${pg + 1}/${pages}`, callback_data: cb('r') }, { text: '›', callback_data: cb('pg', Math.min(pages - 1, pg + 1)) }]);
   rows.push([{ text: 'Max −', callback_data: cb('m-') }, { text: pol.max == null ? 'Max tắt' : `Max ${pol.max}`, callback_data: cb('mt') }, { text: 'Max +', callback_data: cb('m+') }]);
+  // RFC 32 §4.4: switch the night rules off until the window ends / back on. The state is checked against the stored board on press.
+  if (g.quiet?.active) rows.push([{ text: g.quiet.overridden ? '🌙 Bật lại' : `⏩ Tắt giờ im lặng tới ${hhmm(g.quiet.until)}`, callback_data: cb('qz') }]);
   rows.push([{ text: pol.paused ? '▶ Tiếp tục' : '⏸ Dừng phát chỗ', callback_data: cb('p') }, { text: '🔄', callback_data: cb('r') }]);
   if (g.corrupt) rows.push([{ text: 'Ghi lại policy mặc định', callback_data: cb('rs') }]);
   return { view: 'main', text: lines.join('\n'), rows, maps, page: pg };

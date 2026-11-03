@@ -77,6 +77,7 @@ import { Q_BUTTON_RE } from './q-panel.mjs';
 import { handleQButton, runQCommand, topicConvoIds } from './q-cmd.mjs';
 import { deliverNotices } from './queue-control.mjs';
 import { LOCK_DIR } from './machine-lock.mjs';
+import { quietNow, syncQuietCpu } from './quiet-hours.mjs';
 import { recordFetchOk, startListenWatchdog } from './listen-watch.mjs';
 import { launchCleanup, startCleanupScheduler } from './cleanup-launch.mjs';
 import { autoNudgeTick } from './auto-nudge.mjs';
@@ -463,6 +464,12 @@ async function main() {
         // Machine watch: early low-RAM warning + agents that vanished (OOM-kills).
         try { await machineWatch(watchState, (t) => sendText(daemonUserId, t)); }
         catch (e) { console.error(`[daemon] machine watch: ${e?.message ?? e}`); }
+        // RFC 32 §4.2: the build slice's CPU limit follows the night quiet hours (idempotent; warns, never throws).
+        try {
+          const qs = quietNow({ dir: LOCK_DIR });
+          if (qs.error && watchState.quietErr !== qs.error) { watchState.quietErr = qs.error; console.error(`[daemon] ⚠️ buildQuietHours: ${qs.error} — giờ im lặng đang tắt`); }
+          syncQuietCpu({ dir: LOCK_DIR, state: qs, warn: (m) => console.error(`[daemon] ${m}`) });
+        } catch (e) { console.error(`[daemon] quiet sync: ${e?.message ?? e}`); }
         // RFC 24: a build holding the lock too long while others wait → owner alert with a stop button.
         try { await longBuildWatch(ctx); }
         catch (e) { console.error(`[daemon] long-build watch: ${e?.message ?? e}`); }

@@ -6,7 +6,8 @@
 // redraw (strict edit) → answer. A crash between "consume" and "act" loses the press, never replays it.
 
 import crypto from 'node:crypto';
-import { LOCK_DIR, readQueue, readHolders } from './machine-lock.mjs';
+import { LOCK_DIR, readQueue, readHolders, quietNowFor } from './machine-lock.mjs';
+import { writeOverride, clearOverride, syncQuietCpu } from './quiet-hours.mjs';
 import { parseDuration, readPolicy } from './build-policy.mjs';
 import {
   setMax, stepMax, toggleMax, setRetry, setPaused, updatePolicy, kickTicket, topTicket, blockPlan, plainOwnerPlan, blockOwner, unblockOwner, resetPolicy,
@@ -33,7 +34,7 @@ export function latestQ(store, now = Date.now()) {
   return best;
 }
 
-const entryFor = (g, r, base) => ({ ...base, rows: r.maps.rows, running: r.maps.running, blocks: r.maps.blocks });
+const entryFor = (g, r, base) => ({ ...base, rows: r.maps.rows, running: r.maps.running, blocks: r.maps.blocks, quiet: r.maps.quiet });
 
 /** Send a fresh board and make it the only live one. */
 let qChain = Promise.resolve();
@@ -118,6 +119,12 @@ export async function qPress(cq, ctx, deps = {}) {
     const v = run ? (deps.verify ?? verifyHolder)(run, { dir }) : { why: 'build đó không còn' };
     if (!v.holder) { op = 'r'; note = `Không dừng: ${v.why}.`; run = null; }
   }
+  else if (op === 'qz') {
+    // The night-rules button: the state lives in the stored board (not in callback_data). An old board (another night's
+    // `until`, or the state changed since) is refused.
+    const cur = (deps.quietOf ?? quietNowFor)(dir, now), was = entry.quiet;
+    if (!was?.active || !cur.active || cur.until !== was.until || !!cur.overridden !== !!was.overridden) { op = 'r'; note = 'Bảng đã đổi — 🔄'; }
+  }
   // consume the revision FIRST (strict; failure = nothing is done)
   const next = { ...entry, rev: entry.rev + 1, createdAt: now };
   try { store.setStrict(tok, next); } catch { await ctx.answerButton(cq.id, '❌ không lưu được trạng thái nút — gõ /q lại.'); return; }
@@ -146,6 +153,15 @@ export async function qPress(cq, ctx, deps = {}) {
     case 'u': { const r = await res(unblockOwner(dir, owner, { now })); if (r.ok) note = 'Đã bỏ chặn.'; break; }
     case 's': view = `s:${idx}`; pin = run; break;
     case 'sy': note = await qStop(ctx, run, deps); break;
+    case 'qz': {
+      const was = entry.quiet;
+      try {
+        if (was.overridden) clearOverride(dir); else writeOverride(dir, { offUntil: was.until, by: 'q', at: now });
+        note = was.overridden ? 'Đã bật lại giờ im lặng.' : `Đã tắt giờ im lặng tới ${hhmm(was.until)} (build chạy hết tốc lực).`;
+        try { (deps.syncQuiet ?? (() => syncQuietCpu({ dir })))(); } catch (e) { console.error(`[q] sync quiet: ${e?.message ?? e}`); }
+      } catch (e) { note = `không ghi được: ${e?.message ?? e}`; }
+      break;
+    }
     case 'rs': view = 'rs'; break;
     case 'rsy': { const r = await res(resetPolicy(dir, { now })); if (r.ok) note = 'Đã ghi lại policy mặc định.'; break; }
     default: break;

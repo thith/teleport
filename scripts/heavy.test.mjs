@@ -201,7 +201,7 @@ test('RFC20: parseSize / scopeMemMax (45% of RAM default, env override, 0 = no l
 
 test('RFC20: scopeArgv — .scope unit, TimeoutStopSec, limits only when capped', () => {
   const a = scopeArgv({ unit: 'heavy-1-ab.scope', memMax: 8 * GiB }, ['setpriv', '--', 'cargo', 'test']);
-  assert.deepEqual(a, ['systemd-run', '--user', '--scope', '--quiet', '--collect', '--unit=heavy-1-ab.scope', '-p', 'TimeoutStopSec=10s',
+  assert.deepEqual(a, ['systemd-run', '--user', '--scope', '--quiet', '--collect', '--unit=heavy-1-ab.scope', '--slice=app-teleportbuild.slice', '-p', 'TimeoutStopSec=10s',
     '-p', `MemoryMax=${8 * GiB}`, '-p', `MemorySwapMax=${2 * GiB}`, '--', 'setpriv', '--', 'cargo', 'test']);
   assert.ok(!scopeArgv({ unit: 'u.scope', memMax: 0 }, ['x']).some((x) => /Memory/.test(x)), 'no MemoryMax=0 ever');
 });

@@ -54,11 +54,33 @@ Bị kill khi **đang chờ** thì vô hại: chưa giữ lock, lệnh không ch
 - **RAM:** mỗi build giới hạn 30% RAM khi có thể chạy cùng build khác (45% khi chạy một mình như trước). Build thứ hai, sau khi lấy chỗ, chờ tới khi RAM trống ≥ giới hạn của nó + 3 GiB, và tổng giới hạn các build cùng chạy ≤ 65% RAM (in `⏳ chờ RAM cho build thứ 2: …`; `/health` ghi `(chờ RAM)`). Build không giới hạn RAM (`--no-scope`, `--no-stop`, `TELEPORT_HEAVY_MEM_MAX=0`) chỉ chạy khi không còn build nào lấy chỗ trước nó.
 - **Triển khai (đã xong 2026-10-18: máy 32 GB, N = 2):** merge code RFC 23 **trước** khi cắm RAM (cắm RAM = tắt máy → mọi tiến trình cũ chạy lại bằng code mới); không giữ worktree teleport cũ còn chạy được. Nếu RAM vào trước: `lock-queue.mjs slots 1` cho tới khi code mới chạy và `lock-queue.mjs ls` trống.
 
+## Chỗ thứ 2 chỉ cấp khi CPU rảnh (RFC 32)
+
+- Khi số chỗ là **auto** (không có `build.slots`) và N = 2, một build sẽ chạy **cạnh** build khác chỉ khi: `load1 < 0.75 × số nhân` **và** mọi build đang giữ chỗ đã chạy lệnh thật ≥ 90 giây (tính từ lúc lệnh bắt đầu chạy, không tính lúc lấy lock). Máy rảnh (không còn build nào) thì build đầu hàng luôn chạy. Cổng chỉ làm **chờ thêm**, không từ chối hay dừng build nào; N, MemoryMax và ngân sách RAM không đổi.
+- Thấy gì: heavy in `(chỗ thứ 2: CPU bận (load 11.2/12))` hoặc `build kia mới chạy <90s` trong dòng chờ; `lock-queue.mjs ls` ghi `còn 1 chỗ — chờ CPU (load 11.2/12)`; `/q` thêm ` · chờ CPU (…)` vào tiêu đề. Đặt tay `slots 1` thì giữ nguyên như cũ, không qua cổng.
+- Người dùng agent không phải làm gì khác.
+
+## Giờ im lặng ban đêm (RFC 32 §4)
+
+Máy kêu vì quạt CPU, nên ban đêm giới hạn **tổng CPU của mọi build** và chỉ nhận build mới khi không còn build nào. **Mặc định tắt**; bật bằng `projects.json`:
+
+```json
+"_config": { "buildQuietHours": { "from": "23:30", "to": "06:00", "cpuPercent": 25, "maxBuilds": 1 } }
+```
+
+(khoá `_config.quietHours` là của nhắc heartbeat, không liên quan). Giờ theo giờ địa phương của máy; `from` > `to` là khung qua nửa đêm. Cấu hình hỏng = tắt, có cảnh báo trong log daemon và `/health`.
+
+- **Giới hạn CPU:** mọi scope build nằm chung `app-teleportbuild.slice` (con của `app.slice`, nên `/health` vẫn thấy OOM của build). `CPUQuota` của slice = `cpuPercent × số nhân` (25% của 12 nhân = 300%), áp bằng `systemctl --user set-property --runtime`, đổi ngay cả khi build đang chạy. Chỉ gọi systemctl để đổi khi slice lệch (idempotent). Chạy ở: tick mỗi phút của daemon, trước khi heavy tạo scope, và mỗi 60 giây khi heavy đang chạy build (nên đúng giờ cả khi daemon không chạy). Build không qua scope (`--no-scope`, `TELEPORT_HEAVY_SCOPE=0`, scope lỗi) **không** bị giới hạn CPU; holder ghi `scoped: false` và `/health` cảnh báo.
+- **Một build một lúc (chỉ khi auto):** trong khung, cổng đóng hẳn mỗi khi đã có một build, bất kể load. Build đang chạy lúc 23:30 vẫn chạy tiếp, không bị kick. `slots 1` đặt tay vốn là 1; giới hạn CPU vẫn áp.
+- **Không có systemd user hoặc controller `cpu`:** không giới hạn được CPU, chỉ còn giới hạn số build; có cảnh báo, không lỗi.
+- **Tắt tạm để chạy nhanh:** nút `[⏩ Tắt giờ im lặng tới 06:00]` / `[🌙 Bật lại]` ở bảng `/q`, hoặc `node ../teleport/scripts/lock-queue.mjs quiet` (xem), `quiet off` (tắt tạm tới hết khung), `quiet on` (bật lại). Ghi `~/.local/state/teleport/locks/quiet.override.json`; hết khung thì tự hết hiệu lực nên đêm sau tự bật lại. Chỉ owner / admin / maintainer (như `slots`).
+- `/health` giờ gọn: một dòng máy (`load x/N`, RAM, đĩa trống), một dòng ⚠️ gộp cảnh báo, và mục **⚙️ Đang áp dụng** liệt kê thông số đang có hiệu lực (số chỗ build, giờ im lặng, hàng `/q`, automerge).
+
 ## Merge
 
 Merge cũng có lock riêng (`merge.mjs` tự lấy, agent không cần làm gì). `/merge`, nút [Merge] và `merge-request` không bao giờ chạy 2 merge cùng lúc. Chờ quá 3 phút thì merge báo `❌ đang có merge khác chạy…`, thử lại sau.
 
 ## Chi tiết
 
-- Lock: `~/.local/state/teleport/locks/{build,merge,cleanup}.lock` (flock, do process Node giữ); chỗ build thứ hai là `build.1.lock`. `*.holder.json` để hiển thị ai đang giữ (và với build: giới hạn RAM đã khai báo).
-- Thiết kế, cùng lý do không dùng `flock <file> <cmd>`: RFC 17 trong `teleport-docs`; hai chỗ build: RFC 23.
+- Lock: `~/.local/state/teleport/locks/{build,merge,cleanup}.lock` (flock, do process Node giữ); chỗ build thứ hai là `build.1.lock`. `*.holder.json` để hiển thị ai đang giữ (và với build: giới hạn RAM đã khai báo, `running`/`runningSince`, `scoped`).
+- Thiết kế, cùng lý do không dùng `flock <file> <cmd>`: RFC 17 trong `teleport-docs`; hai chỗ build: RFC 23; cổng CPU và giờ im lặng: RFC 32.

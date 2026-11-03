@@ -3,6 +3,7 @@
 //   node ../teleport/scripts/lock-queue.mjs ls [--lock build]
 //   node ../teleport/scripts/lock-queue.mjs leave [--lock build] [--all | --pid N]
 //   node ../teleport/scripts/lock-queue.mjs slots [1|auto]     (owner: build slots, RFC 23)
+//   node ../teleport/scripts/lock-queue.mjs quiet [on|off]      (owner: night quiet hours, RFC 32 — off = pause them until the window ends)
 //   node ../teleport/scripts/lock-queue.mjs ls --ids            (also each ticket's file name + owner)
 //   node ../teleport/scripts/lock-queue.mjs max <n|off> | retry <phút> | kick <vé> | top <vé>
 //        | block <owner|vé> <30m|1h|2h30m|today> | unblock <owner> | pause | resume   (owner's queue control, RFC 29)
@@ -25,7 +26,8 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { LOCK_DIR, readQueue, readHolder, readHolders, queueOrder, readServed, hasLegacyWaiter, cancelTickets, selfConvoId, describeHolder, readStruck, readClaimed, worktreeOf, slotsFor, slotFiles, memTotal, TWO_SLOT_MIN_RAM, recordOwner } from './machine-lock.mjs';
+import { LOCK_DIR, readQueue, readHolder, readHolders, queueOrder, readServed, hasLegacyWaiter, cancelTickets, selfConvoId, describeHolder, readStruck, readClaimed, worktreeOf, slotsFor, slotFiles, memTotal, TWO_SLOT_MIN_RAM, recordOwner, cpuGateNote } from './machine-lock.mjs';
+import { quietNow, writeOverride, clearOverride, syncQuietCpu, hhmm as clock } from './quiet-hours.mjs';
 import { readPolicy, parseDuration, MAX_QUEUE_LIMIT } from './build-policy.mjs';
 import { setMax, setRetry, setPaused, kickTicket, topTicket, blockOwner, unblockOwner, blockPlan, plainOwnerPlan } from './queue-control.mjs';
 import { isMainModule } from './is-direct-run.mjs';
@@ -57,7 +59,7 @@ export function shortCmd(cmd, max = CMD_MAX) {
  * One lock's running jobs + queue as text lines (read-only). RFC 23: one layout
  * for 1 or 2 slots — "đang chạy x/N", one ▶ line per running job, "Chờ (k):".
  */
-export function formatQueue(name, { dir = LOCK_DIR, now = Date.now(), max = LIST_MAX, read = readQueue, struck = readStruck, holderOf = readHolder, slots = null, claimedOf = readClaimed, servedOf = readServed, policyOf = (d) => readPolicy(d, { now }).policy, ids = false } = {}) {
+export function formatQueue(name, { dir = LOCK_DIR, now = Date.now(), max = LIST_MAX, read = readQueue, struck = readStruck, holderOf = readHolder, slots = null, claimedOf = readClaimed, servedOf = readServed, policyOf = (d) => readPolicy(d, { now }).policy, ids = false, gate } = {}) {
   const N = slotsFor(name, { slots, dir });
   const hs = readHolders(name, { dir, holderOf }).sort((a, b) => a.startedAt - b.startedAt || a.slot - b.slot);
   // RFC 24: the order waiters use (fair for build, FIFO otherwise); the non-live come last, unnumbered
@@ -70,10 +72,12 @@ export function formatQueue(name, { dir = LOCK_DIR, now = Date.now(), max = LIST
   const head = q.find((t) => t.status === 'live');
   // an exclusive holder (cleanup) holds every slot; a build in a slot N no longer grants still counts (x may exceed N for a while)
   const busy = hs.some((h) => h.exclusive) ? Math.max(N, hs.length) : hs.length;
+  // RFC 32: with a free slot but a closed CPU gate, say why ("còn 1 chỗ — chờ CPU (load 11.2/12)")
+  const gateNote = name === 'build' && !pol?.paused ? cpuGateNote({ dir, N, holders: hs, claimed: claimedOf(name, { dir }), now, gate }) : '';
   const lines = [pol?.paused
     ? `🔒 ${name}: ${busy ? `đang chạy ${busy}/${N}` : `trống (0/${N})`} — ⏸ tạm dừng phát chỗ (owner)`
     : busy
-      ? `🔒 ${name}: đang chạy ${busy}/${N}${busy < N ? ` — còn ${N - busy} chỗ trống` : ''}`
+      ? `🔒 ${name}: đang chạy ${busy}/${N}${busy < N ? (gateNote ? ` — còn ${N - busy} chỗ — ${gateNote}` : ` — còn ${N - busy} chỗ trống`) : ''}`
       : `🔒 ${name}: trống (0/${N})${head ? ` — ${head.label || `pid ${head.pid}`} đang nhận lock` : ''}`];
   for (const h of hs) {
     lines.push(`  ▶ ${describeHolder({ ...h, label: who(h), cmd: shortCmd(h.cmd) }, now)}${h.exclusive ? ` (giữ cả ${slotFiles(name)} chỗ)` : ''}${h.waitingRam ? ' (chờ RAM)' : ''}`);
@@ -111,6 +115,10 @@ export function parseArgs(argv) {
       return d.error ? { error: d.error } : { cmd: 'block', target: a.slice(0, -1).join(' '), duration: a[a.length - 1] };
     }
     return a.length === 1 ? { cmd: o.cmd, target: a[0] } : bad; // kick | top | unblock
+  }
+  if (o.cmd === 'quiet') {
+    if (argv.length > 2 || (argv[1] != null && !['on', 'off'].includes(argv[1]))) return { error: 'usage: lock-queue.mjs quiet [on|off]' };
+    return { cmd: 'quiet', value: argv[1] ?? null };
   }
   if (o.cmd === 'slots') {
     if (argv.length > 2 || (argv[1] != null && !['1', 'auto'].includes(argv[1]))) return { error: 'usage: lock-queue.mjs slots [1|auto]' };
@@ -211,9 +219,26 @@ export function setSlots(value, { dir = LOCK_DIR, total = memTotal() } = {}) {
   return [`🔒 build: ${slotsFor('build', { dir })} chỗ (${forced ? `giới hạn 1 bởi ${file}` : `tự động theo RAM ${(total / 1024 ** 3).toFixed(0)} GiB → ${auto}`}). Áp dụng cho build lấy chỗ từ giờ; build đang chạy chạy nốt.`];
 }
 
+/** quiet [on|off] → { lines, code }. none = status; off = switch the night rules off until the window ends; on = back on. */
+export function quietCmd(value, { dir = LOCK_DIR, now = Date.now(), by = 'cli', stateOf = (d, n) => quietNow({ dir: d, now: n }), sync = () => syncQuietCpu({ dir }), write = writeOverride, clear = clearOverride } = {}) {
+  const st = stateOf(dir, now);
+  if (st.error) return { code: 1, lines: [`⚠️ giờ im lặng: cấu hình hỏng (${st.error}) — đang tắt.`] };
+  if (!st.enabled) return { code: value ? 1 : 0, lines: ['🌙 giờ im lặng: chưa cấu hình (projects.json _config.buildQuietHours).'] };
+  const describe = (s) => (!s.active ? `chưa tới giờ (${s.from}–${s.to}, bắt đầu ${clock(s.until)})` : s.overridden ? `TẮT TẠM tới ${clock(s.until)}` : `đang áp tới ${clock(s.until)}`);
+  if (value == null) return { code: 0, lines: [`🌙 giờ im lặng ${st.from}–${st.to}: build ≤ ${st.cpuPercent}% CPU, ${st.maxBuilds} build một lúc — ${describe(st)}`] };
+  if (value === 'off') {
+    if (!st.active) return { code: 1, lines: [`ℹ️ giờ im lặng: ${describe(st)} — không có gì để tắt.`] };
+    write(dir, { offUntil: st.until, by, at: now });
+  } else clear(dir);
+  const after = stateOf(dir, now);
+  sync();
+  return { code: 0, lines: [`✅ giờ im lặng: ${describe(after)}`] };
+}
+
 if (isMainModule(import.meta.url)) {
   const a = parseArgs(process.argv.slice(2));
   if (a.error) { console.error(a.error); process.exit(2); }
+  if (a.cmd === 'quiet') { const r = quietCmd(a.value); console.log(r.lines.join('\n')); process.exit(r.code); }
   if (a.cmd === 'slots') { console.log(setSlots(a.value).join('\n')); process.exit(0); }
   if (a.cmd === 'ls') {
     for (const name of a.lock ? [a.lock] : LOCK_NAMES) console.log(formatQueue(name, { ids: a.ids }).join('\n'));
