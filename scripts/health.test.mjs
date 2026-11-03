@@ -43,7 +43,7 @@ test('formatHealth: calm = no ⚠️ and no RAM top; several warnings = one ⚠�
 
 test('formatHealth: approved mock', () => {
   const now = 100 * 60_000;
-  const locks = formatLocksShort({ build: { N: 2, holders: [{ label: '🧚 Tiên', startedAt: now - 60_000 }], waiting: 0 }, merge: { holders: [], waiting: 0 }, cleanup: { holders: [], waiting: 0 } }, { now });
+  const locks = formatLocksShort({ build: { N: 2, holders: [{ label: '🧚 Tiên', startedAt: now - 60_000 }], waiting: [] }, merge: { holders: [], waiting: [] }, cleanup: { holders: [], waiting: [] } }, { now });
   const inEffect = formatInEffect({ build: { slots: 2, forced: false }, quiet: { enabled: true, active: true, overridden: false, until: new Date(2026, 10, 4, 6, 0).getTime() }, policy: { max: null } });
   const text = formatHealth({
     cores: 12, load: [5.0, 9, 8], mem: { total: 31 * GB, available: 20 * GB, swapTotal: 8 * GB, swapFree: 0 }, disk: { size: 500 * GB, avail: 152 * GB, target: '/' },
@@ -52,23 +52,28 @@ test('formatHealth: approved mock', () => {
   assert.equal(text, [
     '🩺 Máy', '💻 CPU: load 5.0/12', '🧠 RAM: 11/31 GB', '💾 Đĩa trống: 152 GB', '⚠️ Swap đầy 8/8 GB',
     '🐘 Ăn RAM nhiều nhất:', '   postgres ×31 — 2.5G', '   claude ×5 — 2.2G',
-    '🔒 Build 1/2 chỗ, chờ 0:', "   ▶ 🧚 Tiên (1')",
+    '🔒 Build:', "   ▶ 🧚 Tiên (1')",
     '', '📋 Thông số', '• Max build: auto (2)', '• Max chờ: auto', '• 🌙 tới 06:00',
     '', '/cswap   /q   /ls   /cleanup',
   ].join('\n'));
 });
 
-test('formatLocksShort: build with 0 / 1 / 2 holders; merge / cleanup only when held or waited for; unreadable → ?', () => {
+test('formatLocksShort: ▶ holders then ⏳ waiters, no counts; trống; merge / cleanup only when held or waited for; cap; unreadable → ?', () => {
   const now = 10 * 60_000;
-  const none = { holders: [], waiting: 0 };
-  assert.deepEqual(formatLocksShort({ build: { N: 2, holders: [], waiting: 0 }, merge: none, cleanup: none }, { now }), ['🔒 Build 0/2 chỗ, chờ 0']);
-  assert.deepEqual(formatLocksShort({ build: { N: 2, holders: [{ label: 'Ma #ab12', startedAt: 0 }], waiting: 2 } }, { now }), ['🔒 Build 1/2 chỗ, chờ 2:', "   ▶ Ma (10')"]);
-  assert.deepEqual(formatLocksShort({ build: { N: 2, holders: [{ label: 'A', startedAt: now }, { label: 'B', startedAt: now - 60_000 }], waiting: 0 } }, { now }),
-    ['🔒 Build 2/2 chỗ, chờ 0:', "   ▶ A (0')", "   ▶ B (1')"]);
-  const l = formatLocksShort({ build: { N: 1, holders: [], waiting: 0 }, merge: { holders: [{ label: '🦊 Cáo #ab12', startedAt: now - 120_000 }], waiting: 1 }, cleanup: { holders: [], waiting: 3 } }, { now });
-  assert.deepEqual(l, ['🔒 Build 0/1 chỗ, chờ 0', '🔒 Merge, chờ 1:', "   ▶ 🦊 Cáo (2')", '🔒 Cleanup, chờ 3']);
+  const none = { holders: [], waiting: [] };
+  assert.deepEqual(formatLocksShort({ build: none, merge: none, cleanup: none }, { now }), ['🔒 Build: trống']);
+  assert.deepEqual(formatLocksShort({ build: { holders: [{ label: 'Ma #ab12', startedAt: 0 }], waiting: [{ label: 'Mèo #c0ffee', since: now - 5 * 60_000 }, { pid: 77, since: now - 60_000 }] } }, { now }),
+    ['🔒 Build:', "   ▶ Ma (10')", "   ⏳ Mèo (5')", "   ⏳ pid 77 (1')"]);
+  assert.deepEqual(formatLocksShort({ build: { holders: [{ label: 'A', startedAt: now }, { label: 'B', startedAt: now - 60_000 }], waiting: [] } }, { now }),
+    ['🔒 Build:', "   ▶ A (0')", "   ▶ B (1')"]);
+  assert.deepEqual(formatLocksShort({ build: none, merge: { holders: [{ label: '🦊 Cáo #ab12', startedAt: now - 120_000 }], waiting: [{ label: 'X', since: now }] }, cleanup: { holders: [], waiting: [{ label: 'Y', since: now }] } }, { now }),
+    ['🔒 Build: trống', '🔒 Merge:', "   ▶ 🦊 Cáo (2')", "   ⏳ X (0')", '🔒 Cleanup:', "   ⏳ Y (0')"]);
   assert.deepEqual(formatLocksShort({ build: null }, { now }), ['🔒 Build ?']);
-  assert.deepEqual(formatLocksShort({ build: { N: 1, holders: [{ label: 'cleanup', startedAt: now, exclusive: true }], waiting: 0 } }, { now }), ['🔒 Build 1/1 chỗ, chờ 0:', "   ▶ cleanup (0') [giữ cả lock]"]);
+  assert.deepEqual(formatLocksShort({ build: { holders: [{ label: 'cleanup', startedAt: now, exclusive: true }], waiting: [] } }, { now }), ['🔒 Build:', "   ▶ cleanup (0') [giữ cả lock]"]);
+  const many = Array.from({ length: 13 }, (_, i) => ({ label: `W${i}`, since: now }));
+  const c = formatLocksShort({ build: { holders: [], waiting: many } }, { now });
+  assert.equal(c.length, 1 + 10 + 1);
+  assert.equal(c.at(-1), '   … +3');
 });
 
 test('formatInEffect: Max build auto/manual, Max chờ auto/n, 🌙 only while active; unreadable → ?', () => {
@@ -105,7 +110,8 @@ test('gatherLocal: reads buildQuietHours (not quietHours), shows 🌙 only in th
   assert.ok(w.extraWarn.some((x) => /^1 build đang chạy ngoài scope/.test(x)));
   assert.ok(w.extraWarn.includes('cargo cache chưa prune được 5 lần'));
   assert.equal(w.inEffect[2], '• 🌙 tới 06:00', 'the CPU limitation is only in the ⚠️ warning');
-  assert.equal(w.locks[0], '🔒 Build 1/' + w.locks[0].match(/1\/(\d)/)[1] + ' chỗ, chờ 0:');
+  assert.equal(w.locks[0], '🔒 Build:');
+  assert.ok(w.locks[1].startsWith('   ▶ A ('), w.locks.join('|'));
   const bad = gatherLocal({ dir, readProjects: () => ({ _config: { buildQuietHours: { from: 'x', to: 'y' } } }), supported: () => true, pruneLines: () => [] });
   assert.ok(bad.extraWarn.some((x) => /cấu hình hỏng/.test(x)));
   assert.equal(bad.inEffect.length, 2);
@@ -128,7 +134,7 @@ test('gatherLocal: unreadable build.slots / lock dir / queue dir print ? (ENOENT
   fs.mkdirSync(path.join(d2, 'build.queue')); fs.mkdirSync(path.join(d2, 'merge.queue'));
   fs.chmodSync(path.join(d2, 'merge.queue'), 0);
   const l = gatherLocal(opts(d2)).locks;
-  assert.ok(l.some((x) => /^🔒 Build \d\/\d chỗ, chờ 0$/.test(x)), l.join('|'));
+  assert.ok(l.some((x) => x === '🔒 Build: trống'), l.join('|'));
   assert.ok(l.includes('🔒 Merge ?'), l.join('|'));
   fs.chmodSync(path.join(d2, 'merge.queue'), 0o700);
   // unreadable lock dir → every lock prints ?
