@@ -8,6 +8,7 @@ import path from 'node:path';
 import zlib from 'node:zlib';
 import { execFile, execFileSync, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
+import { acquireLock } from './machine-lock.mjs';
 import { probeManual, manualRemove, writeBackup, verifyBackup, readTgz, buildRestoreScript, manualCommand, listKept, findNestedRepo } from './cleanup-manual.mjs';
 import {
   handleCleanupButton, startCleanupList, startManualFor, parseCleanupCommand, formatManualTable, renderCleanupList, manualDigest, manualEntryMatchesMessage,
@@ -349,22 +350,37 @@ test('a backup that can not be written or verified → the worktree stays', asyn
   await assert.rejects(verifyBackup(dir2, pr2, deps()), /unstaged\.patch thiếu/);
 });
 
-test('repo with diff.noprefix + a textconv driver: the patch is still valid and restores', async () => {
+test('repo with diff.noprefix + a textconv driver that WOULD run: the patch is raw, still valid, restores, and the converter never runs', async () => {
   const w = world();
   const a = w.add('feat-cfg');
+  const marker = path.join(w.parent, 'textconv-ran');
+  const conv = path.join(w.parent, 'conv.sh');
+  fs.writeFileSync(conv, `#!/bin/sh\necho ran >> '${marker}'\ncat "$1" | tr a-z A-Z\n`, { mode: 0o755 });
   g(w.main, 'config', 'diff.noprefix', 'true');
   g(w.main, 'config', 'diff.mnemonicPrefix', 'true');
-  write(path.join(w.main, '.gitattributes'), '*.dat diff=hex\n');
-  g(w.main, 'config', 'diff.hex.textconv', 'xxd');
+  g(w.main, 'config', 'diff.hex.textconv', conv);
+  write(path.join(a.path, '.gitattributes'), '*.dat diff=hex\n');
+  write(path.join(a.path, 'x.dat'), 'v1\n');
+  g(a.path, 'add', '.gitattributes', 'x.dat'); g(a.path, 'commit', '-qm', 'dat');
+  write(path.join(a.path, 'x.dat'), 'v2 lower\n');                       // a changed file the driver matches
   write(path.join(a.path, 'a.txt'), 'changed under noprefix');
   fs.writeFileSync(path.join(a.path, 'blob.bin'), Buffer.from([0, 1, 2, 3, 255]));
   g(a.path, 'add', 'blob.bin');
+  // proof the converter would have run for a plain `git diff`
+  g(a.path, 'diff', 'x.dat');
+  assert.ok(fs.existsSync(marker), 'a plain git diff runs the textconv driver');
+  fs.rmSync(marker);
   const p = await probe(w, a.path);
+  assert.equal(p.ok, true, p.reason);
   const res = await manualRemove(a.path, { parentDir: w.parent, deps: deps(), expectFingerprint: p.fingerprint, backupDir: w.backups });
   assert.equal(res.ok, true, res.reason);
-  assert.match(fs.readFileSync(path.join(res.backupDir, 'unstaged.patch'), 'utf8'), /^diff --git a\/a\.txt b\/a\.txt/m);
+  assert.equal(fs.existsSync(marker), false, 'neither the probe, the backup, the verification nor the late probe ran the converter');
+  const patch = fs.readFileSync(path.join(res.backupDir, 'unstaged.patch'), 'utf8');
+  assert.match(patch, /^diff --git a\/a\.txt b\/a\.txt/m);
+  assert.match(patch, /\+v2 lower/, 'raw content, not the converter output (upper case)');
   await execFileP('bash', [path.join(res.backupDir, 'restore.sh')]);
   assert.equal(fs.readFileSync(path.join(a.path, 'a.txt'), 'utf8'), 'changed under noprefix');
+  assert.equal(fs.readFileSync(path.join(a.path, 'x.dat'), 'utf8'), 'v2 lower\n');
   assert.deepEqual([...fs.readFileSync(path.join(a.path, 'blob.bin'))], [0, 1, 2, 3, 255], 'binary content restored byte for byte');
 });
 
@@ -713,15 +729,16 @@ test('/cleanup with the lock busy → a plain "đang bận" (nothing run)', asyn
   assert.match(h.dms.at(-1), /đang bận/);
 });
 
-test('listKept: only what the daily run keeps (an ok one is left out); childManual runs the same probe in a real child', async () => {
+test('listKept: no transcript scan — a row that passes every cheap gate is shown with a note; childManual runs the same probe in a real child', async () => {
   const w = world();
   const a = w.add('feat-ok');
   const b = w.add('feat-dirty');
   write(path.join(b.path, 'a.txt'), 'dirty');
   const prs = { 'feat-ok': [{ number: 1, state: 'MERGED', headRefOid: a.head, headRefName: 'feat-ok' }], 'feat-dirty': [{ number: 2, state: 'MERGED', headRefOid: b.head, headRefName: 'feat-dirty' }] };
-  const r = await listKept({ parentDir: w.parent, deps: { ...deps({ prs }), transcriptCwds: () => new Set() }, now: Date.now() + 30 * 24 * 3600_000 });
-  assert.deepEqual(r.rows.map((x) => x.branch), ['feat-dirty']);
+  const r = await listKept({ parentDir: w.parent, deps: { ...deps({ prs }), transcriptCwds: () => { throw new Error('the list must not scan transcripts'); } }, now: Date.now() + 30 * 24 * 3600_000 });
+  assert.deepEqual(r.rows.map((x) => x.branch), ['feat-dirty', 'feat-ok']);
   assert.match(r.rows[0].reason, /thay đổi chưa commit/);
+  assert.match(r.rows[1].reason, /qua mọi điều kiện dọn tự động.*không quét transcript/);
   assert.equal(r.rows[0].blocked, null);
   const viaChild = await childManual([])('manual-probe', b.path, { quick: true, parentDir: w.parent });
   assert.equal(viaChild.ok, true, viaChild.reason);
@@ -769,4 +786,176 @@ test('dispatchCommand /cleanup: the list and <target> are owner-only; run / --dr
   await dispatchCommand({ cmd: 'cleanup', rest: 'run' }, { id: 2 }, { ...base, runner });     // the old launcher, any admin
   await dispatchCommand({ cmd: 'cleanup', rest: '--dry-run' }, { id: 2 }, { ...base, runner });
   assert.deepEqual(ran, [['run'], ['--dry-run']]);
+});
+
+// ── code review round 1 ─────────────────────────────────────────────────────
+
+test('R1: filter=set / unset / unspecified are looked up as driver names too (fail closed)', async () => {
+  const w = world();
+  const a = w.add('feat-fset');
+  write(path.join(a.path, '.gitattributes'), 'big.dat filter=set\n');
+  write(path.join(a.path, 'big.dat'), 'v1');
+  g(a.path, 'add', '-f', '.gitattributes', 'big.dat'); g(a.path, 'commit', '-qm', 'attrs');
+  write(path.join(a.path, 'big.dat'), 'v2');
+  assert.equal((await probe(w, a.path)).ok, true, 'filter=set with no driver configured is harmless');
+  g(a.path, 'config', 'filter.set.clean', 'cat');
+  await blocked(w, a.path, /filter "set"/);
+});
+
+test('R2: a file going A→B during the backup and back to A before the late probe → the backup is rejected, nothing removed', async () => {
+  const w = world();
+  const a = w.add('feat-aba');
+  write(path.join(a.path, 'b.txt'), 'A');
+  const p = await probe(w, a.path);
+  const r = await manualRemove(a.path, { parentDir: w.parent, deps: deps(), expectFingerprint: p.fingerprint, backupDir: w.backups,
+    hooks: { beforeBackup: () => write(path.join(a.path, 'b.txt'), 'B'), afterBackup: () => write(path.join(a.path, 'b.txt'), 'A') } });
+  assert.equal(r.ok, false);
+  assert.equal(r.backupFailed, true);
+  assert.match(r.reason, /khác bản đã xác nhận/);
+  assert.ok(fs.existsSync(a.path));
+  assert.deepEqual(fs.readdirSync(w.backups), []);
+  // straight at the writer too
+  const pr = await probe(w, a.path);
+  write(path.join(a.path, 'b.txt'), 'C');
+  await assert.rejects(writeBackup(pr, { root: w.backups }), /unstaged\.patch khác bản đã xác nhận/);
+  assert.deepEqual(fs.readdirSync(w.backups), []);
+});
+
+test('R3: the late probe does no PR query and no du; the first probe does both once', async () => {
+  const w = world();
+  const a = w.add('feat-fast');
+  write(path.join(a.path, 'target', 'x'), 'junk');
+  write(path.join(a.path, 'n.txt'));
+  const calls = [];
+  const d = deps();
+  const rec = { ...d, exec: async (cmd, args, o) => { calls.push(cmd); return d.exec(cmd, args, o); } };
+  const p = await probeManual(a.path, { parentDir: w.parent, deps: rec });
+  const base = { gh: calls.filter((c) => c === 'gh').length, du: calls.filter((c) => c === 'du').length };
+  assert.deepEqual(base, { gh: 1, du: 1 });
+  calls.length = 0;
+  const r = await manualRemove(a.path, { parentDir: w.parent, deps: rec, expectFingerprint: p.fingerprint, backupDir: w.backups });
+  assert.equal(r.ok, true, r.reason);
+  assert.deepEqual({ gh: calls.filter((c) => c === 'gh').length, du: calls.filter((c) => c === 'du').length }, { gh: 1, du: 1 }, 'two probes in the remove, one gh + one du in total (not three)');
+});
+
+test('R4: manual-remove holds the cleanup lock itself for the whole operation; a busy lock → busy, nothing run; the group kill outlives nothing', async () => {
+  const w = world();
+  const a = w.add('feat-lock4');
+  write(path.join(a.path, 'n.txt'));
+  const p = await probe(w, a.path);
+  const lk = { dir: w.lockDir, waitSec: 0, label: 't', cmd: 'test' };
+  const held = await acquireLock('cleanup', { waitSec: 0, dir: w.lockDir, cmd: 'other' });
+  const busy = await manualCommand('manual-remove', a.path, { parentDir: w.parent, deps: deps(), expectFingerprint: p.fingerprint, backupDir: w.backups, lock: lk });
+  held.release();
+  assert.equal(busy.busy, true);
+  assert.ok(fs.existsSync(a.path));
+  let heldDuring = null;
+  const r = await manualCommand('manual-remove', a.path, { parentDir: w.parent, deps: deps(), expectFingerprint: p.fingerprint, backupDir: w.backups, lock: lk,
+    hooks: { afterBackup: async () => { heldDuring = !!(await acquireLock('cleanup', { waitSec: 0, dir: w.lockDir })).timeout; } } });
+  assert.equal(r.ok, true, r.reason);
+  assert.equal(heldDuring, true, 'the lock is held while the backup / removal runs');
+  const after = await acquireLock('cleanup', { waitSec: 0, dir: w.lockDir });
+  assert.ok(!after.timeout, 'released afterwards');
+  after.release();
+  // timeout → the whole process group is killed, and the answer comes only after it is gone
+  const dir = tmp('tp-grp-');
+  const script = path.join(dir, 'hang.mjs');
+  fs.writeFileSync(script, `import { spawn } from 'node:child_process'; import fs from 'node:fs'; import path from 'node:path';
+const c = spawn('sleep', ['60'], { stdio: 'ignore' }); fs.writeFileSync(path.join(path.dirname(process.argv[1]), 'pid'), String(c.pid)); setInterval(() => {}, 1000);`);
+  const res = await childManual([], { script, timeout: 800 })('manual-remove', '/x', {});
+  assert.equal(res.childError, true);
+  const pid = Number(fs.readFileSync(path.join(dir, 'pid'), 'utf8'));
+  let alive = true;
+  try { process.kill(pid, 0); } catch { alive = false; }
+  assert.equal(alive, false, 'the grandchild died with the group before we answered');
+});
+
+test('R5: a mode change on a backed-up file (0644 → 0755) changes the fingerprint', async () => {
+  const w = world();
+  const a = w.add('feat-mode');
+  write(path.join(a.path, 'run.sh'), 'echo', 0o644);
+  const p = await probe(w, a.path);
+  fs.chmodSync(path.join(a.path, 'run.sh'), 0o755);
+  assert.notEqual((await probe(w, a.path)).fingerprint, p.fingerprint);
+});
+
+test('R6/R10: a delayed press of a consumed token answers only and never edits; a legacy ck is guarded by the in-flight set', async () => {
+  const w = world();
+  const a = w.add('feat-stale');
+  write(path.join(a.path, 'n.txt'));
+  const h = harness(w);
+  const { tok, text } = seedCm(h, a);
+  await handleCleanupButton(press(`cm:${tok}`, text), h.ctx, h.o);
+  const table = h.edits.at(-1);
+  const edits = h.edits.length;
+  await handleCleanupButton(press(`cm:${tok}`, text), h.ctx, { ...h.o, runManual: async () => { throw new Error('must not run'); } }); // the old, consumed token
+  assert.equal(h.edits.length, edits, 'no edit: the newer confirm keyboard stays');
+  assert.match(h.answers.at(-1), /Hết hạn hoặc đã xử lý/);
+  await handleCleanupButton(press(`ck:${'9'.repeat(16)}`, 'x'), h.ctx, h.o);
+  assert.equal(h.edits.length, edits, 'a stale ck answers only too');
+  // ck vs an in-flight press of the same token
+  h.store.set('f'.repeat(16), { kind: 'cleanup', path: a.path, convoId: null, head: a.head, stray: ['n.txt'], strayHash: 'h', createdAt: Date.now() });
+  manualInFlight.add('f'.repeat(16));
+  try { await handleCleanupButton(press(`ck:${'f'.repeat(16)}`, 'x'), h.ctx, h.o); } finally { manualInFlight.delete('f'.repeat(16)); }
+  assert.match(h.answers.at(-1), /đang xử lý/);
+  assert.ok(h.store.has('f'.repeat(16)), 'the in-flight token was not consumed by ck');
+  assert.ok(table.rows.length);
+});
+
+test('R7: the 20 000-file limit counts patch-backed + tar-backed paths together (checked in the probe, before any backup)', async () => {
+  const w = world();
+  const a = w.add('feat-union');
+  for (let i = 0; i < 6; i++) write(path.join(a.path, `u${i}.txt`));
+  write(path.join(a.path, 'a.txt'), 'x'); write(path.join(a.path, 'b.txt'), 'y'); write(path.join(a.path, 'README.md'), 'z');
+  assert.equal((await probe(w, a.path, { maxFiles: 9 })).ok, true, '6 untracked + 3 tracked = 9');
+  const r = await probe(w, a.path, { maxFiles: 8 });
+  assert.equal(r.limit, true);
+  assert.equal(fs.existsSync(w.backups), false);
+});
+
+test('R8/R13: the /cleanup list gives a hard-blocked row (incl. the filter check) no delete button; errors are shown; expired tokens are swept', async () => {
+  const w = world();
+  const a = w.add('feat-listf');
+  write(path.join(a.path, '.gitattributes'), 'big.dat filter=lfs\n');
+  write(path.join(a.path, 'big.dat'), 'v1');
+  g(a.path, 'add', '-f', '.gitattributes', 'big.dat'); g(a.path, 'commit', '-qm', 'attrs');
+  g(a.path, 'config', 'filter.lfs.clean', 'cat');
+  write(path.join(a.path, 'big.dat'), 'v2');
+  w.add('feat-plain');
+  fs.mkdirSync(path.join(w.parent, 'broken', '.git'), { recursive: true }); // a repo whose `worktree list` fails → an error line
+  const h = harness(w);
+  h.store.set('e'.repeat(16), { kind: 'cleanup', mode: 'list', rows: {}, createdAt: 1 }); // long expired
+  await startCleanupList(h.ctx, h.o);
+  assert.equal(h.store.has('e'.repeat(16)), false, 'expired cleanup entries are swept');
+  const m = h.sent.at(-1);
+  const lines = m.t.split('\n');
+  assert.match(lines.find((l) => l.includes('feat-listf')), /🚫 không xoá tay được: .*filter "lfs"/);
+  const labels = m.rows.flat().map((b) => b.text);
+  assert.equal(labels.filter((l) => /^🗑 \d/.test(l)).length, 1, 'only the plain row has a button');
+  assert.ok(lines.some((l) => l.startsWith('⚠️ ') && /broken/.test(l)), 'list errors are shown');
+  // an expired token that is pressed is deleted, without touching the message
+  h.store.set('d'.repeat(16), { kind: 'cleanup', mode: 'manual', path: a.path, createdAt: 1 });
+  const n = h.edits.length;
+  await handleCleanupButton(press(`cm:${'d'.repeat(16)}`, 'x'), h.ctx, h.o);
+  assert.equal(h.store.has('d'.repeat(16)), false);
+  assert.equal(h.edits.length, n);
+});
+
+test('R11: git worktree remove failing after the backup → the message names the backup + restore.sh and does NOT say the tree is intact', async () => {
+  const w = world();
+  const a = w.add('feat-rmfail');
+  write(path.join(a.path, 'n.txt'));
+  const h = harness(w);
+  const d = deps();
+  h.o.deps = { ...d, exec: async (cmd, args, o) => { if (cmd === 'git' && args.includes('remove')) throw new Error('fatal: cannot remove: Directory not empty'); return d.exec(cmd, args, o); } };
+  const { tok, text } = seedCm(h, a);
+  await handleCleanupButton(press(`cm:${tok}`, text), h.ctx, h.o);
+  const t1 = h.edits.at(-1);
+  await handleCleanupButton(press(t1.rows[0][0].callback_data, t1.t), h.ctx, h.o);
+  const last = h.edits.at(-1);
+  assert.match(last.t, /git worktree remove lỗi: .* — worktree có thể đã bị xoá một phần\. Sao lưu: .* · khôi phục: bash .*restore\.sh/);
+  assert.doesNotMatch(last.t, /còn nguyên/);
+  assert.deepEqual(last.rows, []);
+  assert.ok(fs.readdirSync(w.backups).length === 1, 'the backup is kept');
+  assert.match(h.delivered.at(-1).cleanupResult.text, /restore\.sh/);
 });

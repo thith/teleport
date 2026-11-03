@@ -23,7 +23,7 @@
 import fs from 'node:fs';
 import crypto from 'node:crypto';
 import path from 'node:path';
-import { execFile } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { claimRequests, deliverResult } from './merge-inbox.mjs';
 import { CLEANUP_REQUEST_DIR } from './cleanup-request.mjs';
@@ -120,12 +120,25 @@ function childExchange(msg, fallback, secretEnvKeys, { script = path.join(__dirn
   return new Promise((resolve) => {
     const env = { ...process.env };
     for (const k of secretEnvKeys) delete env[k];
-    const child = execFile(process.execPath, [script],
-      { env, timeout, maxBuffer: 4 * 1024 * 1024 }, (err, stdout, stderr) => {
-        if (stderr) process.stderr.write(stderr); // the child's [cleanup] log lines → the daemon log
-        try { const r = JSON.parse(String(stdout).trim().split('\n').pop()); if (r && typeof r === 'object') return resolve(r); } catch {}
-        resolve(fallback(String(err?.message || 'không có kết quả').split('\n')[0].slice(0, 160)));
-      });
+    // Own process group: on a timeout the WHOLE group (the node child and the git / tar / du it started) is killed, and we only
+    // answer once it has exited — a destructive worker must not outlive the answer.
+    const child = spawn(process.execPath, [script], { env, detached: true, stdio: ['pipe', 'pipe', 'pipe'] });
+    let out = '', errOut = '', timedOut = false, done = false;
+    const kill = () => { try { process.kill(-child.pid, 'SIGKILL'); } catch { try { child.kill('SIGKILL'); } catch {} } };
+    const timer = setTimeout(() => { timedOut = true; kill(); }, timeout);
+    const finish = (why) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      if (errOut) process.stderr.write(errOut); // the child's [cleanup] log lines → the daemon log
+      if (!why) { try { const r = JSON.parse(out.trim().split('\n').pop()); if (r && typeof r === 'object') return resolve(r); } catch {} why = 'không có kết quả'; }
+      resolve(fallback(why));
+    };
+    child.stdout.on('data', (d) => { if (out.length < 4 * 1024 * 1024) out += d; });
+    child.stderr.on('data', (d) => { if (errOut.length < 1024 * 1024) errOut += d; });
+    child.on('error', (e) => { kill(); finish(String(e?.message || e).split('\n')[0].slice(0, 160)); });
+    child.on('close', (code) => finish(timedOut ? 'quá thời gian, đã dừng tiến trình' : (code ? `thoát mã ${code}` : null)));
+    child.stdin.on('error', () => {});
     child.stdin.end(JSON.stringify(msg));
   });
 }
@@ -278,6 +291,11 @@ export function baseOf(text) {
   let i = -1;
   lines.forEach((l, k) => { if (/^(?:💾 .*  )?🔑 [0-9a-f]{16}$/.test(l)) i = k; });
   return (i < 0 ? lines : lines.slice(0, i + 1)).join('\n').slice(0, OFFER_TEXT_MAX);
+}
+
+/** Drop expired `kind: 'cleanup'` entries (manual, list, legacy) from the button store. Best effort. */
+export function sweepCleanupEntries(store, now = Date.now(), ttlMs = CLEANUP_BUTTON_TTL_MS) {
+  try { for (const [k, v] of [...store.entries()]) if (v?.kind === 'cleanup' && !(now - v.createdAt <= ttlMs)) store.delete(k); } catch (e) { console.error(`[cleanup] sweep: ${e?.message ?? e}`); }
 }
 
 const newTok = () => crypto.randomBytes(8).toString('hex');
@@ -436,7 +454,7 @@ export function renderCleanupList(e, tok) {
     return `${n}. ${esc(i.repo, 40)}/${esc(i.name, 60)} · ${esc(i.branch ?? '?', 60)} — ${esc(i.reason, 120)}${i.blocked ? ` · 🚫 không xoá tay được: ${esc(i.blocked, 120)}` : ''}`;
   });
   const head = nums.length ? `🧹 Worktree đang được giữ lại (${nums.length})${pages > 1 ? ` — trang ${page + 1}/${pages}` : ''}:` : '🧹 Không có worktree nào đang được giữ lại.';
-  const text = [head, ...lines, ...(slice.some((n) => !(e.info || {})[n]?.blocked) ? ['', 'Bấm 🗑 <số> để xem bảng "sẽ mất gì" trước khi xoá.'] : []), `🔑 ${manualDigest(e)}`].join('\n');
+  const text = [head, ...lines, ...(slice.some((n) => !(e.info || {})[n]?.blocked) ? ['', 'Bấm 🗑 <số> để xem bảng "sẽ mất gì" trước khi xoá.'] : []), ...(e.errors || []).map((x) => `⚠️ ${esc(x, 200)}`), `🔑 ${manualDigest(e)}`].join('\n');
   const keys = slice.filter((n) => !(e.info || {})[n]?.blocked).map((n) => ({ text: `🗑 ${n}`, callback_data: `cw:${tok}:${n}` }));
   const rows = [];
   for (let i = 0; i < keys.length; i += 4) rows.push(keys.slice(i, i + 4));
@@ -516,7 +534,6 @@ const buttonsOf = (op) => (op === 'cy' ? confirmButtons : op === 'cx' ? legacyBu
 export async function handleCleanupButton(cq, ctx, o = {}) {
   const m = String(cq.data || '').match(CLEANUP_BUTTON_RE);
   if (!m) { await ctx.answerButton(cq.id); return; }
-  if (m[1] === 'ck') { await keepLegacy(m, cq, ctx, o); return; }
   const op = m[1], tok = m[2], param = m[3] ?? null;
   const store = ctx.buttonStore;
   const chatId = cq.message?.chat?.id, messageId = cq.message?.message_id;
@@ -524,14 +541,18 @@ export async function handleCleanupButton(cq, ctx, o = {}) {
   const answer = (t) => ctx.answerButton(cq.id, t);
   const key = param != null ? `${tok}:${param}` : tok;
   if (manualInFlight.has(key)) { await answer('⌛ đang xử lý — đã xử lý rồi, đợi chút.'); return; }
-  const entry = store?.get(tok);
-  const now = (o.now ?? Date.now)();
-  const isList = entry?.mode === 'list', isManual = entry?.mode === 'manual';
-  if (!entry || entry.kind !== 'cleanup' || now - entry.createdAt > CLEANUP_BUTTON_TTL_MS) {
-    await answer('⌛ Hết hạn hoặc đã xử lý.');
-    if (cq.message?.reply_markup && chatId != null) await editWith(ctx)(chatId, messageId, `${baseOf(msgText)}\n\n⌛ Hết hạn.`, []).catch(() => {});
+  if (op === 'ck') { // legacy [Giữ]: also guarded, so it can't race an in-flight cx on the same token
+    manualInFlight.add(key);
+    try { await keepLegacy(m, cq, ctx, o); } finally { manualInFlight.delete(key); }
     return;
   }
+  const now = (o.now ?? Date.now)();
+  if (store) sweepCleanupEntries(store, now);
+  const entry = store?.get(tok);
+  const isList = entry?.mode === 'list', isManual = entry?.mode === 'manual';
+  // A delayed press of an old / already-consumed token answers the callback ONLY: the message now belongs to a newer token
+  // (a confirm keyboard, or the success / restore text) and must not be edited.
+  if (!entry || entry.kind !== 'cleanup') { await answer('⌛ Hết hạn hoặc đã xử lý.'); return; }
   const shapeOk = op === 'cm' ? isManual && !entry.stage : (op === 'cy' || op === 'cn') ? isManual && entry.stage === 'confirm'
     : op === 'cx' ? !isManual && !isList : isList && (op === 'cr' || (param != null));
   if (!shapeOk) { await answer('Nút không khớp.'); return; }
@@ -573,10 +594,16 @@ async function openTable(c) {
 async function confirmRemove(c) {
   const { entry, ctx, o } = c;
   await c.answer('Đang sao lưu và xoá…');
-  const r = await underLock(o, 'teleport daemon (cleanup button)', `cleanup manual-remove ${entry.path}`,
-    () => c.runManual('manual-remove', entry.path, { ...(c.parentDir ? { parentDir: c.parentDir } : {}), expectFingerprint: entry.fingerprint, ...(o.backupDir ? { backupDir: o.backupDir } : {}) }));
-  if (r.busy || r.value?.childError) { await retryButtons(c, busyNote, confirmButtons); return; }
-  const v = r.value;
+  // The destructive child takes the `cleanup` lock itself and holds it to the end (the daemon does NOT hold it here).
+  let v;
+  try {
+    v = await c.runManual('manual-remove', entry.path, {
+      ...(c.parentDir ? { parentDir: c.parentDir } : {}), expectFingerprint: entry.fingerprint, ...(o.backupDir ? { backupDir: o.backupDir } : {}),
+      lock: { dir: o.lockDir ?? LOCK_DIR, waitSec: o.waitSec ?? CLEANUP_LOCK_WAIT_SEC, label: 'teleport daemon (cleanup button)', cmd: `cleanup manual-remove ${entry.path}` },
+      ...(o.acquire ? { acquire: o.acquire } : {}),
+    });
+  } catch (e) { v = { ok: false, childError: true, reason: String(e?.message ?? e) }; }
+  if (v?.busy || v?.childError) { await retryButtons(c, busyNote, confirmButtons); return; }
   const deliver = o.deliver ?? deliverResult;
   const tell = async (text, ok) => entry.convoId && deliver({ convoId: entry.convoId, text, ok, path: entry.path }, { build: buildCleanupResultPrompt }).catch(() => {});
   if (v.ok) {
@@ -587,7 +614,13 @@ async function confirmRemove(c) {
     return;
   }
   if (v.changed) { await showProbe(c, v.probe, { note: v.note }); return; } // a new table, a new token
-  c.audit({ requester: entry.convoId, path: entry.path, ok: false, mode: 'manual-remove', reason: v.reason });
+  c.audit({ requester: entry.convoId, path: entry.path, ok: false, mode: 'manual-remove', reason: v.reason, ...(v.backupDir ? { backup: v.backupDir } : {}) });
+  if (v.removeFailed) { // the backup is good but the removal failed: the tree may be partly deleted — say where the restore is
+    const text = escapeControls(`❌ ${v.reason} — worktree có thể đã bị xoá một phần. Sao lưu: ${v.backupDir} · khôi phục: bash ${v.backupDir}/restore.sh`);
+    await swapAndEdit(ctx, c.store, c.tok, null, null, c.chatId, c.messageId, `${baseOf(c.msgText)}\n\n${text}`.slice(0, 4000), []);
+    await tell(text, false);
+    return;
+  }
   if (v.backupFailed || (!v.hard && !v.limit)) { await retryButtons(c, `❌ ${escapeControls(v.reason || 'lỗi')} — worktree còn nguyên`, confirmButtons); return; }
   await swapAndEdit(ctx, c.store, c.tok, null, null, c.chatId, c.messageId, `${baseOf(c.msgText)}\n\n🚫 không xoá được: ${escapeControls(v.reason || '?')}`.slice(0, 4000), []);
   await tell(escapeControls(`❌ owner định xoá tay ${entry.path} nhưng bị chặn: ${v.reason}`), false);
@@ -640,12 +673,9 @@ async function keepLegacy(m, cq, ctx, o) {
   const msgText = cq.message?.text || '';
   const original = msgText.length > OFFER_TEXT_MAX ? `${msgText.slice(0, OFFER_TEXT_MAX)}…` : msgText;
   const take = o.take ?? takeCleanupButton;
+  if (store) sweepCleanupEntries(store, (o.now ?? Date.now)());
   const entry = store ? take(m[2], { store }) : null;
-  if (!entry) {
-    await ctx.answerButton(cq.id, '⌛ Hết hạn hoặc đã xử lý.');
-    if (chatId != null) await ctx.editButtonsMessage(chatId, messageId, `${original}\n\n⌛ Hết hạn.`);
-    return;
-  }
+  if (!entry) { await ctx.answerButton(cq.id, '⌛ Hết hạn hoặc đã xử lý.'); return; } // answer only (see handleCleanupButton)
   await ctx.answerButton(cq.id, 'Giữ lại');
   await ctx.editButtonsMessage(chatId, messageId, `${original}\n\n✋ Owner giữ lại.`);
   (o.audit ?? auditCleanupRequest)({ requester: entry.convoId, path: entry.path, ok: false, mode: 'button-keep' });
@@ -668,7 +698,8 @@ export async function startCleanupList(ctx, o = {}) {
     rows[i + 1] = { path: x.path, head: x.head };
     info[i + 1] = { repo: x.repo, name: x.name, branch: x.branch, reason: x.reason, blocked: x.blocked || null };
   });
-  const entry = { kind: 'cleanup', mode: 'list', rows, info, page: 0, createdAt: (o.now ?? Date.now)() };
+  const entry = { kind: 'cleanup', mode: 'list', rows, info, page: 0, createdAt: (o.now ?? Date.now)(), errors: (r.value.errors || []).slice(0, 5).map((x) => cut(x, 200)) };
+  sweepCleanupEntries(buttonStore, entry.createdAt);
   const tok = newTok();
   const { text, rows: kb } = renderCleanupList(entry, tok);
   buttonStore.set(tok, entry);

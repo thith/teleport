@@ -18,6 +18,7 @@ import {
   defaultDeps, locateWorktree, listLinkedWorktrees, judgeWorktree, parseWorktreePorcelain, hiddenEdits, isBuildPath, looksLikeRepo,
   procsInside, duBytes, fmtGB, WALK_MAX_ENTRIES, MANUAL_BACKUP_DIR, TRANSCRIPT_WINDOW_MS,
 } from './cleanup.mjs';
+import { acquireLock } from './machine-lock.mjs';
 import { PARENT_DIR } from './workspace.mjs';
 
 export const MANUAL_MAX_BYTES = 2 * 2 ** 30;   // more to back up than this → no ✅
@@ -153,12 +154,13 @@ export async function hardBlocks(L, deps, { realParent, nested = true, maxEntrie
       const names = new Set();
       for (let i = 0; i < trackedPaths.length; i += 200) {
         const toks = String(await gitIn(deps, real, ['check-attr', '-z', 'filter', '--', ...trackedPaths.slice(i, i + 200)])).split('\0');
-        for (let j = 0; j + 2 < toks.length; j += 3) { const v = toks[j + 2]; if (v && !['unspecified', 'unset', 'set'].includes(v)) names.add(v); }
+        // `set` / `unset` / `unspecified` can also be literal driver names (`filter=set`): look every value up as a driver, fail closed.
+        for (let j = 0; j + 2 < toks.length; j += 3) { const v = toks[j + 2]; if (v) names.add(v); }
       }
       for (const n of names) {
         for (const kind of ['clean', 'process']) {
           let val = '';
-          try { val = String(await gitIn(deps, real, ['config', '--get', `filter.${n}.${kind}`])).trim(); } catch {}
+          try { val = String(await gitIn(deps, real, ['config', '--get', `filter.${n}.${kind}`])).trim(); } catch (e) { if (e?.code !== 1) val = '?'; } // exit 1 = not configured; any other failure = unknown → block
           if (val) { blocks.push(`file đã track đổi mà dùng filter "${n}" (${kind}) — patch có thể thiếu nội dung thật`); return; }
         }
       }
@@ -194,7 +196,7 @@ export async function locateManaged(target, { deps, realParent }) {
  * `quick`: the blocks only, no file inventory (is a button worth offering at all?).
  */
 export async function probeManual(target, {
-  parentDir = PARENT_DIR, deps: injected = {}, quick = false, maxEntries = WALK_MAX_ENTRIES, maxBytes = MANUAL_MAX_BYTES, maxFiles = MANUAL_MAX_FILES,
+  parentDir = PARENT_DIR, deps: injected = {}, quick = false, fast = false, maxEntries = WALK_MAX_ENTRIES, maxBytes = MANUAL_MAX_BYTES, maxFiles = MANUAL_MAX_FILES,
 } = {}) {
   const deps = { ...defaultDeps(), ...injected };
   let shown = target;
@@ -241,7 +243,8 @@ export async function probeManual(target, {
       files.push(rec);
       bytes += rec.size;
       if (bytes > maxBytes) throw Object.assign(new Error('big'), { big: fmtGB(bytes) });
-      if (files.length > maxFiles) throw Object.assign(new Error('many'), { big: `${files.length}+ file` });
+      // patch-backed (tracked) and tar-backed paths are disjoint (checked below): the union is their sum
+      if (files.length + trackedPaths.length > maxFiles) throw Object.assign(new Error('many'), { big: `${files.length + trackedPaths.length}+ file` });
     };
     const display = [];
     try {
@@ -285,8 +288,11 @@ export async function probeManual(target, {
     const statusV2 = await git(['status', '--porcelain=v2', '-z', '--untracked-files=all', '--ignored=matching', '--no-renames']);
     const fp = crypto.createHash('sha256');
     fp.update(JSON.stringify([headNow, branch, hashFile(path.join(gitDir, 'index')), sha(statusV2), patchIn.staged.sha256, patchIn.unstaged.sha256]));
-    for (const f of files) fp.update(`\n${JSON.stringify([f.path, f.type, f.sha256])}`);
+    for (const f of files) fp.update(`\n${JSON.stringify([f.path, f.type, f.mode, f.sha256])}`);
     const fingerprint = fp.digest('hex');
+
+    // `fast` (the late re-probe right before the removal): only the volatile safety facts above — no PR query, no du, no table extras
+    if (fast) return { ok: true, fast: true, path: shown, real, main: L.main, repo: L.repo, commonDir, branch, head: headNow, files, patches: patchIn, fingerprint };
 
     // table extras: upstream / unpushed, PR, sizes of the skipped build dirs (best effort)
     let upstream = null, aheadCommits = 0;
@@ -314,7 +320,7 @@ export async function probeManual(target, {
       ok: true, path: shown, real, main: L.main, repo: L.repo, commonDir, branch, head: headNow, upstream, aheadCommits, pr,
       tracked: { count: trackedPaths.length, staged: staged.length, names: trackedPaths.slice(0, 6) },
       entries: display.slice(0, 6), entryCount: display.length, skipped: skippedInfo, skippedMore: Math.max(0, skipped.length - 5),
-      fileCount: files.length, bytes: bytes + patchBytes, files, fingerprint,
+      fileCount: files.length, bytes: bytes + patchBytes, files, patches: patchIn, fingerprint,
     };
   } catch (e) {
     return { ok: false, hard: true, path: shown, reason: `lỗi probe: ${firstLine(e)}` };
@@ -322,7 +328,7 @@ export async function probeManual(target, {
 }
 
 /** The probe without the (big) file list — what crosses the child's stdout. */
-const slim = (p) => { if (!p?.files) return p; const { files, real, ...rest } = p; return rest; };
+const slim = (p) => { if (!p?.files) return p; const { files, real, patches, ...rest } = p; return rest; };
 
 // ── tar reader (verifies the backup without parsing `tar t` output) ─────────
 
@@ -445,9 +451,13 @@ export async function writeBackup(p, { root = MANUAL_BACKUP_DIR, now = Date.now(
   const made = { dir };
   try {
     const staged = path.join(dir, 'staged.patch'), unstaged = path.join(dir, 'unstaged.patch');
-    await streamGit(p.real, ['diff', '--cached', ...DIFF_FLAGS], { toFile: staged });
-    await streamGit(p.real, ['diff', ...DIFF_FLAGS], { toFile: unstaged });
-    for (const f of [staged, unstaged]) if (fs.statSync(f).size === 0) fs.unlinkSync(f);
+    // The patches written must be byte-for-byte the ones the owner confirmed (a file A→B→A during the backup would pass the late fingerprint otherwise).
+    for (const [name, file, args] of [['staged', staged, ['--cached']], ['unstaged', unstaged, []]]) {
+      const w = await streamGit(p.real, ['diff', ...args, ...DIFF_FLAGS], { toFile: file });
+      const want = p.patches?.[name];
+      if (!want || w.sha256 !== want.sha256 || w.bytes !== want.bytes) throw new Error(`${name}.patch khác bản đã xác nhận (worktree đổi trong lúc sao lưu)`);
+      if (w.bytes === 0) fs.unlinkSync(file);
+    }
     const hasTar = p.files.length > 0;
     if (hasTar) {
       await new Promise((resolve, reject) => {
@@ -491,7 +501,7 @@ export async function verifyBackup(dir, p, deps) {
     await run(['read-tree', p.head]);
     for (const [name, cachedFlag] of [['staged', '--cached'], ['unstaged', null]]) {
       const f = path.join(dir, `${name}.patch`);
-      const hasDiff = await real(['diff', ...(cachedFlag ? [cachedFlag] : []), '--quiet', '--no-ext-diff']).then(() => false, (e) => { if (e.code === 1) return true; throw e; });
+      const hasDiff = await real(['diff', ...(cachedFlag ? [cachedFlag] : []), '--quiet', ...DIFF_FLAGS]).then(() => false, (e) => { if (e.code === 1) return true; throw e; });
       if (hasDiff !== fs.existsSync(f)) throw new Error(`${name}.patch ${hasDiff ? 'thiếu' : 'thừa'}`);
     }
     for (const name of ['staged', 'unstaged']) {
@@ -518,10 +528,12 @@ export async function manualRemove(target, { expectFingerprint, backupDir = MANU
   if (!expectFingerprint || p1.fingerprint !== expectFingerprint) return { ok: false, changed: true, path: p1.path, probe: slim(p1), note: '⚠️ worktree đã thay đổi — xem lại' };
   let dir = null;
   try {
+    if (hooks.beforeBackup) await hooks.beforeBackup();
     dir = await writeBackup(p1, { root: backupDir, now, ...(rand ? { rand } : {}) });
     await verifyBackup(dir, p1, deps);
     if (hooks.afterBackup) await hooks.afterBackup();
-    const p2 = await probeManual(target, { ...probeOpts, deps });
+    // the late probe: fast (no gh / du), immediately before the removal
+    const p2 = await probeManual(target, { ...probeOpts, deps, fast: true });
     if (!p2.ok) { rmDir(dir); return slim(p2); }
     if (p2.fingerprint !== p1.fingerprint) { rmDir(dir); return { ok: false, changed: true, path: p2.path, probe: slim(p2), note: '⚠️ worktree đã thay đổi trong lúc sao lưu' }; }
   } catch (e) {
@@ -531,7 +543,7 @@ export async function manualRemove(target, { expectFingerprint, backupDir = MANU
   try {
     await deps.exec('git', ['-C', p1.main, 'worktree', 'remove', '--force', p1.path]);
     try { await deps.exec('git', ['-C', p1.main, 'worktree', 'prune']); } catch {}
-  } catch (e) { return { ok: false, path: p1.path, backupDir: dir, reason: `git worktree remove lỗi: ${firstLine(e)} (bản sao lưu vẫn còn)` }; }
+  } catch (e) { return { ok: false, removeFailed: true, path: p1.path, backupDir: dir, reason: `git worktree remove lỗi: ${firstLine(e)}` }; }
   deps.log(`removed ${p1.path} (manual, backup ${dir})`);
   return { ok: true, path: p1.path, branch: p1.branch, backupDir: dir, bytes: p1.bytes };
 }
@@ -560,25 +572,27 @@ export async function listKept({ parentDir = PARENT_DIR, deps: injected = {}, no
   const realParent = fs.realpathSync(parentDir);
   const errors = [];
   const linked = await listLinkedWorktrees(parentDir, deps, errors);
-  let transcriptCwds = null;
-  try { transcriptCwds = [...deps.transcriptCwds(now - TRANSCRIPT_WINDOW_MS)]; } catch { /* the judge then keeps everything: "không đọc được transcript" */ }
+  // RFC 30 §2.6: one light judge per worktree — no transcript scan (an empty set), no du, no target/ scan.
   const rows = [];
   for (const L of linked) {
     let v;
-    try { v = await judgeWorktree(L, { deps, realParent, now, transcriptCwds }); } catch (e) { v = { ok: false, reason: `lỗi: ${firstLine(e)}` }; }
-    if (v.ok) continue; // the daily run will remove it
+    try { v = await judgeWorktree(L, { deps, realParent, now, transcriptCwds: [] }); } catch (e) { v = { ok: false, reason: `lỗi: ${firstLine(e)}` }; }
+    // Passed every cheap gate: the daily run removes it unless a Claude session used it in the last 7 days — which is not scanned here.
+    if (v.ok) v = { ok: false, reason: 'qua mọi điều kiện dọn tự động; còn đây có thể vì phiên Claude dùng trong 7 ngày (không quét transcript ở đây)' };
     let blocked = null;
     try {
       const loc = await locateManaged(L.wt.path, { deps, realParent });
       if (!loc.L) blocked = loc.reason;
       else {
-        const b = await hardBlocks(loc.L, deps, { realParent, nested: false });
+        const st = parseStatusEntries(await gitIn(deps, loc.L.real, ['status', '--porcelain=v1', '-z', '--untracked-files=all', '--ignored=matching', '--no-renames']));
+        // the cheap hard blocks incl. the filter check; the nested-repo walk waits for the press (which re-probes in full)
+        const b = await hardBlocks(loc.L, deps, { realParent, nested: false, trackedPaths: [...new Set(st.tracked.map((t) => t.p))] });
         if (b.length) blocked = b.join('; ');
       }
     } catch (e) { blocked = `lỗi probe: ${firstLine(e)}`; }
     rows.push({ repo: L.repo, name: path.basename(L.wt.path), path: L.wt.path, branch: L.wt.branch ? L.wt.branch.replace(/^refs\/heads\//, '') : null, head: L.wt.head, reason: v.reason, blocked });
   }
-  return { ok: true, rows, errors };
+  return { ok: true, rows, errors: errors.slice(0, 5) };
 }
 
 // ── the child's entry point (also called in-process by tests) ────────────────
@@ -595,7 +609,15 @@ export async function manualCommand(cmd, target, opts = {}) {
       t = r.path;
     }
     if (cmd === 'manual-probe') return slim(await probeManual(t, opts));
-    if (cmd === 'manual-remove') return await manualRemove(t, opts);
+    if (cmd === 'manual-remove') {
+      // The destructive worker holds the `cleanup` lock ITSELF for the whole operation: if the daemon dies, a new daemon can't take it under us.
+      const { lock: lk, acquire = acquireLock, ...rest } = opts;
+      if (!lk) return await manualRemove(t, rest);
+      let lock;
+      try { lock = await acquire('cleanup', { waitSec: lk.waitSec, dir: lk.dir, label: lk.label, convoId: null, cmd: lk.cmd }); } catch (e) { lock = { error: e }; }
+      if (lock.left || lock.timeout || lock.error) return { ok: false, busy: true, path: t, reason: 'đợt dọn khác đang giữ lock cleanup' };
+      try { return await manualRemove(t, rest); } finally { lock.release(); }
+    }
     return { ok: false, path: target, reason: `lệnh lạ: ${cmd}` };
   } catch (e) { return { ok: false, path: target, reason: `lỗi: ${firstLine(e)}` }; }
 }
