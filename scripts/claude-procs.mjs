@@ -232,24 +232,40 @@ export function rowTag(r) {
 }
 
 /**
+ * Screens-first row order shared by /ls and broadcast: screen names (listed screens, then any a
+ * claude's STY names that `screen -ls` missed), each with the claude rows inside it; then terminal
+ * rows. Returns `{ screenItems: [{ name, rows }], terminal }`. Pure.
+ */
+export function lsLayout({ screens = [], procs = [] } = {}) {
+  const inScreen = new Map();
+  const terminal = [];
+  for (const r of procs) {
+    if (r.screen) (inScreen.get(r.screen) || inScreen.set(r.screen, []).get(r.screen)).push(r);
+    else terminal.push(r);
+  }
+  const names = [...new Set([...screens.map((s) => s.name), ...inScreen.keys()])];
+  return { screenItems: names.map((name) => ({ name, rows: inScreen.get(name) || [] })), terminal };
+}
+
+/**
  * The agents /ls lists, as identities `{ convoId, hashtag }` (convoId null when only the hashtag is
- * known). Same selection as formatAgentList: each claude proc counts as itself (its session's convo
- * + hashtag, else its screen label); a screen label counts ONLY for a screen with no claude inside.
- * Pure.
+ * known), in the exact order formatAgentList renders them. A claude proc counts as itself (its
+ * session's convo + hashtag, else its `tele-` screen label); an EMPTY `tele-` screen counts by its
+ * label. Pure.
  */
 export function lsIdentities({ screens = [], procs = [] } = {}) {
   const out = [];
-  const occupied = new Set();
-  for (const r of procs) {
-    if (r.screen) occupied.add(r.screen);
+  const add = (r) => {
     const c = r.sessionId ? uuidToConvoInt(r.sessionId) : null;
     const tag = rowTag(r);
     if (c != null || tag) out.push({ convoId: c == null ? null : String(c), hashtag: tag ? String(tag).toLowerCase() : null });
+  };
+  const { screenItems, terminal } = lsLayout({ screens, procs });
+  for (const { name, rows } of screenItems) {
+    if (rows.length) rows.forEach(add);
+    else if (String(name).startsWith('tele-')) out.push({ convoId: null, hashtag: name.slice(5).toLowerCase() });
   }
-  for (const s of screens) {
-    if (occupied.has(s.name) || !String(s.name).startsWith('tele-')) continue;
-    out.push({ convoId: null, hashtag: s.name.slice(5).toLowerCase() });
-  }
+  terminal.forEach(add);
   return out;
 }
 
@@ -315,13 +331,9 @@ export function formatAgentList({ screens = [], procs = [], personaOf = () => nu
     return links.length ? `${head}\n${links.join(' ')}` : head;
   };
 
-  const inScreen = new Map(); // screen name → claude rows inside it
-  const terminal = [];
-  for (const r of procs) {
-    if (r.screen) (inScreen.get(r.screen) || inScreen.set(r.screen, []).get(r.screen)).push(r);
-    else terminal.push(r);
-  }
-  const screenNames = [...new Set([...screens.map((s) => s.name), ...inScreen.keys()])];
+  const { screenItems, terminal } = lsLayout({ screens, procs });
+  const screenNames = screenItems.map((x) => x.name);
+  const inScreen = new Map(screenItems.map((x) => [x.name, x.rows]));
 
   const screenBlocks = screenNames.flatMap((name) => {
     const rows = inScreen.get(name) || [];

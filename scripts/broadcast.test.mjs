@@ -105,7 +105,7 @@ test('doBroadcast: topics not in the /ls set are not sent', async () => {
 });
 
 test('doBroadcast: /ls order, persona names (best-effort), no skipped count', async () => {
-  const personaOf = (c) => { if (String(c) === '222') throw new Error('boom'); return '🪼 Sứa'; };
+  const personaOf = (h) => { if (h === shortConvoHash(222)) throw new Error('boom'); return '🪼 Sứa'; };
   const rows = () => [shortConvoHash(222), { convoId: '111', hashtag: shortConvoHash(111) }];   // /ls lists 222 first
   const r = await doBroadcast(['hi'], { from: {}, config: CFG, store: STORE, writePrompt: async () => {}, env: {}, envFile: {}, lsHashtags: rows, personaOf });
   assert.equal(r.message, `📢 broadcast — 2 session\n\n✅ Đã gửi\n#${shortConvoHash(222)}\n🪼 Sứa #${shortConvoHash(111)}`);

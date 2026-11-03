@@ -17,9 +17,8 @@ import { fileURLToPath } from 'node:url';
 import { isMainModule } from './is-direct-run.mjs';
 import { readTopicsStore } from './topics-store.mjs';
 import { listLiveTopics } from './handover.mjs';
-import { lsHashtagSet } from './spawn.mjs';
+import { lsHashtagSet, personaByHashtag } from './spawn.mjs';
 import { formatPersona } from './persona.mjs';
-import { peekPersona } from './persona-store.mjs';
 import { durableWrite } from './steer.mjs';
 import { DEFAULT_TMP_DIR } from './tele-listen.mjs';
 import { readProjectsConfig, resolveDefaultChatId, projectEntries } from './projects-config.mjs';
@@ -98,7 +97,7 @@ export async function doBroadcast(argv, {
   tmpDir = DEFAULT_TMP_DIR, writePrompt = durableWrite, env = process.env, envFile = {},
   raw = process.env.TELE_RAW_ARGS, // the daemon's untokenized text; unset/'' → argv
   lsHashtags = lsHashtagSet,       // () => /ls rows ({convoId,hashtag} | hashtag); throws → fail closed
-  personaOf = (convoId) => formatPersona(peekPersona(convoId)),   // best-effort; failure → hashtag only
+  personaOf = null,                // (hashtag) → name; default = /ls's lookup (personaByHashtag + formatPersona)
 } = {}) {
   const args = raw ? parseBroadcastRaw(raw) : parseBroadcastArgs(argv);
   if (args.error) return { ok: false, message: args.error };
@@ -134,9 +133,11 @@ export async function doBroadcast(argv, {
   // bounces, so nothing is skipped; a hard write/lock failure (rare) is surfaced.
   const label = (t) => {
     let p = null;
-    try { p = personaOf(t.convoId); } catch { /* hashtag only */ }
+    try { p = personaOf(t.hashtag); } catch { /* hashtag only */ }
     return `${p ? `${p} ` : ''}#${t.hashtag}`;
   };
+  let pmap = {};
+  if (!personaOf) { try { pmap = personaByHashtag(store); } catch { /* hashtag only */ } personaOf = (h) => (pmap[h] ? formatPersona(pmap[h]) : null); }
   let sent = 0; const okLines = []; const failLines = [];
   for (const t of live) {
     const prompt = buildBroadcastPrompt({
