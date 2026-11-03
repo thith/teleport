@@ -484,7 +484,7 @@ async function main() {
         catch (e) { console.error(`[daemon] long-build watch: ${e?.message ?? e}`); }
         // RFC 26 §3.11: nudge agents about NEW unread mail / Telegram. Not awaited (typing takes seconds), never overlapping.
         runAutoNudge();
-        // RFC 34: one "sắp auto compact" notice per agent at 94% of its window. Not awaited, never overlapping.
+        // RFC 34: one "sắp auto compact" notice per agent at (window − 40k). Not awaited, never overlapping.
         runCompactWarn();
       }
     } catch (e) {

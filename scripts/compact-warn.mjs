@@ -1,4 +1,4 @@
-// Daemon warns a Claude agent ONCE when its context reaches 94% of the auto-compact window (RFC 34).
+// Daemon warns a Claude agent ONCE when its context reaches (auto-compact window − 40k) (RFC 34).
 // Runs on the daemon's 60 s heartbeat. The notice is an "info-only" daemon prompt dropped into the agent's
 // convo queue (deliverResult); the listener announces it inline and deletes it (tele-listen.mjs, RFC 34 §2.3).
 // Nice-to-have: when unsure (window unknown, project overrides it, guessed/twin process) → say nothing.
@@ -12,7 +12,11 @@ import { findTranscript, transcriptState, fmtTokens } from './transcript-state.m
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 export const COMPACT_WARN_FILE = path.join(__dirname, 'tmp', 'compact-warn.json');
-export const COMPACT_WARN_PCT = 0.94; // Thi: warn at 94% of the window
+export const COMPACT_WARN_MARGIN = 40_000; // Thi: warn when context >= window − 40k
+// Claude Code compacts ~33k BELOW the window (output reserve + buffer; seen 217k at 250k, ~970k at 1M). Used only in the notice text.
+export const AUTO_COMPACT_RESERVE = 33_000;
+/** Context size at which the warning fires for window y. Pure. */
+export const warnAt = (y) => y - COMPACT_WARN_MARGIN;
 export const RESET_RATIO = 0.8;
 export const WARNED_TTL_MS = 14 * 24 * 3600 * 1000;
 export const MIN_WINDOW = 100_000;
@@ -124,14 +128,15 @@ export function compactWindowFor({ cfg = null, hashtag = null, model = null, cwd
 export function compactWarnNeed({ x, y, compacted = false, warned = false }) {
   if (compacted) return { warn: false, clear: warned };
   if (!Number.isFinite(x) || !Number.isFinite(y) || !(y > 0)) return { warn: false, clear: false };
-  if (x < RESET_RATIO * y) return { warn: false, clear: warned };
-  return { warn: x >= COMPACT_WARN_PCT * y && !warned, clear: false };
+  // reset is relative to the warn line (not y): with a small window 0.8·y could sit above warnAt(y) and re-warn repeatedly
+  if (x < RESET_RATIO * warnAt(y)) return { warn: false, clear: warned };
+  return { warn: x >= warnAt(y) && !warned, clear: false };
 }
 
 /** The info-only daemon notice (Thi 13184). `infoOnly` makes the listener announce it inline and delete it. Pure. */
 export function buildCompactWarnPrompt({ convoId, chatId, x, y }) {
   return {
-    text: `🤖 Teleport daemon: context ~${fmtTokens(x)}/${fmtTokens(y)}, sắp auto compact (sẽ compact khi context chạm ${fmtTokens(y)}). Lưu lại state cần thiết.`,
+    text: `🤖 Teleport daemon: context ~${fmtTokens(x)}/${fmtTokens(y)}, sắp auto compact (sẽ compact khi context chạm ~${fmtTokens(y - AUTO_COMPACT_RESERVE)}). Lưu lại state cần thiết.`,
     messageId: null, chatId: chatId == null ? null : String(chatId),
     fromUserId: null, fromName: 'teleport daemon', fromRole: 'daemon', fromMember: null,
     replyToMessageId: null, replyToText: null, quotedText: null,
