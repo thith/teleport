@@ -28,7 +28,7 @@ import { fileURLToPath } from 'node:url';
 import { claimRequests, deliverResult } from './merge-inbox.mjs';
 import { CLEANUP_REQUEST_DIR } from './cleanup-request.mjs';
 import { cleanupRequested, fmtGB, CLEANUP_OFFER_DIR, MANUAL_BACKUP_DIR } from './cleanup.mjs';
-import { manualCommand, findRemovingBackup } from './cleanup-manual.mjs';
+import { manualCommand, findRemovingBackup, REMOVING_MARKER } from './cleanup-manual.mjs';
 import { launchCleanup } from './cleanup-launch.mjs';
 import { acquireLock, LOCK_DIR } from './machine-lock.mjs';
 
@@ -595,17 +595,19 @@ async function confirmRemove(c) {
   const { entry, ctx, o } = c;
   await c.answer('Đang sao lưu và xoá…');
   // The destructive child takes the `cleanup` lock itself and holds it to the end (the daemon does NOT hold it here).
+  const runId = crypto.randomBytes(8).toString('hex'); // scopes the removing.json marker to THIS press
   let v;
   try {
     v = await c.runManual('manual-remove', entry.path, {
       ...(c.parentDir ? { parentDir: c.parentDir } : {}), expectFingerprint: entry.fingerprint, ...(o.backupDir ? { backupDir: o.backupDir } : {}),
       lock: { dir: o.lockDir ?? LOCK_DIR, waitSec: o.waitSec ?? CLEANUP_LOCK_WAIT_SEC, label: 'teleport daemon (cleanup button)', cmd: `cleanup manual-remove ${entry.path}` },
-      ...(o.acquire ? { acquire: o.acquire } : {}),
+      runId, ...(o.acquire ? { acquire: o.acquire } : {}),
     });
   } catch (e) { v = { ok: false, childError: true, reason: String(e?.message ?? e) }; }
   if (v?.childError) { // killed / crashed: if it was already inside `git worktree remove`, the tree may be half gone — point at the backup
-    const bk = findRemovingBackup(o.backupDir ?? MANUAL_BACKUP_DIR, entry.path);
-    if (bk) { v = { ok: false, removeFailed: true, backupDir: bk, reason: `tiến trình xoá bị dừng giữa chừng (${v.reason || 'lỗi'})` }; }
+    const bk = findRemovingBackup(o.backupDir ?? MANUAL_BACKUP_DIR, entry.path, runId);
+    if (bk) {
+      try { fs.rmSync(path.join(bk, REMOVING_MARKER), { force: true }); } catch {} v = { ok: false, removeFailed: true, backupDir: bk, reason: `tiến trình xoá bị dừng giữa chừng (${v.reason || 'lỗi'})` }; }
   }
   if (v?.busy || v?.childError) { await retryButtons(c, busyNote, confirmButtons); return; }
   const deliver = o.deliver ?? deliverResult;
@@ -619,6 +621,12 @@ async function confirmRemove(c) {
   }
   if (v.changed) { await showProbe(c, v.probe, { note: v.note }); return; } // a new table, a new token
   c.audit({ requester: entry.convoId, path: entry.path, ok: false, mode: 'manual-remove', reason: v.reason, ...(v.backupDir ? { backup: v.backupDir } : {}) });
+  if (v.notStarted) { // the backup is fine and nothing was removed
+    const text = escapeControls(`❌ ${v.reason}. Worktree còn nguyên; sao lưu vẫn còn ở ${v.backupDir}`);
+    await swapAndEdit(ctx, c.store, c.tok, null, null, c.chatId, c.messageId, `${baseOf(c.msgText)}\n\n${text}`.slice(0, 4000), []);
+    await tell(text, false);
+    return;
+  }
   if (v.removeFailed) { // the backup is good but the removal failed: the tree may be partly deleted — say where the restore is
     const text = escapeControls(`❌ ${v.reason} — worktree có thể đã bị xoá một phần. Sao lưu: ${v.backupDir} · khôi phục: bash ${v.backupDir}/restore.sh`);
     await swapAndEdit(ctx, c.store, c.tok, null, null, c.chatId, c.messageId, `${baseOf(c.msgText)}\n\n${text}`.slice(0, 4000), []);

@@ -1011,7 +1011,7 @@ test('R2-3: the child dies during git worktree remove → the owner is pointed a
   const runner = async (cmd, target, opts) => {
     await manualCommand(cmd, target, { ...opts, deps: killing });
     const bk = path.join(w.backups, fs.readdirSync(w.backups)[0]);
-    fs.writeFileSync(path.join(bk, 'removing.json'), JSON.stringify({ path: a.path, at: Date.now() })); // the real run killed before it could delete it
+    fs.writeFileSync(path.join(bk, 'removing.json'), JSON.stringify({ path: a.path, runId: opts.runId, at: Date.now() })); // the real run killed before it could delete it
     return { ok: false, childError: true, reason: 'quá thời gian, đã dừng tiến trình' };
   };
   await handleCleanupButton(press(t1.rows[0][0].callback_data, t1.t), h.ctx, { ...h.o, runManual: runner });
@@ -1027,4 +1027,81 @@ test('R2-3: the child dies during git worktree remove → the owner is pointed a
   const ok = await manualRemove(b.path, { parentDir: w.parent, deps: deps(), expectFingerprint: pb.fingerprint, backupDir: w.backups });
   assert.equal(ok.ok, true, ok.reason);
   assert.equal(fs.existsSync(path.join(ok.backupDir, 'removing.json')), false);
+});
+
+// ── code review round 3 ─────────────────────────────────────────────────────
+
+async function crashedPress(w, h, a, { marker }) {
+  const { tok, text } = seedCm(h, a, undefined);
+  await handleCleanupButton(press(`cm:${tok}`, text), h.ctx, h.o);
+  const t1 = h.edits.at(-1);
+  const runner = async (cmd, target, opts) => {
+    if (marker) marker(opts);
+    return { ok: false, childError: true, reason: 'quá thời gian, đã dừng tiến trình' };
+  };
+  await handleCleanupButton(press(t1.rows[0][0].callback_data, t1.t), h.ctx, { ...h.o, runManual: runner });
+  return h.edits.at(-1);
+}
+
+test('R3-1: a stale marker (other runId) does not make a later childError look like a partial deletion; the matching run is picked', async () => {
+  const w = world();
+  const a = w.add('feat-stale-mk');
+  write(path.join(a.path, 'n.txt'));
+  const old = path.join(w.backups, 'old-run'); fs.mkdirSync(old, { recursive: true });
+  fs.writeFileSync(path.join(old, 'removing.json'), JSON.stringify({ path: a.path, runId: 'deadbeefdeadbeef', at: 1 }));
+  const h = harness(w);
+  const last = await crashedPress(w, h, a, {});
+  assert.match(last.t, /bấm lại/);
+  assert.doesNotMatch(last.t, /xoá một phần/);
+  assert.deepEqual(last.rows[0].map((x) => x.text), ['✅ Xoá', '✖']);
+  // two crashed runs: the one with this press's runId wins, and its marker is unlinked once matched
+  const h2 = harness(w);
+  const mine = path.join(w.backups, 'mine'); fs.mkdirSync(mine, { recursive: true });
+  const l2 = await crashedPress(w, h2, a, { marker: (opts) => fs.writeFileSync(path.join(mine, 'removing.json'), JSON.stringify({ path: a.path, runId: opts.runId, at: 2 })) });
+  assert.match(l2.t, /xoá một phần\. Sao lưu: .*\/mine · khôi phục: bash .*\/mine\/restore\.sh/);
+  assert.equal(fs.existsSync(path.join(mine, 'removing.json')), false, 'unlinked after matching');
+  assert.equal(fs.existsSync(path.join(old, 'removing.json')), true, 'another run\'s marker is not touched by the daemon');
+});
+
+test('R3-1b: before writing its marker the child clears older markers for the same path', async () => {
+  const w = world();
+  const a = w.add('feat-clear');
+  write(path.join(a.path, 'n.txt'));
+  const old = path.join(w.backups, 'older'); fs.mkdirSync(old, { recursive: true });
+  fs.writeFileSync(path.join(old, 'removing.json'), JSON.stringify({ path: a.path, runId: 'x', at: 1 }));
+  const other = path.join(w.backups, 'other'); fs.mkdirSync(other, { recursive: true });
+  fs.writeFileSync(path.join(other, 'removing.json'), JSON.stringify({ path: '/some/other', runId: 'x', at: 1 }));
+  const p = await probe(w, a.path);
+  let during = null;
+  const r = await manualRemove(a.path, { parentDir: w.parent, deps: deps(), expectFingerprint: p.fingerprint, backupDir: w.backups, runId: 'r1',
+    hooks: { writeMarker: (f, body) => { during = fs.existsSync(path.join(old, 'removing.json')); fs.writeFileSync(f, body); } } });
+  assert.equal(r.ok, true, r.reason);
+  assert.equal(during, false);
+  assert.equal(fs.existsSync(path.join(other, 'removing.json')), true);
+});
+
+test('R3-2: a marker that can not be written → git worktree remove is NOT run; "chưa xoá gì", the backup stays', async () => {
+  const w = world();
+  const a = w.add('feat-nomark');
+  write(path.join(a.path, 'n.txt'));
+  const p = await probe(w, a.path);
+  const d = deps();
+  let removed = false;
+  const dd = { ...d, exec: async (cmd, args, o) => { if (cmd === 'git' && args.includes('remove')) removed = true; return d.exec(cmd, args, o); } };
+  const r = await manualRemove(a.path, { parentDir: w.parent, deps: dd, expectFingerprint: p.fingerprint, backupDir: w.backups, runId: 'r2',
+    hooks: { writeMarker: () => { throw new Error('ENOSPC'); } } });
+  assert.equal(r.ok, false);
+  assert.equal(r.notStarted, true);
+  assert.match(r.reason, /chưa xoá gì/);
+  assert.equal(removed, false);
+  assert.ok(fs.existsSync(a.path));
+  assert.ok(fs.existsSync(path.join(r.backupDir, 'restore.sh')));
+  // the daemon says so, without buttons
+  const h = harness(w);
+  const { tok, text } = seedCm(h, a);
+  await handleCleanupButton(press(`cm:${tok}`, text), h.ctx, h.o);
+  const t1 = h.edits.at(-1);
+  await handleCleanupButton(press(t1.rows[0][0].callback_data, t1.t), h.ctx, { ...h.o, runManual: async () => r });
+  assert.match(h.edits.at(-1).t, /Worktree còn nguyên; sao lưu vẫn còn ở/);
+  assert.deepEqual(h.edits.at(-1).rows, []);
 });

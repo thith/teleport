@@ -517,15 +517,26 @@ export async function verifyBackup(dir, p, deps) {
 // ── remove (§2.3) ────────────────────────────────────────────────────────────
 
 export const REMOVING_MARKER = 'removing.json';
-/** The backup dir (under `root`) whose removal of `wtPath` started but never reported → its path, or null. */
-export function findRemovingBackup(root, wtPath) {
+/** The backup dir (under `root`) whose removal of `wtPath` — THIS press (`runId`) — started but never reported → its path, or null. */
+export function findRemovingBackup(root, wtPath, runId) {
+  if (!runId) return null;
   try {
     for (const e of fs.readdirSync(root, { withFileTypes: true })) {
       if (!e.isDirectory()) continue;
-      try { const m = JSON.parse(fs.readFileSync(path.join(root, e.name, REMOVING_MARKER), 'utf8')); if (m?.path === wtPath) return path.join(root, e.name); } catch {}
+      try { const m = JSON.parse(fs.readFileSync(path.join(root, e.name, REMOVING_MARKER), 'utf8')); if (m?.path === wtPath && m.runId === runId) return path.join(root, e.name); } catch {}
     }
   } catch {}
   return null;
+}
+/** Delete every removing.json under `root` that names `wtPath` (stale markers of older crashed runs). */
+function clearMarkers(root, wtPath) {
+  let ents = [];
+  try { ents = fs.readdirSync(root, { withFileTypes: true }); } catch { return; }
+  for (const e of ents) {
+    if (!e.isDirectory()) continue;
+    const f = path.join(root, e.name, REMOVING_MARKER);
+    try { if (JSON.parse(fs.readFileSync(f, 'utf8'))?.path === wtPath) fs.rmSync(f, { force: true }); } catch {}
+  }
 }
 
 const rmDir = (d) => { try { fs.rmSync(d, { recursive: true, force: true }); } catch {} };
@@ -534,7 +545,7 @@ const rmDir = (d) => { try { fs.rmSync(d, { recursive: true, force: true }); } c
  * Probe again → fingerprint must equal `expectFingerprint` → back up → verify → probe once more → remove the worktree
  * (never the branch). Never throws. A changed fingerprint returns { changed: true, probe, note } and removes nothing.
  */
-export async function manualRemove(target, { expectFingerprint, backupDir = MANUAL_BACKUP_DIR, now = Date.now(), rand, hooks = {}, ...probeOpts } = {}) {
+export async function manualRemove(target, { expectFingerprint, backupDir = MANUAL_BACKUP_DIR, now = Date.now(), rand, hooks = {}, runId = null, ...probeOpts } = {}) {
   const deps = { ...defaultDeps(), ...(probeOpts.deps || {}) };
   const p1 = await probeManual(target, { ...probeOpts, deps });
   if (!p1.ok) return slim(p1);
@@ -561,7 +572,13 @@ export async function manualRemove(target, { expectFingerprint, backupDir = MANU
   }
   // If this process is killed mid-removal, this marker tells the daemon which backup belongs to the half-removed tree.
   const marker = path.join(dir, REMOVING_MARKER);
-  try { fs.writeFileSync(marker, JSON.stringify({ path: p1.path, at: Date.now() }), { mode: 0o600 }); } catch {}
+  try {
+    clearMarkers(backupDir, p1.path); // older crashed runs for the same path
+    (hooks.writeMarker ?? ((f, body) => fs.writeFileSync(f, body, { mode: 0o600 })))(marker, JSON.stringify({ path: p1.path, runId, at: Date.now() }));
+  } catch (e) { // without the marker a kill mid-removal could not be explained: do not start
+    try { fs.rmSync(marker, { force: true }); } catch {}
+    return { ok: false, notStarted: true, path: p1.path, backupDir: dir, reason: `không ghi được dấu hiệu xoá (${firstLine(e)}) — chưa xoá gì` };
+  }
   try {
     await deps.exec('git', ['-C', p1.main, 'worktree', 'remove', '--force', p1.path]);
     try { await deps.exec('git', ['-C', p1.main, 'worktree', 'prune']); } catch {}
