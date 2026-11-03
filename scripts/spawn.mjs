@@ -65,7 +65,7 @@ export const SPAWN_PROMPT = 'Find and read process.md and review-guide.md if pre
 // process died. So: re-arm the listener FIRST (with --first-run so a prompt left
 // claimed by the dead life is re-surfaced), then work the queue.
 // Tappable next steps at the end of /ls (Telegram turns a /command in the text into a link that sends it).
-export const LS_SHORTCUTS = '/health   /cswap   /q   /cleanup';
+export const LS_SHORTCUTS = '/health   /cswap   /q';
 
 export const RESUME_PROMPT = 'You were just restarted by teleport: your previous process was stopped and this same session was resumed in a screen (spawn --resume-session / daemon /kill pid:<PID> --restart). Do these now, in order: 1) check your mailbox: node ../teleport/scripts/mailbox.mjs check (read it if there is mail); 2) re-arm your Telegram Monitor listener for your existing convo: re-read ../teleport/rules/telegram-guide.md section "Listening for replies" and use the canonical command (it passes --first-run on its first poll so anything left pending is re-surfaced); 3) send a short greeting in your Telegram topic saying you are back online, then handle whatever is queued.';
 

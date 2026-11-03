@@ -72,7 +72,7 @@ export const IO_PSI_ALERT = 30;   // io full avg10 %: every task stalled on the 
 
 /** Build the /health message. All inputs passed in → pure. */
 // Tappable next steps (Telegram turns a /command in the text into a link that sends it).
-export const HEALTH_SHORTCUTS = '/cswap   /q   /ls   /cleanup';
+export const HEALTH_SHORTCUTS = '/cswap   /q   /ls';
 
 const gbInt = (b) => Math.round(b / GB);
 const topSize = (mb) => (mb >= 1024 ? `${(mb / 1024).toFixed(1)}G` : `${mb}M`);
