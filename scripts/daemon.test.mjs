@@ -1117,3 +1117,11 @@ test('notifyAfterRestart: delivers via deliverResult (prompt-convo-<id>.json) an
 test('startupGreeting: appends the notified line', () => {
   assert.match(startupGreeting({ pid: 1, commit: 'a', commands: 2, notified: '→ đã xếp tin cho X' }), /\n→ đã xếp tin cho X$/);
 });
+
+test('takeRestartNotify: file vanishes between read and unlink (ENOENT) → gone, and notifyAfterRestart never delivers', async () => {
+  const r = takeRestartNotify({ file: '/n', now: NOW, readFile: () => JSON.stringify({ convoId: 111, at: NOW }), unlink: () => { throw Object.assign(new Error('nf'), { code: 'ENOENT' }); } });
+  assert.equal(r.status, 'gone');
+  let delivered = false;
+  const out = await notifyAfterRestart('x', { take: () => r, deliver: async () => { delivered = true; } });
+  assert.equal(out, null); assert.equal(delivered, false);
+});

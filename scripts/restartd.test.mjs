@@ -189,3 +189,16 @@ test('restartdCommand: chat ids come from the .env loader (env has none)', async
     assert.deepEqual(groupChatIds({ _default: { chatId: '-1,-2' } }), ['-1', '-2'], 'multi-group default is split');
   } finally { if (saved !== undefined) process.env.TELEGRAM_ADMIN_CHAT_ID = saved; }
 });
+
+test('restartdCommand: systemctl fails AND rollback unlink fails (EACCES) → error mentions the leftover file; ENOENT is ignored', async () => {
+  const r = rig({ execFail: true });
+  const exec = r.deps.exec; let n = 0;
+  r.deps.fsx = { ...r.deps.fsx, unlinkSync: (f) => { if (n++ === 0) return r.files.delete(f) || (() => { throw Object.assign(new Error('nf'), { code: 'ENOENT' }); })(); throw Object.assign(new Error('EACCES denied'), { code: 'EACCES' }); } };
+  const out = await restartdCommand(['Sứa'], r.deps);
+  assert.match(out.error, /failed.*không xoá được file báo: EACCES denied/);
+  assert.equal(exec === r.deps.exec, true);
+  const r2 = rig({ execFail: true });
+  const real = r2.deps.fsx.unlinkSync; let k = 0;
+  r2.deps.fsx.unlinkSync = (f) => { if (k++ === 0) return real(f); r2.files.delete(f); throw Object.assign(new Error('nf'), { code: 'ENOENT' }); };
+  assert.doesNotMatch((await restartdCommand(['Sứa'], r2.deps)).error, /không xoá được/);
+});

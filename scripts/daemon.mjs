@@ -542,13 +542,14 @@ export const RESTART_NOTIFY_MAX_AGE_MS = 15 * 60 * 1000;
 /**
  * Read + delete the one-shot notify file. The request is returned ONLY when the delete succeeded
  * (otherwise a crash-restart could deliver it twice). Every field is validated; nothing here is
- * owner text. → { status: 'none'|'stale'|'invalid'|'delete-failed', error? } | { status: 'ok', convoId, fromCommit }. Pure-ish (fs/clock injected).
+ * owner text. → { status: 'none'|'gone'|'stale'|'invalid'|'delete-failed', error? } | { status: 'ok', convoId, fromCommit }. Pure-ish (fs/clock injected).
  */
 export function takeRestartNotify({ file = RESTARTD_NOTIFY_FILE, now = Date.now(), readFile = (f) => fs.readFileSync(f, 'utf8'), unlink = (f) => fs.unlinkSync(f) } = {}) {
   let raw;
   try { raw = readFile(file); } catch { return { status: 'none' }; }
   try { unlink(file); } catch (e) {
-    if (e?.code !== 'ENOENT') return { status: 'delete-failed', error: e?.message ?? String(e) };
+    if (e?.code === 'ENOENT') return { status: 'gone' }; // a concurrent /restartd cleared the intent: never deliver
+    return { status: 'delete-failed', error: e?.message ?? String(e) };
   }
   let j;
   try { j = JSON.parse(raw); } catch { return { status: 'invalid' }; }

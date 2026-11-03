@@ -93,8 +93,9 @@ export function runRestartd({
   try {
     exec('systemctl', ['--user', '--no-block', 'restart', svc.unit], { stdio: 'ignore' });
   } catch (e) {
-    try { if (onRestartFailed) onRestartFailed(); } catch {}
-    return { error: `systemctl restart ${svc.unit} failed: ${e?.message ?? e}` };
+    let cleanup = '';
+    try { if (onRestartFailed) onRestartFailed(); } catch (c) { cleanup = ` · không xoá được file báo: ${c?.message ?? c}`; }
+    return { error: `systemctl restart ${svc.unit} failed: ${e?.message ?? e}${cleanup}` };
   }
   return { ok: true, message: `🔄 restarting ${svc.unit} (KillMode=${killMode || '?'})… check with /help or /ls in a few seconds.` };
 }
@@ -145,7 +146,10 @@ export async function restartdCommand(argv, {
         fsx.renameSync(tmp, notifyFile);
       },
       onRestartFailed: () => { // only our own request: a later /restartd may have replaced the file
-        try { if (JSON.parse(fsx.readFileSync(notifyFile, 'utf8')).id === id) fsx.unlinkSync(notifyFile); } catch {}
+        let mine = false;
+        try { mine = JSON.parse(fsx.readFileSync(notifyFile, 'utf8')).id === id; } catch { /* gone or replaced by junk: not ours to delete */ }
+        if (!mine) return;
+        try { fsx.unlinkSync(notifyFile); } catch (e) { if (e?.code !== 'ENOENT') throw e; }
       },
     };
     const r = runRestartd({ force: args.force, ...hooks, ...run });
