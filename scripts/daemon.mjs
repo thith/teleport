@@ -1172,7 +1172,7 @@ export const COMPACT_COMMAND = 'compact';
 export const NUDGE_COMMAND = 'nudge';
 const TYPE_OP_LABEL = { c: '/compact', r: '/remote-control', e: '⎋ Esc', i: '🔍 ô nhập', u: '🧹 Xoá ô nhập', n: '👋 nudge' };
 // Buttons are emoji only (Thi), except Esc (short already); no legend (the owner knows them).
-const TYPE_BUTTON_LABEL = { c: '🗜️', r: '📡', e: 'Esc', i: '🔍', u: '🧹', k: '💀', y: '✅', n: '👋' };
+const TYPE_BUTTON_LABEL = { c: '🗜️', r: '📡', e: 'Esc', i: '🔍', u: '🧹', k: '💀', y: '✅', q: '🗜️→💀', n: '👋' };
 const CANCEL_BUTTON = (tok) => ({ text: '✖', callback_data: `ty:${tok}:x` });
 export { COMPACT_MIN_TOKENS }; // type-cmd.mjs (shared with the /ls links)
 let typeRunner = null; // one per daemon: per-agent locks, cool-down, Esc rate limit
@@ -1180,6 +1180,28 @@ const getTypeRunner = () => (typeRunner ||= new TypeRunner(defaultIo()));
 
 // personaOf(row | hashtag) — a row gets its own convo's persona (RFC 28 §2.5); a bare hashtag (display) the map fallback.
 const personaLookup = () => makePersonaOf();
+
+/**
+ * RFC 35 §2.1: show the 🗜️→💀 button on a kill confirm? On a FRESH observation: typeable screen agent (tele-<own hash>
+ * + screenPid), one window / same session / claude the screen's child, /compact allowed (idle | busy), context strictly
+ * above COMPACT_MIN_TOKENS (unknown usage → no). Never throws.
+ */
+export function compactKillVisible(t, io) {
+  try {
+    if (!(t.screen === `tele-${t.hashtag}` && t.screenPid)) return false;
+    const obs = observe(t, io);
+    if (obs.mismatch) return false;
+    return allowedOps(obs.state, obs.bridge).includes('c') && obs.usage?.tokens > COMPACT_MIN_TOKENS;
+  } catch { return false; }
+}
+
+/** The kill confirm keyboard: [✅] [🗜️→💀]? [✖], plus the token's `ops`. */
+function killConfirm(tok, withQ) {
+  const row = [{ text: TYPE_BUTTON_LABEL.y, callback_data: `ty:${tok}:y` }];
+  if (withQ) row.push({ text: TYPE_BUTTON_LABEL.q, callback_data: `ty:${tok}:q` });
+  row.push(CANCEL_BUTTON(tok));
+  return { rows: [row], ops: withQ ? ['y', 'q', 'x'] : ['y', 'x'] };
+}
 
 /** Step 2 text + keyboard for one agent (fresh observation). Pure-ish (no I/O beyond `obs`). */
 export function typeStep2({ target, obs, persona, cfg = {}, tok, signals = null }) {
@@ -1266,14 +1288,16 @@ export async function runTypeCommand(op, rest, from, ctx, { list = () => listCla
   if (obs.mismatch) { await sendText(daemonUserId, `❌ ${cmd} ${agentLabel(t, persona)}: ${obs.mismatch}.`); return; }
   const ctxNote = op === 'c' ? formatContext(obs.usage, contextWindowFor(projectsConfig || {}, { hashtag: t.hashtag, model: obs.usage?.model })) : null;
   const r = await runner.run(op, t, String(from?.id ?? 'owner'), { persona });
+  try { // finish() in finally even if the first send throws — a leaked watch count would block 🗜️→💀
   await sendText(daemonUserId, `${r.text}${ctxNote && obs.usage?.tokens != null && obs.usage.tokens < COMPACT_MIN_TOKENS ? ` (${ctxNote})` : ''}`);
   if (!r.watch) return;
-  const more = await r.watch().catch((e) => `❔ ${e?.message ?? e}`);
-  await sendText(daemonUserId, `${agentLabel(t, persona)}: ${more}`);
-  const convoId = uuidToConvoInt(t.sessionId);
-  if (String(more).startsWith(COMPACT_OK) && convoId != null) {
-    await deliver({ convoId, text: more }, { build: buildCompactNoticePrompt }).catch((e) => console.error(`[daemon] compact notice: ${e?.message ?? e}`));
-  }
+    const more = await r.watch().catch((e) => `❔ ${e?.message ?? e}`);
+    await sendText(daemonUserId, `${agentLabel(t, persona)}: ${more}`);
+    const convoId = uuidToConvoInt(t.sessionId);
+    if (String(more).startsWith(COMPACT_OK) && convoId != null) {
+      await deliver({ convoId, text: more }, { build: buildCompactNoticePrompt }).catch((e) => console.error(`[daemon] compact notice: ${e?.message ?? e}`));
+    }
+  } finally { r.finish?.(); }
 }
 
 // RFC 26 §3.11 auto-nudge: what was already reminded (convo → { mail, tg }), in RAM only; one pass at a time.
@@ -1367,9 +1391,9 @@ export async function startTapKill(rest, ctx, { list = () => listClaudeProcs(), 
   const ctxStr = formatContext(tr?.usage, contextWindowFor(projectsConfig || {}, { hashtag: tag, model: tr?.usage?.model }));
   const line = agentLine(t, { persona: personaOf(r), state: classify(sess?.status, tr?.ended), ctx: ctxStr });
   const tok = crypto.randomBytes(8).toString('hex');
-  const sent = await sendButtonRows(daemonUserId, `💀 ${line}\n\nKill agent này (SIGTERM, phiên dừng hẳn — muốn chạy lại dùng /resume_${tag})? Bấm ✅ để xác nhận.`,
-    [[{ text: TYPE_BUTTON_LABEL.y, callback_data: `ty:${tok}:y` }, CANCEL_BUTTON(tok)]]);
-  buttonStore.set(tok, { kind: 'type', target: t, chatId: daemonUserId, messageId: sent?.message_id ?? null, createdAt: Date.now(), ops: ['y', 'x'] });
+  const kc = killConfirm(tok, compactKillVisible(t, io)); // fresh observation, right as the confirm is drawn
+  const sent = await sendButtonRows(daemonUserId, `💀 ${line}\n\nKill agent này (SIGTERM, phiên dừng hẳn — muốn chạy lại dùng /resume_${tag})? Bấm ✅ để xác nhận.`, kc.rows);
+  buttonStore.set(tok, { kind: 'type', target: t, chatId: daemonUserId, messageId: sent?.message_id ?? null, createdAt: Date.now(), ops: kc.ops });
 }
 
 /**
@@ -1425,7 +1449,7 @@ export async function handleTypeButton(cq, ctx, { runner = getTypeRunner(), list
   }
   // A token answers only the buttons it was sent with (✅ only from its own confirm prompt).
   // Entries without `ops` (stored before this field) keep working, except for ✅.
-  if (entry.ops ? !entry.ops.includes(op) : op === 'y') {
+  if (entry.ops ? !entry.ops.includes(op) : (op === 'y' || op === 'q')) {
     await ctx.answerButton(cq.id, 'Nút không khớp — gõ /type lại.');
     await ctx.editButtonRows(chatId, messageId, `${original}\n\n⚠️ Nút không khớp — không làm gì.`, []);
     return;
@@ -1434,12 +1458,13 @@ export async function handleTypeButton(cq, ctx, { runner = getTypeRunner(), list
   const base = original.split('\n')[0];
   if (op === 'k') { // ask first: one stray tap must not kill an agent
     const t2 = crypto.randomBytes(8).toString('hex');
-    ctx.buttonStore.set(t2, { kind: 'type', target: entry.target, chatId, messageId, createdAt: Date.now(), ops: ['y', 'x'] });
+    const kc = killConfirm(t2, compactKillVisible(entry.target, io)); // fresh observation, not the step-2 ops
+    ctx.buttonStore.set(t2, { kind: 'type', target: entry.target, chatId, messageId, createdAt: Date.now(), ops: kc.ops });
     await ctx.answerButton(cq.id);
-    await ctx.editButtonRows(chatId, messageId, `${base}\n\n💀 Kill agent này (SIGTERM, phiên dừng hẳn — muốn chạy lại dùng /resume)? Bấm ✅ để xác nhận.`,
-      [[{ text: TYPE_BUTTON_LABEL.y, callback_data: `ty:${t2}:y` }, CANCEL_BUTTON(t2)]]);
+    await ctx.editButtonRows(chatId, messageId, `${base}\n\n💀 Kill agent này (SIGTERM, phiên dừng hẳn — muốn chạy lại dùng /resume)? Bấm ✅ để xác nhận.`, kc.rows);
     return;
   }
+  if (op === 'q') { await compactThenKill(entry.target, tok, cq, ctx, { base, chatId, messageId, runner, io, kill }); return; }
   if (op === 'y') {
     // Identity only (pid + start + session): the screen checks guard keystrokes, not a SIGTERM —
     // a second screen window or a hung `screen -Q` must not block killing a stuck agent.
@@ -1454,11 +1479,26 @@ export async function handleTypeButton(cq, ctx, { runner = getTypeRunner(), list
       await ctx.editButtonRows(chatId, messageId, `${base}\n\n❌ agent đã đổi (${bad}) — không kill. Gõ /type lại.`, []);
       return;
     }
-    audit('kill');
-    await ctx.answerButton(cq.id, 'Đang kill…');
-    await ctx.editButtonRows(chatId, messageId, `${base}\n\n⏳ đang kill PID ${entry.target.pid}…`, []);
-    const out = await kill(entry.target, cq.from, ctx);
-    await ctx.editButtonRows(chatId, messageId, `${base}\n\n${out}`, []);
+    if (runner.killsPending?.has(t.pid)) { // a ✅ for this pid is already running — one at a time
+      audit('refused', { reason: 'kill-pending' });
+      await ctx.answerButton(cq.id, 'Đang kill rồi.');
+      await ctx.editButtonRows(chatId, messageId, `${base}\n\n⏳ đang kill bởi lần bấm khác — không làm gì.`, []);
+      return;
+    }
+    if (runner.reserved?.has(t.pid)) { // RFC 35: a 🗜️→💀 owns this pid
+      audit('refused', { reason: 'reserved' });
+      await ctx.answerButton(cq.id, 'Đang compact→kill — không kill.');
+      await ctx.editButtonRows(chatId, messageId, `${base}\n\n⏳ agent đang compact→kill — không kill.`, []);
+      return;
+    }
+    runner.killsPending?.add(t.pid); // no await since the reservation check above
+    try {
+      audit('kill');
+      await ctx.answerButton(cq.id, 'Đang kill…');
+      await ctx.editButtonRows(chatId, messageId, `${base}\n\n⏳ đang kill PID ${entry.target.pid}…`, []).catch(() => {});
+      const out = await kill(entry.target, cq.from, ctx);
+      await ctx.editButtonRows(chatId, messageId, `${base}\n\n${out}`, []);
+    } finally { runner.killsPending?.delete(t.pid); }
     return;
   }
   await ctx.answerButton(cq.id, op === 'i' ? 'Đang đọc ô nhập…' : op === 'u' ? 'Đang xoá ô nhập…' : `Đang gõ ${TYPE_OPS[op] === 'esc' ? 'Esc' : TYPE_OPS[op]}…`);
@@ -1470,13 +1510,66 @@ export async function handleTypeButton(cq, ctx, { runner = getTypeRunner(), list
     await ctx.editButtonRows(chatId, messageId, `${base}\n\n${r.text}`, [[{ text: TYPE_BUTTON_LABEL.u, callback_data: `ty:${t2}:u` }, CANCEL_BUTTON(t2)]]);
     return;
   }
+  try { // finish() in finally even if the edit throws
   await ctx.editButtonRows(chatId, messageId, `${base}\n\n${r.text}`, []);
   if (r.watch) {
-    const more = await r.watch().catch((e) => `❔ ${e?.message ?? e}`);
-    await ctx.editButtonRows(chatId, messageId, `${base}\n\n${r.text.replace(/ — đang chờ kết quả…$/, '')}\n${more}`, []);
-    const convoId = uuidToConvoInt(entry.target.sessionId);
-    if (String(more).startsWith(COMPACT_OK) && convoId != null) { // tell the agent itself (its prompt queue, not its topic)
-      await deliver({ convoId, text: more }, { build: buildCompactNoticePrompt }).catch((e) => console.error(`[daemon] compact notice: ${e?.message ?? e}`));
+    {
+      const more = await r.watch().catch((e) => `❔ ${e?.message ?? e}`);
+      await ctx.editButtonRows(chatId, messageId, `${base}\n\n${r.text.replace(/ — đang chờ kết quả…$/, '')}\n${more}`, []);
+      const convoId = uuidToConvoInt(entry.target.sessionId);
+      if (String(more).startsWith(COMPACT_OK) && convoId != null) { // tell the agent itself (its prompt queue, not its topic)
+        await deliver({ convoId, text: more }, { build: buildCompactNoticePrompt }).catch((e) => console.error(`[daemon] compact notice: ${e?.message ?? e}`));
+      }
     }
   }
+  } finally { r.finish?.(); }
+}
+
+/**
+ * RFC 35 tap on 🗜️→💀: compact first, SIGTERM only after the compact is confirmed (with its summary entry).
+ * The pid is reserved from before the first keystroke until after the kill / refusal.
+ */
+async function compactThenKill(t, tok, cq, ctx, { base, chatId, messageId, runner, io, kill }) {
+  const who = String(cq.from?.id ?? 'owner');
+  const audit = (step, extra = {}) => io.audit?.({ who, op: TYPE_OPS.q, pid: t.pid, sessionId: t.sessionId, hashtag: t.hashtag, step, ...extra });
+  const edit = (text, rows = []) => ctx.editButtonRows(chatId, messageId, `${base}\n\n${text}`, rows);
+  const identity = () => { // pid + start + session (as ✅)
+    const proc = io.proc(t.pid), sess = io.session(t.pid);
+    return !proc || proc.comm !== 'claude' ? 'tiến trình claude không còn'
+      : String(proc.start) !== String(t.procStart) ? 'PID đã thuộc tiến trình khác'
+        : !sess || sess.sessionId !== t.sessionId ? 'phiên đã đổi' : null;
+  };
+  // Buttons gone and the callback answered BEFORE any typing (run('c') can take ~24 s).
+  await ctx.answerButton(cq.id, 'Đang compact…');
+  await edit('⏳ đang compact…');
+  const bad = identity();
+  if (bad) { audit('refused', { reason: bad }); await edit(`❌ agent đã đổi (${bad}) — không kill. Gõ /type lại.`); return; }
+  if (typeof runner.reserve !== 'function') { audit('refused', { reason: 'no-reserve' }); await edit('❌ không reserve được — không kill.'); return; }
+  const why = runner.reserve(t, tok);
+  if (why) { audit('refused', { reason: why }); await edit(`${why} — không kill.`); return; }
+  let finish = null;
+  // Not killed: show why, and a fresh one-shot [✅] [✖] (same pinned target) so the owner can still kill by hand.
+  const noKill = async (text) => {
+    const t2 = crypto.randomBytes(8).toString('hex');
+    const kc = killConfirm(t2, false);
+    ctx.buttonStore.set(t2, { kind: 'type', target: t, chatId, messageId, createdAt: Date.now(), ops: kc.ops });
+    await edit(`${text} — không kill.`, kc.rows);
+  };
+  try {
+    const r = await runner.run('c', t, who, { persona: personaLookup()(t), reservedBy: tok });
+    finish = r.finish;
+    if (!r.watch) { audit('compact-kill', { result: 'refused', text: r.text }); await noKill(r.text); return; }
+    const more = String(await r.watch().catch((e) => `❔ ${e?.message ?? e}`));
+    audit('compact-kill', { result: more });
+    if (!more.startsWith(COMPACT_OK)) { await noKill(more); return; }
+    const bad2 = identity(); // the process may have changed during the wait
+    if (bad2) { audit('refused', { reason: bad2 }); await edit(`${more}\n❌ agent đã đổi (${bad2}) — không kill.`); return; }
+    audit('kill');
+    await edit(`${more}\n⏳ đang kill PID ${t.pid}…`);
+    const out = await kill(t, cq.from, ctx);
+    await edit(`${more}\n${out}`);
+  } catch (e) {
+    audit('refused', { reason: `error: ${e?.message ?? e}` });
+    await edit(`❌ lỗi: ${e?.message ?? e} — không kill.`).catch(() => {});
+  } finally { finish?.(); runner.release(t.pid, tok); }
 }

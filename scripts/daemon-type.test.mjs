@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { startType, handleTypeButton, takeTypeButton, typeStep2, takeMergeButton, dispatchCommand, killViaSpawn, runTypeCommand, startTapKill, nudgeAll, parseDaemonCommand } from './daemon.mjs';
+import { startType, handleTypeButton, takeTypeButton, typeStep2, takeMergeButton, dispatchCommand, killViaSpawn, runTypeCommand, startTapKill, nudgeAll, parseDaemonCommand, compactKillVisible } from './daemon.mjs';
+import { TypeRunner } from './type-cmd.mjs';
 
 const T = { pid: 644406, procStart: '5', sessionId: 'S', screenPid: 644405, screen: 'tele-c2383556', hashtag: 'c2383556', cwd: '/w' };
 const T2 = { ...T, pid: 331131, screenPid: 331130, screen: 'tele-d8133684', hashtag: 'd8133684' };
@@ -359,4 +360,251 @@ test('pick button: a TERMINAL twin sharing the hashtag (never in the menu list) 
   assert.match(calls.at(-1)[1], /2 process/);
   assert.equal(ctx.buttonStore.size, 0);
   assert.ok(!calls.some((c) => c[0] === 'edit' && /rảnh/.test(c[1]) && c[2]?.length), 'no step-2 keyboard was offered');
+});
+
+// ── RFC 35: 🗜️→💀 compact then kill ───────────────────────────────────────────
+
+const SCREEN = '644405.tele-c2383556';
+const qUsage = { tokens: 140_000 };
+/** A live io for a typeable agent; `st` is mutable (status, tokens, windows, procStart, compact result, order log). */
+function qIo(over = {}) {
+  const st = { status: 'idle', usage: qUsage, windows: 1, start: '5', compact: { preTokens: 140000, postTokens: 20000 }, log: [], audits: [], now: 0, ...over };
+  const io = {
+    now: () => st.now, sleep: async (ms) => { st.now += ms; },
+    session: () => ({ sessionId: 'S', status: st.status, bridgeSessionId: null }),
+    proc: () => ({ comm: 'claude', start: st.start }), ppid: () => 644405, windows: () => st.windows,
+    transcript: () => ({ ended: true, usage: st.usage }),
+    hardcopy: async () => '', compactAfter: (f, o, opt) => { st.log.push(['compactAfter', opt]); return typeof st.compact === 'function' ? st.compact() : st.compact; },
+    audit: (e) => st.audits.push(e),
+  };
+  return { io, st };
+}
+/** A real TypeRunner whose keystroke part is stubbed (it is covered in type-cmd.test.mjs). */
+function qRunner(io, { ok = true } = {}) {
+  const runner = new TypeRunner(io);
+  runner.typeAndEnter = async () => (ok ? { ok: true, file: '/t.jsonl', offset: { size: 1 }, queued: false } : { text: '❌ agent đang bận — không gõ /compact.' });
+  return runner;
+}
+const tr = (t) => ({ ...t, screenPid: 644405 });
+const TQ = tr(T);
+
+test('compactKillVisible: typeable + no mismatch + idle/busy + tokens > 100k; hidden at exactly 100k, unknown usage, terminal agent, waiting, 2 windows', () => {
+  const vis = (over, t = TQ) => compactKillVisible(t, qIo(over).io);
+  assert.equal(vis({}), true);
+  assert.equal(vis({ status: 'busy' }), true);
+  assert.equal(vis({ usage: { tokens: 100_001 } }), true);
+  assert.equal(vis({ usage: { tokens: 100_000 } }), false);
+  assert.equal(vis({ usage: null }), false);
+  assert.equal(vis({ usage: {} }), false);
+  assert.equal(vis({}, { ...TQ, screen: null, screenPid: null }), false);
+  assert.equal(vis({}, { ...TQ, screen: 'tele-other' }), false);
+  assert.equal(vis({ status: 'waiting' }), false);
+  assert.equal(vis({ windows: 2 }), false);
+  assert.equal(vis({ start: '9' }), false, 'process changed');
+  assert.equal(compactKillVisible(TQ, { ...qIo().io, windows: () => { throw new Error('x'); } }), false);
+});
+
+test('💀 confirm: middle 🗜️→💀 only when visible (fresh observation, not step-2 ops); token ops follow', async () => {
+  const text = '⌨️ /type — #c2383556 · PID 644406 · rảnh\nChọn lệnh';
+  for (const [over, want] of [[{}, ['✅', '🗜️→💀', '✖']], [{ usage: { tokens: 100_000 } }, ['✅', '✖']]]) {
+    const { ctx, calls } = ui();
+    ctx.buttonStore.set('a'.repeat(16), { kind: 'type', target: TQ, chatId: 42, messageId: 100, createdAt: Date.now(), ops: ['k', 'x'] });
+    await handleTypeButton(cq(`ty:${'a'.repeat(16)}:k`, text), ctx, { runner: {}, io: qIo(over).io });
+    const ask = calls.at(-1);
+    assert.deepEqual(ask[2][0].map((b) => b.text), want);
+    const tok = ask[2][0][0].callback_data.split(':')[1];
+    assert.deepEqual(ctx.buttonStore.get(tok).ops, want.length === 3 ? ['y', 'q', 'x'] : ['y', 'x']);
+  }
+});
+
+test('/kill_<hash> confirm: same helper — 🗜️→💀 for a big typeable agent, plain [✅][✖] for a terminal agent', async () => {
+  const r = row({ pid: 644406, hashtag: 'c2383556', sessionId: 'S' });
+  const { io } = qIo();
+  const { ctx, calls } = ui();
+  await startTapKill('#c2383556', ctx, { list: () => [r], io });
+  assert.deepEqual(calls.at(-1)[2][0].map((b) => b.text), ['✅', '🗜️→💀', '✖']);
+  assert.deepEqual(ctx.buttonStore.get(calls.at(-1)[2][0][0].callback_data.split(':')[1]).ops, ['y', 'q', 'x']);
+  await startTapKill('#c2383556', ctx, { list: () => [{ ...r, screen: null, screenPid: null, ppid: 1 }], io });
+  assert.deepEqual(calls.at(-1)[2][0].map((b) => b.text), ['✅', '✖']);
+});
+
+/** Put a q token in the store and tap it. */
+async function tapQ({ runner, io, ops = ['y', 'q', 'x'], kill, target = TQ, store } = {}) {
+  const { ctx, calls } = ui();
+  if (store) ctx.buttonStore = store;
+  const text = '💀 #c2383556 · PID 644406 · rảnh · ctx 140k\n\nKill agent này';
+  if (ops !== 'legacy') ctx.buttonStore.set('b'.repeat(16), { kind: 'type', target, chatId: 42, messageId: 100, createdAt: Date.now(), ops });
+  else ctx.buttonStore.set('b'.repeat(16), { kind: 'type', target, chatId: 42, messageId: 100, createdAt: Date.now() });
+  await handleTypeButton(cq(`ty:${'b'.repeat(16)}:q`, text), ctx, { runner, io, kill, deliver: async () => { throw new Error('no notice for the dying agent'); } });
+  return { ctx, calls };
+}
+
+test('q → compact OK (with summary) → kill once, AFTER the compact; message keeps the compact line; buttons gone first; no notice', async () => {
+  const { io, st } = qIo();
+  const runner = qRunner(io);
+  const order = [];
+  const kill = async (t) => { order.push('kill'); st.log.push(['kill']); assert.ok(runner.reserved.has(t.pid), 'still reserved at the kill'); return '[spawn] ✅ PID 644406 stopped'; };
+  const { calls } = await tapQ({ runner, io, kill });
+  const edits = calls.filter((c) => c[0] === 'edit');
+  assert.match(edits[0][1], /\n\n⏳ đang compact…$/);
+  assert.deepEqual(edits[0][2], [], 'no keyboard');
+  assert.match(edits[1][1], /\n\n✅ đã compact: 140k → 20k\n⏳ đang kill PID 644406…$/);
+  assert.match(edits.at(-1)[1], /\n\n✅ đã compact: 140k → 20k\n\[spawn\] ✅ PID 644406 stopped$/);
+  assert.deepEqual(order, ['kill']);
+  assert.deepEqual(st.log.map((l) => l[0]), ['compactAfter', 'kill']);
+  assert.deepEqual(st.log[0][1], { requireSummary: true });
+  assert.equal(runner.reserved.size, 0, 'released');
+  assert.equal(runner.compactWatches.size, 0);
+  assert.deepEqual(st.audits.filter((a) => a.step !== 'result').map((a) => a.step), ['compact-kill', 'kill']);
+  assert.match(st.audits.find((a) => a.step === 'compact-kill').result, /đã compact/);
+});
+
+test('q → compact NOT ok (timeout / transcript missing / refused type) → no kill, "— không kill.", fresh [✅][✖]', async () => {
+  for (const [name, mk, re] of [
+    ['timeout', () => { const f = qIo({ compact: null }); return { ...f, runner: qRunner(f.io) }; }, /chưa thấy compact xong sau 5 phút.* — không kill\.$/],
+    ['refused type', () => { const f = qIo(); return { ...f, runner: qRunner(f.io, { ok: false }) }; }, /không gõ \/compact\. — không kill\.$/],
+    ['no transcript', () => { const f = qIo(); const runner = qRunner(f.io); runner.typeAndEnter = async () => ({ ok: true, file: null, offset: null }); return { ...f, runner }; }, /không tìm thấy transcript.* — không kill\.$/],
+    ['compactAfter error', () => { const f = qIo({ compact: { error: 'transcript bị cắt ngắn / thay' } }); return { ...f, runner: qRunner(f.io) }; }, /không theo dõi được.* — không kill\.$/],
+  ]) {
+    const { io, runner } = mk();
+    const killed = [];
+    const { ctx, calls } = await tapQ({ runner, io, kill: async (t) => { killed.push(t.pid); return 'x'; } });
+    assert.equal(killed.length, 0, name);
+    const last = calls.at(-1);
+    assert.match(last[1], re, name);
+    assert.deepEqual(last[2][0].map((b) => b.text), ['✅', '✖'], name);
+    const fresh = ctx.buttonStore.get(last[2][0][0].callback_data.split(':')[1]);
+    assert.deepEqual(fresh.ops, ['y', 'x']);
+    assert.equal(fresh.target.pid, 644406);
+    assert.equal(runner.reserved.size, 0, `${name}: released`);
+  }
+});
+
+test('q: the boundary without isCompactSummary keeps waiting (no kill) until the summary shows', async () => {
+  let n = 0;
+  const { io, st } = qIo({ compact: () => (++n < 3 ? null : { preTokens: 140000, postTokens: 20000 }) });
+  const killed = [];
+  const { calls } = await tapQ({ runner: qRunner(io), io, kill: async (t) => { killed.push([t.pid, n]); return 'ok'; } });
+  assert.deepEqual(killed, [[644406, 3]], 'killed only on the 3rd poll, when compactAfter finally returned');
+  assert.ok(st.now >= 3000 + 5000 * 2 + 2000);
+  assert.match(calls.at(-1)[1], /✅ đã compact/);
+});
+
+test('q: identity changes during the wait → no kill (PID reused / session changed)', async () => {
+  for (const change of [(st) => { st.start = '9'; }, (st) => { st.sess = 'OTHER'; }]) {
+    const { io, st } = qIo({ compact: () => { change(st); return { preTokens: 140000, postTokens: 20000 }; } });
+    if (st.sess === undefined) io.session = () => ({ sessionId: st.sess ?? 'S', status: 'idle' });
+    const killed = [];
+    const runner = qRunner(io);
+    const { calls } = await tapQ({ runner, io, kill: async (t) => { killed.push(t.pid); return 'x'; } });
+    assert.equal(killed.length, 0);
+    assert.match(calls.at(-1)[1], /✅ đã compact: 140k → 20k\n❌ agent đã đổi .* — không kill/);
+    assert.equal(runner.reserved.size, 0);
+  }
+  // …and before the compact starts: nothing typed, nothing reserved
+  const { io } = qIo({ start: '9' });
+  const runner = qRunner(io); let typed = 0; runner.typeAndEnter = async () => { typed++; return { text: 'x' }; };
+  const { calls } = await tapQ({ runner, io, kill: async () => { throw new Error('no'); } });
+  assert.equal(typed, 0);
+  assert.match(calls.at(-1)[1], /agent đã đổi.*không kill/);
+});
+
+test('q is refused from a token whose ops lack it, and from a legacy token without ops (nothing typed)', async () => {
+  for (const ops of [['y', 'x'], 'legacy']) {
+    const { io } = qIo();
+    const runner = qRunner(io); let typed = 0; runner.typeAndEnter = async () => { typed++; return { text: 'x' }; };
+    const { calls } = await tapQ({ runner, io, ops, kill: async () => { throw new Error('no kill'); } });
+    assert.equal(typed, 0);
+    assert.match(calls.at(-1)[1], /Nút không khớp/);
+    assert.equal(runner.reserved.size, 0);
+  }
+});
+
+test('q refused while a lock / Esc / kill / earlier compact watch is in flight, or when already reserved; nothing typed; others\' state kept', async () => {
+  for (const arm of [(r) => r.locks.add(644406), (r) => r.escInFlight.add(644406), (r) => r.killsPending.add(644406), (r) => r.compactWatches.set(644406, 1), (r) => r.reserved.set(644406, { tok: 'other' })]) {
+    const { io } = qIo();
+    const runner = qRunner(io); let typed = 0; runner.typeAndEnter = async () => { typed++; return { text: 'x' }; };
+    arm(runner);
+    const before = runner.reserved.get(644406);
+    const { calls } = await tapQ({ runner, io, kill: async () => { throw new Error('no kill'); } });
+    assert.equal(typed, 0);
+    assert.match(calls.at(-1)[1], /(bận lệnh khác|compact→kill).* — không kill\.$/);
+    assert.equal(runner.reserved.get(644406), before, 'a refused q does not touch the holder\'s reservation');
+  }
+});
+
+test('✅ on a reserved pid is refused (no kill); ✅ marks the kill pending while it runs; cleared after', async () => {
+  const { io } = qIo();
+  const runner = qRunner(io);
+  const text = '💀 #c2383556 · PID 644406 · rảnh\n\nKill';
+  const killed = [];
+  let pendingDuring = null;
+  const kill = async (t) => { pendingDuring = runner.killsPending.has(t.pid); killed.push(t.pid); return 'ok'; };
+  let c = ui();
+  runner.reserved.set(644406, { tok: 'z' });
+  c.ctx.buttonStore.set('c'.repeat(16), { kind: 'type', target: TQ, chatId: 42, messageId: 100, createdAt: Date.now(), ops: ['y', 'x'] });
+  await handleTypeButton(cq(`ty:${'c'.repeat(16)}:y`, text), c.ctx, { runner, io, kill });
+  assert.equal(killed.length, 0);
+  assert.match(c.calls.at(-1)[1], /đang compact→kill — không kill/);
+  runner.reserved.clear();
+  c = ui();
+  c.ctx.buttonStore.set('d'.repeat(16), { kind: 'type', target: TQ, chatId: 42, messageId: 100, createdAt: Date.now(), ops: ['y', 'x'] });
+  await handleTypeButton(cq(`ty:${'d'.repeat(16)}:y`, text), c.ctx, { runner, io, kill });
+  assert.deepEqual(killed, [644406]);
+  assert.equal(pendingDuring, true);
+  assert.equal(runner.killsPending.size, 0);
+});
+
+test('a second ✅ while the first kill is still running is refused (one kill per pid)', async () => {
+  const { io } = qIo();
+  const runner = qRunner(io);
+  const text = '💀 #c2383556 · PID 644406 · rảnh\n\nKill';
+  const killed = [];
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  const kill = async (t) => { killed.push(t.pid); await gate; return 'ok'; };
+  const a = ui(), b = ui();
+  a.ctx.buttonStore.set('e'.repeat(16), { kind: 'type', target: TQ, chatId: 42, messageId: 100, createdAt: Date.now(), ops: ['y', 'x'] });
+  b.ctx.buttonStore.set('f'.repeat(16), { kind: 'type', target: TQ, chatId: 42, messageId: 100, createdAt: Date.now(), ops: ['y', 'x'] });
+  const first = handleTypeButton(cq(`ty:${'e'.repeat(16)}:y`, text), a.ctx, { runner, io, kill });
+  await new Promise((r) => setImmediate(r));
+  await handleTypeButton(cq(`ty:${'f'.repeat(16)}:y`, text), b.ctx, { runner, io, kill });
+  assert.match(b.calls.at(-1)[1], /đang kill bởi lần bấm khác/);
+  assert.equal(runner.reserve?.(TQ, 'q1') == null ? 'reserved' : 'refused', 'refused', 'q cannot reserve while a kill is pending');
+  release();
+  await first;
+  assert.deepEqual(killed, [644406]);
+  assert.equal(runner.killsPending.size, 0);
+});
+
+test('a second q while the first is still waiting is refused (one compact can\'t satisfy two watchers); reservation held through the wait', async () => {
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  const { io, st } = qIo();
+  io.sleep = async (ms) => { st.now += ms; if (ms === 3000) await gate; };
+  const runner = qRunner(io);
+  const killed = [];
+  const kill = async (t) => { killed.push(t.pid); return 'ok'; };
+  const first = tapQ({ runner, io, kill });
+  await new Promise((r) => setTimeout(r, 20));
+  assert.ok(runner.reserved.has(644406), 'held while the compact is awaited');
+  const second = await tapQ({ runner, io, kill });
+  assert.match(second.calls.at(-1)[1], /compact→kill.* — không kill\.$/);
+  assert.match((await runner.run('n', TQ)).text, /compact→kill/);
+  release();
+  await first;
+  assert.deepEqual(killed, [644406], 'killed exactly once');
+  assert.equal(runner.reserved.size, 0);
+});
+
+test('plain 🗜️ via the button/command releases its compact watch counter (finish) after notice delivery', async () => {
+  const { io } = qIo();
+  const runner = qRunner(io);
+  const { ctx } = ui();
+  ctx.buttonStore.set('e'.repeat(16), { kind: 'type', target: { ...TQ, sessionId: 'ae61d4f1-5ecc-46fe-9cea-75b4c9d9b751' }, chatId: 42, messageId: 100, createdAt: Date.now() });
+  io.session = () => ({ sessionId: 'ae61d4f1-5ecc-46fe-9cea-75b4c9d9b751', status: 'idle' });
+  let during = null;
+  await handleTypeButton(cq(`ty:${'e'.repeat(16)}:c`, '⌨️ /type — #c2383556 · PID 644406'), ctx, { runner, io, deliver: async () => { during = runner.compactWatches.get(644406); } });
+  assert.equal(during, 1, 'still counted while the notice is delivered');
+  assert.equal(runner.compactWatches.size, 0);
 });

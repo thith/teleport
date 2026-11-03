@@ -133,3 +133,19 @@ test('findTranscript: by cwd slug, else any project dir; bad id → null', () =>
   assert.equal(findTranscript(id, '/elsewhere', { projectsDir: dir }), path.join(dir, '-w-umipay', `${id}.jsonl`));
   assert.equal(findTranscript('../etc/passwd', '/w', { projectsDir: dir }), null);
 });
+
+test('compactAfter requireSummary (RFC 35): a boundary alone keeps waiting; the isCompactSummary entry after it completes', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ts-'));
+  const f = path.join(dir, 't.jsonl');
+  fs.writeFileSync(f, '');
+  const w = (o) => fs.appendFileSync(f, JSON.stringify(o) + '\n');
+  w(user('old summary', { isCompactSummary: true })); // an OLD one, before the baseline
+  const offset = fs.statSync(f).size;
+  w(sys('compact_boundary', { compactMetadata: { trigger: 'manual', preTokens: 140000, postTokens: 20000 } }));
+  assert.deepEqual(compactAfter(f, offset), { preTokens: 140000, postTokens: 20000 }, 'default: boundary is enough');
+  assert.equal(compactAfter(f, offset, { requireSummary: true }), null, 'boundary without a summary → not yet');
+  w(user('<local-command-stdout>x</local-command-stdout>'));
+  assert.equal(compactAfter(f, offset, { requireSummary: true }), null);
+  w(user('summary…', { isCompactSummary: true }));
+  assert.deepEqual(compactAfter(f, offset, { requireSummary: true }), { preTokens: 140000, postTokens: 20000 });
+});

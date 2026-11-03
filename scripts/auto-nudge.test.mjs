@@ -61,3 +61,13 @@ test('autoNudgeTick: a throwing runner is logged, never thrown', async () => {
   await autoNudgeTick({ list: () => [row({})], io, runner, seen: new Map(), mailAt: () => NOW, tgAt: () => null, listener: () => 'on', now: NOW, log: (s) => logs.push(s) });
   assert.match(logs[0], /#aaaa0001: ❌ boom/);
 });
+
+test('autoNudgeTick: a pid reserved for compact→kill (RFC 35) is skipped', async () => {
+  const ran = [];
+  const runner = { reserved: new Map([[101, { procStart: '5', sessionId: SID, tok: 't' }]]), run: async (...a) => { ran.push(a); return { text: '👋 đã nudge #aaaa0001.' }; } };
+  const deps = { io, runner, seen: new Map(), mailAt: () => NOW - 5_000, tgAt: () => null, listener: () => 'on', now: NOW, list: () => [row({})] };
+  assert.deepEqual(await autoNudgeTick(deps), []);
+  assert.equal(ran.length, 0);
+  runner.reserved.clear();
+  assert.equal((await autoNudgeTick(deps)).length, 1, 'released → nudged');
+});
