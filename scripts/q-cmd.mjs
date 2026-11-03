@@ -51,11 +51,11 @@ async function startQUnlocked(ctx, deps = {}) {
   const r = renderQ(g, { tok, rev: 0, page: 0, view: 'main', stoppingKeys: stoppingKeysOf(store) });
   const sent = await sendButtonRows(daemonUserId, r.text, r.rows);
   const entry = entryFor(g, r, { kind: 'q', createdAt: now, chatId: daemonUserId, messageId: sent?.message_id ?? null, rev: 0, page: 0, view: 'main' });
-  try { store.setStrict(tok, entry); } catch {
+  const older = [...store.entries()].filter(([k, v]) => k !== tok && v?.kind === 'q').map(([k]) => k);
+  try { store.setStrict(tok, entry, { remove: older }); } catch { // one write: the new board in, the older ones out (or neither)
     if (sent?.message_id != null) await (ctx.editButtonRows?.(daemonUserId, sent.message_id, `${r.text}\n\n❌ không lưu được trạng thái nút — gõ /q lại.`, []) ?? null);
     return;
   }
-  for (const [k, v] of [...store.entries()]) if (k !== tok && v?.kind === 'q') { try { store.delete(k); } catch {} } // the older board expires
 }
 
 /** ⏹ confirmed on a running build: a separate status message + the RFC 24 stop job. → a one-line note. */

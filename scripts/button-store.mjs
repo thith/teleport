@@ -51,9 +51,10 @@ export class PersistentMap extends Map {
    * Like set(), but a write failure THROWS and memory is put back (RFC 29: /q consumes a revision before acting —
    * no revision may stay valid after a restart that never saw its consumption). The cap sweep still applies.
    */
-  setStrict(k, v) {
+  setStrict(k, v, { remove = [] } = {}) { // `remove`: keys dropped in the SAME flush (one transaction)
     const had = super.has(k), prev = super.get(k);
     const before = new Map(this);
+    for (const key of remove) if (key !== k) super.delete(key);
     super.set(k, v);
     if (this.size > this.cap) {
       const oldest = [...this.entries()].filter(([key, e]) => key !== k && e?.kind !== 'stop').sort((a, b) => (a[1].createdAt || 0) - (b[1].createdAt || 0));

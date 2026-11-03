@@ -591,3 +591,39 @@ test('R2.2 a /q sent while a press is in flight waits for it: the old board cann
   assert.equal(ctx.buttonStore.get('aaaaaaaaaaaa'), undefined, 'old token stays dead');
   assert.ok(ctx.buttonStore.get('bbbbbbbbbbbb'));
 });
+
+// ── final review regressions ──
+
+test('F1 blockOwner refuses any sid:/pid: owner without a process identity (ticket path included)', async () => {
+  const { blockOwner, blockPlan } = await import('./queue-control.mjs');
+  const dir = tmpDir();
+  const until = Date.now() + 60_000;
+  assert.equal((await blockOwner(dir, { owner: 'pid:7', label: 'x', until })).ok, false);
+  assert.equal((await blockOwner(dir, { owner: 'sid:7', label: 'x', until, ident: null })).ok, false);
+  assert.equal(readPolicy(dir).policy.blocks.length, 0);
+  // a ticket whose session leader is gone → plan has no ident → refused
+  const plan = blockPlan({ owner: 'sid:999999999', label: 'L', pid: 9 }, { stat: () => null });
+  assert.equal(plan.ident, null);
+  assert.equal((await blockOwner(dir, { owner: plan.owner, label: plan.label, until, ident: plan.ident })).ok, false);
+  assert.equal((await blockOwner(dir, { owner: 'pid:7', label: 'x', until, ident: { pid: me, procStart: myStart } })).ok, true);
+  assert.equal((await blockOwner(dir, { owner: 'convo:1', label: 'c', until })).ok, true, 'convo/git need none');
+});
+
+test('F2 starting a board is ONE strict write: the new entry in, older q boards out; on failure neither changes', async () => {
+  const dir = tmpDir(); ticket(dir, 'A');
+  const ctx = fakeCtx(dir);
+  await startQ(ctx, { rand: () => 'aaaaaaaaaaaa' });
+  const file = ctx.buttonStore.file;
+  let flushes = 0;
+  const realFlush = ctx.buttonStore.flush.bind(ctx.buttonStore);
+  ctx.buttonStore.flush = () => { flushes++; return realFlush(); };
+  await startQ(ctx, { rand: () => 'bbbbbbbbbbbb' });
+  assert.equal(flushes, 1, 'a single write');
+  const disk = JSON.parse(fs.readFileSync(file, 'utf8'));
+  assert.deepEqual(Object.keys(disk).filter((k) => disk[k].kind === 'q'), ['bbbbbbbbbbbb']);
+  // failing write: memory and disk keep the old board, the new one is not registered
+  ctx.buttonStore.flush = () => { throw new Error('EIO'); };
+  await startQ(ctx, { rand: () => 'cccccccccccc' });
+  assert.ok(ctx.buttonStore.get('bbbbbbbbbbbb'), 'old board still there');
+  assert.equal(ctx.buttonStore.get('cccccccccccc'), undefined);
+});

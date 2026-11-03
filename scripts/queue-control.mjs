@@ -216,6 +216,7 @@ export function plainOwnerPlan(owner, { stat = procStat } = {}) {
 /** Block `owner` until `until` and kick all its waiting tickets, under ONE hold of the policy lock. */
 export const blockOwner = (dir, { owner, label, until, ident = null }, opts = {}) => updatePolicy(dir, (p, { now }) => {
   if (!(until > now)) return { error: '❌ thời hạn đã qua' };
+  if (/^(sid|pid):/.test(owner) && !(ident && Number.isSafeInteger(ident.pid))) return { error: `❌ không xác định được tiến trình của ${owner} (đã thoát?) — không chặn` };
   p.blocks = p.blocks.filter((b) => b.owner !== owner);
   if (p.blocks.length >= MAX_BLOCKS) return { error: `❌ tối đa ${MAX_BLOCKS} mục chặn` };
   p.blocks.push({ owner, label: label || owner, until, at: now, ...(ident ? { ident } : {}) });
