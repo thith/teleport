@@ -950,7 +950,14 @@ export function promptSegments(data) {
     quotedText: data.quotedText ?? null,
     timestamp: data.timestamp ?? null,
     attachments: data.attachments ?? [],
+    ...(data.infoOnly === true ? { infoOnly: true } : {}), // RFC 34 §2.3
   }];
+}
+
+/** RFC 34 §2.3: every segment is an info-only daemon notice (no reply expected, never claimed). Pure. */
+export function isInfoOnlyPrompt(data) {
+  const segs = promptSegments(data);
+  return segs.length > 0 && segs.every((s) => s && s.infoOnly === true);
 }
 
 export function buildPromptData(msg, updateId = null, botId = null, roles = null) {
@@ -2115,6 +2122,8 @@ export function dropPresentSegments(data, presentKeys) {
   if (keep.length === segs.length) return data;
   if (keep.length === 0) return null;
   const last = keep[keep.length - 1];
+  // RFC 34 §2.3: routing comes from the newest NON-info-only segment (a daemon notice never overrides it).
+  const route = [...keep].reverse().find((seg) => seg.infoOnly !== true) ?? last;
   const out = {
     ...data,
     messages: keep,
@@ -2125,14 +2134,15 @@ export function dropPresentSegments(data, presentKeys) {
     editedAt: keep.reduce((acc, seg) => (seg.editedAt != null && (acc == null || seg.editedAt > acc) ? seg.editedAt : acc), null),
   };
   for (const k of ['messageId', 'fromUserId', 'fromName', 'fromRole', 'replyToMessageId', 'replyToText', 'quotedText', 'timestamp']) {
-    out[k] = last[k] ?? null;
+    out[k] = route[k] ?? null;
   }
-  out.chatId = last.chatId ?? null;
+  out.chatId = route.chatId ?? null;
+  if (keep.every((seg) => seg.infoOnly === true)) out.infoOnly = true; else delete out.infoOnly; // recomputed (RFC 34)
   // `fromMember` is batch-level (the newest sender's member record, a pure
   // function of that user id) and segments don't carry it. Keep it only if the
   // newest KEPT segment has the same sender; otherwise null — never let a
   // dropped segment's member record leak onto a different sender.
-  out.fromMember = (last.fromUserId != null && String(last.fromUserId) === String(data.fromUserId ?? ''))
+  out.fromMember = (route.fromUserId != null && String(route.fromUserId) === String(data.fromUserId ?? ''))
     ? (data.fromMember ?? null)
     : null;
   return out;
@@ -2170,6 +2180,15 @@ export function mergePromptData(existing, incoming) {
   // steer to the WRONG person (a group member) or fail. When the steer flag is
   // carried from `existing` and `incoming` is NOT itself a steer, restore the
   // steer side's DM target so the reply routes to the real instructor.
+  // RFC 34 §2.3: the info-only flag is recomputed from the segments; when exactly one side is a daemon
+  // info-only notice, routing scalars + persona/projectDescription come from the OTHER (real) side.
+  if (merged.messages.every((m) => m.infoOnly === true)) merged.infoOnly = true; else delete merged.infoOnly;
+  const exInfo = isInfoOnlyPrompt(existing), inInfo = isInfoOnlyPrompt(incoming);
+  if (inInfo && !exInfo) {
+    for (const k of ['messageId', 'chatId', 'fromUserId', 'fromName', 'fromRole', 'fromMember', 'replyToMessageId', 'replyToText', 'quotedText', 'persona', 'projectDescription']) {
+      if (existing[k] !== undefined) merged[k] = existing[k]; else delete merged[k];
+    }
+  }
   const incomingIsSteer = incoming.instruct || incoming.whisper;
   const existingIsSteer = existing.instruct || existing.whisper;
   if (existingIsSteer && !incomingIsSteer) {
@@ -2410,15 +2429,48 @@ export function announceBody(file, fallbackText = null) {
   return `${JSON.stringify(body)}${id != null ? ` (messageId: ${id})` : ''}`;
 }
 
+// RFC 34 §2.3: an open prompt made only of info-only segments → its parsed data, else null.
+function readInfoOnlyPrompt(promptFile) {
+  try { const d = JSON.parse(fs.readFileSync(promptFile, 'utf8')); return isInfoOnlyPrompt(d) ? d : null; } catch { return null; }
+}
+
+/** The announce line of a consumed info-only notice: no file, no claim id, nothing to reply (RFC 34 §2.3). */
+export function infoOnlyAnnounce(promptFile, claim) {
+  return `[tele-listen] prompt ready: ${promptFile} (info-only — không có file .processing, không cần đọc file hay trả lời) ${announceBody('', claim?.text ?? '')}`;
+}
+
+/**
+ * RFC 34: delete an old info-only `.processing.json` only if it is STILL the one we read. Under the per-convo
+ * write lock (every claim takes it), re-read and compare: a concurrent consume + a fresh real claim at the same
+ * path must never be deleted (Codex code review). Not locked / changed / gone → leave it (the TTL net recovers).
+ */
+export function dropInfoOnlyProcessing(processingFile, seen, writeLockFile = null) {
+  const locked = writeLockFile ? acquirePollLock(writeLockFile) : true;
+  if (!locked) return false;
+  try {
+    let now = null;
+    try { now = JSON.parse(fs.readFileSync(processingFile, 'utf8')); } catch { return false; }
+    if (!isInfoOnlyPrompt(now) || (now.claimId ?? null) !== (seen?.claimId ?? null) || (now.text ?? '') !== (seen?.text ?? '')) return false;
+    fs.unlinkSync(processingFile);
+    return true;
+  } catch { return false; } finally { if (writeLockFile) releasePollLock(writeLockFile); }
+}
+
 export function claimPreexistingPrompt(promptFile, processingFile, writeLockFile = null) {
-  if (fs.existsSync(processingFile)) return false;   // agent handling a batch → don't pre-empt
   if (!fs.existsSync(promptFile)) return false;      // nothing pending
+  // An info-only notice never needs the agent's claim, so a busy agent doesn't hold it back (RFC 34).
+  const busy = fs.existsSync(processingFile);        // agent handling a batch → don't pre-empt
+  if (busy && !readInfoOnlyPrompt(promptFile)) return false;
   const locked = writeLockFile ? acquirePollLock(writeLockFile) : true;
   if (!locked) return false;                         // another writer active → announce next poll
   try {
     // Re-check under the lock: a peer may have claimed/consumed in the window.
-    if (fs.existsSync(processingFile)) return false;
     if (!fs.existsSync(promptFile)) return false;
+    // RFC 34 §2.3: all-info-only → unlink the open file right here (never a .processing.json) and hand the
+    // text back for an inline announce. Under the write lock, so no append can slip in between read and unlink.
+    const info = readInfoOnlyPrompt(promptFile);
+    if (info) { fs.unlinkSync(promptFile); return { infoOnly: true, text: info.text ?? '' }; }
+    if (fs.existsSync(processingFile)) return false;
     // Stamp the claim's IDENTITY *BEFORE* publishing it. `claimId` is what lets the
     // consumer (send-telegram) prove it is deleting the batch it actually handled
     // rather than whatever happens to sit in the slot — the confirmed data-loss
@@ -2846,6 +2898,13 @@ async function main() {
       // "glimpsed but lost" hole this change closes (Codex review).
       let stored = null;
       try { stored = JSON.parse(fs.readFileSync(processingFile, 'utf8'))?.claimId ?? null; } catch { /* best-effort */ }
+      let orphan = null;
+      try { orphan = JSON.parse(fs.readFileSync(processingFile, 'utf8')); } catch { /* best-effort */ }
+      if (orphan && isInfoOnlyPrompt(orphan)) { // RFC 34: an old info-only .processing — announce inline, then drop it
+        console.log(infoOnlyAnnounce(promptFile, { text: orphan.text ?? '' }));
+        dropInfoOnlyProcessing(processingFile, orphan, path.join(DEFAULT_TMP_DIR, `prompt-write-${convo}.lock`));
+        process.exit(0);
+      }
       console.log(`[tele-listen] prompt ready: ${promptFile} (re-surfaced on first-run — read the .processing) ${announceBody(processingFile)}${claimSuffix(stored)}`);
       process.exit(0);
     }
@@ -2893,7 +2952,8 @@ async function main() {
         // Echo the claim token: the agent passes it back as `--claim-id` when it
         // replies, which is what lets send-telegram delete THIS batch and only
         // this one (forgetting it costs a duplicate, never a loss).
-        console.log(`[tele-listen] prompt ready: ${promptFile} (pre-existing — claimed by listener) ${announceBody(processingFile)}${claimSuffix(claim)}`);
+        if (claim?.infoOnly) console.log(infoOnlyAnnounce(promptFile, claim));
+        else console.log(`[tele-listen] prompt ready: ${promptFile} (pre-existing — claimed by listener) ${announceBody(processingFile)}${claimSuffix(claim)}`);
         process.exit(0);
       }
     }
@@ -3205,7 +3265,8 @@ async function main() {
       // the agent's CLAIM protocol treats both identically: read `.processing`, do
       // NOT re-`mv` (a re-`mv` could clobber `.processing` if a fresh prompt spooled
       // in the race window — subagent FINDING 1).
-      console.log(`[tele-listen] prompt ready: ${promptFile} (claimed by listener) ${announceBody(processingFile, data.text)}${claimSuffix(claim)}`);
+      if (claim?.infoOnly) console.log(infoOnlyAnnounce(promptFile, claim));
+      else console.log(`[tele-listen] prompt ready: ${promptFile} (claimed by listener) ${announceBody(processingFile, data.text)}${claimSuffix(claim)}`);
     }
     process.exit(0);
   }

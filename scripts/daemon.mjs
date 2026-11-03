@@ -83,6 +83,7 @@ import { quietNow, syncQuietCpu } from './quiet-hours.mjs';
 import { recordFetchOk, startListenWatchdog } from './listen-watch.mjs';
 import { launchCleanup, startCleanupScheduler } from './cleanup-launch.mjs';
 import { autoNudgeTick } from './auto-nudge.mjs';
+import { compactWarnTick, createWarnStore } from './compact-warn.mjs';
 import { peekMail } from './mailbox.mjs';
 import { createListenerStatus } from './listener-status.mjs';
 import { processCleanupRequests, processCleanupOffers, handleCleanupButton, CLEANUP_BUTTON_RE, startCleanupList, startManualFor, parseCleanupCommand } from './cleanup-inbox.mjs';
@@ -483,6 +484,8 @@ async function main() {
         catch (e) { console.error(`[daemon] long-build watch: ${e?.message ?? e}`); }
         // RFC 26 §3.11: nudge agents about NEW unread mail / Telegram. Not awaited (typing takes seconds), never overlapping.
         runAutoNudge();
+        // RFC 34: one "sắp auto compact" notice per agent at 94% of its window. Not awaited, never overlapping.
+        runCompactWarn();
       }
     } catch (e) {
       console.error(`[daemon] loop error: ${e instanceof Error ? e.message : e}`);
@@ -1294,6 +1297,25 @@ export function runAutoNudge({ tick = autoNudgeTick, list = () => listClaudeProc
     }))
     .catch((e) => console.error(`[daemon] auto-nudge: ${e?.message ?? e}`))
     .finally(() => { autoNudgeBusy = false; });
+}
+
+// RFC 34: warn an agent once before auto compact. RAM cache + disk marks live across ticks; one pass at a time.
+const compactWarnCache = new Map();
+let compactWarnStore = null;
+let compactWarnBusy = false;
+export function runCompactWarn({ tick = compactWarnTick, list = () => listClaudeProcs(), store = (compactWarnStore ??= createWarnStore()), deliver = deliverResult } = {}) {
+  if (compactWarnBusy) return null;
+  compactWarnBusy = true;
+  const status = (() => { try { return createListenerStatus(); } catch { return null; } })();
+  return Promise.resolve()
+    .then(() => tick({
+      list, store, deliver, cache: compactWarnCache,
+      cfg: () => { try { return readProjectsConfig(PROJECTS_FILE); } catch { return null; } },
+      listener: (c) => { try { return status?.listener(c) ?? null; } catch { return null; } },
+      log: (s) => console.log(s),
+    }))
+    .catch((e) => console.error(`[daemon] compact-warn: ${e?.message ?? e}`))
+    .finally(() => { compactWarnBusy = false; });
 }
 
 /**

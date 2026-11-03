@@ -26,7 +26,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   DEFAULT_TMP_DIR, REGISTRY_FILE, readRegistry, readCache, readOffset, isLiveEntry,
-  collectMessagesToProcess, promptSegments, botScopedFiles,
+  collectMessagesToProcess, promptSegments, botScopedFiles, isInfoOnlyPrompt,
 } from './tele-listen.mjs';
 import { readTopicsStore, getThreadId } from './topics-store.mjs';
 import { loadEnvFromFile, extractBotId } from './send-telegram.mjs';
@@ -123,12 +123,21 @@ export function createListenerStatus({
     return { n: msgs.length, age: dates.length ? formatAge(now - Math.min(...dates) * 1000) : null };
   }
 
+  // RFC 34: a daemon info-only notice is not an unread Telegram item — "pending" ignores it.
+  function infoOnlyFile(file) {
+    try { return isInfoOnlyPrompt(JSON.parse(fs.readFileSync(file, 'utf8'))); } catch { return false; }
+  }
+
   function promptInfo(convo) {
     const file = path.join(tmpDir, `prompt-convo-${convo}.json`);
     const m = mtimeMs(file);
     if (m == null) return null;
     let n = null;
-    try { n = promptSegments(JSON.parse(fs.readFileSync(file, 'utf8'))).length; } catch { /* count unknown */ }
+    try {
+      const d = JSON.parse(fs.readFileSync(file, 'utf8'));
+      if (isInfoOnlyPrompt(d)) return null;
+      n = promptSegments(d).length;
+    } catch { /* count unknown */ }
     return { n, age: formatAge(now - m) };
   }
 
@@ -199,7 +208,8 @@ export function createListenerStatus({
         }
       }
     } catch { /* unknown */ }
-    const pm = mtimeMs(path.join(tmpDir, `prompt-convo-${convo}.json`));
+    const pf = path.join(tmpDir, `prompt-convo-${convo}.json`);
+    const pm = infoOnlyFile(pf) ? null : mtimeMs(pf);
     if (pm != null) at.push(pm);
     return at.length ? Math.max(...at) : null;
   };

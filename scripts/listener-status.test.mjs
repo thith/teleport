@@ -222,3 +222,14 @@ test('status labels (inline and /ls lines): the leading emoji is Emoji_Presentat
   }
   fs.rmSync(dir, { recursive: true, force: true });
 });
+
+test('RFC 34: an info-only daemon prompt is neither "unread" nor "pending"', () => {
+  const dir = tmp();
+  const p = path.join(dir, `prompt-convo-${CONVO}.json`);
+  fs.writeFileSync(p, JSON.stringify({ text: 'x', infoOnly: true }));
+  const st = status(dir);
+  assert.equal(st.newestUnreadAt(CONVO), null);
+  assert.equal(st.lines(CONVO).some((l) => l.includes('Hàng đợi')), false);
+  fs.writeFileSync(p, JSON.stringify({ text: 'x', messages: [{ text: 'a', infoOnly: true }, { text: 'real' }] }));
+  assert.ok(st.newestUnreadAt(CONVO) != null, 'mixed batch still counts');
+});
