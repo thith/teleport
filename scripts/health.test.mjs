@@ -34,7 +34,7 @@ test('formatHealth: calm = no ⚠️ and no RAM top; several warnings = one ⚠�
   assert.equal(warnLines.length, 5, 'one line each');
   [/CPU quá tải/, /RAM sắp hết/, /Swap đầy 8\/8 GB/, /đĩa sắp đầy \(còn 4%\)/, /3 lần OOM-kill/].forEach((w, i) => assert.match(warnLines[i], w));
   assert.match(bad, /\n🐘 Ăn RAM nhiều nhất:\n {3}postgres ×74 — 5\.0G\n {3}node — 700M\n/, 'RAM tight → one process per line, indented 3');
-  assert.match(bad, /\n\n\/cswap {3}\/q {3}\/ls$/);
+  assert.match(bad, /\n\n\/cswap {3}\/q {3}\/ls {3}\/cleanup$/);
   const hot = formatHealth({ ...base, mem: { total: 16 * GB, available: 2.5 * GB, swapTotal: 2 * GB, swapFree: 2 * GB } });
   assert.match(hot, /🐘 Ăn RAM nhiều nhất:\n {3}postgres ×74/, 'used > 80% shows the top even without a warning');
   assert.doesNotMatch(hot, /⚠️/);
