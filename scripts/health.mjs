@@ -5,7 +5,7 @@
 // just drops that line).
 
 import { pruneSkipLines } from './lock-queue.mjs';
-import { LOCK_DIR, readHolders, readQueue, slotsFor, lockPaths } from './machine-lock.mjs';
+import { LOCK_DIR, readHolders, readQueue, readClaimed, readServed, queueOrder, hasLegacyWaiter, slotsFor, lockPaths } from './machine-lock.mjs';
 import { readPolicy } from './build-policy.mjs';
 import { quietState, readOverrideStrict, cpuLimitSupported } from './quiet-hours.mjs';
 import { DEFAULT_PROJECTS_FILE } from './projects-config.mjs';
@@ -125,24 +125,30 @@ export function formatHealth({ cores, load, mem, disk, top, oomKills, locks = nu
 
 const labelOnly = (l) => String(l ?? '').replace(/\s#[a-z0-9]+$/i, '');
 
+export const WAITING_SHOW_MAX = 10;
+
 /**
- * The locks, one item per line. `build` always: `🔒 Build <holders>/<N> chỗ, chờ <k>:` + one indented line per holder
- * (no holders → one line, no colon); `merge` / `cleanup` only while held or waited for, same style.
- * locks = { build?: { N, holders: [{label, startedAt, exclusive}], waiting }, merge?, cleanup? }.
+ * The locks, one item per line, no counts: `🔒 Build:` then `   ▶ <who> (<min since start>')` per holder and
+ * `   ⏳ <who> (<min waited>')` per waiting ticket (queue order, oldest first; at most WAITING_SHOW_MAX, then `   … +n`).
+ * `build` always (nobody running or waiting → `🔒 Build: trống`); `merge` / `cleanup` only while held or waited for.
+ * locks = { build?: { holders: [{label, startedAt, exclusive}], waiting: [{label, pid, since}] }, merge?, cleanup? }.
  * A lock whose data could not be read is `null` → "?". Pure.
  */
 export function formatLocksShort(locks, { now = Date.now() } = {}) {
   const out = [];
+  const mins = (t) => Math.max(0, Math.round((now - t) / 60000));
   for (const name of ['build', 'merge', 'cleanup']) {
     const l = locks?.[name];
     if (l === undefined) continue;
     const title = name[0].toUpperCase() + name.slice(1);
     if (l === null) { out.push(`🔒 ${title} ?`); continue; }
     const hs = l.holders || [];
-    if (name !== 'build' && !hs.length && !l.waiting) continue;
-    const head = `🔒 ${title}${name === 'build' ? ` ${hs.length}/${l.N ?? 1} chỗ` : ''}, chờ ${l.waiting || 0}`;
-    out.push(hs.length ? `${head}:` : head);
-    for (const h of hs) out.push(`   ▶ ${labelOnly(h.label) || 'pid ?'} (${Math.max(0, Math.round((now - h.startedAt) / 60000))}')${h.exclusive ? ' [giữ cả lock]' : ''}`);
+    const ws = Array.isArray(l.waiting) ? l.waiting : [];
+    if (!hs.length && !ws.length) { if (name === 'build') out.push('🔒 Build: trống'); continue; }
+    out.push(`🔒 ${title}:`);
+    for (const h of hs) out.push(`   ▶ ${labelOnly(h.label) || (h.pid != null ? `pid ${h.pid}` : 'pid ?')} (${mins(h.startedAt)}')${h.exclusive ? ' [giữ cả lock]' : ''}`);
+    for (const w of ws.slice(0, WAITING_SHOW_MAX)) out.push(`   ⏳ ${labelOnly(w.label) || (w.pid != null ? `pid ${w.pid}` : 'pid ?')} (${mins(w.since)}')`);
+    if (ws.length > WAITING_SHOW_MAX) out.push(`   … +${ws.length - WAITING_SHOW_MAX}`);
   }
   return out;
 }
@@ -416,6 +422,21 @@ function buildSlotsStrict(dir) {
 const tryOr = (f, fallback = null) => { try { return f(); } catch { return fallback; } };
 
 /**
+ * The waiting tickets (non-dead) of lock `name` in the order they will really be served — queueOrder() with the same
+ * inputs as lock-queue formatQueue / q-panel gatherQ: owner fairness for build (RFC 24, FIFO while a legacy waiter is in
+ * line), /q boosts (RFC 29), live before stalled. Throws if the policy cannot be read at all (the line prints `?`).
+ */
+function orderedWaiting(name, { dir, now, holders }) {
+  const tickets = readQueue(name, { dir, now }).filter((t) => t.status !== 'dead');
+  const build = name === 'build';
+  const fair = build && !hasLegacyWaiter(tickets);
+  const named = new Set(holders.map((h) => h.ticket).filter(Boolean));
+  const running = fair ? [...holders.filter((h) => !h.exclusive), ...readClaimed(name, { dir }).filter((c) => !named.has(c.ticket))] : [];
+  const boosts = build ? (readPolicy(dir, { now }).policy?.boosts || {}) : {};
+  return queueOrder(tickets, { fair, running, served: fair ? readServed(name, { dir, now }) : {}, boosts });
+}
+
+/**
  * Read the state files for the locks lines and "Thông số". Every piece is independent: one that cannot be read is
  * `null` (the line prints `?`), never an exception. Returns { locks, inEffect, extraWarn }. Injectable for tests.
  * (health.mjs reads `_config.buildQuietHours`, never `_config.quietHours` — that one belongs to the heartbeat reminders.)
@@ -427,7 +448,7 @@ export function gatherLocal({ dir = LOCK_DIR, now = Date.now(), projectsFile = D
   for (const name of ['build', 'merge', 'cleanup']) {
     lockData[name] = tryOr(() => { assertLockReadable(name, dir); return {
       N: slotsFor(name, { dir }), holders: name === 'build' && buildHolders ? buildHolders : readHolders(name, { dir }),
-      waiting: readQueue(name, { dir, now }).filter((t) => t.status !== 'dead').length,
+      waiting: orderedWaiting(name, { dir, now, holders: name === 'build' && buildHolders ? buildHolders : readHolders(name, { dir }) }).map((t) => ({ label: t.label, pid: t.pid, since: t.createdAt ?? t.mtimeMs })),
     }; });
   }
   const quiet = cfg ? tryOr(() => quietState({ config: cfg._config?.buildQuietHours, now, override: readOverrideOf(dir) })) : null;
