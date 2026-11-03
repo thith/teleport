@@ -1288,9 +1288,9 @@ export async function runTypeCommand(op, rest, from, ctx, { list = () => listCla
   if (obs.mismatch) { await sendText(daemonUserId, `❌ ${cmd} ${agentLabel(t, persona)}: ${obs.mismatch}.`); return; }
   const ctxNote = op === 'c' ? formatContext(obs.usage, contextWindowFor(projectsConfig || {}, { hashtag: t.hashtag, model: obs.usage?.model })) : null;
   const r = await runner.run(op, t, String(from?.id ?? 'owner'), { persona });
+  try { // finish() in finally even if the first send throws — a leaked watch count would block 🗜️→💀
   await sendText(daemonUserId, `${r.text}${ctxNote && obs.usage?.tokens != null && obs.usage.tokens < COMPACT_MIN_TOKENS ? ` (${ctxNote})` : ''}`);
   if (!r.watch) return;
-  try {
     const more = await r.watch().catch((e) => `❔ ${e?.message ?? e}`);
     await sendText(daemonUserId, `${agentLabel(t, persona)}: ${more}`);
     const convoId = uuidToConvoInt(t.sessionId);
@@ -1504,17 +1504,19 @@ export async function handleTypeButton(cq, ctx, { runner = getTypeRunner(), list
     await ctx.editButtonRows(chatId, messageId, `${base}\n\n${r.text}`, [[{ text: TYPE_BUTTON_LABEL.u, callback_data: `ty:${t2}:u` }, CANCEL_BUTTON(t2)]]);
     return;
   }
+  try { // finish() in finally even if the edit throws
   await ctx.editButtonRows(chatId, messageId, `${base}\n\n${r.text}`, []);
   if (r.watch) {
-    try {
+    {
       const more = await r.watch().catch((e) => `❔ ${e?.message ?? e}`);
       await ctx.editButtonRows(chatId, messageId, `${base}\n\n${r.text.replace(/ — đang chờ kết quả…$/, '')}\n${more}`, []);
       const convoId = uuidToConvoInt(entry.target.sessionId);
       if (String(more).startsWith(COMPACT_OK) && convoId != null) { // tell the agent itself (its prompt queue, not its topic)
         await deliver({ convoId, text: more }, { build: buildCompactNoticePrompt }).catch((e) => console.error(`[daemon] compact notice: ${e?.message ?? e}`));
       }
-    } finally { r.finish?.(); }
+    }
   }
+  } finally { r.finish?.(); }
 }
 
 /**
