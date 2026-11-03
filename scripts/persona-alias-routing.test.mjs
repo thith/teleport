@@ -65,3 +65,19 @@ test('aliases retain ambiguity, topic-only and exact-address rules', () => {
   assert.equal(normalizeAgentName('wolf'), 'wolf', 'English aliases are not added');
   assert.equal(normalizeAgentName('constructor'), 'constructor', 'object prototype keys are not aliases');
 });
+
+test('a free-text session name is never alias-expanded: "nam" session ≠ persona Nấm; exact name wins over alias', () => {
+  const cao = { pid: 31, ppid: 1, screenPid: 1, screen: 'tele-a1111001', sessionId: '00000000-0000-4000-8000-000000000031', hashtag: 'a1111001', name: 'nam', procStart: '1' };
+  const nam = { pid: 32, ppid: 2, screenPid: 2, screen: 'tele-a1111002', sessionId: '00000000-0000-4000-8000-000000000032', hashtag: 'a1111002', name: 'worker', procStart: '1' };
+  const personaOf = (r) => (r.pid === 31 ? '🦊 Cáo' : '🍄 Nấm');
+  // Persona "Nấm" (or its alias typed with the accent) → only the real Nấm, never the session named "nam".
+  assert.equal(matchProcsByName('Nấm', [cao, nam], personaOf).pid, 32);
+  assert.deepEqual(resolveSessionNames('Nấm', [cao, nam], personaOf).map((r) => r.pid), [32]);
+  assert.equal(findTypeTarget('Nấm', [cao, nam], personaOf).row.pid, 32);
+  // Typed "nam": the exact session name wins (not ambiguous).
+  assert.equal(matchProcsByName('nam', [cao, nam], personaOf).pid, 31);
+  assert.deepEqual(resolveSessionNames('nam', [cao, nam], personaOf).map((r) => r.pid), [31]);
+  // Without a namesake session, the alias still reaches the persona.
+  assert.equal(matchProcsByName('nam', [nam], personaOf).pid, 32);
+  assert.equal(findTypeTarget('nam', [nam], personaOf).row.pid, 32);
+});

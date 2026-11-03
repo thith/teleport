@@ -12,7 +12,7 @@
 import { isMainModule } from './is-direct-run.mjs';
 import { listClaudeProcs } from './claude-procs.mjs';
 import { makePersonaOf } from './spawn.mjs';
-import { normalizeAgentName, parseAgentTarget, resolveTail } from './agent-target.mjs';
+import { filterByAgentName, parseAgentTarget, resolveTail } from './agent-target.mjs';
 import { uuidToConvoInt } from './convo-registry.mjs';
 
 const tailLabel = (personaOf) => (x) => `${personaOf(x) || x.name || '?'} #${x.hashtag}`;
@@ -38,13 +38,12 @@ export function resolveSessionNames(query, rows, personaOf = () => null) {
   }
   const convo = t.kind === 'convoId' ? t.value : null; // a full convoId is compared in FULL (its hashtag is only the last digits)
   const exact = t.kind === 'hashtag' ? t.value : null;
-  const nq = normalizeAgentName(t.value);
-  const byName = (r) => (r.persona && normalizeAgentName(r.persona) === nq) || normalizeAgentName(r.name) === nq;
-  return rows
+  const named = rows
     .filter((r) => r.name)
-    .map((r) => ({ ...r, persona: r.hashtag ? personaOf(r) : null }))
-    .filter((r) => (convo ? String(uuidToConvoInt(r.sessionId)) === convo
-      : exact ? r.hashtag === exact : byName(r)));
+    .map((r) => ({ ...r, persona: r.hashtag ? personaOf(r) : null }));
+  if (convo) return named.filter((r) => String(uuidToConvoInt(r.sessionId)) === convo);
+  if (exact) return named.filter((r) => r.hashtag === exact);
+  return filterByAgentName(t.value, named);
 }
 
 /** "👻 Ma #c2383556 → 📨 umipay-ae · PID 644406 · busy". Pure. */

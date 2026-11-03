@@ -39,7 +39,7 @@ import { fileURLToPath } from 'node:url';
 import { isMainModule } from './is-direct-run.mjs';
 import { uuidToConvoInt } from './convo-registry.mjs';
 import { shortConvoHash } from './convo-hash.mjs';
-import { normalizeAgentName, parseAgentTarget, unquoteTarget, resolveTail, HASHTAG_RE } from './agent-target.mjs';
+import { normalizeAgentName, filterByAgentName, parseAgentTarget, unquoteTarget, resolveTail, HASHTAG_RE } from './agent-target.mjs';
 import { createListenerStatus } from './listener-status.mjs';
 import { countUnread } from './mailbox.mjs';
 import { typeTargets, lsLinks, screenWindowCount } from './type-cmd.mjs';
@@ -1210,7 +1210,7 @@ export function matchProcsByName(name, rows, personaOf = () => null) {
   }
   const q = normalizeAgentName(name);
   if (!q) return { error: 'empty name.' };
-  const hits = rows.filter((r) => [r.name, personaOf(r)].some((n) => n && normalizeAgentName(n) === q));
+  const hits = filterByAgentName(name, rows, { persona: personaOf, session: (r) => r.name });
   const label = (r) => `PID ${r.pid}${r.name ? ` (${r.name})` : ''}`;
   if (hits.length === 1) return { pid: hits[0].pid, start: hits[0].procStart ?? null };
   if (!hits.length) return { error: `no claude process named "${name}" (see /ls for names).` };
