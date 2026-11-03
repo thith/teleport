@@ -216,6 +216,12 @@ export async function handleLongBuildButton(cq, ctx, { now = Date.now(), verify 
     return;
   }
   const h = v.holder;
+  if (store.has(`stop:${entry.key}`)) { // already being stopped (e.g. from /q): never reset its phase / deadline
+    try { store.delete(tok); } catch {}
+    await ctx.answerButton(cq.id, '⏳ Đang dừng rồi.');
+    await ctx.editButtonRows(chatId, messageId, `${original}\n\n⏳ đang dừng rồi.`, []);
+    return;
+  }
   const job = createStopJob(h, { chatId, statusMessageId: messageId, text: original.split('\n\n')[0], now });
   try { store.replace(tok, `stop:${entry.key}`, job); } // one flush; throws → nothing happened
   catch { await ctx.answerButton(cq.id, 'Lỗi lưu lệnh dừng — không làm gì.'); return; }
