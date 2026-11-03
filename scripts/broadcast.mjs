@@ -118,7 +118,14 @@ export async function doBroadcast(argv, {
   catch (e) { return { ok: false, message: `📢 broadcast: không liệt kê được agent đang chạy (${e?.message || e}) — nothing sent.` }; }
   const norm = (h) => String(h).replace(/^#/, '').toLowerCase();
   const tagCount = new Map();
-  for (const t of all) tagCount.set(norm(t.hashtag), (tagCount.get(norm(t.hashtag)) || 0) + 1);
+  // Uniqueness is store-wide (every chat), not just the --chat scope: a hashtag-only row may belong to
+  // a topic in another chat. Distinct convoIds only.
+  const seenConvo = new Set();
+  for (const t of listLiveTopics(store, Object.keys(store || {}))) {
+    if (seenConvo.has(t.convoId)) continue;
+    seenConvo.add(t.convoId);
+    tagCount.set(norm(t.hashtag), (tagCount.get(norm(t.hashtag)) || 0) + 1);
+  }
   // Position of a topic in /ls order (first matching row), or -1.
   const lsIndex = (t) => entries.findIndex((e) => {
     const isObj = e && typeof e === 'object';

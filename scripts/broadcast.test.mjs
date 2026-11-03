@@ -139,3 +139,13 @@ test('doBroadcast: hashtag collision — a convoId row matches only its own topi
   assert.equal(byTag.r.ok, false); assert.equal(byTag.written.length, 0);
   assert.match(byTag.r.message, /\/ls trống/);
 });
+
+test('doBroadcast --chat: a hashtag-only row is ambiguous if another chat holds a topic with the same hashtag', async () => {
+  const A = 1205483045424020, B = 2205483045424020;
+  const store = { '-100': { [A]: 5, _ts: {} }, '-200': { [B]: 6, _ts: {} } };
+  const cfg = { _default: { chatId: '-100' }, p: { chatId: '-200' }, _config: {} };
+  const run = (argv) => doBroadcast(argv, { from: {}, config: cfg, store, writePrompt: () => { throw new Error('must not send'); }, env: {}, envFile: {}, lsHashtags: () => [{ convoId: null, hashtag: shortConvoHash(A) }] });
+  const r = await run(['--chat', '-100', 'hi']);
+  assert.equal(r.ok, false);
+  assert.match(r.message, /\/ls trống/);
+});
