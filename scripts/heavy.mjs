@@ -708,7 +708,7 @@ export async function main(argv, {
     const oomBefore = scope ? scopeOps.oomKills() : null;
     if (owned) { for (const s of SIGS) process.off(s, preSig); phase = 'run'; } // runForwarded forwards from here
     const onSpawn = (child) => { pgid = child.pid; lock.update?.({ running: true, runningSince: Date.now(), pgid, pgidStart: procStat(pgid)?.start ?? null }); };
-    trySync(); // the RAM wait / gradlew --stop above can cross the start of the night: check again right before the scope is spawned
+    if (scope) trySync(); // the RAM wait / gradlew --stop above can cross the start of the night: check again right before the scope is spawned
     if (scope && !isNested) { quietTimer = setInterval(trySync, scopeOps.syncEveryMs); quietTimer.unref?.(); } // the night starts / ends while we run
     const code = await run(a.cmd, { env: childEnv, ...(scope ? { scope } : {}), ...(owned ? { onSpawn } : {}) });
     clearInterval(quietTimer);
