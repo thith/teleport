@@ -86,7 +86,7 @@ function rig({ killMode = 'process', lock = true, unlinkErr = null, execFail = f
   };
   const exec = (bin, args) => { calls.push([bin, ...args]); if (execFail && args.includes('restart')) throw new Error('boom'); return args.includes('show') ? `${killMode}\n` : ''; };
   let released = 0;
-  const deps = { fsx, notifyFile: '/n.json', now: () => 1000, newId: () => 'ID1', gitHead: () => 'abc1234', ppid: 1, readFile: () => SVC, exec,
+  const deps = { fsx, notifyFile: '/n.json', now: () => 1000, newId: () => 'ID1', gitHead: () => 'abc1234', env: {}, ppid: 1, readFile: () => SVC, exec,
     listClaudes: () => [], loadLive: () => live, acquireLock: async () => (lock ? () => { released++; } : null) };
   return { files, calls, deps, released: () => released };
 }
@@ -119,6 +119,15 @@ test('restartdCommand: valid target + safe → file written (id, convoId, at, fr
   assert.deepEqual(JSON.parse(r.files.get('/n.json')), { id: 'ID1', convoId: 111, at: 1000, fromCommit: 'abc1234' });
   assert.equal(restarted(r.calls), true);
   assert.match(out.message, /sẽ báo 🪼 Sứa \(#f4451780\)/);
+});
+
+test('restartdCommand: TELEPORT_DAEMON_COMMIT wins over git; a bad value falls back to git', async () => {
+  const r = rig();
+  await restartdCommand(['Sứa'], { ...r.deps, env: { TELEPORT_DAEMON_COMMIT: 'deadbee' } });
+  assert.equal(JSON.parse(r.files.get('/n.json')).fromCommit, 'deadbee');
+  const r2 = rig();
+  await restartdCommand(['Sứa'], { ...r2.deps, env: { TELEPORT_DAEMON_COMMIT: 'not a sha!' } });
+  assert.equal(JSON.parse(r2.files.get('/n.json')).fromCommit, 'abc1234');
 });
 
 test('restartdCommand: "Sứa 2" is ONE target (also curly-quoted)', async () => {

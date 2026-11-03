@@ -114,6 +114,12 @@ export function parseRestartdArgs(argv) {
 
 const REAL_FS = { readFileSync: fs.readFileSync, writeFileSync: fs.writeFileSync, renameSync: fs.renameSync, unlinkSync: fs.unlinkSync, mkdirSync: fs.mkdirSync };
 
+/** The commit the RUNNING daemon started on (exported by daemon.mjs), or null if absent/malformed. */
+export function daemonCommit(env = process.env) {
+  const v = env?.TELEPORT_DAEMON_COMMIT;
+  return typeof v === 'string' && /^[0-9a-f]{4,40}$/i.test(v) ? v : null;
+}
+
 /**
  * The whole `/restartd` command (RFC 33). Everything is injectable; returns { ok, message } | { error }.
  */
@@ -122,6 +128,7 @@ export async function restartdCommand(argv, {
   acquireLock = () => acquireHelperLock('restartd', { waitMs: 0 }),
   loadLive = () => listSteerableTargets(readTopicsStore(), groupChatIds(readProjectsConfig(), loadEnvFromFile(ENV_FILE))),
   gitHead = (exec = execFileSync) => { try { return String(exec('git', ['-C', path.join(__dirname, '..'), 'rev-parse', '--short', 'HEAD'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })).trim() || null; } catch { return null; } },
+  env = process.env,
   ...run
 } = {}) {
   const args = parseRestartdArgs(argv);
@@ -142,7 +149,7 @@ export async function restartdCommand(argv, {
       beforeRestart: () => {
         fsx.mkdirSync(path.dirname(notifyFile), { recursive: true });
         const tmp = `${notifyFile}.${process.pid}.tmp`;
-        fsx.writeFileSync(tmp, JSON.stringify({ id, convoId: Number(match.convoId), at: now(), fromCommit: gitHead() }), { mode: 0o600 });
+        fsx.writeFileSync(tmp, JSON.stringify({ id, convoId: Number(match.convoId), at: now(), fromCommit: daemonCommit(env) ?? gitHead() }), { mode: 0o600 });
         fsx.renameSync(tmp, notifyFile);
       },
       onRestartFailed: () => { // only our own request: a later /restartd may have replaced the file
