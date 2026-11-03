@@ -1,14 +1,13 @@
 // `/health` — a daemon command: one-glance machine status for the owner (RFC 32 §4.5: short).
-// One machine line (load/cores, RAM, free disk), one ⚠️ line of warnings, the biggest memory users only when RAM is
-// tight, the locks, and "⚙️ Đang áp dụng" (the knobs in effect). Read-only. Pure formatting is unit-tested; the probes
+// One item per line: CPU, RAM, free disk, one ⚠️ line per warning, the biggest memory users only when RAM is
+// tight, the locks, and "📋 Thông số" (the few knobs in effect). Read-only. Pure formatting is unit-tested; the probes
 // below read /proc, df, ps and the user journal (best effort — a missing source
 // just drops that line).
 
 import { pruneSkipLines } from './lock-queue.mjs';
-import { LOCK_DIR, readHolders, readQueue, slotsFor, cpuGateNote } from './machine-lock.mjs';
+import { LOCK_DIR, readHolders, readQueue, slotsFor, lockPaths } from './machine-lock.mjs';
 import { readPolicy } from './build-policy.mjs';
-import { quietState, readOverrideStrict, cpuLimitSupported, buildRuleText } from './quiet-hours.mjs';
-import { autoMergeAllowlist, validRepoPattern, AUTOMERGE_STATE_FILE } from './merge-inbox.mjs';
+import { quietState, readOverrideStrict, cpuLimitSupported } from './quiet-hours.mjs';
 import { DEFAULT_PROJECTS_FILE } from './projects-config.mjs';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -80,48 +79,46 @@ const topSize = (mb) => (mb >= 1024 ? `${(mb / 1024).toFixed(1)}G` : `${mb}M`);
 export const RAM_TOP_SHOW_PCT = 80; // list the biggest RAM users only above this usage (or with a RAM / swap warning)
 
 /**
- * RFC 32 §4.5: short, one line per fact. Machine line (load/N · RAM · free disk), ONE ⚠️ line joining every warning,
- * the biggest RAM users only when RAM is tight, the locks (formatLocksShort), then "⚙️ Đang áp dụng" (formatInEffect).
+ * RFC 32 §4.5: short, one item per line (phone-friendly). CPU, RAM, free disk, one ⚠️ line per warning, the biggest RAM
+ * users only when RAM is tight, the locks (formatLocksShort), then "📋 Thông số" (formatInEffect).
  * `extraWarn`: warnings the caller computed (e.g. builds running outside their scope).
  */
 export function formatHealth({ cores, load, mem, disk, top, oomKills, locks = null, psi = null, inEffect = null, extraWarn = [] }) {
   const warn = [];
-  const parts = [];
   let ramWarn = false;
+  const lines = ['🩺 Máy'];
   const cpuPsi = psi?.cpu?.some ?? null;
   const ioPsi = psi?.io?.full ?? null;
   if (load) {
-    parts.push(`💻 load ${load[0].toFixed(1)}${cores ? `/${cores}` : ''}`); // load per core count, not a CPU % (a CPUQuota makes % misleading)
+    lines.push(`💻 CPU: load ${load[0].toFixed(1)}${cores ? `/${cores}` : ''}`); // load per core count, not a CPU % (a CPUQuota makes % misleading)
     if (cpuPsi) {
       if (cpuPsi.avg10 >= CPU_PSI_ALERT) warn.push(`CPU quá tải (${Math.round(cpuPsi.avg10)}% thời gian chờ CPU)`);
     } else if (cores && load[0] > cores) warn.push(`CPU quá tải (load ${load[0].toFixed(1)} > ${cores} nhân)`);
-  }
+  } else lines.push('💻 CPU: ?');
   let usedPct = null;
   if (mem && mem.total) {
     const used = mem.total - (mem.available ?? 0);
     usedPct = (used / mem.total) * 100;
-    parts.push(`🧠 RAM ${gbInt(used)}/${gbInt(mem.total)} GB`);
+    lines.push(`🧠 RAM: ${gbInt(used)}/${gbInt(mem.total)} GB`);
     if (mem.available != null && mem.available / mem.total < 0.15) { warn.push(`RAM sắp hết (còn ${fmtGB(mem.available)})`); ramWarn = true; }
     if (mem.swapTotal) {
       const swUsed = mem.swapTotal - (mem.swapFree ?? 0);
       if (swUsed / mem.swapTotal > 0.9) { warn.push(`Swap đầy ${gbInt(swUsed)}/${gbInt(mem.swapTotal)} GB`); ramWarn = true; }
     }
-  }
+  } else lines.push('🧠 RAM: ?');
   if (ioPsi && ioPsi.avg10 >= IO_PSI_ALERT) warn.push(`đĩa nghẽn ${Math.round(ioPsi.avg10)}% thời gian`);
   if (disk) {
-    parts.push(`💾 đĩa trống ${gbInt(disk.avail)} GB`);
+    lines.push(`💾 Đĩa trống: ${gbInt(disk.avail)} GB`);
     if (diskLow(disk)) warn.push(`đĩa sắp đầy (còn ${Math.round((disk.avail / disk.size) * 100)}%)`);
-  }
+  } else lines.push('💾 Đĩa trống: ?');
   if (oomKills) warn.push(`${oomKills} lần OOM-kill trong 24 giờ qua (xem /ls)`);
   warn.push(...extraWarn);
-  const lines = ['🩺 Máy'];
-  if (parts.length) lines.push(parts.join(' · '));
-  if (warn.length) lines.push(`⚠️ ${warn.join(' · ')}`);
+  lines.push(...warn.map((w) => `⚠️ ${w}`));
   if (top && top.length && ((usedPct != null && usedPct > RAM_TOP_SHOW_PCT) || ramWarn)) {
-    lines.push(`🐘 ${top.slice(0, 5).map((t) => `${t.name}${t.count > 1 ? `×${t.count}` : ''} ${topSize(t.mb)}`).join(' · ')}`);
+    lines.push('🐘 Ăn RAM nhiều nhất:', ...top.slice(0, 5).map((t) => `   ${t.name}${t.count > 1 ? ` ×${t.count}` : ''} — ${topSize(t.mb)}`));
   }
   if (locks && locks.length) lines.push(...locks);
-  if (inEffect && inEffect.length) lines.push('', '⚙️ Đang áp dụng', ...inEffect);
+  if (inEffect && inEffect.length) lines.push('', '📋 Thông số', ...inEffect);
   lines.push('', HEALTH_SHORTCUTS);
   return lines.join('\n');
 }
@@ -129,8 +126,9 @@ export function formatHealth({ cores, load, mem, disk, top, oomKills, locks = nu
 const labelOnly = (l) => String(l ?? '').replace(/\s#[a-z0-9]+$/i, '');
 
 /**
- * RFC 32 §4.5: the locks, one line each. `build` always (holders with minutes, then waiting tickets); `merge` / `cleanup`
- * only while held or waited for. locks = { build?: { N, holders: [{label, startedAt, exclusive}], waiting }, merge?, cleanup? }.
+ * The locks, one item per line. `build` always: `🔒 Build <holders>/<N> chỗ, chờ <k>:` + one indented line per holder
+ * (no holders → one line, no colon); `merge` / `cleanup` only while held or waited for, same style.
+ * locks = { build?: { N, holders: [{label, startedAt, exclusive}], waiting }, merge?, cleanup? }.
  * A lock whose data could not be read is `null` → "?". Pure.
  */
 export function formatLocksShort(locks, { now = Date.now() } = {}) {
@@ -138,12 +136,13 @@ export function formatLocksShort(locks, { now = Date.now() } = {}) {
   for (const name of ['build', 'merge', 'cleanup']) {
     const l = locks?.[name];
     if (l === undefined) continue;
-    if (l === null) { out.push(`🔒 ${name}: ?`); continue; }
+    const title = name[0].toUpperCase() + name.slice(1);
+    if (l === null) { out.push(`🔒 ${title} ?`); continue; }
     const hs = l.holders || [];
     if (name !== 'build' && !hs.length && !l.waiting) continue;
-    const who = hs.map((h) => `▶ ${labelOnly(h.label) || 'pid ?'} (${Math.max(0, Math.round((now - h.startedAt) / 60000))}')${h.exclusive ? ' [giữ cả lock]' : ''}`);
-    const head = name === 'build' ? `🔒 build ${hs.length}/${l.N ?? 1}` : `🔒 ${name}`;
-    out.push(hs.length || name !== 'build' ? `${head}: ${[...who, `chờ ${l.waiting || 0}`].join(' · ')}` : `${head}: trống · chờ ${l.waiting || 0}`);
+    const head = `🔒 ${title}${name === 'build' ? ` ${hs.length}/${l.N ?? 1} chỗ` : ''}, chờ ${l.waiting || 0}`;
+    out.push(hs.length ? `${head}:` : head);
+    for (const h of hs) out.push(`   ▶ ${labelOnly(h.label) || 'pid ?'} (${Math.max(0, Math.round((now - h.startedAt) / 60000))}')${h.exclusive ? ' [giữ cả lock]' : ''}`);
   }
   return out;
 }
@@ -151,36 +150,19 @@ export function formatLocksShort(locks, { now = Date.now() } = {}) {
 const hhmm = (ms) => new Date(ms).toTimeString().slice(0, 5);
 
 /**
- * RFC 32 §4.5: "⚙️ Đang áp dụng" — only knobs teleport really has. Every input may be `undefined`/`null` = could not be
- * read → that line prints `?`. Pure.
- *   build   { slots, forced, gateNote }                    (forced = build.slots file)
- *   quiet   a quietState() result, optionally { error }
- *   policy  { max, paused, blocks: [{label, until}], boosts: k }
- *   automerge { enabled, patterns }
+ * "📋 Thông số" — the few knobs the owner can turn. Every input may be `undefined`/`null` = could not be read → `?`. Pure.
+ *   build   { slots, forced }          (forced = a build.slots file; otherwise `slots` is the auto value from RAM)
+ *   quiet   a quietState() result, optionally { error }; the 🌙 line shows ONLY while quiet hours are active
+ *   policy  { max }                    (the /q policy; no max = auto)
  */
-export function formatInEffect({ build, quiet, policy, automerge } = {}) {
+export function formatInEffect({ build, quiet, policy, } = {}) {
   const lines = [];
-  if (!build) lines.push('• Build: ?');
-  else {
-    const how = build.forced ? `đặt tay = ${build.slots} (lock-queue slots 1)` : `tự động theo RAM${build.slots > 1 ? '; chỗ thứ 2 chỉ cấp khi CPU rảnh' : ''}`;
-    lines.push(`• Build: ${build.slots} chỗ, ${how}${build.gateNote ? ` · chỗ thứ 2: ${build.gateNote}` : ''}`);
+  lines.push(!build ? '• Max build: ?' : build.forced ? `• Max build: ${build.slots}` : `• Max build: auto (${build.slots})`);
+  lines.push(!policy ? '• Max chờ: ?' : policy.max == null ? '• Max chờ: auto' : `• Max chờ: ${policy.max}`);
+  if (!quiet) lines.push('• 🌙 ?');
+  else if (quiet.enabled && quiet.active) {
+    lines.push(`• 🌙 ${quiet.overridden ? 'tắt tạm tới' : 'tới'} ${hhmm(quiet.until)}`);
   }
-  if (!quiet) lines.push('• 🌙 Giờ im lặng: ?');
-  else if (!quiet.enabled) lines.push(`• 🌙 Giờ im lặng: tắt${quiet.error ? ` (cấu hình hỏng: ${quiet.error})` : ''}`);
-  else {
-    const now = !quiet.active ? 'chưa tới giờ' : quiet.overridden ? `TẮT TẠM tới ${hhmm(quiet.until)}` : `đang áp tới ${hhmm(quiet.until)}`;
-    const rule = buildRuleText(quiet.maxBuilds);
-    lines.push(`• 🌙 Giờ im lặng ${quiet.from}–${quiet.to}: build ≤ ${quiet.cpuPercent}% CPU, ${rule} (bây giờ: ${now})${quiet.active && !quiet.overridden ? ' — bấm /q để tắt tạm' : ''}`);
-  }
-  if (!policy) lines.push('• Hàng /q: ?');
-  else {
-    const parts = [policy.max == null ? 'không giới hạn' : `max ${policy.max}`, policy.paused ? '⏸ tạm dừng' : 'không tạm dừng'];
-    parts.push(policy.blocks?.length ? `chặn: ${policy.blocks.map((b) => `${b.label} tới ${hhmm(b.until)}`).join(', ')}` : 'không chặn ai');
-    if (policy.boosts > 0) parts.push(`⬆ ưu tiên: ${policy.boosts} vé`);
-    lines.push(`• Hàng /q: ${parts.join(', ')}`);
-  }
-  if (!automerge) lines.push('• Automerge: ?');
-  else lines.push(`• Automerge: ${automerge.enabled ? 'bật' : 'tắt'}${automerge.patterns > 0 || automerge.enabled ? ` (${automerge.patterns} mẫu repo)` : ''}`);
   return lines;
 }
 
@@ -421,36 +403,38 @@ function tryRun(bin, args) {
 
 /** Strict JSON read for /health: missing file → {} (nothing configured), any other failure throws (that line prints `?`). */
 const readJsonOrEmpty = (file) => { try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch (e) { if (e?.code === 'ENOENT') return {}; throw e; } };
-/** automerge-state.json, strictly: missing = the defaults; any other read / parse failure throws (the line prints `?`). */
-export function readAutoMergeStrict(file) {
-  let t;
-  try { t = fs.readFileSync(file, 'utf8'); } catch (e) { if (e?.code === 'ENOENT') return { enabled: false, repos: [] }; throw e; }
-  const j = JSON.parse(t);
-  return { enabled: j.enabled === true, repos: Array.isArray(j.repos) ? j.repos.filter(validRepoPattern).map((r) => r.toLowerCase()) : [] };
+/** /health only: readdir that tolerates a missing dir (nothing there yet) but not an unreadable one (EACCES…) → throws. */
+const readdirStrict = (d) => { try { return fs.readdirSync(d); } catch (e) { if (e?.code === 'ENOENT') return []; throw e; } };
+/** /health only: a lock whose dir or queue dir cannot be listed would look idle through the swallowing readers → throw so it prints `?`. */
+function assertLockReadable(name, dir) { readdirStrict(dir); readdirStrict(lockPaths(name, dir).queue); }
+/** /health only: build.slots present → manual; missing → auto; any other read error throws (the line prints `?`). */
+function buildSlotsStrict(dir) {
+  let forced = true;
+  try { fs.readFileSync(path.join(dir, 'build.slots'), 'utf8'); } catch (e) { if (e?.code !== 'ENOENT') throw e; forced = false; }
+  return { slots: slotsFor('build', { dir }), forced };
 }
 const tryOr = (f, fallback = null) => { try { return f(); } catch { return fallback; } };
 
 /**
- * Read the state files for the locks lines and "Đang áp dụng". Every piece is independent: one that cannot be read is
+ * Read the state files for the locks lines and "Thông số". Every piece is independent: one that cannot be read is
  * `null` (the line prints `?`), never an exception. Returns { locks, inEffect, extraWarn }. Injectable for tests.
  * (health.mjs reads `_config.buildQuietHours`, never `_config.quietHours` — that one belongs to the heartbeat reminders.)
  */
-export function gatherLocal({ dir = LOCK_DIR, now = Date.now(), projectsFile = DEFAULT_PROJECTS_FILE, readProjects = readJsonOrEmpty, readOverrideOf = readOverrideStrict, automergeFile = AUTOMERGE_STATE_FILE, supported = cpuLimitSupported, pruneLines = () => pruneSkipLines({ dir }) } = {}) {
+export function gatherLocal({ dir = LOCK_DIR, now = Date.now(), projectsFile = DEFAULT_PROJECTS_FILE, readProjects = readJsonOrEmpty, readOverrideOf = readOverrideStrict, supported = cpuLimitSupported, pruneLines = () => pruneSkipLines({ dir }) } = {}) {
   const cfg = tryOr(() => readProjects(projectsFile));
   const lockData = {};
   const buildHolders = tryOr(() => readHolders('build', { dir }));
   for (const name of ['build', 'merge', 'cleanup']) {
-    lockData[name] = tryOr(() => ({
+    lockData[name] = tryOr(() => { assertLockReadable(name, dir); return {
       N: slotsFor(name, { dir }), holders: name === 'build' && buildHolders ? buildHolders : readHolders(name, { dir }),
       waiting: readQueue(name, { dir, now }).filter((t) => t.status !== 'dead').length,
-    }));
+    }; });
   }
   const quiet = cfg ? tryOr(() => quietState({ config: cfg._config?.buildQuietHours, now, override: readOverrideOf(dir) })) : null;
   const inEffect = formatInEffect({
-    build: tryOr(() => { const N = slotsFor('build', { dir }); return { slots: N, forced: fs.existsSync(path.join(dir, 'build.slots')), gateNote: cpuGateNote({ dir, N, now }) }; }),
+    build: tryOr(() => buildSlotsStrict(dir)),
     quiet,
-    policy: tryOr(() => { const r = readPolicy(dir, { now }); return r.corrupt ? null : { max: r.policy.max, paused: r.policy.paused, blocks: r.policy.blocks, boosts: Object.keys(r.policy.boosts || {}).length }; }),
-    automerge: cfg ? tryOr(() => { const st = readAutoMergeStrict(automergeFile); return { enabled: st.enabled, patterns: autoMergeAllowlist({ configPatterns: Array.isArray(cfg._config?.autoMergeRepos) ? cfg._config.autoMergeRepos : [], addedPatterns: st.repos }).patterns.length }; }) : null,
+    policy: tryOr(() => { const r = readPolicy(dir, { now }); return r.corrupt ? null : { max: r.policy.max }; }),
   });
   const extraWarn = [];
   if (quiet?.error) extraWarn.push(`giờ im lặng: cấu hình hỏng (${quiet.error}) — đang tắt`);

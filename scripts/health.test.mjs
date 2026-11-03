@@ -18,7 +18,7 @@ test('parsers: meminfo, df, ps aggregation, oom lines', () => {
   assert.equal(countOomKills('a\nfoo: systemd-oomd killed 233 process(es) in this unit.\nbar: A process of this unit has been killed by the OOM killer.\nok\n'), 2);
 });
 
-test('formatHealth (RFC 32 §4.5): calm = no ⚠️ line and no RAM top; warnings join into ONE line; RAM > 80% shows the top', () => {
+test('formatHealth: calm = no ⚠️ and no RAM top; several warnings = one ⚠️ line each; RAM > 80% shows the top', () => {
   const base = {
     cores: 12, load: [4, 5, 7],
     mem: { total: 16 * GB, available: 6 * GB, swapTotal: 2 * GB, swapFree: 1 * GB },
@@ -27,100 +27,114 @@ test('formatHealth (RFC 32 §4.5): calm = no ⚠️ line and no RAM top; warning
     oomKills: 0,
   };
   const ok = formatHealth(base);
-  assert.equal(ok, '🩺 Máy\n💻 load 4.0/12 · 🧠 RAM 10/16 GB · 💾 đĩa trống 120 GB\n\n/cswap   /q   /ls');
-  assert.doesNotMatch(ok, /⚠️|🐘|Không có cảnh báo|Agent claude/);
+  assert.equal(ok, '🩺 Máy\n💻 CPU: load 4.0/12\n🧠 RAM: 10/16 GB\n💾 Đĩa trống: 120 GB\n\n/cswap   /q   /ls');
+  assert.doesNotMatch(ok, /⚠️|🐘/);
   const bad = formatHealth({ ...base, load: [14, 9, 8], mem: { total: 16 * GB, available: 1 * GB, swapTotal: 8 * GB, swapFree: 0 }, disk: { size: 500 * GB, avail: 20 * GB, target: '/' }, oomKills: 3 });
   const warnLines = bad.split('\n').filter((l) => l.startsWith('⚠️'));
-  assert.equal(warnLines.length, 1, 'one line');
-  for (const w of [/CPU quá tải/, /RAM sắp hết/, /Swap đầy 8\/8 GB/, /đĩa sắp đầy \(còn 4%\)/, /3 lần OOM-kill/]) assert.match(warnLines[0], w);
-  assert.match(bad, /\n🐘 postgres×74 5\.0G · node 700M\n/, 'RAM tight → top users in one line');
+  assert.equal(warnLines.length, 5, 'one line each');
+  [/CPU quá tải/, /RAM sắp hết/, /Swap đầy 8\/8 GB/, /đĩa sắp đầy \(còn 4%\)/, /3 lần OOM-kill/].forEach((w, i) => assert.match(warnLines[i], w));
+  assert.match(bad, /\n🐘 Ăn RAM nhiều nhất:\n {3}postgres ×74 — 5\.0G\n {3}node — 700M\n/, 'RAM tight → one process per line, indented 3');
   assert.match(bad, /\n\n\/cswap {3}\/q {3}\/ls$/);
   const hot = formatHealth({ ...base, mem: { total: 16 * GB, available: 2.5 * GB, swapTotal: 2 * GB, swapFree: 2 * GB } });
-  assert.match(hot, /🐘 postgres×74/, 'used > 80% shows the top even without a warning');
+  assert.match(hot, /🐘 Ăn RAM nhiều nhất:\n {3}postgres ×74/, 'used > 80% shows the top even without a warning');
   assert.doesNotMatch(hot, /⚠️/);
-  assert.equal(formatHealth({ cores: 4, load: null, mem: null, disk: null, top: null, oomKills: 0 }), '🩺 Máy\n\n/cswap   /q   /ls', 'missing sources just drop pieces');
+  assert.equal(formatHealth({ cores: 4, load: null, mem: null, disk: null, top: null, oomKills: 0 }), '🩺 Máy\n💻 CPU: ?\n🧠 RAM: ?\n💾 Đĩa trống: ?\n\n/cswap   /q   /ls', 'a failed probe prints ?, never silently drops the line');
 });
 
-test('formatHealth: approved mock — machine line, ⚠️ line, locks, ⚙️ Đang áp dụng', () => {
+test('formatHealth: approved mock', () => {
   const now = 100 * 60_000;
-  const locks = formatLocksShort({ build: { N: 2, holders: [{ label: '🤖 Robot 2 #aaaa1111', startedAt: now - 4 * 60_000 }, { label: '🧚 Tiên', startedAt: now - 60_000 }], waiting: 0 }, merge: { holders: [], waiting: 0 }, cleanup: { holders: [], waiting: 0 } }, { now });
-  const inEffect = formatInEffect({
-    build: { slots: 2, forced: false, gateNote: '' },
-    quiet: { enabled: true, active: false, overridden: false, from: '23:30', to: '06:00', cpuPercent: 25, maxBuilds: 1, until: now },
-    policy: { max: null, paused: false, blocks: [], boosts: 0 }, automerge: { enabled: true, patterns: 3 },
-  });
+  const locks = formatLocksShort({ build: { N: 2, holders: [{ label: '🧚 Tiên', startedAt: now - 60_000 }], waiting: 0 }, merge: { holders: [], waiting: 0 }, cleanup: { holders: [], waiting: 0 } }, { now });
+  const inEffect = formatInEffect({ build: { slots: 2, forced: false }, quiet: { enabled: true, active: true, overridden: false, until: new Date(2026, 10, 4, 6, 0).getTime() }, policy: { max: null } });
   const text = formatHealth({
-    cores: 12, load: [11.5, 9, 8], mem: { total: 31 * GB, available: 21 * GB, swapTotal: 8 * GB, swapFree: 0 }, disk: { size: 500 * GB, avail: 138 * GB, target: '/' },
-    psi: { io: { some: { avg10: 40, avg60: 1, avg300: 1 }, full: { avg10: 30, avg60: 1, avg300: 1 } } }, locks, inEffect,
+    cores: 12, load: [5.0, 9, 8], mem: { total: 31 * GB, available: 20 * GB, swapTotal: 8 * GB, swapFree: 0 }, disk: { size: 500 * GB, avail: 152 * GB, target: '/' },
+    top: [{ name: 'postgres', mb: 2560, count: 31 }, { name: 'claude', mb: 2253, count: 5 }], locks, inEffect,
   });
   assert.equal(text, [
-    '🩺 Máy',
-    '💻 load 11.5/12 · 🧠 RAM 10/31 GB · 💾 đĩa trống 138 GB',
-    '⚠️ Swap đầy 8/8 GB · đĩa nghẽn 30% thời gian',
-    "🔒 build 2/2: ▶ 🤖 Robot 2 (4') · ▶ 🧚 Tiên (1') · chờ 0",
-    '',
-    '⚙️ Đang áp dụng',
-    '• Build: 2 chỗ, tự động theo RAM; chỗ thứ 2 chỉ cấp khi CPU rảnh',
-    '• 🌙 Giờ im lặng 23:30–06:00: build ≤ 25% CPU, chỉ nhận build mới khi không còn build nào (bây giờ: chưa tới giờ)',
-    '• Hàng /q: không giới hạn, không tạm dừng, không chặn ai',
-    '• Automerge: bật (3 mẫu repo)',
-    '',
-    '/cswap   /q   /ls',
+    '🩺 Máy', '💻 CPU: load 5.0/12', '🧠 RAM: 11/31 GB', '💾 Đĩa trống: 152 GB', '⚠️ Swap đầy 8/8 GB',
+    '🐘 Ăn RAM nhiều nhất:', '   postgres ×31 — 2.5G', '   claude ×5 — 2.2G',
+    '🔒 Build 1/2 chỗ, chờ 0:', "   ▶ 🧚 Tiên (1')",
+    '', '📋 Thông số', '• Max build: auto (2)', '• Max chờ: auto', '• 🌙 tới 06:00',
+    '', '/cswap   /q   /ls',
   ].join('\n'));
 });
 
-test('formatLocksShort: build always one line; merge / cleanup only when held or waited for; unreadable → ?', () => {
+test('formatLocksShort: build with 0 / 1 / 2 holders; merge / cleanup only when held or waited for; unreadable → ?', () => {
   const now = 10 * 60_000;
-  assert.deepEqual(formatLocksShort({ build: { N: 2, holders: [], waiting: 0 }, merge: { holders: [], waiting: 0 }, cleanup: { holders: [], waiting: 0 } }, { now }), ['🔒 build 0/2: trống · chờ 0']);
-  const l = formatLocksShort({ build: { N: 1, holders: [{ label: 'Ma', startedAt: 0 }], waiting: 2 }, merge: { holders: [{ label: '🦊 Cáo #ab12', startedAt: now - 120_000 }], waiting: 1 }, cleanup: { holders: [], waiting: 3 } }, { now });
-  assert.deepEqual(l, ["🔒 build 1/1: ▶ Ma (10') · chờ 2", "🔒 merge: ▶ 🦊 Cáo (2') · chờ 1", '🔒 cleanup: chờ 3']);
-  assert.deepEqual(formatLocksShort({ build: null }, { now }), ['🔒 build: ?']);
-  assert.deepEqual(formatLocksShort({ build: { N: 1, holders: [{ label: 'cleanup', startedAt: now, exclusive: true }], waiting: 0 } }, { now }), ["🔒 build 1/1: ▶ cleanup (0') [giữ cả lock] · chờ 0"]);
+  const none = { holders: [], waiting: 0 };
+  assert.deepEqual(formatLocksShort({ build: { N: 2, holders: [], waiting: 0 }, merge: none, cleanup: none }, { now }), ['🔒 Build 0/2 chỗ, chờ 0']);
+  assert.deepEqual(formatLocksShort({ build: { N: 2, holders: [{ label: 'Ma #ab12', startedAt: 0 }], waiting: 2 } }, { now }), ['🔒 Build 1/2 chỗ, chờ 2:', "   ▶ Ma (10')"]);
+  assert.deepEqual(formatLocksShort({ build: { N: 2, holders: [{ label: 'A', startedAt: now }, { label: 'B', startedAt: now - 60_000 }], waiting: 0 } }, { now }),
+    ['🔒 Build 2/2 chỗ, chờ 0:', "   ▶ A (0')", "   ▶ B (1')"]);
+  const l = formatLocksShort({ build: { N: 1, holders: [], waiting: 0 }, merge: { holders: [{ label: '🦊 Cáo #ab12', startedAt: now - 120_000 }], waiting: 1 }, cleanup: { holders: [], waiting: 3 } }, { now });
+  assert.deepEqual(l, ['🔒 Build 0/1 chỗ, chờ 0', '🔒 Merge, chờ 1:', "   ▶ 🦊 Cáo (2')", '🔒 Cleanup, chờ 3']);
+  assert.deepEqual(formatLocksShort({ build: null }, { now }), ['🔒 Build ?']);
+  assert.deepEqual(formatLocksShort({ build: { N: 1, holders: [{ label: 'cleanup', startedAt: now, exclusive: true }], waiting: 0 } }, { now }), ['🔒 Build 1/1 chỗ, chờ 0:', "   ▶ cleanup (0') [giữ cả lock]"]);
 });
 
-test('formatInEffect: every state of every line; unreadable → ?', () => {
-  const q = { enabled: true, from: '23:30', to: '06:00', cpuPercent: 25, maxBuilds: 1 };
+test('formatInEffect: Max build auto/manual, Max chờ auto/n, 🌙 only while active; unreadable → ?', () => {
   const until = new Date(2026, 10, 4, 6, 0).getTime();
-  const get = (o, i) => formatInEffect(o)[i];
-  assert.equal(get({ build: { slots: 1, forced: true } }, 0), '• Build: 1 chỗ, đặt tay = 1 (lock-queue slots 1)');
-  assert.equal(get({ build: { slots: 1, forced: false } }, 0), '• Build: 1 chỗ, tự động theo RAM');
-  assert.equal(get({ build: { slots: 2, forced: false, gateNote: 'chờ CPU (load 11.2/12)' } }, 0), '• Build: 2 chỗ, tự động theo RAM; chỗ thứ 2 chỉ cấp khi CPU rảnh · chỗ thứ 2: chờ CPU (load 11.2/12)');
-  assert.match(get({ quiet: { ...q, active: true, overridden: false, until } }, 1), /\(bây giờ: đang áp tới 06:00\) — bấm \/q để tắt tạm$/);
-  assert.match(get({ quiet: { ...q, active: true, overridden: true, until } }, 1), /\(bây giờ: TẮT TẠM tới 06:00\)$/);
-  assert.match(get({ quiet: { ...q, active: false, overridden: false } }, 1), /\(bây giờ: chưa tới giờ\)$/);
-  assert.match(get({ quiet: { ...q, maxBuilds: 2, active: false } }, 1), /tối đa 2 build/);
-  assert.equal(get({ quiet: { enabled: false } }, 1), '• 🌙 Giờ im lặng: tắt');
-  assert.equal(get({ quiet: { enabled: false, error: 'x' } }, 1), '• 🌙 Giờ im lặng: tắt (cấu hình hỏng: x)');
-  const until2 = new Date(2026, 10, 3, 15, 30).getTime();
-  assert.equal(get({ policy: { max: 3, paused: true, blocks: [{ label: '🦊 Cáo', until: until2 }], boosts: 2 } }, 2), '• Hàng /q: max 3, ⏸ tạm dừng, chặn: 🦊 Cáo tới 15:30, ⬆ ưu tiên: 2 vé');
-  assert.equal(get({ policy: { max: null, paused: false, blocks: [], boosts: 0 } }, 2), '• Hàng /q: không giới hạn, không tạm dừng, không chặn ai');
-  assert.equal(get({ automerge: { enabled: false, patterns: 0 } }, 3), '• Automerge: tắt');
-  assert.equal(get({ automerge: { enabled: false, patterns: 2 } }, 3), '• Automerge: tắt (2 mẫu repo)');
-  assert.deepEqual(formatInEffect({}), ['• Build: ?', '• 🌙 Giờ im lặng: ?', '• Hàng /q: ?', '• Automerge: ?']);
+  const q = { enabled: true, from: '23:30', to: '06:00', cpuPercent: 25, maxBuilds: 1, until };
+  assert.deepEqual(formatInEffect({ build: { slots: 2, forced: false }, policy: { max: null }, quiet: { enabled: false } }), ['• Max build: auto (2)', '• Max chờ: auto']);
+  assert.equal(formatInEffect({ build: { slots: 1, forced: true }, policy: { max: 3 }, quiet: { enabled: false } }).join('|'), '• Max build: 1|• Max chờ: 3');
+  assert.equal(formatInEffect({ build: { slots: 2, forced: false }, policy: { max: null }, quiet: { ...q, active: true, overridden: false } })[2], '• 🌙 tới 06:00');
+  assert.equal(formatInEffect({ build: { slots: 2, forced: false }, policy: { max: null }, quiet: { ...q, active: true, overridden: true } })[2], '• 🌙 tắt tạm tới 06:00');
+  assert.equal(formatInEffect({ build: { slots: 2, forced: false }, policy: { max: null }, quiet: { ...q, active: false, overridden: false } }).length, 2, 'inactive → no 🌙 line');
+  assert.equal(formatInEffect({ build: { slots: 2 }, policy: { max: null }, quiet: { enabled: false, error: 'x' } }).length, 2, 'not configured → no 🌙 line');
+  assert.deepEqual(formatInEffect({}), ['• Max build: ?', '• Max chờ: ?', '• 🌙 ?']);
 });
 
-test('gatherLocal: reads buildQuietHours (not quietHours), counts automerge patterns once, a read error prints ?', () => {
+test('gatherLocal: reads buildQuietHours (not quietHours), shows 🌙 only in the window, a read error prints ?', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tp-health-'));
-  const cfg = { _config: { quietHours: { start: '01:00', end: '02:00' }, buildQuietHours: { from: '23:30', to: '06:00' }, autoMergeRepos: ['a/b', 'A/B', 'c/*'] } };
-  const g = gatherLocal({ dir, now: new Date(2026, 10, 3, 12, 0).getTime(), readProjects: () => cfg, supported: () => true, pruneLines: () => [] });
-  const text = g.inEffect.join('\n');
-  assert.match(text, /Giờ im lặng 23:30–06:00: build ≤ 25% CPU/);
-  assert.match(text, /Automerge: (bật|tắt) \(\d+ mẫu repo\)/);
-  assert.deepEqual(g.extraWarn, []);
+  const cfg = { _config: { quietHours: { start: '01:00', end: '02:00' }, buildQuietHours: { from: '23:30', to: '06:00' } } };
+  const at = (h, m) => new Date(2026, 10, 3, h, m).getTime();
+  const inside = gatherLocal({ dir, now: at(23, 45), readProjects: () => cfg, supported: () => true, pruneLines: () => [] });
+  assert.deepEqual(inside.inEffect.slice(0, 2), ['• Max build: auto (' + inside.inEffect[0].match(/\((\d)\)/)[1] + ')', '• Max chờ: auto']);
+  assert.match(inside.inEffect[2], /^• 🌙 tới 06:00$/);
+  assert.deepEqual(inside.extraWarn, []);
+  const outside = gatherLocal({ dir, now: at(12, 0), readProjects: () => cfg, supported: () => true, pruneLines: () => [] });
+  assert.equal(outside.inEffect.length, 2);
+  fs.writeFileSync(path.join(dir, 'build.slots'), '1\n');
+  assert.equal(gatherLocal({ dir, now: at(12, 0), readProjects: () => cfg, supported: () => true, pruneLines: () => [] }).inEffect[0], '• Max build: 1');
+  fs.rmSync(path.join(dir, 'build.slots'));
   const broken = gatherLocal({ dir, readProjects: () => { throw new Error('EACCES'); }, pruneLines: () => [] });
-  assert.match(broken.inEffect.join('\n'), /Giờ im lặng: \?/);
-  assert.match(broken.inEffect.join('\n'), /Automerge: \?/);
-  assert.match(broken.inEffect.join('\n'), /Hàng \/q: không giới hạn/, 'the other lines are unaffected');
-  // quiet configured but no cgroup cpu → a warning; a holder running outside its scope → a warning (pending / exclusive ones are not counted)
+  assert.ok(broken.inEffect.includes('• 🌙 ?'));
+  assert.ok(broken.inEffect.includes('• Max chờ: auto'), 'the other lines are unaffected');
   fs.writeFileSync(path.join(dir, 'build.holder.json'), JSON.stringify({ pid: process.pid, label: 'A', startedAt: Date.now(), scoped: false }));
-  const w = gatherLocal({ dir, readProjects: () => cfg, supported: () => false, pruneLines: () => ['⚠️ cargo cache chưa prune được 5 lần'] });
+  const w = gatherLocal({ dir, now: at(23, 45), readProjects: () => cfg, supported: () => false, pruneLines: () => ['⚠️ cargo cache chưa prune được 5 lần'] });
   assert.ok(w.extraWarn.some((x) => /không giới hạn được CPU/.test(x)));
   assert.ok(w.extraWarn.some((x) => /^1 build đang chạy ngoài scope/.test(x)));
   assert.ok(w.extraWarn.includes('cargo cache chưa prune được 5 lần'));
-  assert.equal(w.locks[0].startsWith('🔒 build'), true);
+  assert.equal(w.inEffect[2], '• 🌙 tới 06:00', 'the CPU limitation is only in the ⚠️ warning');
+  assert.equal(w.locks[0], '🔒 Build 1/' + w.locks[0].match(/1\/(\d)/)[1] + ' chỗ, chờ 0:');
   const bad = gatherLocal({ dir, readProjects: () => ({ _config: { buildQuietHours: { from: 'x', to: 'y' } } }), supported: () => true, pruneLines: () => [] });
   assert.ok(bad.extraWarn.some((x) => /cấu hình hỏng/.test(x)));
-  assert.match(bad.inEffect.join('\n'), /Giờ im lặng: tắt \(cấu hình hỏng/);
+  assert.equal(bad.inEffect.length, 2);
+});
+
+test('gatherLocal: unreadable build.slots / lock dir / queue dir print ? (ENOENT = normal), not a wrong value', (t) => {
+  if (process.getuid?.() === 0) return t.skip('root ignores permissions');
+  const mk = () => fs.mkdtempSync(path.join(os.tmpdir(), 'tp-health-'));
+  const opts = (dir) => ({ dir, readProjects: () => ({}), supported: () => true, pruneLines: () => [] });
+  // build.slots: missing = auto, present = manual, unreadable = ?
+  const d1 = mk();
+  assert.match(gatherLocal(opts(d1)).inEffect[0], /^• Max build: auto \(\d\)$/);
+  fs.writeFileSync(path.join(d1, 'build.slots'), '1\n');
+  assert.equal(gatherLocal(opts(d1)).inEffect[0], '• Max build: 1');
+  fs.chmodSync(path.join(d1, 'build.slots'), 0);
+  assert.equal(gatherLocal(opts(d1)).inEffect[0], '• Max build: ?');
+  fs.chmodSync(path.join(d1, 'build.slots'), 0o600);
+  // unreadable queue dir → that lock prints ? instead of looking idle; the others are unaffected
+  const d2 = mk();
+  fs.mkdirSync(path.join(d2, 'build.queue')); fs.mkdirSync(path.join(d2, 'merge.queue'));
+  fs.chmodSync(path.join(d2, 'merge.queue'), 0);
+  const l = gatherLocal(opts(d2)).locks;
+  assert.ok(l.some((x) => /^🔒 Build \d\/\d chỗ, chờ 0$/.test(x)), l.join('|'));
+  assert.ok(l.includes('🔒 Merge ?'), l.join('|'));
+  fs.chmodSync(path.join(d2, 'merge.queue'), 0o700);
+  // unreadable lock dir → every lock prints ?
+  const d3 = mk();
+  fs.chmodSync(d3, 0);
+  try { assert.deepEqual(gatherLocal(opts(d3)).locks, ['🔒 Build ?', '🔒 Merge ?', '🔒 Cleanup ?']); } finally { fs.chmodSync(d3, 0o700); }
 });
 
 test('PSI: parse /proc/pressure; warn on what tasks actually wait for, not raw load', () => {
@@ -131,7 +145,7 @@ test('PSI: parse /proc/pressure; warn on what tasks actually wait for, not raw l
   assert.equal(parsePressure(null), null);
   // The real case: load 17.6 on 12 cores, but nothing waits for CPU — the disk is the jam. No CPU %, just load/cores.
   const jam = formatHealth({ cores: 12, load: [17.64, 13.26, 7.46], psi: { cpu: cpuIdle, io } });
-  assert.match(jam, /💻 load 17\.6\/12/);
+  assert.match(jam, /💻 CPU: load 17\.6\/12/);
   assert.doesNotMatch(jam, /%\)|~\d+%/);
   assert.match(jam, /⚠️ đĩa nghẽn 67% thời gian/);
   assert.doesNotMatch(jam, /CPU quá tải/);
@@ -382,20 +396,12 @@ test('oomdSummary: a single-digit day (journalctl pads it with a space) still gi
   assert.equal(oomdSummary('Oct  3 09:38:17 h systemd[1]: run-x.scope: systemd-oomd killed 4 process(es) in this unit.').at, '09:38');
 });
 
-test('R3 gatherLocal: a read error on the override / automerge state prints ? (absent = normal default)', () => {
+test('R3 gatherLocal: a read error on the override prints ? (absent = normal default)', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tp-health-'));
   const cfg = { _config: { buildQuietHours: { from: '23:30', to: '06:00' } } };
-  const base = { dir, readProjects: () => cfg, supported: () => true, pruneLines: () => [], automergeFile: path.join(dir, 'am.json') };
-  const ok = gatherLocal(base).inEffect.join('\n');
-  assert.match(ok, /Giờ im lặng 23:30/);
-  assert.match(ok, /Automerge: tắt\b/, 'absent file = off, not ?');
+  const base = { dir, now: new Date(2026, 10, 3, 23, 45).getTime(), readProjects: () => cfg, supported: () => true, pruneLines: () => [] };
+  assert.match(gatherLocal(base).inEffect.join('\n'), /🌙 tới 06:00/);
   fs.mkdirSync(path.join(dir, 'quiet.override.json')); // EISDIR
-  const bad = gatherLocal(base).inEffect.join('\n');
-  assert.match(bad, /Giờ im lặng: \?/);
-  assert.match(bad, /Automerge: tắt\b/);
-  fs.rmdirSync(path.join(dir, 'quiet.override.json'));
-  fs.writeFileSync(path.join(dir, 'am.json'), '{broken');
-  assert.match(gatherLocal(base).inEffect.join('\n'), /Automerge: \?/);
-  fs.writeFileSync(path.join(dir, 'am.json'), JSON.stringify({ enabled: true, repos: ['a/b'] }));
-  assert.match(gatherLocal(base).inEffect.join('\n'), /Automerge: bật \(1 mẫu repo\)/);
+  assert.match(gatherLocal(base).inEffect.join('\n'), /• 🌙 \?/);
+  assert.match(gatherLocal(base).inEffect.join('\n'), /Max chờ: auto/);
 });

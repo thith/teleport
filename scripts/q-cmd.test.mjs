@@ -659,7 +659,9 @@ test('RFC32 /q quiet button: only while the window is active; label by state; th
   assert.ok(b, 'button present');
   assert.match(b.callback_data, Q_BUTTON_RE);
   assert.ok(Buffer.byteLength(b.callback_data) < 48);
-  assert.doesNotMatch(b.callback_data, /\d{4}/, 'no until in callback_data');
+  const mins = Math.floor(UNTIL / 60000);
+  for (const enc of [String(UNTIL), UNTIL.toString(36), String(mins), mins.toString(36)]) assert.ok(!b.callback_data.includes(enc), `no until (${enc}) in callback_data`);
+  assert.equal(b.callback_data.match(Q_BUTTON_RE)[5], undefined, 'no extra until arg group');
   // outside the window: no button
   const day = quietDeps({ quietOf: quietFor({ ...QCFG, from: clock(NIGHT + 3600_000), to: clock(NIGHT + 2 * 3600_000) }) });
   const c2 = fakeCtx(dir);
