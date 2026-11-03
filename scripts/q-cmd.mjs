@@ -9,7 +9,7 @@ import crypto from 'node:crypto';
 import { LOCK_DIR, readQueue, readHolders } from './machine-lock.mjs';
 import { parseDuration, readPolicy } from './build-policy.mjs';
 import {
-  setMax, stepMax, toggleMax, setRetry, setPaused, updatePolicy, kickTicket, topTicket, blockPlan, blockOwner, unblockOwner, resetPolicy,
+  setMax, stepMax, toggleMax, setRetry, setPaused, updatePolicy, kickTicket, topTicket, blockPlan, plainOwnerPlan, blockOwner, unblockOwner, resetPolicy,
   resolveQueueTarget, blockMatches, parseBlockArgs,
 } from './queue-control.mjs';
 import { gatherQ, renderQ, Q_BUTTON_RE, Q_TTL_MS } from './q-panel.mjs';
@@ -36,7 +36,13 @@ export function latestQ(store, now = Date.now()) {
 const entryFor = (g, r, base) => ({ ...base, rows: r.maps.rows, running: r.maps.running, blocks: r.maps.blocks });
 
 /** Send a fresh board and make it the only live one. */
-export async function startQ(ctx, deps = {}) {
+let qChain = Promise.resolve();
+const exclusive = (fn) => { const run = qChain.then(fn); qChain = run.catch(() => {}); return run; };
+
+/** Send a fresh board. Serialised with button presses (a press in flight can't re-save a board this one replaces). */
+export const startQ = (ctx, deps = {}) => exclusive(() => startQUnlocked(ctx, deps));
+
+async function startQUnlocked(ctx, deps = {}) {
   const { daemonUserId, sendText, sendButtonRows, buttonStore: store } = ctx;
   if (!sendButtonRows || !store?.setStrict) { await sendText(daemonUserId, '❌ /q cần chạy trong daemon.'); return; }
   const dir = dirOf(ctx, deps), now = nowOf(deps);
@@ -73,12 +79,9 @@ export async function qStop(ctx, runEntry, deps = {}) {
   return `đang dừng ${h.label || `pid ${h.pid}`} pid ${h.pid}`;
 }
 
-let qChain = Promise.resolve();
 /** Presses run one after the other (a double tap on Max + can only count once). */
 export function handleQButton(cq, ctx, deps = {}) {
-  const run = qChain.then(() => qPress(cq, ctx, deps));
-  qChain = run.catch(() => {});
-  return run;
+  return exclusive(() => qPress(cq, ctx, deps));
 }
 
 export async function qPress(cq, ctx, deps = {}) {
@@ -161,7 +164,7 @@ export async function qPress(cq, ctx, deps = {}) {
   try { await edit(chatId, messageId, text, r.rows); }
   catch (e) { // message too old / deleted: a new board, and this one expires
     console.error(`[q] edit failed (${e?.message ?? e}) — sending a new board`);
-    try { await startQ(ctx, deps); } catch (e2) { console.error(`[q] new board: ${e2?.message ?? e2}`); }
+    try { await startQUnlocked(ctx, deps); } catch (e2) { console.error(`[q] new board: ${e2?.message ?? e2}`); }
   }
   await ctx.answerButton(cq.id, note ? note.slice(0, 190) : undefined);
 }
@@ -250,7 +253,8 @@ export async function runQCommand(rest, ctx, deps = {}) {
         if (!cur) { await say(`❌ vé ${n} không còn (gõ /q để xem bảng mới).`); return; }
         plan = blockPlan(cur);
       } else if (/^(convo|git|sid|pid):\S+$/.test(a.target)) {
-        plan = { owner: a.target, label: a.target, ident: null, scope: `chặn ${a.target}` };
+        plan = plainOwnerPlan(a.target);
+        if (plan.error) { await say(plan.error); return; }
       } else {
         const tg = resolveQueueTarget(a.target, queueTargetTiers({ dir, now, procs: deps.procs ?? (() => []), topics: deps.topics ?? (() => []), peek: deps.peek ?? peekPersona }));
         if (tg.error) { await say(`❌ ${tg.error}`); return; }

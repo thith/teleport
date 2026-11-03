@@ -550,3 +550,44 @@ test('R5 ⛔ / ⏹ confirmations are pinned to the pressed ticket/build, even if
   await qPress(cqFor(ctx, qCallback(tok, entry.rev, 'bd', 1, '1h')), ctx);
   assert.equal(readPolicy(dir).policy.blocks.length, 1);
 });
+
+// ── review round 2 regressions ──
+
+test('R2.1 typed pid:/sid: block targets persist the process identity; an unknown process is refused', async () => {
+  const { plainOwnerPlan } = await import('./queue-control.mjs');
+  const { control } = await import('./lock-queue.mjs');
+  const p = plainOwnerPlan(`pid:${me}`);
+  assert.deepEqual(p.ident, { pid: me, procStart: myStart });
+  assert.equal(plainOwnerPlan('convo:5').ident, null);
+  assert.match(plainOwnerPlan('pid:999999999').error, /không xác định/);
+  const dir = tmpDir();
+  const ctx = fakeCtx(dir);
+  await runQCommand(`block sid:${me} 1h`, ctx);
+  assert.deepEqual(readPolicy(dir).policy.blocks[0].ident, { pid: me, procStart: myStart });
+  await runQCommand('block pid:999999999 1h', ctx);
+  assert.match(ctx.texts.at(-1), /không xác định/);
+  assert.equal(readPolicy(dir).policy.blocks.length, 1);
+  const dir2 = tmpDir();
+  const r = await control({ cmd: 'block', target: `pid:${me}`, duration: '30m' }, { dir: dir2 });
+  assert.equal(r.code, 0);
+  assert.deepEqual(readPolicy(dir2).policy.blocks[0].ident, { pid: me, procStart: myStart });
+  assert.equal((await control({ cmd: 'block', target: 'pid:999999999', duration: '30m' }, { dir: dir2 })).code, 1);
+});
+
+test('R2.2 a /q sent while a press is in flight waits for it: the old board cannot be resurrected', async () => {
+  const dir = tmpDir(); ticket(dir, 'A');
+  const ctx = fakeCtx(dir);
+  await startQ(ctx, { rand: () => 'aaaaaaaaaaaa' });
+  const slow = ctx.editButtonRowsStrict;
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  ctx.editButtonRowsStrict = async (...a) => { await gate; return slow(...a); };
+  const press = handleQButton(cqFor(ctx, qCallback('aaaaaaaaaaaa', 0, 'm+')), ctx);
+  const fresh = startQ(ctx, { rand: () => 'bbbbbbbbbbbb' });
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal(ctx.buttonStore.get('bbbbbbbbbbbb'), undefined, 'new board waits for the in-flight press');
+  release();
+  await Promise.all([press, fresh]);
+  assert.equal(ctx.buttonStore.get('aaaaaaaaaaaa'), undefined, 'old token stays dead');
+  assert.ok(ctx.buttonStore.get('bbbbbbbbbbbb'));
+});

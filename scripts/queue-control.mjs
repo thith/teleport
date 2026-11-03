@@ -197,6 +197,22 @@ export function blockPlan(ticket, { stat = procStat } = {}) {
   return { owner, label, ident: Number.isSafeInteger(pid) && start != null ? { pid, procStart: String(start) } : null, scope: 'chặn riêng tiến trình/phiên này', warn: false };
 }
 
+/**
+ * A typed owner string → a block plan. `sid:`/`pid:` get { pid, procStart } from the live process (a reused pid is then never
+ * blocked); one whose identity can't be established is refused. convo:/git: need none. → plan | { error }.
+ */
+export function plainOwnerPlan(owner, { stat = procStat } = {}) {
+  const m = /^(convo|git|sid|pid):(.+)$/.exec(String(owner));
+  if (!m) return { error: `❌ owner không hợp lệ: ${owner}` };
+  if (m[1] === 'sid' || m[1] === 'pid') {
+    const pid = Number(m[2]);
+    const st = Number.isSafeInteger(pid) && pid > 1 ? stat(pid) : null;
+    if (!st || st.state === 'Z' || st.state === 'X') return { error: `❌ không xác định được tiến trình ${owner} (đã thoát?) — không chặn` };
+    return { owner, label: owner, ident: { pid, procStart: String(st.start) }, scope: `chặn ${owner} (riêng tiến trình/phiên này)` };
+  }
+  return { owner, label: owner, ident: null, scope: `chặn ${owner}` };
+}
+
 /** Block `owner` until `until` and kick all its waiting tickets, under ONE hold of the policy lock. */
 export const blockOwner = (dir, { owner, label, until, ident = null }, opts = {}) => updatePolicy(dir, (p, { now }) => {
   if (!(until > now)) return { error: '❌ thời hạn đã qua' };

@@ -27,7 +27,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { LOCK_DIR, readQueue, readHolder, readHolders, queueOrder, readServed, hasLegacyWaiter, cancelTickets, selfConvoId, describeHolder, readStruck, readClaimed, worktreeOf, slotsFor, slotFiles, memTotal, TWO_SLOT_MIN_RAM, recordOwner } from './machine-lock.mjs';
 import { readPolicy, parseDuration, MAX_QUEUE_LIMIT } from './build-policy.mjs';
-import { setMax, setRetry, setPaused, kickTicket, topTicket, blockOwner, unblockOwner, blockPlan } from './queue-control.mjs';
+import { setMax, setRetry, setPaused, kickTicket, topTicket, blockOwner, unblockOwner, blockPlan, plainOwnerPlan } from './queue-control.mjs';
 import { isMainModule } from './is-direct-run.mjs';
 
 export const LOCK_NAMES = ['build', 'merge', 'cleanup'];
@@ -177,7 +177,8 @@ export async function control(a, { dir = LOCK_DIR, now = Date.now(), read = read
     }
     case 'block': {
       const t = ticketOf(a.target);
-      const plan = t ? blockPlan(t) : /^(convo|git|sid|pid):\S+$/.test(a.target) ? { owner: a.target, label: a.target, ident: null, scope: `chặn ${a.target}` } : null;
+      const plan = t ? blockPlan(t) : /^(convo|git|sid|pid):\S+$/.test(a.target) ? plainOwnerPlan(a.target) : null;
+      if (plan?.error) return { code: 1, lines: [plan.error] };
       if (!plan) return { code: 1, lines: ['❌ <owner|vé> là tên vé (lock-queue.mjs ls --ids) hoặc convo:<id> / git:<…> / sid:<n> / pid:<n>'] };
       const until = parseDuration(a.duration, { now }).until;
       r = await blockOwner(dir, { owner: plan.owner, label: plan.label, until, ident: plan.ident }, { now });
