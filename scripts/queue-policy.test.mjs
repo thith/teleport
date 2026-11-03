@@ -357,3 +357,55 @@ test('policy lock helpers: withPolicyLock reports busy instead of waiting foreve
   assert.deepEqual(r, { busy: true });
   assert.deepEqual(await withPolicyLock(dir, () => 7, { waitMs: 200 }), { value: 7 });
 });
+
+// ── failure modes ──
+
+test('ticket cannot be written (policy caller) → refused busy and NO slot kept — never "run without a ticket"', async () => {
+  const dir = tmpDir();
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(lockPaths('build', dir).queue, 'a file where the queue dir should be'); // mkdir/write of tickets fails
+  // free slot → the "build now" path writes the ticket after winning the flock
+  const r = await acquireLock('build', { dir, label: 'F', convoId: 'F', waitSec: 5, ...base });
+  assert.deepEqual(r, { refused: 'busy' });
+  assert.equal(probe(dir), 'free', 'the slot it had won was released');
+  // busy slot → the enqueue path
+  const h = await acquireLock('build', { dir, waitSec: 0, convoId: 'H', slots: 1 });
+  assert.deepEqual(await acquireLock('build', { dir, label: 'F2', convoId: 'F2', waitSec: 5, ...base }), { refused: 'busy' });
+  h.release();
+  // the old behaviour (no policy flag) is unchanged: warn and wait without a ticket
+  const warns = [];
+  const l = await acquireLock('build', { dir, label: 'OLD', convoId: 'OLD', waitSec: 2, slots: 1, pollMs: 30, warn: (m) => warns.push(m) });
+  assert.ok(l.release);
+  assert.ok(warns.some((m) => /không ghi được vé/.test(m)));
+  l.release();
+});
+
+test('a vanished ticket is put back; if it cannot be put back 3 beats in a row, the policy caller leaves with busy', async () => {
+  const dir = tmpDir();
+  const h = await acquireLock('build', { dir, waitSec: 0, convoId: 'H', slots: 1 });
+  const warns = [];
+  const w = waiter(dir, 'V', { warn: (m) => warns.push(m) });
+  await queued(dir, 1);
+  const [t] = readQueue('build', { dir });
+  fs.unlinkSync(t.file); // pruned by someone who misjudged us
+  await until(() => warns.some((m) => /đã ghi lại đúng chỗ cũ/.test(m)));
+  assert.equal(readQueue('build', { dir }).length, 1, 'put back');
+  // now make restoring impossible: remove the ticket, then take away write access to the queue dir
+  const q = lockPaths('build', dir).queue;
+  const [t2] = readQueue('build', { dir });
+  if (process.getuid?.() === 0) { h.release(); (await Promise.race([w, sleep(10)])); return; } // root ignores modes: nothing to test
+  fs.unlinkSync(t2.file);
+  fs.chmodSync(q, 0o500); // (no await in between: the waiter cannot restore the ticket first)
+  try {
+    assert.deepEqual(await w, { refused: 'busy' });
+  } finally { fs.chmodSync(q, 0o700); h.release(); }
+});
+
+test('no flock binary: the policy lock error propagates (heavy then runs unlocked, loudly) instead of becoming "busy"', async () => {
+  const dir = tmpDir();
+  const saved = process.env.PATH;
+  process.env.PATH = path.join(dir, 'nowhere');
+  try {
+    await assert.rejects(acquireLock('build', { dir, label: 'N', convoId: 'N', waitSec: 5, ...base }), (e) => e.code === 'ENOENT' && (e.syscall === 'spawn flock' || e.path === 'flock'));
+  } finally { process.env.PATH = saved; }
+});

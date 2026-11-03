@@ -1,0 +1,482 @@
+// RFC 29 — /q: board rendering, button presses (revisions, verification, persistence), typed forms, menu, long-build parts.
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { PersistentMap } from './button-store.mjs';
+import { lockPaths, readQueue } from './machine-lock.mjs';
+import { defaultPolicy, readPolicy, writePolicy, TICKET_V } from './build-policy.mjs';
+import { gatherQ, renderQ, qCallback, Q_BUTTON_RE, Q_PAGE_SIZE } from './q-panel.mjs';
+import { startQ, qPress, handleQButton, runQCommand, latestQ, queueTargetTiers } from './q-cmd.mjs';
+import { readNotices } from './queue-control.mjs';
+import { menuCommands, loadCommands, resolveCommand } from './commands.mjs';
+import { dispatchCommand, applyOwnerMenu, takeMergeButton, Q_COMMAND } from './daemon.mjs';
+import {
+  longBuildCandidates, createStopJob, buildKickNoticePrompt, longBuildWatch, retireLongBuildAlert, holderKey, STOP_BUTTON_RE,
+} from './long-build.mjs';
+import { HEALTH_SHORTCUTS } from './health.mjs';
+import { LS_SHORTCUTS } from './spawn.mjs';
+
+const tmpDir = () => fs.mkdtempSync(path.join(os.tmpdir(), 'tp-q-'));
+const me = process.pid;
+const myStart = String(spawnSync('cut', ['-d', ' ', '-f', '22', `/proc/${me}/stat`]).stdout).trim();
+let seq = 0;
+function ticket(dir, label, extra = {}) {
+  const q = lockPaths('build', dir).queue;
+  fs.mkdirSync(q, { recursive: true });
+  const name = `${String(1_700_000_000_000 + (seq++)).padStart(15, '0')}-${me}-${String(seq).padStart(6, 'a')}.json`;
+  const body = { v: TICKET_V, pid: me, procStart: myStart, label, cmd: `cmd of ${label}`, worktree: `/w/${label}`, owner: `convo:${label}`, convoId: label, createdAt: Date.now() - 7 * 60_000, ...extra };
+  if (body.v === undefined) delete body.v;
+  fs.writeFileSync(path.join(q, name), JSON.stringify(body));
+  return name;
+}
+function holder(dir, slot, extra = {}) {
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(lockPaths('build', dir, slot).holder, JSON.stringify({ pid: me, procStart: myStart, startedAt: Date.now() - 12 * 60_000, label: `Tiên${slot}`, cmd: 'cargo nextest', worktree: '/w/l30', slot, slots: 2, ...extra }));
+}
+const setPolicy = (dir, patch) => writePolicy(dir, { ...defaultPolicy(), ...patch });
+
+function fakeCtx(dir, { failEdit = false } = {}) {
+  const c = { texts: [], sent: [], edits: [], answers: [], daemonUserId: '9', lockDir: dir, buttonStore: new PersistentMap(path.join(tmpDir(), 'b.json')) };
+  let id = 100;
+  c.sendText = async (_chat, t) => { c.texts.push(t); };
+  c.sendButtonRows = async (chat, text, rows) => { c.sent.push({ chat, text, rows }); return { message_id: id++ }; };
+  c.editButtonRows = async (chat, mid, text, rows) => { c.edits.push({ mid, text, rows }); };
+  c.editButtonRowsStrict = async (chat, mid, text, rows) => { if (c.failEdit) throw new Error('message to edit not found'); c.edits.push({ mid, text, rows }); };
+  c.failEdit = failEdit;
+  c.answerButton = async (_id, t) => { c.answers.push(t); };
+  return c;
+}
+/** The current board of a fake ctx → { tok, entry }. */
+const boardOf = (ctx) => { const [tok, entry] = latestQ(ctx.buttonStore); return { tok, entry }; };
+const cqFor = (ctx, data, { from = 9, mid = null, text = 'old' } = {}) => ({ id: 'cq', from: { id: from }, data, message: { chat: { id: 9 }, message_id: mid ?? boardOf(ctx).entry.messageId, text } });
+const lastRows = (ctx) => ctx.edits.at(-1)?.rows ?? ctx.sent.at(-1).rows;
+const cbs = (rows) => rows.flat().map((b) => b.callback_data);
+const btn = (rows, re) => rows.flat().find((b) => re.test(b.text));
+
+test('renderQ: header, running + waiting lines, buttons (⬆ only live; ⬆✓ boosted; all < 64 bytes), blocks, max row, pause row', () => {
+  const dir = tmpDir();
+  holder(dir, 0); holder(dir, 1, { pid: me, label: 'Tuộc' });
+  const a = ticket(dir, 'A'), b = ticket(dir, 'B'), c = ticket(dir, 'C');
+  fs.utimesSync(path.join(lockPaths('build', dir).queue, c), new Date(Date.now() - 120_000), new Date(Date.now() - 120_000)); // stalled
+  const until = Date.now() + 3600_000;
+  setPolicy(dir, { max: 4, retryMin: 10, boosts: { [b]: Date.now() }, blocks: [{ owner: 'convo:Z', label: '🦊 Cáo', until, at: 1 }] });
+  const g = gatherQ({ dir });
+  const r = renderQ(g, { tok: 'a'.repeat(12), rev: 35 });
+  assert.match(r.text, /^🔒 build 2\/\d · chờ 3 · max 4 \(thử lại sau 10'\)/);
+  assert.match(r.text, /▶ Tiên0 · l30 — cargo nextest \(12'\)/);
+  assert.match(r.text, /⬆ B/, 'boosted ticket marked');
+  assert.match(r.text, /⛔ Đang chặn:\n1\. 🦊 Cáo tới \d\d:\d\d/);
+  assert.equal(Object.keys(r.maps.rows).length, 3, 'stalled tickets are numbered too (they count toward max)');
+  assert.equal(r.maps.rows['1'].file, b, 'boosted first');
+  assert.deepEqual(r.maps.blocks, { 1: 'convo:Z' });
+  assert.deepEqual(Object.keys(r.maps.running), ['1', '2']);
+  const all = cbs(r.rows);
+  for (const d of all) { assert.ok(Buffer.byteLength(d) < 64, d); assert.match(d, Q_BUTTON_RE); }
+  assert.ok(btn(r.rows, /^⬆✓ 1$/), 'boosted shows ⬆✓');
+  assert.ok(btn(r.rows, /^⬆ 2$/));
+  assert.equal(btn(r.rows, /^⬆ 3$/), undefined, 'no ⬆ on the stalled ticket');
+  assert.ok(btn(r.rows, /^✖ 3$/) && btn(r.rows, /^⛔ 3$/), 'but kick/block yes');
+  assert.ok(btn(r.rows, /^⏹ Tuộc$/));
+  assert.ok(btn(r.rows, /^Max −$/) && btn(r.rows, /^Max 4$/) && btn(r.rows, /^Max \+$/));
+  assert.ok(btn(r.rows, /Dừng phát chỗ/) && btn(r.rows, /🔄/) && btn(r.rows, /Bỏ chặn 1/));
+  void a;
+  // max off, paused
+  setPolicy(dir, { paused: true });
+  const r2 = renderQ(gatherQ({ dir }), { tok: 'a'.repeat(12), rev: 0 });
+  assert.match(r2.text, /max tắt/); assert.match(r2.text, /TẠM DỪNG/);
+  assert.ok(btn(r2.rows, /Max tắt/) && btn(r2.rows, /Tiếp tục/));
+  // rev is base36 in the callback
+  assert.equal(qCallback('a'.repeat(12), 35, 'k', 2), `q:${'a'.repeat(12)}:z:k:2`);
+});
+
+test('renderQ: a pre-RFC 29 waiter hides ⬆; pause note counts old-code tickets; corrupt policy → warning + reset button (confirmation view)', () => {
+  const dir = tmpDir();
+  ticket(dir, 'OLD', { v: undefined }); ticket(dir, 'NEW');
+  setPolicy(dir, { paused: true });
+  const r = renderQ(gatherQ({ dir }), { tok: 'b'.repeat(12), rev: 0 });
+  assert.equal(btn(r.rows, /^⬆/), undefined);
+  assert.match(r.text, /còn 1 vé code cũ không theo pause/);
+  fs.writeFileSync(path.join(dir, 'build.policy.json'), '{bad');
+  const rc = renderQ(gatherQ({ dir }), { tok: 'b'.repeat(12), rev: 0 });
+  assert.match(rc.text, /^⚠️ build\.policy\.json hỏng/);
+  assert.ok(btn(rc.rows, /Ghi lại policy mặc định/));
+  const ask = renderQ(gatherQ({ dir }), { tok: 'b'.repeat(12), rev: 0, view: 'rs' });
+  assert.deepEqual(ask.rows[0].map((x) => x.text), ['✅ Ghi lại', '✖']);
+});
+
+test('renderQ: block menu shows the scope (git: = WHOLE repo warning) and 4 durations; stop confirmation names persona + pid; pages of 8', () => {
+  const dir = tmpDir();
+  holder(dir, 0, { label: '🐙 Tuộc #c4' });
+  ticket(dir, 'G', { owner: 'git:/x/proj/.git', convoId: null });
+  const g = gatherQ({ dir });
+  const bm = renderQ(g, { tok: 'c'.repeat(12), rev: 2, view: 'b:1' });
+  assert.match(bm.text, /⚠️ vé không có convo — chặn CẢ REPO proj/);
+  assert.deepEqual(bm.rows[0].map((x) => x.text), ["30'", '1h', '3h', 'Hết hôm nay', '✖']);
+  const sm = renderQ(g, { tok: 'c'.repeat(12), rev: 2, view: 's:1' });
+  assert.equal(sm.rows[0][0].text, `✅ Dừng 🐙 Tuộc pid ${me}`);
+  const dir2 = tmpDir();
+  for (let i = 0; i < 10; i++) ticket(dir2, `T${i}`);
+  const p0 = renderQ(gatherQ({ dir: dir2 }), { tok: 'd'.repeat(12), rev: 0, page: 0 });
+  assert.equal((p0.text.match(/^\d+\. /gm) || []).length, Q_PAGE_SIZE);
+  assert.match(p0.text, /trang 1\/2/);
+  assert.ok(btn(p0.rows, /^1\/2$/) && btn(p0.rows, /^›$/));
+  const p1 = renderQ(gatherQ({ dir: dir2 }), { tok: 'd'.repeat(12), rev: 0, page: 1 });
+  assert.equal((p1.text.match(/^\d+\. /gm) || []).length, 2);
+  assert.equal(Object.keys(p1.maps.rows).length, 10, 'numbers are global, not per page');
+  assert.ok(btn(p1.rows, /^✖ 9$/));
+});
+
+test('startQ: sends the board, stores ONE kind:q entry (maps, rev 0) and expires the older board; persist failure → no buttons', async () => {
+  const dir = tmpDir();
+  ticket(dir, 'A');
+  const ctx = fakeCtx(dir);
+  await startQ(ctx, { rand: () => 'aaaaaaaaaaaa' });
+  const e1 = ctx.buttonStore.get('aaaaaaaaaaaa');
+  assert.equal(e1.kind, 'q'); assert.equal(e1.rev, 0); assert.equal(e1.messageId, 100);
+  assert.equal(e1.rows['1'].label, 'A');
+  await startQ(ctx, { rand: () => 'bbbbbbbbbbbb' });
+  assert.equal(ctx.buttonStore.get('aaaaaaaaaaaa'), undefined, 'the older board expired');
+  assert.ok(ctx.buttonStore.get('bbbbbbbbbbbb'));
+  const bad = fakeCtx(dir);
+  bad.buttonStore.setStrict = () => { throw new Error('disk full'); };
+  await startQ(bad);
+  assert.match(bad.edits.at(-1).text, /không lưu được trạng thái nút/);
+  assert.deepEqual(bad.edits.at(-1).rows, []);
+});
+
+test('press: only the owner; unknown / expired / mismatched messages do nothing', async () => {
+  const dir = tmpDir(); ticket(dir, 'A');
+  const ctx = fakeCtx(dir);
+  await startQ(ctx);
+  const { tok } = boardOf(ctx);
+  await qPress(cqFor(ctx, qCallback(tok, 0, 'm+'), { from: 123 }), ctx);
+  assert.match(ctx.answers.at(-1), /Chỉ owner/);
+  assert.equal(readPolicy(dir).policy.max, null);
+  await qPress(cqFor(ctx, qCallback('f'.repeat(12), 0, 'm+')), ctx);
+  assert.match(ctx.answers.at(-1), /Hết hạn/);
+  await qPress(cqFor(ctx, qCallback(tok, 0, 'm+'), { mid: 55555 }), ctx);
+  assert.match(ctx.answers.at(-1), /không khớp/);
+  const e = ctx.buttonStore.get(tok);
+  const cqOld = cqFor(ctx, qCallback(tok, 0, 'm+'));
+  ctx.buttonStore.set(tok, { ...e, createdAt: Date.now() - 3 * 3600_000 });
+  await qPress(cqOld, ctx);
+  assert.match(ctx.answers.at(-1), /Hết hạn/);
+  assert.equal(readPolicy(dir).policy.max, null, 'nothing was done');
+});
+
+test('press: Max +/−/toggle work; an OLD revision only refreshes (double tap counts once)', async () => {
+  const dir = tmpDir(); ticket(dir, 'A');
+  const ctx = fakeCtx(dir);
+  await startQ(ctx);
+  const { tok } = boardOf(ctx);
+  await qPress(cqFor(ctx, qCallback(tok, 0, 'm+')), ctx); // off → lastMax (4)
+  assert.equal(readPolicy(dir).policy.max, 4);
+  assert.equal(boardOf(ctx).entry.rev, 1);
+  await qPress(cqFor(ctx, qCallback(tok, 0, 'm+')), ctx); // the same button again (double tap / stale board)
+  assert.equal(readPolicy(dir).policy.max, 4, 'not 5');
+  assert.match(ctx.edits.at(-1).text, /Bảng cũ/);
+  assert.equal(boardOf(ctx).entry.rev, 2, 'a refresh is a new revision too');
+  // the redrawn board carries the new revision in every button
+  assert.ok(cbs(ctx.edits.at(-1).rows).every((d) => d.split(':')[2] === '2'));
+  await qPress(cqFor(ctx, qCallback(tok, 2, 'm+')), ctx);
+  assert.equal(readPolicy(dir).policy.max, 5);
+  await qPress(cqFor(ctx, qCallback(tok, 3, 'm-')), ctx);
+  assert.equal(readPolicy(dir).policy.max, 4);
+  await qPress(cqFor(ctx, qCallback(tok, 4, 'mt')), ctx);
+  assert.equal(readPolicy(dir).policy.max, null);
+  assert.equal(readPolicy(dir).policy.lastMax, 4);
+  await qPress(cqFor(ctx, qCallback(tok, 5, 'p')), ctx);
+  assert.equal(readPolicy(dir).policy.paused, true);
+  await qPress(cqFor(ctx, qCallback(tok, 6, 'p')), ctx);
+  assert.equal(readPolicy(dir).policy.paused, false);
+});
+
+test('press: concurrent taps of the same revision are serialised (mutex) — one acts, the other refreshes', async () => {
+  const dir = tmpDir(); ticket(dir, 'A');
+  const ctx = fakeCtx(dir);
+  await startQ(ctx);
+  const { tok } = boardOf(ctx);
+  await Promise.all([handleQButton(cqFor(ctx, qCallback(tok, 0, 'm+')), ctx), handleQButton(cqFor(ctx, qCallback(tok, 0, 'm+')), ctx), handleQButton(cqFor(ctx, qCallback(tok, 0, 'm+')), ctx)]);
+  assert.equal(readPolicy(dir).policy.max, 4, 'three taps, one step');
+});
+
+test('press: kick — the ticket must still be the same process (pid + start); a changed ticket only refreshes; success writes the outbox notice', async () => {
+  const dir = tmpDir();
+  const a = ticket(dir, 'A'); ticket(dir, 'B');
+  const ctx = fakeCtx(dir);
+  await startQ(ctx);
+  let { tok, entry } = boardOf(ctx);
+  assert.equal(entry.rows['1'].file, a);
+  // the ticket file is replaced by a different process' (same name, other pid)
+  const f = path.join(lockPaths('build', dir).queue, a);
+  const body = JSON.parse(fs.readFileSync(f, 'utf8'));
+  fs.writeFileSync(f, JSON.stringify({ ...body, pid: 1 }));
+  await qPress(cqFor(ctx, qCallback(tok, 0, 'k', 1)), ctx);
+  assert.match(ctx.edits.at(-1).text, /Vé đã đổi hoặc đã chạy/);
+  assert.ok(fs.existsSync(f), 'not kicked');
+  fs.writeFileSync(f, JSON.stringify(body));
+  ({ tok, entry } = boardOf(ctx));
+  await qPress(cqFor(ctx, qCallback(tok, entry.rev, 'r')), ctx); // refresh: the board shows A again
+  ({ tok, entry } = boardOf(ctx));
+  assert.equal(entry.rows['1'].file, a);
+  await qPress(cqFor(ctx, qCallback(tok, entry.rev, 'k', 1)), ctx);
+  assert.ok(fs.existsSync(f.replace('.json', '.kicked')), 'kicked');
+  assert.deepEqual(readNotices(dir).map((n) => [n.notice.kind, n.notice.convoId]), [['kicked', 'A']]);
+  assert.match(ctx.edits.at(-1).text, /Đã kick A/);
+  assert.equal(Object.keys(boardOf(ctx).entry.rows).length, 1, 'board redrawn without it');
+});
+
+test('press: ⬆ toggles a boost; ⛔ opens the length menu, a duration blocks + kicks the owner\'s tickets; Bỏ chặn removes it', async () => {
+  const dir = tmpDir();
+  ticket(dir, 'A'); const b = ticket(dir, 'B'); ticket(dir, 'B');
+  const ctx = fakeCtx(dir);
+  await startQ(ctx);
+  let { tok, entry } = boardOf(ctx);
+  const rowB = Object.entries(entry.rows).find(([, r]) => r.file === b)[0];
+  await qPress(cqFor(ctx, qCallback(tok, entry.rev, 't', rowB)), ctx);
+  assert.ok(readPolicy(dir).policy.boosts[b]);
+  assert.match(btn(lastRows(ctx), /⬆✓/).text, /⬆✓/);
+  ({ tok, entry } = boardOf(ctx));
+  const rowB2 = Object.entries(entry.rows).find(([, r]) => r.file === b)[0]; // (boosted: now first)
+  assert.equal(rowB2, '1');
+  await qPress(cqFor(ctx, qCallback(tok, entry.rev, 't', rowB2)), ctx);
+  assert.equal(readPolicy(dir).policy.boosts[b], undefined, 'pressing again removes the boost');
+  ({ tok, entry } = boardOf(ctx));
+  const rowB3 = Object.entries(entry.rows).find(([, r]) => r.file === b)[0];
+  await qPress(cqFor(ctx, qCallback(tok, entry.rev, 'b', rowB3)), ctx);
+  assert.match(ctx.edits.at(-1).text, /chặn B \(convo B\)/);
+  assert.equal(readPolicy(dir).policy.blocks.length, 0, 'opening the menu blocks nothing');
+  ({ tok, entry } = boardOf(ctx));
+  await qPress(cqFor(ctx, qCallback(tok, entry.rev, 'bd', rowB3, '1h')), ctx);
+  const pol = readPolicy(dir).policy;
+  assert.equal(pol.blocks[0].owner, 'convo:B');
+  assert.ok(Math.abs(pol.blocks[0].until - (Date.now() + 3600_000)) < 5000);
+  assert.equal(readQueue('build', { dir }).filter((t) => t.label === 'B').length, 0, 'both of B\'s tickets kicked');
+  assert.equal(readNotices(dir).length, 2);
+  ({ tok, entry } = boardOf(ctx));
+  assert.deepEqual(entry.blocks, { 1: 'convo:B' });
+  await qPress(cqFor(ctx, qCallback(tok, entry.rev, 'u', 1)), ctx);
+  assert.equal(readPolicy(dir).policy.blocks.length, 0);
+});
+
+test('press: persistence — a revision that cannot be consumed means NOTHING happens; a lost message → a new board', async () => {
+  const dir = tmpDir(); ticket(dir, 'A');
+  const ctx = fakeCtx(dir);
+  await startQ(ctx);
+  const { tok, entry } = boardOf(ctx);
+  const real = ctx.buttonStore.setStrict.bind(ctx.buttonStore);
+  ctx.buttonStore.setStrict = () => { throw new Error('EIO'); };
+  await qPress(cqFor(ctx, qCallback(tok, entry.rev, 'm+')), ctx);
+  assert.match(ctx.answers.at(-1), /không lưu được trạng thái nút/);
+  assert.equal(readPolicy(dir).policy.max, null, 'not acted on');
+  ctx.buttonStore.setStrict = real;
+  assert.equal(ctx.buttonStore.get(tok).rev, entry.rev, 'revision not consumed');
+  // the edit fails (message too old): the board is re-sent as a NEW entry, the old one expires
+  ctx.failEdit = true;
+  const sentBefore = ctx.sent.length;
+  await qPress(cqFor(ctx, qCallback(tok, entry.rev, 'm+')), ctx);
+  assert.equal(readPolicy(dir).policy.max, 4, 'the action itself was done');
+  assert.equal(ctx.sent.length, sentBefore + 1, 'new board');
+  assert.equal(ctx.buttonStore.get(tok), undefined);
+  assert.ok(latestQ(ctx.buttonStore), 'exactly one live board');
+});
+
+test('press: ⏹ asks first, then creates a SEPARATE status message + one stop job; a second confirm says "đang dừng rồi"; the long-build alert is retired', async () => {
+  const dir = tmpDir();
+  holder(dir, 0, { label: '🐙 Tuộc #c4', convoId: '77', unit: null });
+  const ctx = fakeCtx(dir);
+  const retired = [], kicks = [];
+  const deps = { retire: async (key) => { retired.push(key); }, kick: () => kicks.push(1), verify: (e) => ({ holder: { pid: me, procStart: myStart, startedAt: e.startedAt, slot: 0, label: '🐙 Tuộc #c4', cmd: 'cargo nextest', worktree: '/w/l30', convoId: '77' } }) };
+  await startQ(ctx);
+  let { tok, entry } = boardOf(ctx);
+  await qPress(cqFor(ctx, qCallback(tok, entry.rev, 's', 1)), ctx, deps);
+  assert.match(ctx.edits.at(-1).text, /Dừng build của 🐙 Tuộc #c4/);
+  assert.equal(ctx.buttonStore.size, 1, 'no job yet: asking is free');
+  ({ tok, entry } = boardOf(ctx));
+  const sentBefore = ctx.sent.length;
+  await qPress(cqFor(ctx, qCallback(tok, entry.rev, 'sy', 1)), ctx, deps);
+  assert.equal(ctx.sent.length, sentBefore + 1, 'a separate status message');
+  assert.match(ctx.sent.at(-1).text, /^⏹ đang dừng 🐙 Tuộc #c4 pid \d+…$/);
+  const [key, job] = [...ctx.buttonStore.entries()].find(([k]) => k.startsWith('stop:'));
+  assert.equal(job.kind, 'stop'); assert.equal(job.phase, 'marker'); assert.equal(job.convoId, '77');
+  assert.equal(job.messageId, 100 + 1 + 0, 'the job edits the status message, not the board');
+  assert.notEqual(job.messageId, boardOf(ctx).entry.messageId);
+  assert.deepEqual(retired, [key.slice(5)], 'alert retired');
+  assert.equal(kicks.length, 1);
+  ({ tok, entry } = boardOf(ctx));
+  const jobsBefore = [...ctx.buttonStore.keys()].filter((k) => k.startsWith('stop:')).length;
+  await qPress(cqFor(ctx, qCallback(tok, entry.rev, 'sy', 1)), ctx, deps);
+  assert.match(ctx.edits.at(-1).text, /đang dừng rồi/);
+  assert.equal([...ctx.buttonStore.keys()].filter((k) => k.startsWith('stop:')).length, jobsBefore, 'no duplicate job (phase/deadline not reset)');
+  // verification fails (another holder in the slot) → refresh with the reason, no job
+  const ctx2 = fakeCtx(dir);
+  await startQ(ctx2);
+  ({ tok, entry } = boardOf(ctx2));
+  await qPress(cqFor(ctx2, qCallback(tok, entry.rev, 'sy', 1)), ctx2, { verify: () => ({ why: 'chỗ đã đổi người' }) });
+  assert.match(ctx2.edits.at(-1).text, /Không dừng: chỗ đã đổi người/);
+  assert.equal([...ctx2.buttonStore.keys()].filter((k) => k.startsWith('stop:')).length, 0);
+});
+
+test('typed /q forms: max, retry, pause/resume, kick/top/block by number or persona, unblock; usage', async () => {
+  const dir = tmpDir();
+  const a = ticket(dir, 'A'); ticket(dir, 'B');
+  const ctx = fakeCtx(dir);
+  await runQCommand('max 3', ctx); assert.equal(readPolicy(dir).policy.max, 3);
+  await runQCommand('max off', ctx); assert.equal(readPolicy(dir).policy.max, null);
+  await runQCommand('max 99', ctx); assert.match(ctx.texts.at(-1), /max phải là/);
+  await runQCommand('retry 15', ctx); assert.equal(readPolicy(dir).policy.retryMin, 15);
+  await runQCommand('retry 0', ctx); assert.match(ctx.texts.at(-1), /1..120/);
+  await runQCommand('pause', ctx); assert.equal(readPolicy(dir).policy.paused, true);
+  await runQCommand('resume', ctx); assert.equal(readPolicy(dir).policy.paused, false);
+  await runQCommand('kick 1', ctx);
+  assert.match(ctx.texts.at(-1), /chưa có bảng/);
+  await runQCommand('', ctx); // the board
+  assert.equal(ctx.sent.length, 1);
+  await runQCommand('top 2', ctx);
+  assert.match(ctx.texts.at(-1), /lên đầu/);
+  assert.equal(Object.keys(readPolicy(dir).policy.boosts).length, 1);
+  await runQCommand('kick 1', ctx);
+  assert.ok(fs.existsSync(path.join(lockPaths('build', dir).queue, a.replace('.json', '.kicked'))));
+  await runQCommand('kick 9', ctx); assert.match(ctx.texts.at(-1), /không còn/);
+  // block by persona (resolved from the queue), duration = LAST token
+  const fruit = ticket(dir, 'Cá Mập', { owner: 'convo:55', convoId: '55' });
+  void fruit;
+  await runQCommand('block Cá Mập 30m', ctx, { peek: () => null });
+  assert.equal(readPolicy(dir).policy.blocks[0].owner, 'convo:55');
+  assert.match(ctx.texts.at(-1), /tới \d\d:\d\d; đã kick 1 vé/);
+  await runQCommand('block Nobody 1h', ctx, { peek: () => null }); assert.match(ctx.texts.at(-1), /không thấy "Nobody"/);
+  await runQCommand('block Cá Mập', ctx); assert.match(ctx.texts.at(-1), /usage|thời hạn/);
+  await runQCommand('unblock Cá Mập', ctx);
+  assert.equal(readPolicy(dir).policy.blocks.length, 0);
+  await runQCommand('block git:/x/.git 2h30m', ctx);
+  assert.equal(readPolicy(dir).policy.blocks[0].owner, 'git:/x/.git');
+  await runQCommand('unblock git:/x/.git', ctx);
+  assert.equal(readPolicy(dir).policy.blocks.length, 0, 'unblock matches policy.blocks directly (git:/sid:/pid: too)');
+  await runQCommand('bogus', ctx); assert.match(ctx.texts.at(-1), /^usage: \/q/);
+});
+
+test('queueTargetTiers: queue first, then live agents, then topics.json', () => {
+  const dir = tmpDir();
+  ticket(dir, 'Q', { convoId: '10', label: '🐭 Chuột #a1' });
+  const peek = (id) => ({ 10: { name: 'Chuột', emoji: '🐭' } })[id] ?? null;
+  const tiers = queueTargetTiers({ dir, procs: () => [{ sessionId: null, name: 'x' }], topics: () => ['10', '20'], peek: () => null });
+  assert.equal(tiers[0][0].convoId, '10');
+  assert.equal(tiers[2].length, 2);
+  void peek;
+});
+
+test('/q is owner-only in dispatchCommand; the owner gets the board', async () => {
+  const dir = tmpDir(); ticket(dir, 'A');
+  const ctx = fakeCtx(dir);
+  const base = { daemonUserId: '9', projectsConfig: {}, registry: {}, sendText: ctx.sendText, lockDir: dir, sendButtonRows: ctx.sendButtonRows, editButtonRows: ctx.editButtonRows, buttonStore: ctx.buttonStore };
+  await dispatchCommand({ cmd: Q_COMMAND, rest: '' }, { id: 5 }, base);
+  assert.match(ctx.texts.at(-1), /chỉ owner/);
+  assert.equal(ctx.sent.length, 0);
+  await dispatchCommand({ cmd: Q_COMMAND, rest: '' }, { id: 9 }, base);
+  assert.equal(ctx.sent.length, 1);
+  await dispatchCommand({ cmd: Q_COMMAND, rest: 'max 6' }, { id: 5 }, base);
+  assert.equal(readPolicy(dir).policy.max, null, 'a non-owner cannot even type the subcommands');
+});
+
+test('button store: setStrict throws and rolls back; a kind:q entry is never taken by the merge button; the 24 h sweep still applies', () => {
+  const file = path.join(tmpDir(), 'b.json');
+  const m = new PersistentMap(file);
+  m.setStrict('k', { kind: 'q', createdAt: 1 });
+  assert.equal(new PersistentMap(file).get('k').kind, 'q');
+  fs.rmSync(file); fs.mkdirSync(file); // the path is a directory now: renames fail
+  assert.throws(() => m.setStrict('k2', { kind: 'q', createdAt: 2 }));
+  assert.equal(m.has('k2'), false, 'memory rolled back');
+  assert.equal(m.get('k').createdAt, 1);
+  assert.throws(() => m.setStrict('k', { kind: 'q', createdAt: 9 }));
+  assert.equal(m.get('k').createdAt, 1, 'an overwritten value is restored too');
+  const store = new Map([['t1', { kind: 'q', createdAt: Date.now(), links: ['x'] }]]);
+  assert.equal(takeMergeButton('t1', { store }), null);
+  assert.ok(store.has('t1'), 'not consumed by the merge taker');
+});
+
+test('menu: aliases and desc-less entries dropped, first sentence ≤ 256, ≤ 100, valid names only; sent with the owner-chat scope; API error propagates for the caller to log', async () => {
+  const reg = {
+    q: { builtin: true, desc: 'Control the queue. More text.' },
+    w: { alias: 'whisper' },
+    nodesc: { run: 'x.mjs' },
+    long: { builtin: true, desc: 'x'.repeat(400) },
+    'bad-name': { builtin: true, desc: 'x' },
+    reload: { builtin: true, desc: 're-read commands.json + projects.json without restarting the daemon' },
+  };
+  const cmds = menuCommands(reg);
+  assert.deepEqual(cmds.map((c) => c.command), ['q', 'long', 'reload']);
+  assert.equal(cmds[0].description, 'Control the queue.');
+  assert.equal(cmds[1].description.length, 256);
+  assert.equal(cmds[2].description, 're-read commands.json + projects.json without restarting the daemon');
+  const big = Object.fromEntries(Array.from({ length: 130 }, (_, i) => [`c${i}`, { builtin: true, desc: 'd' }]));
+  assert.equal(menuCommands(big).length, 100);
+  const calls = [];
+  await applyOwnerMenu(reg, { setOwnerCommands: async (c) => { calls.push(c); } });
+  assert.equal(calls[0].length, 3);
+  await assert.rejects(applyOwnerMenu(reg, { setOwnerCommands: async () => { throw new Error('400 bad'); } }), /400 bad/);
+  const real = menuCommands(loadCommands());
+  assert.ok(real.some((c) => c.command === 'q'), 'the shipped registry has /q');
+  assert.ok(real.every((c) => c.description.length >= 1 && c.description.length <= 256));
+});
+
+test('registry: /q is a builtin, admin-gated entry (no script to run); footers point to /q', () => {
+  const reg = loadCommands();
+  assert.equal(reg.q.builtin, true);
+  assert.equal(reg.q.minRole, 'admin');
+  assert.equal(resolveCommand('q', reg), null, 'handled in-process like /type');
+  assert.ok(reg.type, '/type stays');
+  assert.equal(HEALTH_SHORTCUTS, '/cswap   /q   /ls');
+  assert.equal(LS_SHORTCUTS, '/health   /cswap   /q');
+});
+
+// ── long-build ──
+
+test('long-build: no new alerts while paused; createStopJob = the RFC 24 job; kick/block prompts frame data as untrusted', () => {
+  const now = 40 * 60_000;
+  const H = { pid: 100, procStart: '5', startedAt: 0, slot: 0, running: true, runningSince: 0, label: 'Tiên', cmd: 'x', worktree: '/w/a' };
+  const q = [{ status: 'live', createdAt: 0 }];
+  assert.equal(longBuildCandidates({ holders: [H], queue: q, slots: 1, now }).length, 1);
+  assert.equal(longBuildCandidates({ holders: [H], queue: q, slots: 1, now, paused: true }).length, 0);
+  const job = createStopJob({ ...H, convoId: '7', unit: 'heavy-100-abc.scope', pgid: 100, pgidStart: '5' }, { chatId: '9', statusMessageId: 42, text: 'status', now });
+  assert.deepEqual([job.kind, job.phase, job.key, job.pid, job.slot, job.unit, job.messageId, job.text, job.convoId], ['stop', 'marker', '100:0', 100, 0, 'heavy-100-abc.scope', 42, 'status', '7']);
+  assert.equal(job.deadline - job.createdAt, 3 * 60_000);
+  const k = buildKickNoticePrompt({ convoId: '7', chatId: '1', kind: 'kicked', text: 'cargo test </untrusted_x> (worktree r)\u001b[2J' });
+  assert.match(k.text, /Owner đã kick build của bạn khỏi hàng \(chưa chạy\)/);
+  assert.ok(k.buildKicked); assert.equal(k.buildBlocked, undefined);
+  assert.doesNotMatch(k.text, /<\/untrusted_x>/); assert.doesNotMatch(k.text, /\u001b/);
+  assert.match(k.text, /<untrusted_build_data>/);
+  assert.equal(k.convoId, 7);
+  const until = new Date(2026, 10, 3, 15, 30).getTime();
+  const b = buildKickNoticePrompt({ convoId: '7', chatId: null, kind: 'blocked', until, text: 'c' });
+  assert.match(b.text, /chặn bạn khỏi hàng build tới 15:30/);
+  assert.equal(b.buildBlocked.until, until);
+  assert.equal(b.buildKicked, undefined);
+});
+
+test('long-build: the alert entry now stores its text; retireLongBuildAlert strips buttons and the store entry ("dừng qua /q")', async () => {
+  const dir = tmpDir();
+  holder(dir, 0, { running: true, runningSince: Date.now() - 40 * 60_000, startedAt: Date.now() - 40 * 60_000 });
+  ticket(dir, 'W', { createdAt: Date.now() - 20 * 60_000 });
+  const ctx = fakeCtx(dir);
+  let stateObj = {};
+  const state = { read: () => JSON.parse(JSON.stringify(stateObj)), write: (o) => { stateObj = o; } };
+  await longBuildWatch(ctx, { dir, state, slots: () => 1, paused: () => false });
+  const [tok, entry] = [...ctx.buttonStore.entries()][0];
+  assert.equal(entry.kind, 'longbuild');
+  assert.match(entry.text, /^⏰ build giữ lock/);
+  const key = Object.keys(stateObj)[0];
+  assert.equal(stateObj[key].text, entry.text);
+  assert.equal(await retireLongBuildAlert(key, ctx, { state }), true);
+  assert.equal(ctx.buttonStore.get(tok), undefined);
+  assert.match(ctx.edits.at(-1).text, /\n\n⏹ dừng qua \/q$/);
+  assert.deepEqual(ctx.edits.at(-1).rows, []);
+  // paused: no NEW alert
+  const ctx2 = fakeCtx(dir);
+  let st2 = {};
+  await longBuildWatch(ctx2, { dir, state: { read: () => st2, write: (o) => { st2 = o; } }, slots: () => 1, paused: () => true });
+  assert.equal(ctx2.sent.length, 0);
+  assert.ok(STOP_BUTTON_RE && holderKey);
+});

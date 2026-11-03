@@ -4,6 +4,9 @@
 //
 //   node ../teleport/scripts/heavy.mjs [--no-stop] [--no-scope] [--wait <minutes>] [--no-ram-wait] -- <command> [args…]
 //
+// Exit codes that are the OWNER's call (RFC 29; 75 timeout, 76 left/kicked, 77 stopped, 78 queue full or busy
+// updating, 79 blocked — see docs/build-guide.md): the build never ran, and the agent must not retry blindly.
+//
 // Busy → prints who holds it ("⏳ build đang bận: 🧛 Ma #c2383556 — ./gradlew …")
 // and waits (forever by default; --wait N gives up after N minutes, exit 75,
 // command never run). The command runs in its own process group; SIGINT/

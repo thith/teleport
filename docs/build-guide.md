@@ -18,6 +18,17 @@ node ../teleport/scripts/heavy.mjs -- cargo nextest run --workspace
 - **Lệnh là `gradlew`:** sau khi xong, wrapper tự chạy `gradlew --stop` để trả vài GB RAM của Gradle daemon. Dùng `--no-stop` nếu sắp build tiếp ngay. Gọi `gradlew` **trực tiếp** (`./gradlew -p android …`), không gọi qua `sh -c "cd … && ./gradlew"`, nếu không sẽ không được nhận ra.
 - Build chết (Ctrl-C, timeout, bị kill) thì lock tự nhả, không bao giờ kẹt.
 - **Build giữ lock quá lâu (RFC 24):** chạy ≥ 30 phút trong khi có người chờ ≥ 10 phút (và hết chỗ) → daemon nhắn owner kèm nút [⏹ Dừng]. Owner bấm thì heavy tự dừng build (TERM rồi KILL cả process group, dọn scope), in `⏹ Owner đã dừng build này qua daemon … — đừng tự chạy lại; hỏi owner trước.` và thoát **exit 77**. Thấy exit 77: **đừng chạy lại tự động** — hỏi owner. Agent cũng nhận một prompt báo việc này.
+- **Owner điều khiển hàng build (RFC 29):** owner có bảng `/q` trên Telegram (nút bấm) để: đặt **max hàng chờ**, **kick** một vé, đưa vé **lên đầu**, **chặn** một agent trong một khoảng thời gian, **tạm dừng** phát chỗ, **dừng** build đang chạy. Với agent, hệ quả là các exit code riêng của `heavy.mjs`:
+
+  | Exit | Nghĩa | Agent làm gì |
+  |---|---|---|
+  | 76 | đã rời hàng, hoặc **bị owner kick** | không chạy lại ngay; bị kick thì hỏi owner |
+  | 77 | owner dừng build đang chạy (RFC 24) | không chạy lại tự động; hỏi owner |
+  | **78** | hàng build **đã đủ** vé chờ, hoặc hàng đang bận cập nhật | làm việc khác, thử lại sau số phút in ra (mặc định 10) |
+  | **79** | owner **chặn** bạn khỏi hàng tới giờ in ra | không thử lại trước giờ đó |
+
+  Hàng đầy thì lệnh **không chạy và không có vé**. Max chỉ áp cho **vé chờ** (không tính build đang chạy); hạ max không đuổi vé đã xếp. Một ngoại lệ: máy còn chỗ trống, không ai chờ và hàng không bị tạm dừng thì build chạy ngay, kể cả khi max = 0. Khi owner tạm dừng, wrapper in `⏸ owner tạm dừng phát chỗ build` và chờ (build đang chạy chạy nốt; try-once trả busy). Máy không có `flock`: wrapper chạy không khoá và nói rõ rằng hàng **và** policy của owner đều không được áp dụng.
+- **Agent admin/maintainer thay mặt owner (RFC 29):** `node ../teleport/scripts/lock-queue.mjs ls --ids` (in tên file vé + chủ vé), rồi `max <n|off>`, `retry <phút>`, `kick <vé>`, `top <vé>`, `block <owner|vé> <30m|1h|2h30m|today>`, `unblock <owner>`, `pause`, `resume`. Agent **tự kiểm role** (admin/maintainer) trước khi gọi, như `leave --pid`. Vé bị kick/chặn được báo cho agent chủ vé qua prompt của daemon (cần daemon chạy để giao).
 
 ## `target/` và chờ RAM (RFC 18)
 
