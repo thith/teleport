@@ -627,26 +627,26 @@ test('runner compact: the typed message names the persona when given', async () 
 test('every nudge line fits an 80-column input line and asks for a Telegram status', () => {
   for (const s of Object.values(NUDGE_LINES)) {
     assert.ok(s.length <= NUDGE_MAX_LEN, `${s.length} > ${NUDGE_MAX_LEN}: ${s}`);
-    assert.match(s, /post a status in your topic\.$/);
+    assert.match(s, /Telegram/i);
   }
 });
 
-test('nudgeText: asks only for what is broken; neither or unknown → both (force)', () => {
+test('nudgeText: asks only for what is broken; neither or unknown → force', () => {
   assert.equal(nudgeText({ listener: 'off', mail: 2 }), NUDGE_LINES.both);
   assert.equal(nudgeText({ listener: 'off', mail: 0 }), NUDGE_LINES.listener);
   assert.equal(nudgeText({ listener: 'on', mail: 3 }), NUDGE_LINES.mail);
-  assert.equal(nudgeText({ listener: 'on', mail: 0 }), NUDGE_LINES.both, 'healthy → force both');
-  assert.equal(nudgeText({ listener: null, mail: null }), NUDGE_LINES.both, 'unknown → both');
+  assert.equal(nudgeText({ listener: 'on', mail: 0 }), NUDGE_LINES.force, 'healthy → force');
+  assert.equal(nudgeText({ listener: null, mail: null }), NUDGE_LINES.force, 'unknown → force');
   assert.equal(nudgeText({ listener: null, mail: 1 }), NUDGE_LINES.mail);
   assert.equal(nudgeText({ listener: 'off', mail: null }), NUDGE_LINES.listener);
-  assert.equal(nudgeText(), NUDGE_LINES.both);
+  assert.equal(nudgeText(), NUDGE_LINES.force);
 });
 
 test('runner nudge: a healthy agent (listener on, no mail) is still nudged — the owner asked (force)', async () => {
-  const { io, st } = fakeIo({ screens: [IDLE, nudgeTyped(), nudgeTyped()] });
+  const { io, st } = fakeIo({ screens: [IDLE, nudgeTyped(NUDGE_LINES.force), nudgeTyped(NUDGE_LINES.force)] });
   io.nudgeSignals = () => ({ listener: 'on', mail: 0 });
   assert.match((await new TypeRunner(io).run('n', T)).text, /đã nudge #abcd1234/);
-  assert.deepEqual(st.keys, [NUDGE_LINES.both, '\r']);
+  assert.deepEqual(st.keys, [NUDGE_LINES.force, '\r']);
 });
 
 test('runner nudge: `line` picks a fixed line; anything else falls back to the state line', async () => {
@@ -673,7 +673,7 @@ test('runner nudge: the line wrapped / differs on screen → typed but NO Enter'
   const { io, st } = fakeIo({ screens: [IDLE, hc('compact-typed')] });
   io.nudgeSignals = () => ({ listener: null, mail: null });
   const r = await new TypeRunner(io).run('n', T);
-  assert.deepEqual(st.keys, [NUDGE_TEXT]);
+  assert.deepEqual(st.keys, [NUDGE_LINES.force]);
   assert.match(r.text, /KHÔNG Enter/);
 });
 
