@@ -324,6 +324,8 @@ async function main() {
   // Say hello to the owner on every start, so a /restartd (or a crash-restart by
   // systemd) is visible from Telegram, with the code version it came up on.
   const commit = gitShortHead();
+  // Children (e.g. /restartd) need the commit THIS daemon runs, not the checkout's HEAD (already pulled).
+  if (commit) process.env.TELEPORT_DAEMON_COMMIT = commit;
   // RFC 33: an agent named in `/restartd <target>` is told BEFORE the greeting, which reports how it went.
   const notified = await notifyAfterRestart(commit);
   sendText(daemonUserId, startupGreeting({ pid: process.pid, commit, commands: Object.keys(registry).length, notified }));
@@ -563,7 +565,7 @@ export function takeRestartNotify({ file = RESTARTD_NOTIFY_FILE, now = Date.now(
 /** The fixed prompt for the agent named in /restartd. No owner text goes in. Pure. */
 export function buildRestartNotifyPrompt({ convoId, chatId, commit, fromCommit }) {
   return {
-    text: `🤖 Teleport daemon: daemon vừa khởi động lại sau lệnh /restartd của owner, giờ chạy commit \`${commit || '?'}\`${fromCommit ? ` (trước: \`${fromCommit}\`)` : ''}. Nếu bạn đang chờ restart để kiểm tra gì thì làm tiếp; kể NGẮN cho user trong topic.`,
+    text: `🤖 Teleport daemon: daemon vừa khởi động lại sau lệnh /restartd của owner, giờ chạy commit \`${commit || '?'}\`${fromCommit && fromCommit !== commit ? ` (trước: \`${fromCommit}\`)` : ''}. Nếu bạn đang chờ restart để kiểm tra gì thì làm tiếp; kể NGẮN cho user trong topic.`,
     messageId: null, chatId: chatId == null ? null : String(chatId),
     fromUserId: null, fromName: 'teleport daemon', fromRole: 'daemon', fromMember: null,
     replyToMessageId: null, replyToText: null, quotedText: null,

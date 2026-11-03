@@ -1088,6 +1088,11 @@ test('takeRestartNotify: delete fails (not ENOENT) → NOT returned for delivery
   assert.equal(t.r.status, 'delete-failed');
 });
 
+test('buildRestartNotifyPrompt: "trước" only when the commits differ', () => {
+  assert.doesNotMatch(buildRestartNotifyPrompt({ convoId: 1, commit: 'same123', fromCommit: 'same123' }).text, /trước/);
+  assert.match(buildRestartNotifyPrompt({ convoId: 1, commit: 'new1234', fromCommit: 'old5678' }).text, /trước: `old5678`/);
+});
+
 test('buildRestartNotifyPrompt: fixed text with commits, daemon sender, convo set', () => {
   const p = buildRestartNotifyPrompt({ convoId: 111, chatId: -5, commit: 'new1234', fromCommit: 'old5678' });
   assert.match(p.text, /đang chờ restart/);
