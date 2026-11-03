@@ -2,7 +2,7 @@
 // nudged only for something NEW it has not read:
 //   - mailbox mail sent in the last WINDOW_MS                     → "Check your mailbox, …"
 //   - listener OFF and a Telegram item (topic message or queued
-//     prompt: ask / whisper / delivery) newer than WINDOW_MS      → "Restart Telegram monitor, …"
+//     prompt: ask / whisper / delivery) newer than WINDOW_MS      → "Ensure … listener is on, …"
 //   - both → the combined line.
 // A listener that is off with nothing waiting is left alone (turning it off can be intentional — fewer pings).
 // WINDOW_MS > the heartbeat, so every item is seen at least once; `seen` (in RAM, convo → newest stamps

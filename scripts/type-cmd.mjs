@@ -64,12 +64,15 @@ export function saveShotFile(dir, name, text, keep = SHOTS_KEEP) {
 // op letter (callback data) → command. Fixed table: the command never comes from stored data.
 // 'k' only asks (a confirm button follows); 'y' is that confirmation: /kill pid:<PID> (SIGTERM), not a keystroke.
 export const TYPE_OPS = { c: '/compact', r: '/remote-control', e: 'esc', i: 'read-input', u: 'clear-input', k: 'kill-ask', y: 'kill', q: 'compact-kill', n: 'nudge' };
-// The lines /nudge types (Thi, RFC 26) — fixed, never from input. They arrive as host input, so each asks
-// for a Telegram status or the owner sees nothing. Keep them ≤ NUDGE_MAX_LEN: an 80-column screen must not wrap one.
+// The lines /nudge types (Thi, RFC 26) — fixed, never from input. Four cases: listener off + mail waiting
+// (both), listener off only, mail only, and force (nothing broken or unknown — the owner asked anyway, so
+// reply to what is pending or post a status). They say "listener", not "monitor": not every agent has a Monitor.
+// Keep them ≤ NUDGE_MAX_LEN: an 80-column screen must not wrap one.
 export const NUDGE_LINES = {
-  both: 'Restart Telegram monitor, check mailbox, post a status in your topic.',
-  listener: 'Restart Telegram monitor, then post a status in your topic.',
-  mail: 'Check your mailbox, then post a status in your topic.',
+  both: 'Ensure Telegram listener is on, check mailbox, reply to pending msgs.',
+  listener: 'Ensure your Telegram listener is on, then reply to pending messages.',
+  mail: 'Check your mailbox, then reply to pending Telegram messages.',
+  force: 'Reply to pending Telegram and mailbox msgs, or post a status if none.',
 };
 export const NUDGE_TEXT = NUDGE_LINES.both;
 export const NUDGE_MAX_LEN = 70;
@@ -194,12 +197,13 @@ export function findTypeTarget(query, rows, personaOf = () => null) {
 }
 
 /**
- * Which line to type: ask only for what is broken — listener off, mail waiting. Neither (or unknown) → both:
- * the owner asked anyway, so it is a force (Thi). `listener` 'on'|'off'|null, `mail` unread count|null. Pure.
+ * Which line to type: ask only for what is broken. Listener off + mail waiting → both; only off → listener;
+ * only mail → mail; neither (healthy) or unknown → force: the owner asked anyway (Thi). `listener`
+ * 'on'|'off'|null, `mail` unread count|null. Pure.
  */
 export function nudgeText({ listener, mail } = {}) {
   const off = listener === 'off', unread = mail > 0;
-  return off === unread ? NUDGE_LINES.both : off ? NUDGE_LINES.listener : NUDGE_LINES.mail;
+  return off && unread ? NUDGE_LINES.both : off ? NUDGE_LINES.listener : unread ? NUDGE_LINES.mail : NUDGE_LINES.force;
 }
 
 /** One agent line — carries `#hash` and `PID n` (a press is checked against them). Pure. */
