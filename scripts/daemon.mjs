@@ -85,7 +85,7 @@ import { launchCleanup, startCleanupScheduler } from './cleanup-launch.mjs';
 import { autoNudgeTick } from './auto-nudge.mjs';
 import { peekMail } from './mailbox.mjs';
 import { createListenerStatus } from './listener-status.mjs';
-import { processCleanupRequests, processCleanupOffers, handleCleanupButton, CLEANUP_BUTTON_RE } from './cleanup-inbox.mjs';
+import { processCleanupRequests, processCleanupOffers, handleCleanupButton, CLEANUP_BUTTON_RE, startCleanupList, startManualFor, parseCleanupCommand } from './cleanup-inbox.mjs';
 import { PersistentMap } from './button-store.mjs';
 import { formatPersona } from './persona.mjs';
 import { shortConvoHash } from './convo-hash.mjs';
@@ -135,6 +135,7 @@ export function parseDaemonCommand(text) {
 export const COMMAND_TIMEOUT_MS = 5 * 60 * 1000;
 export const RELOAD_COMMAND = 'reload';
 export const Q_COMMAND = 'q'; // RFC 29: the owner's build-queue board
+export const CLEANUP_COMMAND = 'cleanup'; // RFC 30: no argument = the kept-worktree list, <path|branch> = manual removal; run / --dry-run = the old launcher (registry)
 export const COMMAND_MAX_BUFFER = 8 * 1024 * 1024;
 
 // The whisperer's advisory role, looked up across the catch-all roster
@@ -1035,6 +1036,17 @@ export async function dispatchCommand(parsed, from, {
     if (String(from?.id) !== String(daemonUserId)) { await sendText(daemonUserId, `❌ /${Q_COMMAND} chỉ owner dùng được.`); return; }
     await runQCommand(parsed.rest, { daemonUserId, projectsConfig, sendText, ...extra }, { procs: () => listClaudeProcs(), topics: () => topicConvoIds(), ...(extra.qDeps || {}) });
     return;
+  }
+  if (parsed.cmd === CLEANUP_COMMAND) {
+    const cc = parseCleanupCommand(parsed.rest);
+    if (cc.kind !== 'launch') { // `/cleanup run` and `/cleanup --dry-run` keep going to the registry (cleanup-launch.mjs)
+      // Owner only: it removes another agent's worktree.
+      if (String(from?.id) !== String(daemonUserId)) { await sendText(daemonUserId, `❌ /${CLEANUP_COMMAND} chỉ owner dùng được.`); return; }
+      const c = { daemonUserId, projectsConfig, sendText, secretEnvKeys, ...extra };
+      const o = { parentDir, ...(extra.cleanupOpts || {}) };
+      if (cc.kind === 'list') await startCleanupList(c, o); else await startManualFor(cc.target, c, o);
+      return;
+    }
   }
   if (parsed.cmd === COMPACT_COMMAND || parsed.cmd === NUDGE_COMMAND || (parsed.cmd === 'kill' && parsed.tapped)) {
     // Owner only, like /type: they type keys into (or SIGTERM) another agent's session.

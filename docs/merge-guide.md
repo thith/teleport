@@ -73,7 +73,7 @@ node ../teleport/scripts/merge-request.mjs <URL PR> [<URL PR> …] [--keep-branc
 
 ## Dành cho agent: dọn worktree (cleanup-request)
 
-> **Kiểm trước khi gọi:** chạy `git -C <worktree> status --short --untracked-files=all --ignored=matching` (đúng lệnh daemon dùng). Thư mục `tmp/` ở **gốc** worktree là chỗ nháp của agent: bị xoá cùng worktree, không hỏi, nên đừng để gì cần giữ trong đó. Ngoài nó ra: không được có dòng `??` (file untracked, ở đâu cũng tính); dòng `!!` (file đã gitignore) chỉ được nằm trong thư mục build (`target/`, `node_modules/`, `build/`, `.gradle/`, `.kotlin/`, `dist/`, `.idea/`, `__pycache__/`). Còn log, `.env`, ghi chú… thì chuyển đi (nếu cần) hoặc xoá trước. Nếu vẫn còn (vd hook dự án chặn xoá) mà mọi điều kiện khác đều đạt, daemon giữ worktree và gửi owner danh sách + nút **[🧹 Xoá luôn] [Giữ]**; kết quả bấm nút quay về topic của bạn. Cũng phải không còn thay đổi chưa commit, không file nào bị skip-worktree/assume-unchanged (`git ls-files -v | grep -E '^(S|[a-z])'` rỗng), PR đã merge đúng commit hiện tại, và bạn đã `cd` ra ngoài.
+> **Kiểm trước khi gọi:** chạy `git -C <worktree> status --short --untracked-files=all --ignored=matching` (đúng lệnh daemon dùng). Thư mục `tmp/` ở **gốc** worktree là chỗ nháp của agent: bị xoá cùng worktree, không hỏi, nên đừng để gì cần giữ trong đó. Ngoài nó ra: không được có dòng `??` (file untracked, ở đâu cũng tính); dòng `!!` (file đã gitignore) chỉ được nằm trong thư mục build (`target/`, `node_modules/`, `build/`, `.gradle/`, `.kotlin/`, `dist/`, `.idea/`, `__pycache__/`, `.next/`). Còn log, `.env`, ghi chú… thì chuyển đi (nếu cần) hoặc xoá trước. Nếu vẫn còn (vd hook dự án chặn xoá) mà mọi điều kiện khác đều đạt, daemon giữ worktree và gửi owner danh sách các mục đó cùng nút **[🗑 Xoá tay]** (owner xem bảng "sẽ mất gì", daemon sao lưu rồi mới xoá); kết quả bấm nút quay về topic của bạn. Cũng phải không còn thay đổi chưa commit, không file nào bị skip-worktree/assume-unchanged (`git ls-files -v | grep -E '^(S|[a-z])'` rỗng), PR đã merge đúng commit hiện tại, và bạn đã `cd` ra ngoài.
 
 > Phần này viết cho **agent**. Owner không phải đọc.
 
@@ -106,6 +106,16 @@ node ../teleport/scripts/cleanup-request.mjs <đường dẫn worktree | tên nh
 Đạt hết thì xoá bằng `git worktree remove --force`, **nhánh giữ nguyên**. Owner nhận một dòng FYI.
 
 **Nhận kết quả:** một **prompt** trong hàng đợi (`fromRole: 'daemon'`, trường `cleanupResult`): `✅ đã xoá worktree <path> (nhánh … giữ nguyên), lấy lại X GB` hoặc `❌ giữ lại <path>: <lý do>`. Tự kể ngắn cho user. Nếu ❌ vì lý do bạn sửa được (còn đứng trong thư mục, file chưa commit…) thì sửa rồi gọi lại; nếu vì chưa có PR merged thì theo luật 1 ở trên.
+
+## Xoá tay worktree (owner, RFC 30)
+
+Khi cleanup-request bị từ chối, tin DM cho owner có một nút **[🗑 Xoá tay]** (không có thì lý do nằm ở danh sách chặn cứng bên dưới). `/cleanup` (chỉ owner) cũng liệt kê mọi worktree dọn hằng ngày đang giữ lại, mỗi dòng một nút `[🗑 n]`; `/cleanup <đường dẫn | nhánh>` đi thẳng vào bước 1; `/cleanup run` và `/cleanup --dry-run` vẫn là lệnh dọn cũ (nút `[🧹 Dọn ngay]` cũng vậy).
+
+1. **Bấm nút:** daemon kiểm worktree (chỉ đọc, dưới lock `cleanup`) rồi sửa tin thành bảng "sẽ mất gì": thay đổi đã track (stage / chưa stage), file ngoài git, nhánh chưa push, dung lượng sao lưu, kèm dấu vân tay nội dung `🔑`.
+2. **Bấm ✅ Xoá:** daemon kiểm lại (vân tay đổi thì không xoá, hiện bảng mới), sao lưu vào `~/.local/state/teleport/cleanup-backups/<repo>-<nhánh>-<ngày giờ>-<hex>/` (giữ 7 ngày: `staged.patch`, `unstaged.patch`, `untracked.tgz`, `restore.sh`, `info.json`), kiểm lại bản sao lưu, kiểm muộn lần nữa, rồi `git worktree remove --force`. **Nhánh luôn giữ nguyên.** Khôi phục: `bash <thư mục sao lưu>/restore.sh`.
+3. **Không bao giờ xoá tay** (không có nút, hoặc dừng với lý do): có tiến trình đang ở trong worktree (tắt rồi gửi lại, không có nút kill); có repo git lồng bên trong (kể cả trong `tmp/`, `target/`); file skip-worktree / assume-unchanged; HEAD tách rời; worktree bị `git worktree lock`; đang xung đột hoặc giữa merge/rebase/cherry-pick; file đã track đổi mà dùng filter clean/process (vd Git LFS); có submodule; không phải worktree phụ của repo daemon quản lý; phần cần sao lưu > 2 GiB hoặc > 20 000 file.
+
+Giới hạn còn lại: một tiến trình **ngoài** worktree ghi vào nó trong vài trăm ms giữa lần kiểm muộn và lúc xoá thì phần đó mất. Dọn **tự động** hằng ngày không đổi: nó vẫn coi `tmp/` ở gốc worktree là đồ bỏ được và **không sao lưu**; dọn hằng ngày chỉ xoá bản sao lưu cũ hơn 7 ngày (thư mục lạ, thiếu `info.json` thì để nguyên và ghi `sao lưu lạ: <tên>` trong báo cáo).
 
 ## Đóng PR (không merge)
 

@@ -27,18 +27,18 @@ test('formatHealth: calm = no ⚠️ and no RAM top; several warnings = one ⚠�
     oomKills: 0,
   };
   const ok = formatHealth(base);
-  assert.equal(ok, '🩺 Máy\n💻 CPU: load 4.0/12\n🧠 RAM: 10/16 GB\n💾 Đĩa trống: 120 GB\n\n/cswap   /q   /ls');
+  assert.equal(ok, '🩺 Máy\n💻 CPU: load 4.0/12\n🧠 RAM: 10/16 GB\n💾 Đĩa trống: 120 GB\n\n/cswap   /q   /ls   /cleanup');
   assert.doesNotMatch(ok, /⚠️|🐘/);
   const bad = formatHealth({ ...base, load: [14, 9, 8], mem: { total: 16 * GB, available: 1 * GB, swapTotal: 8 * GB, swapFree: 0 }, disk: { size: 500 * GB, avail: 20 * GB, target: '/' }, oomKills: 3 });
   const warnLines = bad.split('\n').filter((l) => l.startsWith('⚠️'));
   assert.equal(warnLines.length, 5, 'one line each');
   [/CPU quá tải/, /RAM sắp hết/, /Swap đầy 8\/8 GB/, /đĩa sắp đầy \(còn 4%\)/, /3 lần OOM-kill/].forEach((w, i) => assert.match(warnLines[i], w));
   assert.match(bad, /\n🐘 Ăn RAM nhiều nhất:\n {3}postgres ×74 — 5\.0G\n {3}node — 700M\n/, 'RAM tight → one process per line, indented 3');
-  assert.match(bad, /\n\n\/cswap {3}\/q {3}\/ls$/);
+  assert.match(bad, /\n\n\/cswap {3}\/q {3}\/ls {3}\/cleanup$/);
   const hot = formatHealth({ ...base, mem: { total: 16 * GB, available: 2.5 * GB, swapTotal: 2 * GB, swapFree: 2 * GB } });
   assert.match(hot, /🐘 Ăn RAM nhiều nhất:\n {3}postgres ×74/, 'used > 80% shows the top even without a warning');
   assert.doesNotMatch(hot, /⚠️/);
-  assert.equal(formatHealth({ cores: 4, load: null, mem: null, disk: null, top: null, oomKills: 0 }), '🩺 Máy\n💻 CPU: ?\n🧠 RAM: ?\n💾 Đĩa trống: ?\n\n/cswap   /q   /ls', 'a failed probe prints ?, never silently drops the line');
+  assert.equal(formatHealth({ cores: 4, load: null, mem: null, disk: null, top: null, oomKills: 0 }), '🩺 Máy\n💻 CPU: ?\n🧠 RAM: ?\n💾 Đĩa trống: ?\n\n/cswap   /q   /ls   /cleanup', 'a failed probe prints ?, never silently drops the line');
 });
 
 test('formatHealth: approved mock', () => {
@@ -54,7 +54,7 @@ test('formatHealth: approved mock', () => {
     '🐘 Ăn RAM nhiều nhất:', '   postgres ×31 — 2.5G', '   claude ×5 — 2.2G',
     '🔒 Build 1/2 chỗ, chờ 0:', "   ▶ 🧚 Tiên (1')",
     '', '📋 Thông số', '• Max build: auto (2)', '• Max chờ: auto', '• 🌙 tới 06:00',
-    '', '/cswap   /q   /ls',
+    '', '/cswap   /q   /ls   /cleanup',
   ].join('\n'));
 });
 
