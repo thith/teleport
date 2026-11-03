@@ -2,9 +2,11 @@
 // daemon's poll loop never blocks on its synchronous filesystem walks
 // (fingerprints, tmp/ repo scan, the daily gates' transcript + 24h-edit walks).
 // stdin: {"target": "<path>", "opts": {…JSON-serialisable cleanupRequested options}}
+//        or (RFC 30) {"cmd": "manual-probe" | "manual-remove" | "manual-list", "target": "<path | branch>", "opts": {…}}
 // stdout: the result object as one JSON line. Spawned by cleanup-inbox.mjs.
 
 import { cleanupRequested } from './cleanup.mjs';
+import { manualCommand } from './cleanup-manual.mjs';
 import { isMainModule } from './is-direct-run.mjs';
 
 if (isMainModule(import.meta.url)) {
@@ -14,8 +16,8 @@ if (isMainModule(import.meta.url)) {
   process.stdin.on('end', async () => {
     let r;
     try {
-      const { target, opts } = JSON.parse(input);
-      r = await cleanupRequested(target, opts || {});
+      const { cmd, target, opts } = JSON.parse(input);
+      r = cmd ? await manualCommand(cmd, target, opts || {}) : await cleanupRequested(target, opts || {});
     } catch (e) { r = { ok: false, path: null, reason: `lỗi: ${String(e?.message || e).split('\n')[0].slice(0, 160)}` }; }
     process.stdout.write(`${JSON.stringify(r)}\n`);
   });

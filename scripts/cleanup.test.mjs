@@ -61,7 +61,7 @@ function deps({ prs = {}, procs = [], transcripts = [], ghError = new Set(), cal
   };
 }
 
-const run = (w, d, extra = {}) => runCleanup({ parentDir: w.parent, now: NOW, lockDir: w.lockDir, cargoCacheDir: path.join(w.parent, 'no-cache'), deps: d, ...extra });
+const run = (w, d, extra = {}) => runCleanup({ parentDir: w.parent, now: NOW, lockDir: w.lockDir, cargoCacheDir: path.join(w.parent, 'no-cache'), backupDir: path.join(w.parent, 'no-backups'), deps: d, ...extra });
 const exists = (p) => fs.existsSync(p);
 const keptReason = (r, wt) => r.kept.find((k) => k.path === wt.path)?.reason;
 

@@ -427,8 +427,8 @@ test('registry: /q is a builtin, admin-gated entry (no script to run); footers p
   assert.equal(reg.q.minRole, 'admin');
   assert.equal(resolveCommand('q', reg), null, 'handled in-process like /type');
   assert.ok(reg.type, '/type stays');
-  assert.equal(HEALTH_SHORTCUTS, '/cswap   /q   /ls');
-  assert.equal(LS_SHORTCUTS, '/health   /cswap   /q');
+  assert.equal(HEALTH_SHORTCUTS, '/cswap   /q   /ls   /cleanup');
+  assert.equal(LS_SHORTCUTS, '/health   /cswap   /q   /cleanup');
 });
 
 // ── long-build ──

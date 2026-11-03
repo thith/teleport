@@ -114,10 +114,10 @@ export function startCleanupScheduler({ launch, stateFile = CLEANUP_STATE_FILE, 
   return () => { clearTimeout(t); if (iv) clearInterval(iv); };
 }
 
-/** `/cleanup` arguments: none, or exactly `--dry-run`. Anything else (incl. a phone's `—dry-run`) throws. */
+/** `/cleanup` arguments reaching this script: none, `run` (RFC 30: the old "clean now"), or `--dry-run`. Anything else (incl. a phone's `—dry-run`) throws. */
 export function parseLaunchArgs(argv) {
-  const bad = argv.filter((a) => a !== '--dry-run');
-  if (bad.length) throw new Error(`❌ /cleanup: không hiểu ${bad.join(' ')} — dùng /cleanup hoặc /cleanup --dry-run`);
+  const bad = argv.filter((a) => a !== '--dry-run' && a !== 'run');
+  if (bad.length) throw new Error(`❌ /cleanup: không hiểu ${bad.join(' ')} — dùng /cleanup, /cleanup run hoặc /cleanup --dry-run`);
   return { dryRun: argv.includes('--dry-run') };
 }
 

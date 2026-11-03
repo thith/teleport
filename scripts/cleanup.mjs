@@ -48,7 +48,7 @@ import { PARENT_DIR } from './workspace.mjs';
 const execFileP = promisify(execFile);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-export const BUILD_DIRS = new Set(['target', 'node_modules', 'build', '.gradle', '.kotlin', 'dist', '.idea', '__pycache__']);
+export const BUILD_DIRS = new Set(['target', 'node_modules', 'build', '.gradle', '.kotlin', 'dist', '.idea', '__pycache__', '.next']);
 export const MAX_REMOVALS = 30;
 const HOUR = 3600_000, DAY = 24 * HOUR;
 export const RECENT_EDIT_MS = DAY;
@@ -58,6 +58,9 @@ export const CACHE_IDLE_MS = 14 * DAY;
 export const WALK_MAX_ENTRIES = 300_000;
 export const CARGO_CACHE_DIR = path.join(os.homedir(), '.cache', 'teleport', 'cargo-target');
 export const TRANSCRIPTS_DIR = path.join(os.homedir(), '.claude', 'projects');
+// RFC 30: where a manual cleanup (cleanup-manual.mjs) backs up what it would delete; kept 7 days.
+export const MANUAL_BACKUP_DIR = path.join(process.env.XDG_STATE_HOME || path.join(os.homedir(), '.local', 'state'), 'teleport', 'cleanup-backups');
+export const BACKUP_KEEP_MS = 7 * DAY;
 
 // ── Pure helpers ─────────────────────────────────────────────────────────────
 
@@ -523,6 +526,62 @@ export async function cleanupRequested(target, {
   }
 }
 
+// ── RFC 30 helpers ───────────────────────────────────────────────────────────
+
+/**
+ * Every linked worktree of every repo that sits directly in the workspace (the set the daily run manages) →
+ * [{ repo, main, slug, wt, real }]. A repo that can't be listed adds a line to `errors`.
+ */
+export async function listLinkedWorktrees(parentDir, deps, errors = []) {
+  const git = (args, opts) => deps.exec('git', args, opts);
+  const out = [];
+  let entries;
+  try { entries = fs.readdirSync(parentDir, { withFileTypes: true }); } catch (e) { errors.push(`không đọc được ${parentDir}: ${e.message}`); return out; }
+  for (const ent of entries.sort((a, b) => a.name.localeCompare(b.name))) {
+    if (!ent.isDirectory()) continue;
+    const main = path.join(parentDir, ent.name);
+    try { if (!fs.lstatSync(path.join(main, '.git')).isDirectory()) continue; } catch { continue; }
+    let list, slug = null;
+    try { list = parseWorktreePorcelain(await git(['-C', main, 'worktree', 'list', '--porcelain'])); }
+    catch (e) { errors.push(`${ent.name}: git worktree list lỗi: ${e.message}`); continue; }
+    try { slug = githubSlug(await git(['-C', main, 'remote', 'get-url', 'origin'])); } catch {}
+    const realMain = fs.realpathSync(main);
+    for (const wt of list.slice(1)) {
+      if (wt.bare) continue;
+      let real = null;
+      try { real = fs.realpathSync(wt.path); } catch {}
+      if (real === realMain || wt.path === main) continue;
+      out.push({ repo: ent.name, main, slug, wt, real });
+    }
+  }
+  return out;
+}
+
+/**
+ * RFC 30 §2.5: delete manual-cleanup backups older than 7 days. Only a DIRECT child directory of `dir` (never a
+ * symlink) with a valid `info.json` (complete: true, a createdAt) is ever removed; anything else is reported
+ * as odd and left alone. → { removed: [name], odd: [name] }
+ */
+export function pruneBackups({ dir = MANUAL_BACKUP_DIR, now = Date.now(), dryRun = false, keepMs = BACKUP_KEEP_MS, rm = (p) => fs.rmSync(p, { recursive: true, force: true }) } = {}) {
+  const res = { removed: [], odd: [] };
+  let ents;
+  try { ents = fs.readdirSync(dir, { withFileTypes: true }); } catch (e) { if (e.code === 'ENOENT') return res; throw e; }
+  for (const ent of ents) {
+    if (!ent.isDirectory()) { res.odd.push(ent.name); continue; } // a symlink (even to a dir) or a stray file
+    const sub = path.join(dir, ent.name);
+    let info = null;
+    try {
+      const f = path.join(sub, 'info.json');
+      if (fs.lstatSync(f).isFile()) info = JSON.parse(fs.readFileSync(f, 'utf8'));
+    } catch {}
+    if (!info || info.v !== 1 || info.complete !== true || !Number.isFinite(info.createdAt)) { res.odd.push(ent.name); continue; }
+    if (now - info.createdAt <= keepMs) continue;
+    if (!dryRun) rm(sub);
+    res.removed.push(ent.name);
+  }
+  return res;
+}
+
 // ── The run ──────────────────────────────────────────────────────────────────
 
 /**
@@ -532,12 +591,12 @@ export async function cleanupRequested(target, {
  */
 export async function runCleanup({
   parentDir = PARENT_DIR, dryRun = false, now = Date.now(), maxRemovals = MAX_REMOVALS,
-  cargoCacheDir = CARGO_CACHE_DIR, lockDir = LOCK_DIR, deps: injected = {},
+  cargoCacheDir = CARGO_CACHE_DIR, lockDir = LOCK_DIR, deps: injected = {}, backupDir = MANUAL_BACKUP_DIR,
 } = {}) {
   const deps = { ...defaultDeps(), ...injected };
   const git = (args, opts) => deps.exec('git', args, opts);
   const du = (p) => duBytes(deps, p);
-  const res = { dryRun, removed: [], kept: [], targets: [], cache: [], cacheSkipped: null, errors: [], offers: [] };
+  const res = { dryRun, removed: [], kept: [], targets: [], cache: [], cacheSkipped: null, errors: [], offers: [], backups: { removed: [], odd: [] } };
   const realParent = fs.realpathSync(parentDir);
 
   // Global probes: if one fails, nothing can be proven safe → keep everything.
@@ -655,6 +714,8 @@ export async function runCleanup({
       } finally { lock.release(); }
     }
   }
+  // RFC 30 §2.5: manual-cleanup backups older than 7 days (we hold the `cleanup` lock here).
+  try { res.backups = pruneBackups({ dir: backupDir, now, dryRun }); } catch (e) { res.errors.push(`dọn bản sao lưu lỗi: ${e.message}`); }
   return res;
 }
 
@@ -697,6 +758,10 @@ export function formatReport(r) {
   }
   const quiet = r.kept.filter((k) => !k.notable).length;
   if (quiet) L.push('', `Giữ lại ${quiet} worktree khác (PR chưa merge, detached, khoá…).`);
+  if (r.kept.length) L.push('', `còn giữ ${r.kept.length} worktree — /cleanup để xoá tay`);
+  const bk = r.backups || { removed: [], odd: [] };
+  if (bk.removed.length) L.push('', `Bản sao lưu xoá tay cũ hơn 7 ngày ${verb} (${bk.removed.length}).`);
+  for (const n of bk.odd) L.push(`sao lưu lạ: ${n}`);
   if (r.targets.length) {
     L.push('', `target/ bỏ hoang ${verb} (${r.targets.length}, ${fmtGB(sum(r.targets))}):`);
     for (const t of r.targets) L.push(`  • ${t.path} — ${fmtGB(t.bytes)}`);
