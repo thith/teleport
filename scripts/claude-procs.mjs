@@ -226,6 +226,33 @@ export function padNarrowEmoji(text) {
  *   full     — false (the default `/ls`, Thi): one line per agent — 📺/💻, name #hashtag, state, context,
  *              🔇 listener off / 📬 mail — then its links; no section headers. `listenerOf(convo)` → 'on'|'off'|null.
  */
+/** The hashtag /ls titles a claude row with: its own session's, else its `tele-<hash>` screen label. */
+export function rowTag(r) {
+  return r.hashtag || (typeof r.screen === 'string' && r.screen.startsWith('tele-') ? r.screen.slice(5) : null);
+}
+
+/**
+ * The agents /ls lists, as identities `{ convoId, hashtag }` (convoId null when only the hashtag is
+ * known). Same selection as formatAgentList: each claude proc counts as itself (its session's convo
+ * + hashtag, else its screen label); a screen label counts ONLY for a screen with no claude inside.
+ * Pure.
+ */
+export function lsIdentities({ screens = [], procs = [] } = {}) {
+  const out = [];
+  const occupied = new Set();
+  for (const r of procs) {
+    if (r.screen) occupied.add(r.screen);
+    const c = r.sessionId ? uuidToConvoInt(r.sessionId) : null;
+    const tag = rowTag(r);
+    if (c != null || tag) out.push({ convoId: c == null ? null : String(c), hashtag: tag ? String(tag).toLowerCase() : null });
+  }
+  for (const s of screens) {
+    if (occupied.has(s.name) || !String(s.name).startsWith('tele-')) continue;
+    out.push({ convoId: null, hashtag: s.name.slice(5).toLowerCase() });
+  }
+  return out;
+}
+
 export function formatAgentList({ screens = [], procs = [], personaOf = () => null, home = os.homedir(), statusLinesOf = () => [], mailOf = () => null, convoOfHashtag = () => null, ctxOf = () => null, linksOf = () => [], showSession = true, full = true, listenerOf = () => null, tokensOf = () => null } = {}) {
   // Folder name only (Thi: "chỉ hiện tên folder") — the full path is noise on a phone.
   const short = (p) => (p ? (p === home ? '~' : path.basename(p)) : null);
@@ -247,7 +274,7 @@ export function formatAgentList({ screens = [], procs = [], personaOf = () => nu
   };
   // No tty line (Thi: only useful at the keyboard). r.tty stays in the row/audit.
   const block = (r) => {
-    const tag = r.hashtag || (typeof r.screen === 'string' && r.screen.startsWith('tele-') ? r.screen.slice(5) : null);
+    const tag = rowTag(r);
     // A guessed session's persona/hashtag is a guess too: say so in the title (both forms, UUID shown or not).
     const title = ([persona(tag) || r.name, tag ? `#${tag}` : null].filter(Boolean).join(' ') || `${r.screen ? '📺' : '💻'} PID ${r.pid}`) + (r.guessed ? ' (đoán)' : '');
     const convo = convoOf(r);
@@ -275,7 +302,7 @@ export function formatAgentList({ screens = [], procs = [], personaOf = () => nu
 
   // The short form: everything needed to pick an agent and tap — details are in `/ls full`.
   const line = (r) => {
-    const tag = r.hashtag || (typeof r.screen === 'string' && r.screen.startsWith('tele-') ? r.screen.slice(5) : null);
+    const tag = rowTag(r);
     const convo = convoOf(r);
     const ctx = safe(() => ctxOf(r), null);
     const mail = convo != null ? safe(() => mailOf(convo), null) : null;

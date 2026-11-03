@@ -116,3 +116,20 @@ test('doBroadcast: /ls listing throws → fail closed (ok:false, nothing written
   assert.match(r.message, /ps failed/);
   assert.match(r.message, /nothing sent/);
 });
+
+test('doBroadcast: hashtag collision — a convoId row matches only its own topic; a hashtag-only row is skipped when ambiguous', async () => {
+  const A = 1205483045424020, B = 2205483045424020;
+  assert.equal(shortConvoHash(A), shortConvoHash(B));
+  const store = { '-100': { [A]: 5, [B]: 6, _ts: {} } };
+  const run = async (lsHashtags) => {
+    const written = [];
+    const r = await doBroadcast(['hi'], { from: {}, config: CFG, store, writePrompt: async (o, f) => { written.push(f); }, env: {}, envFile: {}, lsHashtags });
+    return { r, written };
+  };
+  const byConvo = await run(() => [{ convoId: String(A), hashtag: shortConvoHash(A) }]);
+  assert.equal(byConvo.written.length, 1); assert.ok(byConvo.written[0].includes(`convo-${A}.json`));
+  assert.equal(byConvo.r.notRunning, 1);
+  const byTag = await run(() => [{ convoId: null, hashtag: shortConvoHash(A) }]);   // empty screen: ambiguous
+  assert.equal(byTag.r.ok, false); assert.equal(byTag.written.length, 0);
+  assert.match(byTag.r.message, /bỏ qua 2/);
+});

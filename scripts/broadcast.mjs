@@ -108,10 +108,21 @@ export async function doBroadcast(argv, {
   const all = listLiveTopics(store, chatIds);
   if (!all.length) return { ok: false, message: '📢 broadcast: no live topics found (nothing sent).' };
   // Only topics /ls shows (running agents). Fail closed if the listing itself breaks.
-  let running;
-  try { running = new Set([...(await lsHashtags())].map((h) => String(h).replace(/^#/, '').toLowerCase())); }
+  // Entries are `{convoId, hashtag}` (a bare string = hashtag only). A convoId matches exactly; a
+  // hashtag-only row matches only when that hashtag belongs to ONE candidate topic (short hashes can
+  // collide across convoIds — ambiguous → skipped, counted as not running).
+  let entries;
+  try { entries = [...(await lsHashtags())]; }
   catch (e) { return { ok: false, message: `📢 broadcast: không liệt kê được agent đang chạy (${e?.message || e}) — nothing sent.` }; }
-  const live = all.filter((t) => running.has(String(t.hashtag).toLowerCase()));
+  const norm = (h) => String(h).replace(/^#/, '').toLowerCase();
+  const convos = new Set(); const tags = new Set();
+  for (const e of entries) {
+    if (e && typeof e === 'object') { if (e.convoId != null) convos.add(String(e.convoId)); else if (e.hashtag) tags.add(norm(e.hashtag)); }
+    else if (e) tags.add(norm(e));
+  }
+  const tagCount = new Map();
+  for (const t of all) tagCount.set(norm(t.hashtag), (tagCount.get(norm(t.hashtag)) || 0) + 1);
+  const live = all.filter((t) => convos.has(String(t.convoId)) || (tags.has(norm(t.hashtag)) && tagCount.get(norm(t.hashtag)) === 1));
   const notRunning = all.length - live.length;
   if (!live.length) return { ok: false, skippedNotRunning: notRunning, message: `📢 broadcast: không có topic nào đang chạy (/ls trống) — nothing sent, bỏ qua ${notRunning} không chạy.` };
 

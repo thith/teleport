@@ -48,7 +48,7 @@ import { formatPersona } from './persona.mjs';
 import { peekPersona } from './persona-store.mjs';
 import {
   listClaudeProcs, padNarrowEmoji, findProcForSession, findUnidentifiedProcs, cwdToProjectSlug, PROJECTS_DIR,
-  formatAgentList, hashtagForSession, readPs, parseKillPidArg, killClaudePid, KILL_PID_GRACE_MS, inspectPid, etimeToSeconds,
+  formatAgentList, lsIdentities, hashtagForSession, readPs, parseKillPidArg, killClaudePid, KILL_PID_GRACE_MS, inspectPid, etimeToSeconds,
 } from './claude-procs.mjs';
 import { readProjectsConfig, resolveDaemonUserId } from './projects-config.mjs';
 import { transcriptState, formatContext, contextWindowFor } from './transcript-state.mjs';
@@ -349,22 +349,17 @@ export function listSpawnSessions(exec = execFileSync, { onWiped = () => {} } = 
 }
 
 /**
- * The hashtags `/ls` shows: claude procs' `.hashtag` + `tele-<hashtag>` screen names (lowercased).
- * Throws if the process listing fails (callers needing fail-closed rely on that); a missing
- * `screen` binary just contributes no screens. `listScreens`/`listProcs`/`hasScreen` injectable.
+ * The agents `/ls` shows, as `{ convoId, hashtag }` identities (see lsIdentities in claude-procs.mjs):
+ * the occupant's identity when a screen holds a claude, the screen label only for an empty screen.
+ * Throws if the process listing fails (callers rely on it to fail closed); a missing `screen`
+ * binary just contributes no screens. Listers injectable.
  */
 export function lsHashtagSet({
   listScreens = () => listSpawnSessions(), listProcs = () => listClaudeProcs({ strict: true }),
   hasScreen = () => hasBinary('screen'),
 } = {}) {
-  const set = new Set();
   const screens = hasScreen() ? listScreens() : [];
-  for (const s of screens) {
-    const m = String(s?.name ?? '').match(/^tele-(.+)$/);
-    if (m) set.add(m[1].toLowerCase());
-  }
-  for (const p of listProcs()) if (p?.hashtag) set.add(String(p.hashtag).replace(/^#/, '').toLowerCase());
-  return set;
+  return lsIdentities({ screens, procs: listProcs() });
 }
 
 /**
