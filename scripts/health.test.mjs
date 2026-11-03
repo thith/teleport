@@ -411,3 +411,32 @@ test('R3 gatherLocal: a read error on the override prints ? (absent = normal def
   assert.match(gatherLocal(base).inEffect.join('\n'), /• 🌙 \?/);
   assert.match(gatherLocal(base).inEffect.join('\n'), /Max chờ: auto/);
 });
+
+test('gatherLocal: waiters are listed in the real service order (fairness, /q boost, live before stalled), not filename order', async () => {
+  const { TICKET_V } = await import('./build-policy.mjs');
+  const mk = () => fs.mkdtempSync(path.join(os.tmpdir(), 'tp-health-'));
+  const opts = (dir) => ({ dir, readProjects: () => ({}), supported: () => true, pruneLines: () => [] });
+  const now = Date.now();
+  const put = (dir, name, label, owner, { stalled = false, v = TICKET_V } = {}) => {
+    fs.mkdirSync(path.join(dir, 'build.queue'), { recursive: true });
+    const f = path.join(dir, 'build.queue', `${name}.json`);
+    fs.writeFileSync(f, JSON.stringify({ v, pid: process.pid, procStart: null, label, owner, createdAt: now - 60_000 }));
+    if (stalled) { const old = new Date(now - 10 * 60_000); fs.utimesSync(f, old, old); }
+    return `${name}.json`;
+  };
+  const waiters = (dir) => gatherLocal(opts(dir)).locks.filter((l) => l.includes('⏳')).map((l) => l.replace(/ \(\d+'\)$/, '').replace('   ⏳ ', ''));
+  // fairness: owner A has a build running and two tickets; B's ticket (queued later) goes before A's second one
+  const d1 = mk();
+  fs.writeFileSync(path.join(d1, 'build.holder.json'), JSON.stringify({ pid: process.pid, label: 'Run', owner: 'convo:A', startedAt: now, slot: 0 }));
+  put(d1, '000000000000001-1-aaaa', 'A1', 'convo:A'); put(d1, '000000000000002-1-aaaa', 'A2', 'convo:A'); put(d1, '000000000000003-1-aaaa', 'B1', 'convo:B');
+  assert.deepEqual(waiters(d1), ['B1', 'A1', 'A2']);
+  // boost: the later ticket jumps to the front
+  const d2 = mk();
+  put(d2, '000000000000001-1-aaaa', 'First', 'convo:A'); put(d2, '000000000000002-1-aaaa', 'Boosted', 'convo:B');
+  fs.writeFileSync(path.join(d2, 'build.policy.json'), JSON.stringify({ v: 1, max: null, lastMax: 4, retryMin: 10, paused: false, blocks: [], boosts: { '000000000000002-1-aaaa.json': 5 } }));
+  assert.deepEqual(waiters(d2), ['Boosted', 'First']);
+  // a stalled ticket queued earlier is listed after the live one
+  const d3 = mk();
+  put(d3, '000000000000001-1-aaaa', 'Stalled', 'convo:A', { stalled: true }); put(d3, '000000000000002-1-aaaa', 'Live', 'convo:B');
+  assert.deepEqual(waiters(d3), ['Live', 'Stalled']);
+});
