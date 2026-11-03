@@ -44,6 +44,7 @@ export async function autoNudgeTick({ list, io, runner, mailAt, tgAt, listener, 
     const need = autoNudgeNeed({ mailAt: mailAt(convo), tgAt: tgAt(convo), listener: listener(convo), prev: seen.get(convo), now });
     if (!need) continue;
     const t = pinTarget(r);
+    if (runner.reserved?.has(t.pid)) continue; // RFC 35: a compact→kill is running — nothing may be typed
     if (observe(t, io).mismatch) continue;
     const res = await runner.run('n', t, 'auto', { persona: personaOf(t), line: need.line }).catch((e) => ({ text: `❌ ${e?.message ?? e}` }));
     // Marked only once typed: a refusal (lock, cool-down, dialog) is retried next tick while still in the window.

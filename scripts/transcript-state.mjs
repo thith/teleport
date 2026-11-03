@@ -171,7 +171,7 @@ export function transcriptState(sessionId, cwd, opts = {}) {
  * (a bare number = size only). → { postTokens, preTokens } | null (not yet) | { error } (file shrank
  * or was replaced — a boundary in another file can't be attributed to our command).
  */
-export function compactAfter(file, base) {
+export function compactAfter(file, base, { requireSummary = false } = {}) {
   const b = typeof base === 'number' ? { size: base } : (base || {});
   let fd;
   try { fd = fs.openSync(file, 'r'); } catch { return { error: 'transcript biến mất' }; }
@@ -182,8 +182,11 @@ export function compactAfter(file, base) {
     if (st.size === b.size) return null;
     const buf = Buffer.alloc(st.size - b.size);
     fs.readSync(fd, buf, 0, buf.length, b.size);
-    for (const j of parseJsonl(buf.toString('utf8'))) {
+    const lines = parseJsonl(buf.toString('utf8'));
+    for (const [i, j] of lines.entries()) {
       if (j.type === 'system' && j.subtype === 'compact_boundary' && !j.isSidechain && j.compactMetadata?.trigger === 'manual') {
+        // requireSummary: Claude writes the boundary BEFORE the isCompactSummary user entry — wait for that one too.
+        if (requireSummary && !lines.slice(i + 1).some((x) => x.isCompactSummary === true && !x.isSidechain)) return null;
         const num = (v) => (v != null && Number.isFinite(Number(v)) ? Number(v) : null);
         return { postTokens: num(j.compactMetadata.postTokens), preTokens: num(j.compactMetadata.preTokens) };
       }

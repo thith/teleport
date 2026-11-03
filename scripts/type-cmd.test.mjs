@@ -766,3 +766,90 @@ test('countScreenWindows / screenWindowCount: `-Q windows` output with 2 windows
   assert.deepEqual(seen[0], ['screen', ['-S', '10.tele-a1111111', '-Q', 'windows'], 5000]);
   assert.equal(screenWindowCount('10.x', () => { throw new Error('no screen'); }), null);
 });
+
+// ── RFC 35: reservation + compact→kill support ───────────────────────────────
+
+test('TYPE_BUTTON_RE / TYPE_OPS accept op q (RFC 35)', async () => {
+  const { TYPE_OPS } = await import('./type-cmd.mjs');
+  assert.ok(TYPE_BUTTON_RE.test('ty:0123456789abcdef:q'));
+  assert.equal(TYPE_OPS.q, 'compact-kill');
+});
+
+test('reservation: run() of every op is refused on a reserved pid; only the holder\'s compact passes', async () => {
+  const { io, st } = fakeIo({ status: 'idle' });
+  const runner = new TypeRunner(io);
+  assert.equal(runner.reserve(T, 'tok1'), null);
+  for (const op of ['c', 'r', 'e', 'i', 'u', 'n']) assert.match((await runner.run(op, T)).text, /compact→kill/, op);
+  assert.match((await runner.run('c', T, 'owner', { reservedBy: 'other' })).text, /compact→kill/);
+  assert.match((await runner.run('e', T, 'owner', { reservedBy: 'tok1' })).text, /compact→kill/, 'the holder may only compact');
+  assert.deepEqual(st.keys, []);
+  runner.release(T.pid, 'bad'); assert.ok(runner.reserved.has(T.pid), 'only the holder releases');
+  runner.release(T.pid, 'tok1'); assert.ok(!runner.reserved.has(T.pid));
+});
+
+test('reservation: acquire is exclusive both ways — refused while reserved / lock / Esc / kill / an earlier compact watch', () => {
+  const runner = new TypeRunner(fakeIo({}).io);
+  assert.equal(runner.reserve(T, 'a'), null);
+  assert.match(runner.reserve(T, 'b'), /compact→kill/, 'a second q');
+  runner.release(T.pid, 'a');
+  for (const [set, un] of [[() => runner.locks.add(T.pid), () => runner.locks.delete(T.pid)],
+    [() => runner.escInFlight.add(T.pid), () => runner.escInFlight.delete(T.pid)],
+    [() => runner.killsPending.add(T.pid), () => runner.killsPending.delete(T.pid)],
+    [() => runner.compactWatches.set(T.pid, 1), () => runner.compactWatches.delete(T.pid)]]) {
+    set();
+    assert.match(runner.reserve(T, 'c'), /bận lệnh khác/);
+    assert.ok(!runner.reserved.has(T.pid));
+    un();
+  }
+  assert.equal(runner.reserve(T, 'd'), null);
+});
+
+test('reservation: an earlier 🗜️ holds compactWatches until finish(); Esc is refused before its key when reserved meanwhile', async () => {
+  const { io, st } = fakeIo({ screens: [IDLE, hc('compact-typed'), hc('compact-typed')], compact: { preTokens: 9, postTokens: 1 } });
+  const runner = new TypeRunner(io);
+  const r = await runner.run('c', T);
+  assert.match(runner.reserve(T, 'q'), /bận lệnh khác/, 'compact watch / notice not finished');
+  await r.watch();
+  assert.match(runner.reserve(T, 'q'), /bận lệnh khác/, 'still held until the notice delivery is done');
+  r.finish(); r.finish(); // idempotent
+  assert.equal(runner.reserve(T, 'q'), null);
+  runner.release(T.pid, 'q');
+  // Esc: reserved between the start and the key → no key sent
+  const e = fakeIo({ status: 'busy' });
+  const er = new TypeRunner(e.io);
+  const orig = e.io.sleep;
+  e.io.sleep = async (ms) => { await orig(ms); er.reserved.set(T.pid, { tok: 'z' }); };
+  assert.match((await er.run('e', T)).text, /compact→kill/);
+  assert.deepEqual(e.st.keys, []);
+});
+
+test('compact killAfter: requireSummary is passed to compactAfter and a 2 s settle follows; plain compact does neither', async () => {
+  const calls = [];
+  const mk = () => { const f = fakeIo({ screens: [IDLE, hc('compact-typed'), hc('compact-typed')] }); f.io.compactAfter = (...a) => { calls.push(a.slice(2)); return { preTokens: 140000, postTokens: 20000 }; }; return f; };
+  const a = mk(); const runner = new TypeRunner(a.io);
+  runner.reserve(T, 'q');
+  const r = await runner.run('c', T, 'owner', { reservedBy: 'q' });
+  const t0 = a.st.now;
+  assert.equal(await r.watch(), '✅ đã compact: 140k → 20k');
+  assert.deepEqual(calls[0], [{ requireSummary: true }]);
+  assert.equal(a.st.now - t0, 3000 + 2000, '3 s first look + 2 s settle');
+  const b = mk(); calls.length = 0;
+  const r2 = await new TypeRunner(b.io).run('c', T);
+  const t1 = b.st.now;
+  await r2.watch();
+  assert.deepEqual(calls[0], [undefined]);
+  assert.equal(b.st.now - t1, 3000);
+});
+
+test('queued /compact refused after the turn ends: the watch poll sees "Not enough messages" and returns at once', async () => {
+  const busyScreen = hc('compact-typed').replace('auto mode on', 'auto mode on · esc to interrupt');
+  const { io, st } = fakeIo({ status: 'busy', screens: [IDLE, busyScreen, hc('compact-typed'), hc('compact-typed')] });
+  const r = await new TypeRunner(io).run('c', T);
+  assert.match(r.text, /đã xếp hàng/);
+  // first look: nothing; later the turn ends and Claude refuses the queued /compact
+  const shots = [hc('compact-typed'), hc('compact-typed'), hc('compact-done-empty')];
+  io.hardcopy = async () => (shots.length > 1 ? shots.shift() : shots[0]);
+  const t0 = st.now;
+  assert.match(await r.watch(), /chưa đủ tin nhắn/);
+  assert.ok(st.now - t0 < 30_000, `returned early (${st.now - t0} ms), not after 30 min`);
+});

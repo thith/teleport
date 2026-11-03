@@ -63,7 +63,7 @@ export function saveShotFile(dir, name, text, keep = SHOTS_KEEP) {
 
 // op letter (callback data) → command. Fixed table: the command never comes from stored data.
 // 'k' only asks (a confirm button follows); 'y' is that confirmation: /kill pid:<PID> (SIGTERM), not a keystroke.
-export const TYPE_OPS = { c: '/compact', r: '/remote-control', e: 'esc', i: 'read-input', u: 'clear-input', k: 'kill-ask', y: 'kill', n: 'nudge' };
+export const TYPE_OPS = { c: '/compact', r: '/remote-control', e: 'esc', i: 'read-input', u: 'clear-input', k: 'kill-ask', y: 'kill', q: 'compact-kill', n: 'nudge' };
 // The lines /nudge types (Thi, RFC 26) — fixed, never from input. They arrive as host input, so each asks
 // for a Telegram status or the owner sees nothing. Keep them ≤ NUDGE_MAX_LEN: an 80-column screen must not wrap one.
 export const NUDGE_LINES = {
@@ -74,7 +74,7 @@ export const NUDGE_LINES = {
 export const NUDGE_TEXT = NUDGE_LINES.both;
 export const NUDGE_MAX_LEN = 70;
 export const COMPACT_OK = '✅ đã compact'; // a watch() result starting with this = a confirmed compaction
-export const TYPE_BUTTON_RE = /^ty:(?:pick:([0-9a-z]{8})|([0-9a-f]{16}):([crexiukyn]))$/;
+export const TYPE_BUTTON_RE = /^ty:(?:pick:([0-9a-z]{8})|([0-9a-f]{16}):([crexiukyqn]))$/;
 
 // ── Pure helpers ──────────────────────────────────────────────────────────────
 
@@ -342,11 +342,37 @@ export class TypeRunner {
     this.escInFlight = new Set();
     this.keysDone = new Set(); // pid whose running chain has sent its last key
     this.cancel = new Map();   // pid → true while a chain should stop
+    // RFC 35 compact→kill: pid → { procStart, sessionId, tok } while a 🗜️→💀 is between its compact and the SIGTERM.
+    this.reserved = new Map();
+    this.compactWatches = new Map(); // pid → number of 🗜️ compacts whose watch / notice delivery has not finished
+    this.killsPending = new Set();   // pid whose ✅ kill is being dispatched
   }
 
+  /**
+   * Reserve `t.pid` for a compact→kill (token `tok`). Exclusive both ways: refused while the pid is reserved or has
+   * anything in flight (keystroke chain, Esc, kill, an earlier compact's watch / notice). → null (held) | refusal text.
+   */
+  reserve(t, tok) {
+    if (this.reserved.has(t.pid)) return '⏳ agent đang compact→kill';
+    if (this.locks.has(t.pid) || this.escInFlight.has(t.pid) || this.killsPending.has(t.pid) || (this.compactWatches.get(t.pid) || 0) > 0) {
+      return '⏳ agent đang bận lệnh khác — thử lại sau';
+    }
+    this.reserved.set(t.pid, { procStart: String(t.procStart), sessionId: t.sessionId, tok });
+    return null;
+  }
+
+  /** Drop the reservation (only the holder's). */
+  release(pid, tok) { if (this.reserved.get(pid)?.tok === tok) this.reserved.delete(pid); }
+
   /** Run `op` ('c'|'r'|'e') against pinned target `t`. → { text, watch? } — `watch()` resolves a later result line. */
-  async run(op, t, who = 'owner', { persona = null, line = null } = {}) {
+  async run(op, t, who = 'owner', { persona = null, line = null, reservedBy = null } = {}) {
     const audit = (step, extra = {}) => this.io.audit({ who, op: TYPE_OPS[op], pid: t.pid, sessionId: t.sessionId, hashtag: t.hashtag, step, ...extra });
+    if (reservedBy != null) { // only the compact of the 🗜️→💀 that holds the reservation
+      if (op !== 'c' || this.reserved.get(t.pid)?.tok !== reservedBy) return { text: '⏳ agent đang compact→kill' };
+    } else if (this.reserved.has(t.pid)) {
+      audit('refused', { reason: 'reserved' });
+      return { text: '⏳ agent đang compact→kill — thử lại sau.' };
+    }
     if (op === 'e') return this.esc(t, audit);
     if (this.locks.has(t.pid)) return { text: '⏳ đang gõ lệnh khác vào agent này — thử lại sau.' };
     if (op === 'i') { // the probe types too: same lock, no cool-down
@@ -358,7 +384,7 @@ export class TypeRunner {
     this.cancel.delete(t.pid);
     this.keysDone.delete(t.pid);
     try {
-      if (op === 'c') return await this.compact(t, audit, persona);
+      if (op === 'c') return await this.compact(t, audit, persona, { killAfter: reservedBy != null });
       if (op === 'u') return await this.clearInput(t, audit);
       if (op === 'r') return await this.remoteControl(t, audit);
       if (op === 'n') return await this.nudge(t, audit, persona, line);
@@ -439,32 +465,43 @@ export class TypeRunner {
     return { ok: true, file, offset, screenBefore: scr, queued: last.state === 'busy' };
   }
 
-  async compact(t, audit, persona = null) {
+  async compact(t, audit, persona = null, { killAfter = false } = {}) {
     const r = await this.typeAndEnter(t, '/compact', audit, { allowBusy: true });
     if (!r.ok) return r;
     const io = this.io;
+    // killAfter (RFC 35): the boundary alone is not enough — Claude writes isCompactSummary after it — and then ~2 s more.
+    let counted = true;
+    this.compactWatches.set(t.pid, (this.compactWatches.get(t.pid) || 0) + 1);
+    const finish = () => { // the caller is done with the watch AND its notice delivery (idempotent)
+      if (!counted) return;
+      counted = false;
+      const n = (this.compactWatches.get(t.pid) || 0) - 1;
+      if (n > 0) this.compactWatches.set(t.pid, n); else this.compactWatches.delete(t.pid);
+    };
     const watch = async () => {
       const until = io.now() + (r.queued ? COMPACT_QUEUED_WATCH_MS : COMPACT_WATCH_MS);
       await io.sleep(3000);
-      const scr = await io.hardcopy(screenId(t));
-      if (compactRefusedOnScreen(scr)) { // tied to the LAST submitted /compact — an old one may still be on screen
-        audit('result', { result: 'not-enough' });
-        return 'ℹ️ Claude báo: chưa đủ tin nhắn để compact.';
-      }
-      if (!r.file || r.offset == null) return '❔ không tìm thấy transcript để theo dõi kết quả.';
-      while (io.now() < until) {
-        const c = io.compactAfter(r.file, r.offset);
+      while (true) {
+        // Re-read every pass: a queued /compact can be refused only after the turn ends. Tied to the LAST submitted /compact.
+        if (compactRefusedOnScreen(await io.hardcopy(screenId(t)))) {
+          audit('result', { result: 'not-enough' });
+          return 'ℹ️ Claude báo: chưa đủ tin nhắn để compact.';
+        }
+        if (!r.file || r.offset == null) return '❔ không tìm thấy transcript để theo dõi kết quả.';
+        const c = io.compactAfter(r.file, r.offset, killAfter ? { requireSummary: true } : undefined);
         if (c?.error) { audit('result', { result: c.error }); return `❔ không theo dõi được (${c.error}).`; }
         if (c) {
           audit('result', { result: 'compacted', ...c });
+          if (killAfter) await io.sleep(2000);
           return `${COMPACT_OK}: ${fmtTokens(c.preTokens)} → ${fmtTokens(c.postTokens)}`;
         }
+        if (io.now() >= until) break;
         await io.sleep(5000);
       }
       audit('result', { result: 'timeout' });
       return `❔ chưa thấy compact xong sau ${r.queued ? 30 : 5} phút — kiểm tra tay.`;
     };
-    return { text: `⌨️ đã gõ /compact vào ${agentLabel(t, persona)}${r.queued ? ' (đang bận → đã xếp hàng, chạy khi xong lượt)' : ''} — đang chờ kết quả…`, watch };
+    return { text: `⌨️ đã gõ /compact vào ${agentLabel(t, persona)}${r.queued ? ' (đang bận → đã xếp hàng, chạy khi xong lượt)' : ''} — đang chờ kết quả…`, watch, finish };
   }
 
   async nudge(t, audit, persona = null, want = null) {
@@ -621,6 +658,7 @@ export class TypeRunner {
       }
       const prev = this.lastEsc.get(t.pid);
       if (prev != null && io.now() - prev < ESC_GAP_MS) return { text: '⏳ vừa gửi Esc — đợi 3 giây (Esc kép mở menu Rewind).' };
+      if (this.reserved.has(t.pid)) return { text: '⏳ agent đang compact→kill — không gửi Esc.' };
       io.stuff(screenId(t), '\x1b');
       this.lastEsc.set(t.pid, io.now());
       audit('esc', { status: o.status });
