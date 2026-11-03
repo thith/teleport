@@ -62,7 +62,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
-import { acquireLock, describeHolder, readHolders, readQueue, slotsFor, effectiveSlots, gateText, DEFAULT_LOCK_DIR, ownerOf, selfConvoId, worktreeOf, acquireHelperLock, stopMarkerPath, procStat, memTotal, LOCK_DIR, TWO_SLOT_MIN_RAM } from './machine-lock.mjs';
+import { acquireLock, describeHolder, readHolders, readQueue, slotsFor, hasFreeSlot, gateText, DEFAULT_LOCK_DIR, ownerOf, selfConvoId, worktreeOf, acquireHelperLock, stopMarkerPath, procStat, memTotal, LOCK_DIR, TWO_SLOT_MIN_RAM } from './machine-lock.mjs';
 import { readPolicy, blockOf } from './build-policy.mjs';
 import { syncQuietCpu, QUIET_SLICE } from './quiet-hours.mjs';
 import { isMainModule } from './is-direct-run.mjs';
@@ -502,7 +502,7 @@ export function earlyPolicyCheck({ dir, owner, now = Date.now(), holders = null,
   const waiting = (queue || readQueue('build', { dir })).filter((t) => t.status !== 'dead').length;
   if (waiting < policy.max) return null;
   const hs = holders || readHolders('build', { dir });
-  const free = hs.length < effectiveSlots({ dir, N: slots ?? slotsFor('build', { dir }), holders: hs, now, gate }); // RFC 32: a closed CPU gate = no free slot
+  const free = hasFreeSlot({ dir, N: slots ?? slotsFor('build', { dir }), holders: hs, now, gate }); // RFC 32: a closed CPU gate = no free slot
   if (!policy.paused && waiting === 0 && free) return null; // the "build now" exception
   return { refused: 'full', max: policy.max, retryMin: policy.retryMin };
 }
@@ -708,6 +708,7 @@ export async function main(argv, {
     const oomBefore = scope ? scopeOps.oomKills() : null;
     if (owned) { for (const s of SIGS) process.off(s, preSig); phase = 'run'; } // runForwarded forwards from here
     const onSpawn = (child) => { pgid = child.pid; lock.update?.({ running: true, runningSince: Date.now(), pgid, pgidStart: procStat(pgid)?.start ?? null }); };
+    trySync(); // the RAM wait / gradlew --stop above can cross the start of the night: check again right before the scope is spawned
     if (scope && !isNested) { quietTimer = setInterval(trySync, scopeOps.syncEveryMs); quietTimer.unref?.(); } // the night starts / ends while we run
     const code = await run(a.cmd, { env: childEnv, ...(scope ? { scope } : {}), ...(owned ? { onSpawn } : {}) });
     clearInterval(quietTimer);

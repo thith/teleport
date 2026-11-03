@@ -7,7 +7,7 @@ import os from 'node:os';
 import path from 'node:path';
 import {
   quietState, parseQuietConfig, parseTimespanUs, quotaUs, syncQuietCpu, readOverride, writeOverride, clearOverride, cpuLimitSupported,
-  QUIET_SLICE, OVERRIDE_FILE, APPLIED_FILE,
+  QUIET_SLICE, OVERRIDE_FILE, APPLIED_FILE, readOverrideStrict, buildRuleText,
 } from './quiet-hours.mjs';
 import { quietCmd, parseArgs } from './lock-queue.mjs';
 
@@ -197,7 +197,7 @@ test('lock-queue quiet: parse; status; off → override file + sync; on → remo
   const now = at(23, 45);
   const stateOf = (cfg) => (d, n) => quietState({ config: cfg, now: n, override: readOverride(d) });
   const run = (v, cfg = CFG, n = now) => quietCmd(v, { dir, now: n, sync: () => { syncs++; }, stateOf: stateOf(cfg) });
-  assert.match(run(null).lines[0], /23:30–06:00: build ≤ 25% CPU, 1 build một lúc — đang áp tới 06:00/);
+  assert.match(run(null).lines[0], /23:30–06:00: build ≤ 25% CPU, chỉ nhận build mới khi không còn build nào — đang áp tới 06:00/);
   const off = run('off');
   assert.equal(off.code, 0);
   assert.match(off.lines[0], /TẮT TẠM tới 06:00/);
@@ -217,4 +217,45 @@ test('lock-queue quiet: parse; status; off → override file + sync; on → remo
   assert.equal(run('off', null).code, 1);
   assert.equal(run(null, null).code, 0);
   assert.match(run(null, { from: 'x' }).lines[0], /cấu hình hỏng/);
+});
+
+test('R1 marker: written BEFORE a finite quota; repaired when the quota already matches; a stale one is removed when the slice reads infinity', () => {
+  const dir = tmpDir();
+  const night = quietState({ config: CFG, now: at(23, 45) });
+  const marker = path.join(dir, APPLIED_FILE);
+  // marker first: at the moment set-property runs, it already exists
+  let markerAtSet = null;
+  const sc = fakeSystemctl();
+  const run = (bin, args) => { if (args.includes('set-property')) markerAtSet = fs.existsSync(marker); return sc.run(bin, args); };
+  sync({ dir, state: night, run });
+  assert.equal(markerAtSet, true);
+  // a crash / failed write lost the marker but the quota stays: the next sync repairs it
+  fs.unlinkSync(marker);
+  assert.equal(sync({ dir, state: night, run: sc.run }).changed, false);
+  assert.ok(fs.existsSync(marker), 'reconciled on the already-matching path');
+  // reboot: slice is unlimited again, config turned off, the marker lingers → one look removes it, then no more systemctl at all
+  const rebooted = fakeSystemctl('infinity');
+  const offState = quietState({ config: undefined, now: at(12, 0) });
+  assert.equal(sync({ dir, state: offState, run: rebooted.run }).changed, false);
+  assert.equal(fs.existsSync(marker), false, 'stale marker gone');
+  rebooted.calls.length = 0;
+  assert.equal(sync({ dir, state: offState, run: rebooted.run }).skipped, true);
+  assert.equal(rebooted.calls.length, 0);
+});
+
+test('R6 one wording for the build rule (health and lock-queue quiet)', () => {
+  assert.equal(buildRuleText(1), 'chỉ nhận build mới khi không còn build nào');
+  assert.equal(buildRuleText(2), 'tối đa 2 build');
+  const r = quietCmd(null, { dir: tmpDir(), now: at(23, 45), stateOf: () => quietState({ config: { ...CFG, maxBuilds: 2 }, now: at(23, 45) }) });
+  assert.match(r.lines[0], /CPU, tối đa 2 build —/);
+});
+
+test('R3 readOverrideStrict: absent = none; unreadable or corrupt throws', () => {
+  const dir = tmpDir();
+  assert.equal(readOverrideStrict(dir), null);
+  fs.writeFileSync(path.join(dir, OVERRIDE_FILE), '{nope');
+  assert.throws(() => readOverrideStrict(dir));
+  fs.unlinkSync(path.join(dir, OVERRIDE_FILE));
+  fs.mkdirSync(path.join(dir, OVERRIDE_FILE)); // EISDIR: a read error that is not ENOENT
+  assert.throws(() => readOverrideStrict(dir), /EISDIR/);
 });

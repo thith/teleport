@@ -716,3 +716,11 @@ test('RFC32 /q quiet button: an old board (another night\'s `until`, or a change
   assert.match(ctx2.answers.at(-1), /Chỉ owner/);
   assert.equal(readOverride(dir), null);
 });
+
+test('R5 /q: no CPU-gate note while the queue is paused', () => {
+  const dir = tmpDir(); holder(dir, 0);
+  setPolicy(dir, { paused: true });
+  const r = renderQ(gatherQ({ dir, slotsOf: () => 2, gate: () => ({ ok: false, reason: 'cpu', load1: 11.2, cores: 12 }) }), { tok: 'a'.repeat(12), rev: 0 });
+  assert.match(r.text, /TẠM DỪNG/);
+  assert.doesNotMatch(r.text, /chờ CPU/);
+});

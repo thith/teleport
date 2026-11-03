@@ -27,7 +27,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { LOCK_DIR, readQueue, readHolder, readHolders, queueOrder, readServed, hasLegacyWaiter, cancelTickets, selfConvoId, describeHolder, readStruck, readClaimed, worktreeOf, slotsFor, slotFiles, memTotal, TWO_SLOT_MIN_RAM, recordOwner, cpuGateNote } from './machine-lock.mjs';
-import { quietNow, writeOverride, clearOverride, syncQuietCpu, hhmm as clock } from './quiet-hours.mjs';
+import { quietNow, writeOverride, clearOverride, syncQuietCpu, buildRuleText, hhmm as clock } from './quiet-hours.mjs';
 import { readPolicy, parseDuration, MAX_QUEUE_LIMIT } from './build-policy.mjs';
 import { setMax, setRetry, setPaused, kickTicket, topTicket, blockOwner, unblockOwner, blockPlan, plainOwnerPlan } from './queue-control.mjs';
 import { isMainModule } from './is-direct-run.mjs';
@@ -225,7 +225,7 @@ export function quietCmd(value, { dir = LOCK_DIR, now = Date.now(), by = 'cli', 
   if (st.error) return { code: 1, lines: [`⚠️ giờ im lặng: cấu hình hỏng (${st.error}) — đang tắt.`] };
   if (!st.enabled) return { code: value ? 1 : 0, lines: ['🌙 giờ im lặng: chưa cấu hình (projects.json _config.buildQuietHours).'] };
   const describe = (s) => (!s.active ? `chưa tới giờ (${s.from}–${s.to}, bắt đầu ${clock(s.until)})` : s.overridden ? `TẮT TẠM tới ${clock(s.until)}` : `đang áp tới ${clock(s.until)}`);
-  if (value == null) return { code: 0, lines: [`🌙 giờ im lặng ${st.from}–${st.to}: build ≤ ${st.cpuPercent}% CPU, ${st.maxBuilds} build một lúc — ${describe(st)}`] };
+  if (value == null) return { code: 0, lines: [`🌙 giờ im lặng ${st.from}–${st.to}: build ≤ ${st.cpuPercent}% CPU, ${buildRuleText(st.maxBuilds)} — ${describe(st)}`] };
   if (value === 'off') {
     if (!st.active) return { code: 1, lines: [`ℹ️ giờ im lặng: ${describe(st)} — không có gì để tắt.`] };
     write(dir, { offUntil: st.until, by, at: now });

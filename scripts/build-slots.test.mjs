@@ -7,7 +7,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { acquireLock, lockPaths, readHolders, readQueue, readClaimed, resolveBuildSlots, slotsFor, MAX_SLOTS, TWO_SLOT_MIN_RAM, acquireHelperLock, secondSlotOk, secondSlotVerdict, gateText, defaultCpuGate, realCpuGate, effectiveSlots, cpuGateNote, DEFAULT_LOCK_DIR } from './machine-lock.mjs';
+import { acquireLock, lockPaths, readHolders, readQueue, readClaimed, resolveBuildSlots, slotsFor, MAX_SLOTS, TWO_SLOT_MIN_RAM, acquireHelperLock, secondSlotOk, secondSlotVerdict, gateText, defaultCpuGate, realCpuGate, effectiveSlots, hasFreeSlot, cpuGateNote, DEFAULT_LOCK_DIR } from './machine-lock.mjs';
 import { setPaused } from './queue-control.mjs';
 import { longBuildCandidates } from './long-build.mjs';
 import { blockingHolders, slotEnv, slotBlockers, holderBefore, isUnbounded, waitForSlotTurn, heldByAncestor, describeBusy, main as heavyMain, earlyPolicyCheck, SCOPE_MEM_FRACTION, SCOPE_MEM_FRACTION_SHARED } from './heavy.mjs';
@@ -743,7 +743,7 @@ test('RFC32 heavy: syncs the quiet CPU limit before the scope exists and every s
   await heavyMain(['--', 'cargo', 'b'], { env: {}, nested: () => false, log: () => {}, waitRam: async () => {}, acquire: async () => lock,
     run: async () => { order.push('run'); await sleep(120); return 0; },
     scopeOps: { ...OPS, preflight: () => { order.push('preflight'); return { ok: true }; }, syncQuiet: () => order.push('sync'), syncEveryMs: 20 } });
-  assert.deepEqual(order.slice(0, 3), ['sync', 'preflight', 'run'], 'first sync is before the scope is created');
+  assert.deepEqual(order.slice(0, 4), ['sync', 'preflight', 'sync', 'run'], 'a sync before the scope check and another right before spawn');
   assert.ok(order.filter((x) => x === 'sync').length >= 3, `timer syncs while it runs: ${order.join(',')}`);
   assert.equal(updates[0].scoped, true);
   const order2 = [], up2 = [];
@@ -754,4 +754,34 @@ test('RFC32 heavy: syncs the quiet CPU limit before the scope exists and every s
   const code = await heavyMain(['--', 'cargo', 'b'], { env: {}, nested: () => false, log: () => {}, waitRam: async () => {}, acquire: async () => lock, run: async () => 0,
     scopeOps: { ...OPS, syncQuiet: () => { throw new Error('boom'); } } });
   assert.equal(code, 0, 'a sync that throws never fails the build');
+});
+
+test('R4 busy counts claimed (.acq) tickets and an exclusive holder; no misleading note when there is no free slot', () => {
+  const dir = tmpDir();
+  const h = { pid: 1, startedAt: 0, label: 'A', running: true, runningSince: 0 };
+  const claim = [{ ticket: 'x.json' }];
+  assert.equal(effectiveSlots({ dir, N: 2, holders: [], claimed: claim, gate: () => CLOSED() }), 1, 'one claim, no holder file yet → max(1, busy)');
+  assert.equal(effectiveSlots({ dir, N: 2, holders: [h], claimed: claim, gate: () => CLOSED() }), 2, 'holder + claim = both slots busy');
+  assert.equal(hasFreeSlot({ dir, N: 2, holders: [h], claimed: claim, gate: () => OPEN }), false);
+  assert.equal(hasFreeSlot({ dir, N: 2, holders: [h], claimed: [], gate: () => OPEN }), true);
+  assert.equal(hasFreeSlot({ dir, N: 2, holders: [h], claimed: [], gate: () => CLOSED() }), false);
+  const ex = { ...h, exclusive: true };
+  assert.equal(hasFreeSlot({ dir, N: 2, holders: [ex], claimed: [], gate: () => OPEN }), false, 'cleanup holds every slot');
+  assert.equal(cpuGateNote({ dir, N: 2, holders: [ex], claimed: [], gate: () => CLOSED('young') }), '');
+  assert.equal(cpuGateNote({ dir, N: 2, holders: [h], claimed: claim, gate: () => CLOSED('young') }), '', 'claim + holder: full');
+  // earlyPolicyCheck uses it: max 0, one holder + one claim, open gate → no "build now" exception
+  fs.writeFileSync(path.join(dir, 'build.policy.json'), JSON.stringify({ v: 1, max: 0, lastMax: 4, retryMin: 10, paused: false, blocks: [], boosts: {} }));
+  assert.equal(earlyPolicyCheck({ dir, owner: 'convo:9', holders: [h, ], queue: [], slots: 2, gate: () => OPEN }), null);
+  assert.equal(earlyPolicyCheck({ dir, owner: 'convo:9', holders: [ex], queue: [], slots: 2, gate: () => OPEN })?.refused, 'full');
+});
+
+test('R2 heavy syncs once more right before the scope is spawned (after the RAM wait / gradlew --stop)', async () => {
+  const order = [];
+  const lock = { release() {}, update: () => true, waitedMs: 0, slot: 0, slots: 1, startedAt: 7 };
+  await heavyMain(['--', './gradlew', 'b'], { env: {}, nested: () => false, log: () => {}, waitRam: async () => { order.push('ram'); }, acquire: async () => lock,
+    stopGradle: async () => { order.push('stop'); return 0; }, run: async (c) => { order.push('run'); return 0; },
+    scopeOps: { ...OPS, preflight: () => ({ ok: true }), syncQuiet: () => order.push('sync'), syncEveryMs: 1e9 } });
+  const iStop = order.indexOf('stop'), iRun = order.indexOf('run');
+  assert.ok(order.slice(iStop, iRun).includes('sync'), order.join(','));
+  assert.equal(order[iRun - 1], 'sync');
 });

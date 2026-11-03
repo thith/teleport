@@ -7,8 +7,8 @@
 import { pruneSkipLines } from './lock-queue.mjs';
 import { LOCK_DIR, readHolders, readQueue, slotsFor, cpuGateNote } from './machine-lock.mjs';
 import { readPolicy } from './build-policy.mjs';
-import { quietState, readOverride, cpuLimitSupported } from './quiet-hours.mjs';
-import { autoMergeAllowlist, readAutoMergeState } from './merge-inbox.mjs';
+import { quietState, readOverrideStrict, cpuLimitSupported, buildRuleText } from './quiet-hours.mjs';
+import { autoMergeAllowlist, validRepoPattern, AUTOMERGE_STATE_FILE } from './merge-inbox.mjs';
 import { DEFAULT_PROJECTS_FILE } from './projects-config.mjs';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -169,7 +169,7 @@ export function formatInEffect({ build, quiet, policy, automerge } = {}) {
   else if (!quiet.enabled) lines.push(`• 🌙 Giờ im lặng: tắt${quiet.error ? ` (cấu hình hỏng: ${quiet.error})` : ''}`);
   else {
     const now = !quiet.active ? 'chưa tới giờ' : quiet.overridden ? `TẮT TẠM tới ${hhmm(quiet.until)}` : `đang áp tới ${hhmm(quiet.until)}`;
-    const rule = quiet.maxBuilds === 1 ? 'chỉ nhận build mới khi không còn build nào' : `tối đa ${quiet.maxBuilds} build`;
+    const rule = buildRuleText(quiet.maxBuilds);
     lines.push(`• 🌙 Giờ im lặng ${quiet.from}–${quiet.to}: build ≤ ${quiet.cpuPercent}% CPU, ${rule} (bây giờ: ${now})${quiet.active && !quiet.overridden ? ' — bấm /q để tắt tạm' : ''}`);
   }
   if (!policy) lines.push('• Hàng /q: ?');
@@ -421,6 +421,13 @@ function tryRun(bin, args) {
 
 /** Strict JSON read for /health: missing file → {} (nothing configured), any other failure throws (that line prints `?`). */
 const readJsonOrEmpty = (file) => { try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch (e) { if (e?.code === 'ENOENT') return {}; throw e; } };
+/** automerge-state.json, strictly: missing = the defaults; any other read / parse failure throws (the line prints `?`). */
+export function readAutoMergeStrict(file) {
+  let t;
+  try { t = fs.readFileSync(file, 'utf8'); } catch (e) { if (e?.code === 'ENOENT') return { enabled: false, repos: [] }; throw e; }
+  const j = JSON.parse(t);
+  return { enabled: j.enabled === true, repos: Array.isArray(j.repos) ? j.repos.filter(validRepoPattern).map((r) => r.toLowerCase()) : [] };
+}
 const tryOr = (f, fallback = null) => { try { return f(); } catch { return fallback; } };
 
 /**
@@ -428,7 +435,7 @@ const tryOr = (f, fallback = null) => { try { return f(); } catch { return fallb
  * `null` (the line prints `?`), never an exception. Returns { locks, inEffect, extraWarn }. Injectable for tests.
  * (health.mjs reads `_config.buildQuietHours`, never `_config.quietHours` — that one belongs to the heartbeat reminders.)
  */
-export function gatherLocal({ dir = LOCK_DIR, now = Date.now(), projectsFile = DEFAULT_PROJECTS_FILE, readProjects = readJsonOrEmpty, supported = cpuLimitSupported, pruneLines = () => pruneSkipLines({ dir }) } = {}) {
+export function gatherLocal({ dir = LOCK_DIR, now = Date.now(), projectsFile = DEFAULT_PROJECTS_FILE, readProjects = readJsonOrEmpty, readOverrideOf = readOverrideStrict, automergeFile = AUTOMERGE_STATE_FILE, supported = cpuLimitSupported, pruneLines = () => pruneSkipLines({ dir }) } = {}) {
   const cfg = tryOr(() => readProjects(projectsFile));
   const lockData = {};
   const buildHolders = tryOr(() => readHolders('build', { dir }));
@@ -438,12 +445,12 @@ export function gatherLocal({ dir = LOCK_DIR, now = Date.now(), projectsFile = D
       waiting: readQueue(name, { dir, now }).filter((t) => t.status !== 'dead').length,
     }));
   }
-  const quiet = cfg ? tryOr(() => quietState({ config: cfg._config?.buildQuietHours, now, override: readOverride(dir) })) : null;
+  const quiet = cfg ? tryOr(() => quietState({ config: cfg._config?.buildQuietHours, now, override: readOverrideOf(dir) })) : null;
   const inEffect = formatInEffect({
     build: tryOr(() => { const N = slotsFor('build', { dir }); return { slots: N, forced: fs.existsSync(path.join(dir, 'build.slots')), gateNote: cpuGateNote({ dir, N, now }) }; }),
     quiet,
     policy: tryOr(() => { const r = readPolicy(dir, { now }); return r.corrupt ? null : { max: r.policy.max, paused: r.policy.paused, blocks: r.policy.blocks, boosts: Object.keys(r.policy.boosts || {}).length }; }),
-    automerge: cfg ? tryOr(() => ({ enabled: readAutoMergeState().enabled, patterns: autoMergeAllowlist({ configPatterns: Array.isArray(cfg._config?.autoMergeRepos) ? cfg._config.autoMergeRepos : [], addedPatterns: readAutoMergeState().repos }).patterns.length })) : null,
+    automerge: cfg ? tryOr(() => { const st = readAutoMergeStrict(automergeFile); return { enabled: st.enabled, patterns: autoMergeAllowlist({ configPatterns: Array.isArray(cfg._config?.autoMergeRepos) ? cfg._config.autoMergeRepos : [], addedPatterns: st.repos }).patterns.length }; }) : null,
   });
   const extraWarn = [];
   if (quiet?.error) extraWarn.push(`giờ im lặng: cấu hình hỏng (${quiet.error}) — đang tắt`);

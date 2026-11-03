@@ -67,6 +67,17 @@ export function quietState({ config, now = Date.now(), override = null } = {}) {
 }
 
 /** True while the night rules apply (active and not switched off). */
+/** The build rule of the quiet hours, as text (one wording for /health and `lock-queue quiet`). */
+export const buildRuleText = (maxBuilds) => (maxBuilds === 1 ? 'chỉ nhận build mới khi không còn build nào' : `tối đa ${maxBuilds} build`);
+
+/** Like readOverride, but only a missing file means "none"; any other read / parse failure throws (callers show `?`). */
+export function readOverrideStrict(dir) {
+  let t;
+  try { t = fs.readFileSync(overridePath(dir), 'utf8'); } catch (e) { if (e?.code === 'ENOENT') return null; throw e; }
+  const j = JSON.parse(t);
+  return j && typeof j === 'object' && Number.isFinite(j.offUntil) ? j : null;
+}
+
 export const quietApplies = (q) => !!(q && q.active && !q.overridden);
 
 // ── override file ──
@@ -150,15 +161,18 @@ export function syncQuietCpu({
     if (cur.error || cur.status !== 0) { warnOnce(warn, `⚠️ giờ im lặng: không đọc được ${QUIET_SLICE} (${String(cur.error?.message || cur.stderr || `exit ${cur.status}`).trim().split('\n')[0]})`); return { ok: false, unsupported: !!cur.error, why: 'systemctl lỗi' }; }
     const have = parseTimespanUs(cur.stdout);
     if (have == null) { warnOnce(warn, `⚠️ giờ im lặng: không hiểu CPUQuotaPerSecUSec=${String(cur.stdout).trim()}`); return { ok: false, why: 'không hiểu giá trị' }; }
-    if (have === want || (Number.isFinite(have) && Number.isFinite(want) && Math.abs(have - want) <= 1000)) return { ok: true, changed: false };
+    const setMarker = () => { try { fs.mkdirSync(dir, { recursive: true, mode: 0o700 }); fs.writeFileSync(applied, `${Date.now()}\n`, { mode: 0o600 }); return true; } catch { return false; } };
+    if (have === want || (Number.isFinite(have) && Number.isFinite(want) && Math.abs(have - want) <= 1000)) {
+      // already right: reconcile the marker (a crash / failed write may have lost it; a reboot may have left a stale one)
+      if (want === Infinity) { try { fs.unlinkSync(applied); } catch {} } else if (!exists(applied)) setMarker();
+      return { ok: true, changed: false };
+    }
+    if (want !== Infinity && !setMarker()) warnOnce(warn, '⚠️ giờ im lặng: không ghi được quiet.applied (tắt cấu hình sau này có thể không gỡ được giới hạn)'); // marker BEFORE the quota
     const prop = want === Infinity ? 'CPUQuota=' : `CPUQuota=${Math.round(st.cpuPercent * cores * 100) / 100}%`;
     const r = run('systemctl', ['--user', 'set-property', '--runtime', QUIET_SLICE, prop]);
     if (r.error || r.status !== 0) { warnOnce(warn, `⚠️ giờ im lặng: set-property ${prop} lỗi (${String(r.error?.message || r.stderr || `exit ${r.status}`).trim().split('\n')[0]})`); return { ok: false, why: 'set-property lỗi' }; }
     lastWarn = null;
-    try {
-      if (want === Infinity) fs.unlinkSync(applied);
-      else { fs.mkdirSync(dir, { recursive: true, mode: 0o700 }); fs.writeFileSync(applied, `${Date.now()}\n`, { mode: 0o600 }); }
-    } catch {}
+    if (want === Infinity) { try { fs.unlinkSync(applied); } catch {} }
     return { ok: true, changed: true, quota: want };
   } catch (e) {
     warnOnce(warn, `⚠️ giờ im lặng: ${e?.message ?? e}`);

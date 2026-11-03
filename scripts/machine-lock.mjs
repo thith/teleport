@@ -167,16 +167,23 @@ export const gateApplies = (name, N, dir) => name === 'build' && N > 1 && !fs.ex
  * Used by long-build (a build stuck all night must still get its ⏹) and heavy's early check.
  */
 export function gateState({ dir = LOCK_DIR, N = slotsFor('build', { dir }), holders = readHolders('build', { dir }), claimed = null, now = Date.now(), gate = defaultCpuGate(dir) } = {}) {
-  if (!gateApplies('build', N, dir)) return { applies: false, verdict: openGate(), busy: holders.length };
   const named = new Set(holders.map((h) => h.ticket).filter(Boolean));
   const unnamed = (claimed || readClaimed('build', { dir })).filter((c) => !named.has(c.ticket)).length;
-  const busy = holders.length + unnamed;
+  // an exclusive holder (cleanup) holds every slot; a claimed ticket with no holder file yet is running too
+  const busy = (holders.some((h) => h.exclusive) ? Math.max(N, holders.length) : holders.length) + unnamed;
+  if (!gateApplies('build', N, dir)) return { applies: false, verdict: openGate(), busy };
   return { applies: true, busy, verdict: gate({ busy, holders, unnamed, now, dir }) };
 }
 export function effectiveSlots(opts = {}) {
   const dir = opts.dir ?? LOCK_DIR, N = opts.N ?? slotsFor('build', { dir }), holders = opts.holders ?? readHolders('build', { dir });
   const g = gateState({ ...opts, dir, N, holders });
-  return g.applies && !g.verdict.ok ? Math.max(1, holders.length) : N;
+  return g.applies && !g.verdict.ok ? Math.max(1, g.busy) : N;
+}
+/** Is a slot free right now (busy counts claimed tickets and an exclusive holder; a closed gate = none)? */
+export function hasFreeSlot(opts = {}) {
+  const dir = opts.dir ?? LOCK_DIR, N = opts.N ?? slotsFor('build', { dir }), holders = opts.holders ?? readHolders('build', { dir });
+  const g = gateState({ ...opts, dir, N, holders });
+  return g.busy < (g.applies && !g.verdict.ok ? Math.max(1, g.busy) : N);
 }
 /** Header note for ls / /q: '' unless N = 2, a build is running, a slot is free and the gate is closed. */
 export function cpuGateNote(opts = {}) {

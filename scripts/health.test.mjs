@@ -381,3 +381,21 @@ test('oomdSummary: a single-digit day (journalctl pads it with a space) still gi
   const { oomdSummary } = await import('./health.mjs');
   assert.equal(oomdSummary('Oct  3 09:38:17 h systemd[1]: run-x.scope: systemd-oomd killed 4 process(es) in this unit.').at, '09:38');
 });
+
+test('R3 gatherLocal: a read error on the override / automerge state prints ? (absent = normal default)', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tp-health-'));
+  const cfg = { _config: { buildQuietHours: { from: '23:30', to: '06:00' } } };
+  const base = { dir, readProjects: () => cfg, supported: () => true, pruneLines: () => [], automergeFile: path.join(dir, 'am.json') };
+  const ok = gatherLocal(base).inEffect.join('\n');
+  assert.match(ok, /Giờ im lặng 23:30/);
+  assert.match(ok, /Automerge: tắt\b/, 'absent file = off, not ?');
+  fs.mkdirSync(path.join(dir, 'quiet.override.json')); // EISDIR
+  const bad = gatherLocal(base).inEffect.join('\n');
+  assert.match(bad, /Giờ im lặng: \?/);
+  assert.match(bad, /Automerge: tắt\b/);
+  fs.rmdirSync(path.join(dir, 'quiet.override.json'));
+  fs.writeFileSync(path.join(dir, 'am.json'), '{broken');
+  assert.match(gatherLocal(base).inEffect.join('\n'), /Automerge: \?/);
+  fs.writeFileSync(path.join(dir, 'am.json'), JSON.stringify({ enabled: true, repos: ['a/b'] }));
+  assert.match(gatherLocal(base).inEffect.join('\n'), /Automerge: bật \(1 mẫu repo\)/);
+});

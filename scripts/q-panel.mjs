@@ -35,7 +35,7 @@ export function gatherQ({ dir = LOCK_DIR, now = Date.now(), read = readQueue, ho
   const order = queueOrder(tickets, { fair, running, served: fair ? servedOf('build', { dir, now }) : {}, boosts: pr.policy.boosts });
   const N = slotsOf('build', { dir });
   return {
-    gateNote: cpuGateNote({ dir, N, holders, claimed: claimedOf('build', { dir }), now, gate }), // RFC 32: why a free slot is not handed out
+    gateNote: pr.policy.paused ? '' : cpuGateNote({ dir, N, holders, claimed: claimedOf('build', { dir }), now, gate }), // RFC 32: why a free slot is not handed out
     quiet: (({ active, overridden, until }) => ({ active: !!active, overridden: !!overridden, until: until ?? null }))(quietOf(dir, now)),
     now, policy: pr.policy, corrupt: pr.corrupt, error: pr.error ?? null, holders, tickets: order, N,
     preBoost: hasPreBoostWaiter(tickets), oldCode: tickets.filter((t) => t.status === 'live' && !(t.v >= TICKET_V)).length,
