@@ -7,7 +7,7 @@ import {
   parseDaemonCommand, resolveSpawnCwd, dispatchCommand, handleControlMessages,
   validateDaemonConfig, resolveSenderRole, acquireSingleton, releaseSingleton, daemonStatus,
   reloadDaemonState, readJsonStrict,
-  prLinksOnly, takeMergeButton, handlePrLinks, handleMergeButton, startupGreeting, gitShortHead,
+  prLinksOnly, takeMergeButton, handlePrLinks, handleMergeButton, startupGreeting, gitShortHead, takeRestartNotify, buildRestartNotifyPrompt, notifyAfterRestart,
   processMergeRequests, formatAutoMergeStatus, buildAllowlist, expectHeadArgs, MERGE_BUTTON_TTL_MS, clipPrBlock, notifyPrOwners, readMergeResults,
 } from './daemon.mjs';
 
@@ -1058,4 +1058,62 @@ test('RFC 31: very long owner/repo URLs → several prompts, each ≤ 3000, ever
   const all = sent.map((s) => s.text).join('\n\n');
   assert.equal((all.match(/^(✅ merged|❌) PR/gm) || []).length, 20);
   assert.deepEqual(sent.map((s) => s.merged), [true, ...Array(sent.length - 1).fill(false)]);
+});
+
+// ── RFC 33: restart notify ──────────────────────────────────────────────────
+const NOW = 1_000_000_000;
+const takeFrom = (body, extra = {}) => {
+  const files = new Map([['/n', typeof body === 'string' ? body : JSON.stringify(body)]]);
+  const r = takeRestartNotify({ file: '/n', now: NOW, readFile: (f) => { if (!files.has(f)) throw new Error('nf'); return files.get(f); }, unlink: (f) => { if (extra.unlinkErr) throw Object.assign(new Error('perm'), { code: extra.unlinkErr }); files.delete(f); } });
+  return { r, files };
+};
+
+test('takeRestartNotify: reads then deletes; stale / garbage / bad fields are skipped (and deleted); dirty fromCommit dropped', () => {
+  let t = takeFrom({ id: 'x', convoId: 111, at: NOW - 1000, fromCommit: 'abc1234' });
+  assert.deepEqual(t.r, { status: 'ok', convoId: 111, fromCommit: 'abc1234' });
+  assert.equal(t.files.size, 0);
+  t = takeFrom({ convoId: 111, at: NOW - 16 * 60_000 });
+  assert.equal(t.r.status, 'stale'); assert.equal(t.files.size, 0);
+  assert.equal(takeFrom('{nope').r.status, 'invalid');
+  assert.equal(takeFrom({ convoId: 111, at: 'now' }).r.status, 'invalid');
+  assert.equal(takeFrom({ convoId: 111, at: NOW + 5000 }).r.status, 'invalid');
+  assert.equal(takeFrom({ convoId: '../x', at: NOW }).r.status, 'invalid');
+  assert.equal(takeFrom({ convoId: -3, at: NOW }).r.status, 'invalid');
+  assert.deepEqual(takeFrom({ convoId: 111, at: NOW, fromCommit: 'abc; rm -rf /' }).r, { status: 'ok', convoId: 111, fromCommit: null });
+  assert.equal(takeRestartNotify({ file: '/none', readFile: () => { throw new Error('x'); } }).status, 'none');
+});
+
+test('takeRestartNotify: delete fails (not ENOENT) → NOT returned for delivery', () => {
+  const t = takeFrom({ convoId: 111, at: NOW }, { unlinkErr: 'EACCES' });
+  assert.equal(t.r.status, 'delete-failed');
+});
+
+test('buildRestartNotifyPrompt: fixed text with commits, daemon sender, convo set', () => {
+  const p = buildRestartNotifyPrompt({ convoId: 111, chatId: -5, commit: 'new1234', fromCommit: 'old5678' });
+  assert.match(p.text, /đang chờ restart/);
+  assert.match(p.text, /`new1234`.*\(trước: `old5678`\)/);
+  assert.equal(p.fromRole, 'daemon'); assert.equal(p.convoId, 111);
+  assert.doesNotMatch(buildRestartNotifyPrompt({ convoId: 1, commit: 'a' }).text, /trước/);
+});
+
+test('notifyAfterRestart: delivers via deliverResult (prompt-convo-<id>.json) and reports; failures never throw', async () => {
+  const take = () => ({ status: 'ok', convoId: 111, fromCommit: 'old5678' });
+  const persona = () => ({ emoji: '🪼', name: 'Sứa' });
+  const seen = [];
+  const ok = await notifyAfterRestart('new1234', { take, persona, deliver: async (res, opts) => { seen.push([res, opts.build]); } });
+  assert.match(ok, /^→ đã xếp tin cho 🪼 Sứa \(#/);
+  assert.equal(seen[0][0].convoId, 111); assert.equal(seen[0][1], buildRestartNotifyPrompt);
+  assert.match(await notifyAfterRestart('x', { take, persona, deliver: async () => { throw new Error('disk'); } }), /^→ không báo được .*: disk/);
+  assert.match(await notifyAfterRestart('x', { take: () => ({ status: 'delete-failed', error: 'perm' }), deliver: async () => { throw new Error('must not'); } }), /không xoá được file notify: perm/);
+  assert.equal(await notifyAfterRestart('x', { take: () => ({ status: 'stale' }) }), null);
+  assert.match(await notifyAfterRestart('x', { take: () => { throw new Error('weird'); } }), /không báo được/);
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rn-'));
+  const { deliverResult } = await import('./merge-inbox.mjs');
+  await deliverResult({ convoId: 111, commit: 'new1234', fromCommit: null }, { store: {}, tmpDir: dir, build: buildRestartNotifyPrompt, write: async (p, f) => fs.writeFileSync(f, JSON.stringify(p)) });
+  assert.match(JSON.parse(fs.readFileSync(path.join(dir, 'prompt-convo-111.json'), 'utf8')).text, /new1234/);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('startupGreeting: appends the notified line', () => {
+  assert.match(startupGreeting({ pid: 1, commit: 'a', commands: 2, notified: '→ đã xếp tin cho X' }), /\n→ đã xếp tin cho X$/);
 });

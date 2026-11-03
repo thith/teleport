@@ -57,6 +57,8 @@ import {
 } from './tele-listen.mjs';
 export { prLinksOnly, PR_LINK_RE };
 import { HASHTAG_RE } from './agent-target.mjs';
+import { RESTARTD_NOTIFY_FILE } from './restartd.mjs';
+import { isWatchableConvoId } from './handover.mjs';
 import { loadCommands, resolveCommand, roleMeets, tokenizeArgs, splitAtBlocks, COMMANDS_FILE } from './commands.mjs';
 import { canonicalPrUrl } from './merge.mjs';
 // Workspace paths live in workspace.mjs (merge.mjs needs them too — importing
@@ -321,7 +323,10 @@ async function main() {
 
   // Say hello to the owner on every start, so a /restartd (or a crash-restart by
   // systemd) is visible from Telegram, with the code version it came up on.
-  sendText(daemonUserId, startupGreeting({ pid: process.pid, commit: gitShortHead(), commands: Object.keys(registry).length }));
+  const commit = gitShortHead();
+  // RFC 33: an agent named in `/restartd <target>` is told BEFORE the greeting, which reports how it went.
+  const notified = await notifyAfterRestart(commit);
+  sendText(daemonUserId, startupGreeting({ pid: process.pid, commit, commands: Object.keys(registry).length, notified }));
 
   // Bot API calls for the PR-link merge buttons (sendMessage with an inline
   // keyboard, answer/edit on press). Failures are logged, never fatal.
@@ -526,8 +531,58 @@ export function gitShortHead(exec = execFileSyncD) {
 }
 
 /** The owner's "daemon is up" message. Pure. */
-export function startupGreeting({ pid, commit, commands }) {
-  return `🟢 Teleport daemon đã chạy · pid ${pid}${commit ? ` · code ${commit}` : ''} · ${commands} lệnh. Gõ /help để xem lệnh.`;
+export function startupGreeting({ pid, commit, commands, notified = null }) {
+  return `🟢 Teleport daemon đã chạy · pid ${pid}${commit ? ` · code ${commit}` : ''} · ${commands} lệnh. Gõ /help để xem lệnh.${notified ? `\n${notified}` : ''}`;
+}
+
+// ── /restartd <target>: tell the agent the daemon is back (RFC 33) ──────────────
+
+export const RESTART_NOTIFY_MAX_AGE_MS = 15 * 60 * 1000;
+
+/**
+ * Read + delete the one-shot notify file. The request is returned ONLY when the delete succeeded
+ * (otherwise a crash-restart could deliver it twice). Every field is validated; nothing here is
+ * owner text. → { status: 'none'|'stale'|'invalid'|'delete-failed', error? } | { status: 'ok', convoId, fromCommit }. Pure-ish (fs/clock injected).
+ */
+export function takeRestartNotify({ file = RESTARTD_NOTIFY_FILE, now = Date.now(), readFile = (f) => fs.readFileSync(f, 'utf8'), unlink = (f) => fs.unlinkSync(f) } = {}) {
+  let raw;
+  try { raw = readFile(file); } catch { return { status: 'none' }; }
+  try { unlink(file); } catch (e) {
+    if (e?.code !== 'ENOENT') return { status: 'delete-failed', error: e?.message ?? String(e) };
+  }
+  let j;
+  try { j = JSON.parse(raw); } catch { return { status: 'invalid' }; }
+  if (!j || typeof j !== 'object' || !isWatchableConvoId(j.convoId)) return { status: 'invalid' };
+  if (typeof j.at !== 'number' || !Number.isFinite(j.at) || j.at > now) return { status: 'invalid' };
+  if (now - j.at > RESTART_NOTIFY_MAX_AGE_MS) return { status: 'stale' };
+  const fromCommit = typeof j.fromCommit === 'string' && /^[0-9a-f]{4,40}$/i.test(j.fromCommit) ? j.fromCommit : null;
+  return { status: 'ok', convoId: Number(j.convoId), fromCommit };
+}
+
+/** The fixed prompt for the agent named in /restartd. No owner text goes in. Pure. */
+export function buildRestartNotifyPrompt({ convoId, chatId, commit, fromCommit }) {
+  return {
+    text: `🤖 Teleport daemon: daemon vừa khởi động lại sau lệnh /restartd của owner, giờ chạy commit \`${commit || '?'}\`${fromCommit ? ` (trước: \`${fromCommit}\`)` : ''}. Nếu bạn đang chờ restart để kiểm tra gì thì làm tiếp; kể NGẮN cho user trong topic.`,
+    messageId: null, chatId: chatId == null ? null : String(chatId),
+    fromUserId: null, fromName: 'teleport daemon', fromRole: 'daemon', fromMember: null,
+    replyToMessageId: null, replyToText: null, quotedText: null,
+    timestamp: Math.floor(Date.now() / 1000), attachments: [], convoId: Number(convoId),
+  };
+}
+
+/** Take + deliver the restart notice. → the greeting's `notified` line, or null. Never throws. */
+export async function notifyAfterRestart(commit, { take = takeRestartNotify, deliver = deliverResult, persona = peekPersona } = {}) {
+  try {
+    const r = take();
+    if (r.status === 'delete-failed') return `→ không báo được agent (không xoá được file notify: ${r.error})`;
+    if (r.status !== 'ok') return null;
+    const p = persona(r.convoId);
+    const label = `${p ? `${formatPersona(p)} ` : ''}(#${shortConvoHash(r.convoId)})`;
+    try {
+      await deliver({ convoId: r.convoId, commit, fromCommit: r.fromCommit }, { build: buildRestartNotifyPrompt });
+      return `→ đã xếp tin cho ${label}`;
+    } catch (e) { return `→ không báo được ${label}: ${e?.message ?? e}`; }
+  } catch (e) { return `→ không báo được agent: ${e?.message ?? e}`; }
 }
 
 // ── Paste a PR link → preview + [✅ Merge] [✖ Cancel] ─────────────────────────

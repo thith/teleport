@@ -7,7 +7,7 @@
 import path from 'node:path';
 import { readTopicsStore } from './topics-store.mjs';
 import { listSteerableTargets, normalizeTarget, matchTarget } from './handover.mjs';
-import { normalizeAgentName } from './agent-target.mjs';
+import { normalizeAgentName, unquoteTarget } from './agent-target.mjs';
 import { DEFAULT_TMP_DIR, mergeOrSpoolPrompt } from './tele-listen.mjs';
 
 // RFC 03 §5.1 — default durable write: coalesce/spool into the target's OPEN prompt
@@ -18,7 +18,7 @@ export async function durableWrite(promptObj, promptFile) {
   const lock = path.join(path.dirname(promptFile), `prompt-write-${promptObj.convoId}.lock`);
   await mergeOrSpoolPrompt(promptFile, promptObj, lock);
 }
-import { shortConvoHash } from './send-telegram.mjs';
+import { shortConvoHash, parseAdminChatIds } from './send-telegram.mjs';
 import { readProjectsConfig, resolveDefaultChatId, projectEntries } from './projects-config.mjs';
 import { personaForConvo } from './persona.mjs';
 
@@ -95,10 +95,10 @@ export function buildSteerPrompt({ targetConvoId, targetChatId, fromUserId, from
 }
 
 // All group chat ids (catch-all + dedicated) to search for the live topic.
-export function groupChatIds(config) {
+export function groupChatIds(config, envFile = {}) {
   const ids = new Set();
-  const def = resolveDefaultChatId(config, { env: process.env, envFile: {} });
-  if (def) ids.add(String(def));
+  const def = resolveDefaultChatId(config, { env: process.env, envFile });
+  for (const id of parseAdminChatIds(def ? String(def) : '')) ids.add(id); // `_default.chatId` may list several groups
   for (const [, p] of projectEntries(config)) if (p && p.chatId) ids.add(String(p.chatId));
   return [...ids];
 }
@@ -131,6 +131,26 @@ export function resolveSteerTarget(argv, { live, replyText, usage }) {
     return { match: m.match, text: argv.slice(1).join(' ').trim() };
   }
   return { error: usage };
+}
+
+/**
+ * ONE target string (RFC 33: `/restartd Sứa 2` is the single target "Sứa 2") → one live topic.
+ * Same matching as /whisper and /instruct. → { match } | { error }. Pure.
+ */
+export function resolveSingleSteerTarget(raw, live) {
+  const value = unquoteTarget(raw);
+  if (!value) return { error: 'thiếu đích.' };
+  const t = normalizeTarget(value);
+  if (t.error) return { error: t.error };
+  const m = t.kind === 'name' ? matchSteerName(t.value, live) : matchTarget(t, live);
+  if (m.status === 'found') return { match: m.match };
+  if (m.status === 'ambiguous') {
+    const c = m.candidates || [];
+    const byHash = new Set(c.map((x) => x.hashtag)).size < c.length;
+    const list = [...new Set(c.map((x) => (byHash ? String(x.convoId) : `#${x.hashtag}`)))].join(', ');
+    return { error: `target ${value} is ambiguous${list ? ` (${list}) — dùng ${byHash ? 'convoId' : '#hashtag'}` : ''}.` };
+  }
+  return { error: `target ${value} not found among live topics.` };
 }
 
 // Quotes that may wrap a multi-word target (RFC 26 §3.8): ASCII and the phone's curly ones.
