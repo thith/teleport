@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {
-  claimPreexistingPrompt, promptSegments, isInfoOnlyPrompt, mergePromptData, dropPresentSegments, infoOnlyAnnounce, mergeOrSpoolPrompt,
+  claimPreexistingPrompt, promptSegments, isInfoOnlyPrompt, mergePromptData, dropPresentSegments, infoOnlyAnnounce, mergeOrSpoolPrompt, dropInfoOnlyProcessing,
 } from './tele-listen.mjs';
 import { buildCompactWarnPrompt } from './compact-warn.mjs';
 
@@ -109,4 +109,21 @@ test('mergeOrSpoolPrompt: info-only notice spooled under a real batch keeps the 
   assert.equal(got.fromUserId, '42');
   assert.equal(got.persona, 'Sứa');
   assert.equal(isInfoOnlyPrompt(got), false);
+});
+
+test('dropInfoOnlyProcessing: deletes the old info-only .processing it read, never a real claim that replaced it (Codex)', () => {
+  const d = mk();
+  const seen = { ...warn(), claimId: 'aaa' };
+  fs.writeFileSync(PROC(d), JSON.stringify(seen));
+  assert.equal(dropInfoOnlyProcessing(PROC(d), seen, LOCK(d)), true);
+  assert.equal(fs.existsSync(PROC(d)), false);
+  // Read the info-only orphan, then (concurrently) it was consumed and a REAL batch was claimed at the same path.
+  fs.writeFileSync(PROC(d), JSON.stringify({ ...real(), claimId: 'bbb' }));
+  assert.equal(dropInfoOnlyProcessing(PROC(d), seen, LOCK(d)), false);
+  assert.equal(JSON.parse(fs.readFileSync(PROC(d), 'utf8')).claimId, 'bbb');
+  // A different info-only notice (other claim) is left too; gone → false.
+  fs.writeFileSync(PROC(d), JSON.stringify({ ...warn(), claimId: 'ccc' }));
+  assert.equal(dropInfoOnlyProcessing(PROC(d), seen, LOCK(d)), false);
+  fs.unlinkSync(PROC(d));
+  assert.equal(dropInfoOnlyProcessing(PROC(d), seen, LOCK(d)), false);
 });

@@ -2439,6 +2439,23 @@ export function infoOnlyAnnounce(promptFile, claim) {
   return `[tele-listen] prompt ready: ${promptFile} (info-only — không có file .processing, không cần đọc file hay trả lời) ${announceBody('', claim?.text ?? '')}`;
 }
 
+/**
+ * RFC 34: delete an old info-only `.processing.json` only if it is STILL the one we read. Under the per-convo
+ * write lock (every claim takes it), re-read and compare: a concurrent consume + a fresh real claim at the same
+ * path must never be deleted (Codex code review). Not locked / changed / gone → leave it (the TTL net recovers).
+ */
+export function dropInfoOnlyProcessing(processingFile, seen, writeLockFile = null) {
+  const locked = writeLockFile ? acquirePollLock(writeLockFile) : true;
+  if (!locked) return false;
+  try {
+    let now = null;
+    try { now = JSON.parse(fs.readFileSync(processingFile, 'utf8')); } catch { return false; }
+    if (!isInfoOnlyPrompt(now) || (now.claimId ?? null) !== (seen?.claimId ?? null) || (now.text ?? '') !== (seen?.text ?? '')) return false;
+    fs.unlinkSync(processingFile);
+    return true;
+  } catch { return false; } finally { if (writeLockFile) releasePollLock(writeLockFile); }
+}
+
 export function claimPreexistingPrompt(promptFile, processingFile, writeLockFile = null) {
   if (!fs.existsSync(promptFile)) return false;      // nothing pending
   // An info-only notice never needs the agent's claim, so a busy agent doesn't hold it back (RFC 34).
@@ -2885,7 +2902,7 @@ async function main() {
       try { orphan = JSON.parse(fs.readFileSync(processingFile, 'utf8')); } catch { /* best-effort */ }
       if (orphan && isInfoOnlyPrompt(orphan)) { // RFC 34: an old info-only .processing — announce inline, then drop it
         console.log(infoOnlyAnnounce(promptFile, { text: orphan.text ?? '' }));
-        try { fs.unlinkSync(processingFile); } catch { /* best-effort */ }
+        dropInfoOnlyProcessing(processingFile, orphan, path.join(DEFAULT_TMP_DIR, `prompt-write-${convo}.lock`));
         process.exit(0);
       }
       console.log(`[tele-listen] prompt ready: ${promptFile} (re-surfaced on first-run — read the .processing) ${announceBody(processingFile)}${claimSuffix(stored)}`);
