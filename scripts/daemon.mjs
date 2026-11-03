@@ -845,9 +845,12 @@ export function clipPrBlock(text, max) {
   const hasUrl = lines.length > 1 && /^https?:\/\/github\.com\//i.test(lines[lines.length - 1]);
   const url = hasUrl ? lines[lines.length - 1] : null;
   const mid = lines.slice(1, hasUrl ? -1 : undefined).join('\n').trim();
-  const room = max - head.length - (url ? url.length + 1 : 0) - 2;
+  const tail = url ? `\n${url}` : '';
+  // Hard cap: the status line (it quotes the PR title) is cut too when it alone overflows; the URL is kept.
+  if (head.length + tail.length > max) return `${head.slice(0, Math.max(1, max - tail.length - 1))}…${tail}`.slice(-Math.max(max, tail.length));
+  const room = max - head.length - tail.length - 2;
   const body = room > 1 && mid ? `\n${mid.slice(0, room - 1)}…` : '';
-  return `${head}${body}${url ? `\n${url}` : ''}`;
+  return `${head}${body}${tail}`;
 }
 
 const prNum = (url) => `#${url.match(/\/pull\/(\d+)/)[1]}`;
@@ -873,7 +876,7 @@ export async function notifyPrOwners(results, {
     const lines = [];
     for (const [convoId, list] of byOwner) {
       try {
-        const each = Math.floor(MERGE_NOTIFY_MAX / list.length);
+        const each = Math.floor((MERGE_NOTIFY_MAX - 2 * (list.length - 1)) / list.length); // '\n\n' separators count too
         const text = list.map((r) => clipPrBlock(r.text, each)).join('\n\n');
         await deliver({ convoId, text, mode: 'manual', merged: list.some((r) => r.kind === 'merged') });
         const p = persona(convoId);

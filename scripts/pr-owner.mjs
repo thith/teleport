@@ -21,8 +21,11 @@ export const PR_OWNERS_LOCK_WAIT_MS = 2000;
 const PR_URL_RE = /https?:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/pull\/\d+/gi;
 
 /** Every PR URL in `text` (up to the PR number), lower-cased and de-duplicated. Pure. */
+/** Ledger key: lowercased, always https (GitHub's own pr.url is https; a typed http:// link is the same PR). Pure. */
+export const prKey = (u) => String(u).toLowerCase().replace(/^http:\/\//, 'https://');
+
 export function extractPrUrls(text) {
-  return [...new Set((String(text ?? '').match(PR_URL_RE) || []).map((u) => u.toLowerCase()))];
+  return [...new Set((String(text ?? '').match(PR_URL_RE) || []).map(prKey))];
 }
 
 const readLedger = (file) => {
@@ -41,7 +44,7 @@ export async function recordPrOwners(urls, convoId, src, {
 } = {}) {
   let release = null;
   try {
-    const list = [...new Set((urls || []).map((u) => String(u).toLowerCase()))];
+    const list = [...new Set((urls || []).map(prKey))];
     if (!list.length || !/^\d{1,20}$/.test(String(convoId ?? ''))) return 0;
     fs.mkdirSync(path.dirname(file), { recursive: true });
     release = await acquireHelperLock(PR_OWNERS_LOCK, { ...(lockDir ? { dir: lockDir } : {}), waitMs, pollMs: 50 });
@@ -64,7 +67,7 @@ export async function recordPrOwners(urls, convoId, src, {
 /** → { convoId, src } for the PR's recorded owner, only if that convo still has a topic; else null. */
 export function findPrOwner(url, { store, file = PR_OWNERS_FILE } = {}) {
   try {
-    const rec = readLedger(file)[String(url).toLowerCase()];
+    const rec = readLedger(file)[prKey(url)];
     if (!rec || !/^\d{1,20}$/.test(String(rec.convoId ?? ''))) return null;
     if (chatOfConvo(rec.convoId, store ?? readTopicsStore()) == null) return null;
     return { convoId: String(rec.convoId), src: rec.src };

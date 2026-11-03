@@ -1033,3 +1033,14 @@ test('processMergeRequests: records the request convo as owner of every link BEF
   });
   assert.equal(asked.length, 1);
 });
+
+test('RFC 31: 20 PRs with 256-char titles all keep status + URL within the 3000-char budget', async () => {
+  const { notifyPrOwners } = await import('./daemon.mjs');
+  const results = Array.from({ length: 20 }, (_, i) => ({ url: `https://github.com/o/r/pull/${i + 1}`, kind: 'merged',
+    text: `✅ merged PR o/r#${i + 1} "${'T'.repeat(256)}" into main (squash).\n🧹 deleted branch b${i}.\nhttps://github.com/o/r/pull/${i + 1}` }));
+  let sent = null;
+  await notifyPrOwners(results, { store: {}, find: () => ({ convoId: '123' }), deliver: async (r) => { sent = r; }, persona: () => null });
+  assert.ok(sent.text.length <= 3000, `len ${sent.text.length}`);
+  for (let i = 1; i <= 20; i++) assert.ok(sent.text.includes(`https://github.com/o/r/pull/${i}\n`) || sent.text.endsWith(`https://github.com/o/r/pull/${i}`), `PR ${i} URL kept`);
+  assert.equal((sent.text.match(/^✅ merged PR/gm) || []).length, 20);
+});

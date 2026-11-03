@@ -13,7 +13,7 @@ const U = 'https://github.com/o/r/pull/77';
 
 test('extractPrUrls: stops at the PR number, lower-cases, de-dups', () => {
   assert.deepEqual(extractPrUrls('see (https://github.com/O/R/pull/77). and https://github.com/o/r/pull/77/files, http://github.com/a-b/c.d/pull/5x'),
-    ['https://github.com/o/r/pull/77', 'http://github.com/a-b/c.d/pull/5']);
+    ['https://github.com/o/r/pull/77', 'https://github.com/a-b/c.d/pull/5']);
   assert.deepEqual(extractPrUrls('no links, https://github.com/o/r/issues/3'), []);
   assert.deepEqual(extractPrUrls(undefined), []);
 });
@@ -72,4 +72,10 @@ test('recordPrOwnersFromText: scans text/caption, ignores junk, never throws', a
   assert.equal(await recordPrOwnersFromText('nothing here', 42, 'topic', { file, lockDir }), 0);
   assert.equal(await recordPrOwnersFromText('x', 42, 'topic', { file: '/dev/null/x/y', lockDir }), 0);
   assert.equal(await recordPrOwnersFromText(U, 'not-a-convo', 'topic', { file, lockDir }), 0);
+});
+
+test('http:// and https:// links are the same ledger key', async () => {
+  const { prKey } = await import('./pr-owner.mjs');
+  assert.equal(prKey('http://GitHub.com/O/R/pull/7'), 'https://github.com/o/r/pull/7');
+  assert.deepEqual((await import('./pr-owner.mjs')).extractPrUrls('see http://github.com/o/r/pull/7.'), ['https://github.com/o/r/pull/7']);
 });
