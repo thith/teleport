@@ -188,7 +188,7 @@ test('formatAgentList full:false — one line per agent (icon, name #hash, state
     linksOf: (r) => (r.pid === 1 ? ['/compact_a7611284', '/kill_a7611284', '/nudge_a7611284'] : []),
   });
   assert.equal(out, [
-    '📺 tele-empty123 · không thấy claude bên trong',
+    'tele-empty123 · không thấy claude bên trong',
     '🪱 Giun · ⏳ · 150k · 🔇 · 📬2\n/kill_a7611284 /nudge_a7611284',
     '💻 term',
     '💻 PID 3',

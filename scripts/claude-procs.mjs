@@ -344,7 +344,7 @@ export function formatAgentList({ screens = [], procs = [], personaOf = () => nu
     const rows = inScreen.get(name) || [];
     if (rows.length) return rows.map(full ? block : line);
     const p = name.startsWith('tele-') ? persona(name.slice(5)) : null;
-    return [`📺 ${[name, p].filter(Boolean).join(' · ')} · không thấy claude bên trong`];
+    return [`${full ? '📺 ' : ''}${[name, p].filter(Boolean).join(' · ')} · không thấy claude bên trong`];
   });
   if (!full) return [...screenBlocks, ...terminal.map(line)].join('\n\n') || '(không có agent nào)';
   const section = (head, blocks) => [head, ...(blocks.length ? blocks : ['(không có)'])].join('\n\n');
