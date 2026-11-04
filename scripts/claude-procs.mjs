@@ -247,26 +247,47 @@ export function lsLayout({ screens = [], procs = [] } = {}) {
   return { screenItems: names.map((name) => ({ name, rows: inScreen.get(name) || [] })), terminal };
 }
 
+/** Folder name /ls shows for a row (basename, `~` for home), or null when unknown. */
+export function folderOf(r, home = os.homedir()) {
+  const p = r && r.cwd;
+  return p ? (p === home ? '~' : path.basename(p)) : null;
+}
+
+/**
+ * Stable /ls order over `{ empty, key, text }` items: by folder key (case-insensitive a→z), unknown
+ * key after known, empty-screen entries (`empty: 1`) at the very end. Returns the items. Pure.
+ */
+export function sortLsItems(items) {
+  return items
+    .map((it, i) => ({ it, i }))
+    .sort((x, y) => ((x.it.empty || 0) - (y.it.empty || 0))
+      || ((x.it.key == null) - (y.it.key == null))
+      || (x.it.key != null && y.it.key != null && x.it.key !== y.it.key ? (x.it.key < y.it.key ? -1 : 1) : 0)
+      || (x.i - y.i))
+    .map((o) => o.it);
+}
+const folderKeyOf = (r, home) => { const f = folderOf(r, home); return f ? f.toLowerCase() : null; };
+
 /**
  * The agents /ls lists, as identities `{ convoId, hashtag }` (convoId null when only the hashtag is
  * known), in the exact order formatAgentList renders them. A claude proc counts as itself (its
  * session's convo + hashtag, else its `tele-` screen label); an EMPTY `tele-` screen counts by its
  * label. Pure.
  */
-export function lsIdentities({ screens = [], procs = [] } = {}) {
-  const out = [];
+export function lsIdentities({ screens = [], procs = [], home = os.homedir() } = {}) {
+  const items = [];
   const add = (r) => {
     const c = r.sessionId ? uuidToConvoInt(r.sessionId) : null;
     const tag = rowTag(r);
-    if (c != null || tag) out.push({ convoId: c == null ? null : String(c), hashtag: tag ? String(tag).toLowerCase() : null });
+    if (c != null || tag) items.push({ empty: 0, key: folderKeyOf(r, home), id: { convoId: c == null ? null : String(c), hashtag: tag ? String(tag).toLowerCase() : null } });
   };
   const { screenItems, terminal } = lsLayout({ screens, procs });
   for (const { name, rows } of screenItems) {
     if (rows.length) rows.forEach(add);
-    else if (String(name).startsWith('tele-')) out.push({ convoId: null, hashtag: name.slice(5).toLowerCase() });
+    else if (String(name).startsWith('tele-')) items.push({ empty: 1, key: null, id: { convoId: null, hashtag: name.slice(5).toLowerCase() } });
   }
   terminal.forEach(add);
-  return out;
+  return sortLsItems(items).map((it) => it.id);
 }
 
 // Short /ls shows the state as an emoji only; full shows emoji + text (Thi 13524).
@@ -332,6 +353,7 @@ export function formatAgentList({ screens = [], procs = [], personaOf = () => nu
     const head = [
       `${r.screen ? '' : '💻 '}${[persona(tag) || r.name, tag && !hasKill(links) ? `#${tag}` : null].filter(Boolean).join(' ') || `PID ${r.pid}`}${r.guessed ? ' (đoán)' : ''}`,
       r.status ? (STATUS_EMOJI[r.status] || r.status) : null, ctx ? ctxText(ctx, r) : null, off ? '🔇' : null, mail > 0 ? `📬${mail}` : null,
+      short(r.cwd) ? `📁 ${short(r.cwd)}` : null,
     ].filter(Boolean).join(' · ');
     return links.length ? `${head}\n${links.join(' ')}` : head;
   };
@@ -340,17 +362,24 @@ export function formatAgentList({ screens = [], procs = [], personaOf = () => nu
   const screenNames = screenItems.map((x) => x.name);
   const inScreen = new Map(screenItems.map((x) => [x.name, x.rows]));
 
-  const screenBlocks = screenNames.flatMap((name) => {
-    const rows = inScreen.get(name) || [];
-    if (rows.length) return rows.map(full ? block : line);
+  const folderKey = (r) => folderKeyOf(r, home);
+  const sortItems = (items) => sortLsItems(items).map((it) => it.text);
+  const emptyScreenItem = (name) => {
     const p = name.startsWith('tele-') ? persona(name.slice(5)) : null;
-    return [`${full ? '📺 ' : ''}${[name, p].filter(Boolean).join(' · ')} · không thấy claude bên trong`];
+    return { empty: 1, key: null, text: `${full ? '📺 ' : ''}${[name, p].filter(Boolean).join(' · ')} · không thấy claude bên trong` };
+  };
+  const rowItem = (r) => ({ empty: 0, key: folderKey(r), text: (full ? block : line)(r) });
+  const screenItemsAll = screenNames.flatMap((name) => {
+    const rows = inScreen.get(name) || [];
+    return rows.length ? rows.map(rowItem) : [emptyScreenItem(name)];
   });
-  if (!full) return [...screenBlocks, ...terminal.map(line)].join('\n\n') || '(không có agent nào)';
+  const terminalItems = terminal.map((r) => ({ empty: 0, key: folderKey(r), text: (full ? block : line)(r) }));
+  if (!full) return sortItems([...screenItemsAll, ...terminalItems]).join('\n\n') || '(không có agent nào)';
+  const screenBlocks = sortItems(screenItemsAll);
   const section = (head, blocks) => [head, ...(blocks.length ? blocks : ['(không có)'])].join('\n\n');
   return [
     section(`📺 Screen (${screenNames.length})`, screenBlocks),
-    section(`💻 Terminal (${terminal.length})`, terminal.map(block)),
+    section(`💻 Terminal (${terminal.length})`, sortItems(terminalItems)),
   ].join('\n\n');
 }
 
