@@ -188,10 +188,10 @@ test('formatAgentList full:false — one line per agent (icon, name #hash, state
     linksOf: (r) => (r.pid === 1 ? ['/compact_a7611284', '/kill_a7611284', '/nudge_a7611284'] : []),
   });
   assert.equal(out, [
+    '🪱 Giun · ⏳ · 150k · 🔇 · 📬2 · 📁 a\n/kill_a7611284 /nudge_a7611284',
+    '💻 term · 📁 b',
+    '💻 PID 3 · 📁 c',
     'tele-empty123 · không thấy claude bên trong',
-    '🪱 Giun · ⏳ · 150k · 🔇 · 📬2\n/kill_a7611284 /nudge_a7611284',
-    '💻 term',
-    '💻 PID 3',
   ].join('\n\n'));
   assert.equal(formatAgentList({ full: false }), '(không có agent nào)');
   // Short form only: no /compact_ link, no 📺, status emoji; no /kill_ link (non-owner etc.) → the #hashtag stays; with one, it is dropped. Full keeps both.
@@ -203,12 +203,40 @@ test('formatAgentList full:false — one line per agent (icon, name #hash, state
   assert.match(formatAgentList({ full: true, procs: p1, linksOf: () => ['/compact_a7611284', '/kill_a7611284'] }), /\nsess-a #a7611284\n[\s\S]*🚦 Trạng thái: ⏳ busy[\s\S]*\/compact_a7611284 \/kill_a7611284\n/);
   assert.deepEqual(STATUS_EMOJI, { busy: '⏳', idle: '💤', waiting: '✋', shell: '🐚' });
   const st = (status) => formatAgentList({ full: false, procs: [{ ...procs[0], status }] });
-  assert.match(st('idle'), /· 💤$/); assert.match(st('waiting'), /· ✋$/); assert.match(st('shell'), /· 🐚$/); assert.match(st('weird'), /· weird$/);
+  assert.match(st('idle'), /· 💤 · 📁 a$/); assert.match(st('waiting'), /· ✋ · 📁 a$/); assert.match(st('shell'), /· 🐚 · 📁 a$/); assert.match(st('weird'), /· weird · 📁 a$/);
   const hl = (n) => formatAgentList({ full: false, procs: [procs[0]], ctxOf: () => 'ctx Xk (9%)', tokensOf: () => n });
-  assert.match(hl(300_000), /⏳ · Xk$/);
-  assert.match(hl(300_001), /⏳ · 🟡 Xk$/);
-  assert.match(hl(700_001), /⏳ · 🔴 Xk$/);
+  assert.match(hl(300_000), /⏳ · Xk · 📁 a$/);
+  assert.match(hl(300_001), /⏳ · 🟡 Xk · 📁 a$/);
+  assert.match(hl(700_001), /⏳ · 🔴 Xk · 📁 a$/);
   assert.match(formatAgentList({ procs: [procs[0]], ctxOf: () => 'ctx 800k', tokensOf: () => 800_000 }), /🧠 Context: 🔴 800k/, 'full form too');
+});
+
+test('formatAgentList — 📁 folder suffix in the short form; omitted when unknown', () => {
+  const r = { pid: 1, cwd: '/w/teleport', screen: null, name: 'x', status: 'busy' };
+  assert.equal(formatAgentList({ full: false, procs: [r], home: '/h' }), '💻 x · ⏳ · 📁 teleport');
+  assert.equal(formatAgentList({ full: false, procs: [{ ...r, cwd: '/h' }], home: '/h' }), '💻 x · ⏳ · 📁 ~');
+  assert.equal(formatAgentList({ full: false, procs: [{ ...r, cwd: null }], home: '/h' }), '💻 x · ⏳');
+});
+
+test('formatAgentList — sorted by folder: short mixes screen+terminal; full sorts within sections', () => {
+  const procs = [
+    { pid: 1, cwd: '/w/Zed', screen: 'tele-s1', name: 's1' },
+    { pid: 2, cwd: '/w/beta', screen: null, name: 't2' },
+    { pid: 3, cwd: null, screen: null, name: 't3' },
+    { pid: 4, cwd: '/w/alpha', screen: 'tele-s4', name: 's4' },
+    { pid: 5, cwd: '/w/Beta', screen: 'tele-s4', name: 's5' },
+    { pid: 6, cwd: '/w/alpha', screen: null, name: 't6' },
+    { pid: 7, cwd: null, screen: 'tele-s7', name: 's7' },
+  ];
+  const screens = [{ name: 'tele-empty1' }];
+  const short = formatAgentList({ full: false, screens, procs, home: '/h' }).split('\n\n');
+  assert.deepEqual(short.map((b) => b.split(' · ')[0].replace('💻 ', '').split(' ')[0]), ['s4', 't6', 's5', 't2', 's1', 's7', 't3', 'tele-empty1']);
+  const full = formatAgentList({ screens, procs, home: '/h' });
+  const [scr, term] = full.split('\n\n💻 Terminal');
+  const names = (t) => [...t.matchAll(/^📨 Session: (\S+)$/gm)].map((m) => m[1]);
+  assert.deepEqual(names(scr), ['s4', 's5', 's1', 's7']);
+  assert.ok(scr.trimEnd().endsWith('tele-empty1 · không thấy claude bên trong'), 'empty screen last in the screen section');
+  assert.deepEqual(names(term), ['t6', 't2', 't3']);
 });
 
 test('formatAgentList: a throwing lookup drops its line, never the list', () => {

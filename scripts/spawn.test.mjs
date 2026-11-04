@@ -1474,8 +1474,8 @@ test('lsHashtagSet: occupant identity for a screen with a claude, label only for
   const procs = [{ screen: 'tele-label9', sessionId: sid, hashtag: hashtagForSession(sid) }, { screen: null, sessionId: null, hashtag: null }];
   const got = lsHashtagSet({ listScreens: () => screens, listProcs: () => procs, hasScreen: () => true });
   assert.deepEqual(got, [
-    { convoId: null, hashtag: 'abc123' },                                         // empty screen (listed first)
     { convoId: String(uuidToConvoInt(sid)), hashtag: hashtagForSession(sid) },   // occupant, NOT 'label9'
+    { convoId: null, hashtag: 'abc123' },                                         // empty screen (sorted last)
   ]);
   assert.ok(!got.some((e) => e.hashtag === 'label9'));
   const noScreen = lsHashtagSet({ listScreens: () => { throw new Error('no'); }, listProcs: () => procs, hasScreen: () => false });
