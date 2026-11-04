@@ -153,7 +153,7 @@ test('formatAgentList: one block per claude process — title, `<emoji> <name>: 
     screens: [{ pid: '1', name: 'tele-i0744244' }, { pid: '2', name: 'tele-empty123' }], procs,
     personaOf: (h) => (h === 'i0744244' ? '🦛 Hà Mã' : null), home: '/home/u',
     ctxOf: (r) => (r.pid === 830318 ? 'ctx 172k (17%)' : null),
-    linksOf: (r) => (r.pid === 830318 ? ['/compact_a7611284', '/kill_a7611284'] : []),
+    linksOf: (r) => (r.pid === 830318 ? ['/kill_a7611284'] : []),
   });
   const iScreen = out.indexOf('📺 Screen (3)');
   const iTerm = out.indexOf('💻 Terminal (1)');
@@ -162,7 +162,7 @@ test('formatAgentList: one block per claude process — title, `<emoji> <name>: 
   assert.match(out, /\n\n📺 tele-empty123 · không thấy claude bên trong\n\n/);
   assert.match(out, /\n\nx\n📺 Screen: work\n🔢 PID: 11\n📨 Session: x\n📁 Folder: w\n🕒 Uptime: 00:02\n\n/); // non-tele screen hosting a claude
   const term = out.slice(iTerm);
-  assert.equal(term, `💻 Terminal (1)\n\n🪱 Giun #a7611284\n🔢 PID: 830318\n📨 Session: 🪱 Giun\n🆔 Session: ${SID}\n🚦 Trạng thái: idle\n📁 Folder: umipay\n🕒 Uptime: 2-00:49:26\n🧠 Context: 172k\n📡 Remote Control: bật\n/compact_a7611284 /kill_a7611284`);
+  assert.equal(term, `💻 Terminal (1)\n\n🪱 Giun\n🔢 PID: 830318\n📨 Session: 🪱 Giun\n🆔 Session: ${SID}\n🚦 Trạng thái: idle\n📁 Folder: umipay\n🕒 Uptime: 2-00:49:26\n🧠 Context: 172k\n📡 Remote Control: bật\n/kill_a7611284`);
   assert.doesNotMatch(out, /pts\//);   // no tty line
   assert.doesNotMatch(out, /\n\n\n/);  // exactly one empty line between blocks
   const hidden = formatAgentList({ procs, showSession: false });
@@ -185,15 +185,21 @@ test('formatAgentList full:false — one line per agent (icon, name #hash, state
     personaOf: (h) => (h === 'a7611284' ? '🪱 Giun' : null),
     ctxOf: (r) => (r.pid === 1 ? 'ctx 150k (15%)' : null),
     listenerOf: () => 'off', mailOf: () => 2,
-    linksOf: (r) => (r.pid === 1 ? ['/compact_a7611284', '/kill_a7611284', '/nudge_a7611284'] : []),
+    linksOf: (r) => (r.pid === 1 ? ['/kill_a7611284', '/nudge_a7611284'] : []),
   });
   assert.equal(out, [
     '📺 tele-empty123 · không thấy claude bên trong',
-    '📺 🪱 Giun #a7611284 · busy · 150k · 🔇 · 📬2\n/compact_a7611284 /kill_a7611284 /nudge_a7611284',
+    '📺 🪱 Giun · busy · 150k · 🔇 · 📬2\n/kill_a7611284 /nudge_a7611284',
     '💻 term',
     '💻 PID 3',
   ].join('\n\n'));
   assert.equal(formatAgentList({ full: false }), '(không có agent nào)');
+  // No /kill_ link (non-owner etc.) → the #hashtag stays in the title; with one, it is dropped.
+  const p1 = [procs[0]];
+  assert.match(formatAgentList({ full: false, procs: p1, personaOf: () => '🪱 Giun' }), /^📺 🪱 Giun #a7611284 · busy/);
+  assert.match(formatAgentList({ full: true, procs: p1, personaOf: () => '🪱 Giun' }), /\n🪱 Giun #a7611284\n/);
+  assert.match(formatAgentList({ full: false, procs: p1, personaOf: () => null, linksOf: () => ['/kill_a7611284'] }), /^📺 sess-a · busy/);
+  assert.match(formatAgentList({ full: false, procs: [{ ...procs[0], name: null }], linksOf: () => ['/kill_a7611284'] }), /^📺 PID 1 · busy/);
   const hl = (n) => formatAgentList({ full: false, procs: [procs[0]], ctxOf: () => 'ctx Xk (9%)', tokensOf: () => n });
   assert.match(hl(300_000), /busy · Xk$/);
   assert.match(hl(300_001), /busy · 🟡 Xk$/);

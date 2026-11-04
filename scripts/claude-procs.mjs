@@ -288,16 +288,18 @@ export function formatAgentList({ screens = [], procs = [], personaOf = () => nu
     const mark = n > 700_000 ? '🔴 ' : n > 300_000 ? '🟡 ' : '';
     return mark + String(c).replace(/^ctx /, '').replace(/ \(\d+%\)$/, '');
   };
+  const hasKill = (links) => links.some((l) => String(l).startsWith('/kill_'));
   // No tty line (Thi: only useful at the keyboard). r.tty stays in the row/audit.
   const block = (r) => {
     const tag = rowTag(r);
+    const links = safe(() => linksOf(r), []);
     // A guessed session's persona/hashtag is a guess too: say so in the title (both forms, UUID shown or not).
-    const title = ([persona(tag) || r.name, tag ? `#${tag}` : null].filter(Boolean).join(' ') || `${r.screen ? '📺' : '💻'} PID ${r.pid}`) + (r.guessed ? ' (đoán)' : '');
+    // The #hashtag is dropped when a /kill_<hash> link shows it anyway.
+    const title = ([persona(tag) || r.name, tag && !hasKill(links) ? `#${tag}` : null].filter(Boolean).join(' ') || `${r.screen ? '📺' : '💻'} PID ${r.pid}`) + (r.guessed ? ' (đoán)' : '');
     const convo = convoOf(r);
     const ctx = safe(() => ctxOf(r), null);
     const mail = convo != null ? safe(() => mailOf(convo), null) : null;
     const status = convo != null ? safe(() => statusLinesOf(convo), []) : [];
-    const links = safe(() => linksOf(r), []);
     return [
       title,
       r.screen ? `📺 Screen: ${r.screen}` : null,
@@ -325,7 +327,7 @@ export function formatAgentList({ screens = [], procs = [], personaOf = () => nu
     const off = convo != null && safe(() => listenerOf(convo), null) === 'off';
     const links = safe(() => linksOf(r), []);
     const head = [
-      `${r.screen ? '📺' : '💻'} ${[persona(tag) || r.name, tag ? `#${tag}` : null].filter(Boolean).join(' ') || `PID ${r.pid}`}${r.guessed ? ' (đoán)' : ''}`,
+      `${r.screen ? '📺' : '💻'} ${[persona(tag) || r.name, tag && !hasKill(links) ? `#${tag}` : null].filter(Boolean).join(' ') || `PID ${r.pid}`}${r.guessed ? ' (đoán)' : ''}`,
       r.status, ctx ? ctxText(ctx, r) : null, off ? '🔇' : null, mail > 0 ? `📬${mail}` : null,
     ].filter(Boolean).join(' · ');
     return links.length ? `${head}\n${links.join(' ')}` : head;
