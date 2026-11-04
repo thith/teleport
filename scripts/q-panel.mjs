@@ -89,7 +89,7 @@ export function renderQ(g, { tok, rev, page = 0, view = 'main', pin = null, stop
   }
 
   const busy = g.holders.some((h) => h.exclusive) ? Math.max(g.N, g.holders.length) : g.holders.length;
-  const lines = [`🔒 build ${busy}/${g.N} · chờ ${g.tickets.length} · max ${pol.max == null ? 'tắt' : `${pol.max} (thử lại sau ${pol.retryMin}')`}${pol.paused ? ' · ⏸' : ''}${g.gateNote ? ` · ${g.gateNote}` : ''}`];
+  const lines = [`🔒 build ${busy}/${g.N} · chờ ${g.tickets.length} · max chờ: ${pol.max == null ? 'tắt' : `${pol.max} (thử lại sau ${pol.retryMin}')`}${pol.paused ? ' · ⏸' : ''}${g.gateNote ? ` · ${g.gateNote}` : ''}`];
   if (g.corrupt) lines.unshift(`⚠️ build.policy.json hỏng (${clean(g.error)}) — hạn chế của owner đang bị bỏ qua; mọi thao tác ghi bị từ chối.`);
   if (pol.paused && g.oldCode) lines.push(`⏸ (còn ${g.oldCode} vé code cũ không theo pause)`);
   if (g.preBoost) lines.push('⬆ tạm tắt: còn người chờ chạy code cũ — chờ họ xong');

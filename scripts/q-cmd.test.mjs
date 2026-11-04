@@ -66,7 +66,7 @@ test('renderQ: header, running + waiting lines, buttons (⬆ only live; ⬆✓ b
   setPolicy(dir, { max: 4, retryMin: 10, boosts: { [b]: Date.now() }, blocks: [{ owner: 'convo:Z', label: '🦊 Cáo', until, at: 1 }] });
   const g = gatherQ({ dir });
   const r = renderQ(g, { tok: 'a'.repeat(12), rev: 35 });
-  assert.match(r.text, /^🔒 build 2\/\d · chờ 3 · max 4 \(thử lại sau 10'\)/);
+  assert.match(r.text, /^🔒 build 2\/\d · chờ 3 · max chờ: 4 \(thử lại sau 10'\)/);
   assert.match(r.text, /▶ Tiên0 · l30 — cargo nextest \(12'\)/);
   assert.match(r.text, /\n\n▶ Đang chạy \(2\):\n▶ /, 'running header with count, before the ▶ lines');
   assert.match(r.text, /\n\n⏳ Chờ \(3\):\n1\. /, 'waiting header with total count, before the numbered lines');
@@ -89,7 +89,7 @@ test('renderQ: header, running + waiting lines, buttons (⬆ only live; ⬆✓ b
   // max off, paused
   setPolicy(dir, { paused: true });
   const r2 = renderQ(gatherQ({ dir }), { tok: 'a'.repeat(12), rev: 0 });
-  assert.match(r2.text, /max tắt/); assert.match(r2.text, / · ⏸/);
+  assert.match(r2.text, /max chờ: tắt/); assert.match(r2.text, / · ⏸/);
   assert.ok(btn(r2.rows, /^⏳ tắt$/) && btn(r2.rows, /^▶$/));
   // rev is base36 in the callback
   assert.equal(qCallback('a'.repeat(12), 35, 'k', 2), `q:${'a'.repeat(12)}:z:k:2`);
@@ -708,12 +708,12 @@ test('RFC32 /q header: appends " · <note>" when a slot is free but the CPU gate
   const dir = tmpDir(); holder(dir, 0);
   const closed = { ok: false, reason: 'cpu', load1: 11.2, cores: 12 };
   const r = renderQ(gatherQ({ dir, slotsOf: () => 2, gate: () => closed }), { tok: 'a'.repeat(12), rev: 0 });
-  assert.match(r.text, /^🔒 build 1\/2 · chờ 0 · max tắt · chờ CPU \(load 11\.2\/12\)\n/);
+  assert.match(r.text, /^🔒 build 1\/2 · chờ 0 · max chờ: tắt · chờ CPU \(load 11\.2\/12\)\n/);
   assert.match(r.text, /▶ Đang chạy \(1\):/); assert.doesNotMatch(r.text, /Chờ \(/, 'no waiting header when no tickets');
   const q = renderQ(gatherQ({ dir, slotsOf: () => 2, gate: () => ({ ok: false, reason: 'quiet', load1: 0, cores: 12 }) }), { tok: 'a'.repeat(12), rev: 0 });
-  assert.match(q.text, /^🔒 build 1\/2 · chờ 0 · max tắt · 🌙 giờ im lặng\n/);
+  assert.match(q.text, /^🔒 build 1\/2 · chờ 0 · max chờ: tắt · 🌙 giờ im lặng\n/);
   const open = renderQ(gatherQ({ dir, slotsOf: () => 2, gate: () => ({ ok: true }) }), { tok: 'a'.repeat(12), rev: 0 });
-  assert.match(open.text, /^🔒 build 1\/2 · chờ 0 · max tắt\n/);
+  assert.match(open.text, /^🔒 build 1\/2 · chờ 0 · max chờ: tắt\n/);
 });
 
 test('RFC32 /q quiet button: only while the window is active; label by state; the state is in the stored entry, callback_data stays short', async () => {
