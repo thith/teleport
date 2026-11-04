@@ -6,7 +6,7 @@
 
 import crypto from 'node:crypto';
 import { escapeControls } from './cleanup-inbox.mjs';
-import { tokenizeArgs, roleMeets } from './commands.mjs';
+import { roleMeets } from './commands.mjs';
 import { extractBotId } from './send-telegram.mjs';
 import { readRows } from './convo-registry.mjs';
 import { readTopicsStore } from './topics-store.mjs';
@@ -14,8 +14,9 @@ import { lsHashtagSet } from './spawn.mjs';
 import { durableWrite } from './steer.mjs';
 import { DEFAULT_TMP_DIR } from './tele-listen.mjs';
 import { readProjectsConfig } from './projects-config.mjs';
+import { BC_NOW_TTL_MS } from './button-store.mjs';
 import {
-  parseBroadcastRaw, parseBroadcastArgs, groupChatIds, listTargets, resolveLive, sendTo, USAGE,
+  parseBroadcastBoth, knownProjects, checkProjects, groupChatIds, listTargets, resolveLive, sendTo,
 } from './broadcast.mjs';
 
 export const BC_TTL_MS = 10 * 60_000;
@@ -43,11 +44,14 @@ function previewOf(text, n) {
   return `${clean(over > 0 ? text.slice(0, n) : text)}${over > 0 ? `… (+${over} ký tự)` : ''}`;
 }
 
+const emptyLines = (names = []) => names.slice(0, 15).map((p) => `⏹ ${cut(clean(p), 40)}: không có session đang chạy`).concat(names.length > 15 ? [`… +${names.length - 15}`] : []).join('\n');
+
 /** The board for a stored entry → { text, rows }. Callback data carry only the revision and an index. Pure. */
 export function renderBroadcast(entry, tok) {
   const sel = selSet(entry);
   const cb = (op, idx) => bcCallback(tok, entry.rev, op, idx);
-  const head = (n) => `📢 Broadcast — nội dung:\n«${previewOf(entry.text, n)}»\n\nGửi tới ${sel.size}/${entry.targets.length} session:${entry.hidden ? `\n⚠️ chỉ hiện ${entry.targets.length}/${entry.targets.length + entry.hidden}` : ''}`;
+  const empty = emptyLines(entry.emptyProjects);
+  const head = (n) => `📢 Broadcast — nội dung:\n«${previewOf(entry.text, n)}»\n\n${empty ? `${empty}\n` : ''}Gửi tới ${sel.size}/${entry.targets.length} session:${entry.hidden ? `\n⚠️ chỉ hiện ${entry.targets.length}/${entry.targets.length + entry.hidden}` : ''}`;
   let n = BC_PREVIEW, text = head(n);
   while (text.length > MSG_BUDGET && n > 20) { n = Math.floor(n / 2); text = head(n); } // control chars expand when escaped
   const rows = [];
@@ -75,6 +79,34 @@ export function renderResult(entry, { sent, dead, failed }) {
   return txt.length > MSG_BUDGET ? `${txt.slice(0, MSG_BUDGET)}…` : txt;
 }
 
+/**
+ * RFC 38 §3.6: the `--now` result, always ≤ MSG_BUDGET. The counts line is exact and never cut; the detail lines
+ * come in priority order (❌, ⏹ dead, ⏹ empty project, ✅) and the overflow is one `… +n`. Pure.
+ */
+export function renderNowResult({ text, projects = null, sent = [], failed = [], dead = [], empty = [] }) {
+  const total = sent.length + failed.length + dead.length;
+  let plist = '';
+  if (projects?.length) {
+    const names = projects.map((p) => cut(clean(p), 40));
+    let k = 0;
+    while (k < names.length && names.slice(0, k + 1).join(', ').length <= 300) k++;
+    plist = ` · dự án: ${names.slice(0, k).join(', ')}${k < names.length ? ` … +${names.length - k}` : ''}`;
+  }
+  const fixed = [`📢 Broadcast --now — đã gửi ${sent.length}/${total}${plist}`,
+    `✅ ${sent.length} · ❌ lỗi ${failed.length} · ⏹ đã tắt ${dead.length} · dự án trống ${empty.length}`, `«${previewOf(text, 300)}»`].join('\n');
+  const flat = [...failed.map((t) => `❌ ${cut(clean(t.label), 60)} — không ghi được hàng đợi`), ...dead.map((t) => `⏹ ${cut(clean(t.label), 60)} — đã tắt`),
+    ...empty.map((p) => `⏹ ${cut(clean(p), 40)}: không có session đang chạy`), ...sent.map((t) => `✅ ${cut(clean(t.label), 60)}`)];
+  const RES = 12; // room kept for the final `… +n`
+  let used = fixed.length;
+  const out = [];
+  for (let i = 0; i < flat.length; i++) {
+    const need = flat[i].length + 1;
+    if (used + need + (i < flat.length - 1 ? RES : 0) > MSG_BUDGET) { out.push(`… +${flat.length - i}`); break; }
+    out.push(flat[i]); used += need;
+  }
+  return [fixed, ...out].join('\n');
+}
+
 // ── the exclusive chain (a press in flight can't race a new board or another press) ──
 
 let bcChain = Promise.resolve();
@@ -97,6 +129,7 @@ async function finalEdit(ctx, chatId, messageId, text, { fallbackNew = false } =
 async function sweep(store, ctx, now) {
   const gone = [];
   for (const [k, v] of [...store.entries()]) {
+    if (v?.kind === 'broadcast-now') { if (now - v.createdAt > BC_NOW_TTL_MS) gone.push(k); continue; }
     if (v?.kind !== 'broadcast') continue;
     // 'sending' is dropped only once the owner has been told (a failed edit keeps it for the next sweep / press)
     if (v.state === 'sending') { if (v.messageId == null || await finalEdit(ctx, v.chatId, v.messageId, MSG_INTERRUPTED)) gone.push(k); }
@@ -119,18 +152,27 @@ async function runBroadcastUnlocked(rest, from, ctx, deps) {
   const config = deps.config ?? ctx.projectsConfig ?? readProjectsConfig();
   const role = (deps.roleOf ?? (() => 'member'))(from?.id);
   if (!roleMeets(role, 'admin')) { await say(`❌ /broadcast cần quyền admin (bạn: ${role}).`); return; }
-  if (!sendButtonRows || !store?.setStrict) { await say('❌ /broadcast cần chạy trong daemon.'); return; }
+  if (!store?.setStrict) { await say('❌ /broadcast cần chạy trong daemon.'); return; }
 
-  const args = parseBroadcastRaw(rest);
+  // RFC 38: the options of the raw text and of its tokenized reading must both parse and agree — never send wider.
+  const args = parseBroadcastBoth(rest);
   if (args.error) { await say(args.error); return; }
-  // The scope must agree with the tokenized reading (which honours quotes like `--"chat"`): never send wider.
-  if ((parseBroadcastArgs(tokenizeArgs(rest)).chat ?? null) !== (args.chat ?? null)) { await say(`❌ --chat phải đứng đầu, không trong ngoặc — ${USAGE}`); return; }
+  if (!args.now && !sendButtonRows) { await say('❌ /broadcast cần chạy trong daemon.'); return; }
   if (args.text.length > BC_MAX_TEXT) { await say(`❌ nội dung quá dài (${args.text.length} > ${BC_MAX_TEXT} ký tự).`); return; }
+  const nowKey = args.now ? `bcnow:${deps.chatId}:${deps.messageId}` : null;
+  if (args.now) {
+    if (deps.chatId == null || deps.messageId == null) { await say('❌ --now cần chatId và messageId của tin nhắn — không gửi gì.'); return; }
+    if (store.get(nowKey)) { console.error(`[broadcast] --now ${nowKey} already handled — skipped`); return; } // a re-read update
+  }
 
   // recovery of leftover boards runs first, whatever the discovery below turns out to be
   const now = nowOf(deps);
   const gone = await sweep(store, ctx, now);
   const dropGone = () => { for (const k of gone) { try { store.delete(k); } catch { /* the next sweep retries */ } } };
+  if (args.now) { // RFC 38 §3.3: the dedupe key is on disk BEFORE discovery, so a replay never sends what was reported as "không gửi gì"
+    try { store.setStrict(nowKey, { kind: 'broadcast-now', createdAt: now }, { remove: gone }); gone.length = 0; }
+    catch (e) { await say(`❌ không ghi được khoá chống gửi đúp (${e?.message || e}) — không gửi gì.`); return; }
+  }
   const chatIds = args.chat ? [String(args.chat)] : groupChatIds(config, { env: deps.env ?? process.env, envFile: deps.envFile ?? {} });
   const topics = deps.store ?? readTopicsStore();
   let ls;
@@ -138,15 +180,36 @@ async function runBroadcastUnlocked(rest, from, ctx, deps) {
   catch (e) { await say(`📢 broadcast: không liệt kê được agent đang chạy (${e?.message || e}) — nothing sent.`); dropGone(); return; }
   let allocRows = [];
   try { allocRows = (deps.allocRows ?? (() => readRows().rows))(); } catch { /* no allocation info → cwd / chat fallbacks */ }
-  const all = listTargets({ store: topics, chatIds, ls, config, allocRows, botId: deps.botId ?? extractBotId(ctx.token), projectDeps: deps.projectDeps });
+  const botId = deps.botId ?? extractBotId(ctx.token);
+  const everyone = listTargets({ store: topics, chatIds, ls, config, allocRows, botId, projectDeps: deps.projectDeps });
+
+  // --p: every name is checked BEFORE anything is sent, even with no session running (RFC 38 §3.2)
+  let all = everyone, empty = [], shown = null;
+  if (args.projects) {
+    const known = knownProjects({ config, targets: everyone, allocRows, botId, parentDir: deps.parentDir, listDirs: deps.listDirs, ...deps.projectDeps });
+    const chk = checkProjects(args.projects, known, projectsOf(everyone));
+    if (chk.error) { await say(chk.error); dropGone(); return; }
+    shown = args.projects.map((w) => chk.names.get(w));
+    all = everyone.filter((t) => chk.set.has(t.project.toLowerCase()));
+    const live = new Set(all.map((t) => t.project.toLowerCase()));
+    empty = args.projects.filter((w) => !live.has(w)).map((w) => chk.names.get(w));
+    if (!all.length) { await say(`📢 broadcast — không có session nào khớp, không gửi gì.${empty.length ? `\n${emptyLines(empty)}` : ''}`); dropGone(); return; }
+  }
   if (!all.length) { await say('📢 broadcast — không có session nào đang chạy (/ls trống), không gửi gì.'); dropGone(); return; }
+  const fromInfo = { id: from?.id ?? null, name: from?.first_name || from?.username || from?.name || 'admin', role };
+
+  if (args.now) {
+    const { sent, failed } = await sendTo(all, args.text, fromInfo, { tmpDir: deps.tmpDir ?? DEFAULT_TMP_DIR, writePrompt: deps.writePrompt ?? durableWrite });
+    await say(renderNowResult({ text: args.text, projects: shown, sent, failed, empty }));
+    return;
+  }
 
   const targets = all.slice(0, BC_MAX_TARGETS);
   const tok = (deps.rand ?? (() => crypto.randomBytes(6).toString('hex')))();
   const entry = {
     kind: 'broadcast', createdAt: now, chatId: daemonUserId, messageId: null, rev: 0, state: 'open',
-    text: args.text, from: { id: from?.id ?? null, name: from?.first_name || from?.username || from?.name || 'admin', role },
-    targets, projects: projectsOf(targets), selected: targets.map((_, i) => i), hidden: all.length - targets.length,
+    text: args.text, from: fromInfo,
+    targets, projects: projectsOf(targets), selected: targets.map((_, i) => i), hidden: all.length - targets.length, ...(empty.length ? { emptyProjects: empty } : {}),
   };
   const r = renderBroadcast(entry, tok);
   const sent = await sendButtonRows(daemonUserId, r.text, r.rows);

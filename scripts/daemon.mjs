@@ -88,7 +88,7 @@ import { compactWarnTick, createWarnStore } from './compact-warn.mjs';
 import { peekMail } from './mailbox.mjs';
 import { createListenerStatus } from './listener-status.mjs';
 import { processCleanupRequests, processCleanupOffers, handleCleanupButton, CLEANUP_BUTTON_RE, startCleanupList, startManualFor, parseCleanupCommand } from './cleanup-inbox.mjs';
-import { PersistentMap } from './button-store.mjs';
+import { PersistentMap, BC_NOW_TTL_MS } from './button-store.mjs';
 import { formatPersona } from './persona.mjs';
 import { shortConvoHash } from './convo-hash.mjs';
 import { makePersonaOf } from './spawn.mjs';
@@ -527,7 +527,7 @@ export function handleControlMessages(mine, ctx) {
     // auto-converted to a `.md` DOCUMENT whose text rides in `caption`, not `text`
     // — without this, replying to continue an instruct thread would find no #hash.
     const rt = msg.reply_to_message;
-    dispatchCommand(parsed, msg.from || {}, ctx, rt?.text ?? rt?.caption, msg.message_id).catch((e) =>
+    dispatchCommand(parsed, msg.from || {}, ctx, rt?.text ?? rt?.caption, msg.message_id, msg.chat?.id).catch((e) =>
       ctx.sendText(ctx.daemonUserId, `❌ /${parsed.cmd} failed: ${e instanceof Error ? e.message : e}`));
   }
 }
@@ -614,7 +614,7 @@ export function takeMergeButton(tok, { now = Date.now(), store = pendingMergeBut
   const e = store.get(tok);
   if (e?.kind) return null; // allow-list: merge entries carry no kind (cleanup / type have their own takers)
   store.delete(tok);
-  for (const [k, v] of store) if (v?.kind !== 'stop' && !(v?.kind === 'broadcast' && v.state === 'sending') && now - v.createdAt > ttlMs) store.delete(k); // sweep (an in-flight build stop — RFC 24 — and a broadcast mid-send stay: their own sweeps own them)
+  for (const [k, v] of store) if (v?.kind !== 'stop' && !(v?.kind === 'broadcast' && v.state === 'sending') && !(v?.kind === 'broadcast-now' && now - v.createdAt <= BC_NOW_TTL_MS) && now - v.createdAt > ttlMs) store.delete(k); // sweep (an in-flight build stop — RFC 24 —, a broadcast mid-send and an unexpired --now key stay: their own sweeps own them)
   if (!e || now - e.createdAt > ttlMs) return null;
   return e;
 }
@@ -1008,7 +1008,7 @@ export async function dispatchCommand(parsed, from, {
   daemonUserId, projectsConfig, registry, sendText, secretEnvKeys = [],
   runner = execFileP, scriptsDir = __dirname, parentDir = PARENT_DIR, reload = null,
   automergeStateFile = AUTOMERGE_STATE_FILE, notifyOwners = true, notifyDeps = {}, ...extra
-}, replyText = null, messageId = null) {
+}, replyText = null, messageId = null, chatId = null) {
   if (parsed.tapError) { await sendText(daemonUserId, parsed.tapError); return; }
   // Built-in: handled in-process, never via the registry (a `_commands` entry
   // named `reload` can't shadow it). Admin-only.
@@ -1044,7 +1044,7 @@ export async function dispatchCommand(parsed, from, {
   }
   if (parsed.cmd === BROADCAST_COMMAND) {
     // Owner only (the daemon takes commands from the owner alone) + admin role; the board picks the recipients.
-    await runBroadcastCommand(parsed.rest, from, { daemonUserId, projectsConfig, sendText, ...extra }, { roleOf: (id) => resolveSenderRole(projectsConfig, id), ...(extra.broadcastDeps || {}) });
+    await runBroadcastCommand(parsed.rest, from, { daemonUserId, projectsConfig, sendText, ...extra }, { roleOf: (id) => resolveSenderRole(projectsConfig, id), ...(extra.broadcastDeps || {}), chatId, messageId });
     return;
   }
   if (parsed.cmd === CLEANUP_COMMAND) {

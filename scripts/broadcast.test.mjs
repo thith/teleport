@@ -4,7 +4,7 @@ import { shortConvoHash } from './convo-hash.mjs';
 import { parseBroadcastArgs, parseBroadcastRaw, buildBroadcastPrompt, groupChatIds, doBroadcast } from './broadcast.mjs';
 
 test('parseBroadcastArgs: text join; --chat (space/=) extracted; empty → usage error', () => {
-  assert.deepEqual(parseBroadcastArgs(['reload', 'guide', 'now']), { chat: null, text: 'reload guide now', error: null });
+  assert.deepEqual(parseBroadcastArgs(['reload', 'guide', 'now']), { chat: null, now: false, projects: null, text: 'reload guide now', error: null });
   let r = parseBroadcastArgs(['--chat', '-100', 'hi', 'there']);
   assert.equal(r.chat, '-100'); assert.equal(r.text, 'hi there');
   r = parseBroadcastArgs(['--chat=-101', 'msg']);
@@ -63,9 +63,9 @@ test('doBroadcast: empty text → usage error', async () => {
 });
 
 test('parseBroadcastRaw: a LEADING --chat (space or =) is split off; the message is verbatim', () => {
-  assert.deepEqual(parseBroadcastRaw(`reload "guide"\nit's new`), { chat: null, text: `reload "guide"\nit's new`, error: null });
-  assert.deepEqual(parseBroadcastRaw('--chat -100 hi\nthere'), { chat: '-100', text: 'hi\nthere', error: null });
-  assert.deepEqual(parseBroadcastRaw('--chat=-100   hi'), { chat: '-100', text: 'hi', error: null });
+  assert.deepEqual(parseBroadcastRaw(`reload "guide"\nit's new`), { chat: null, now: false, projects: null, text: `reload "guide"\nit's new`, error: null });
+  assert.deepEqual(parseBroadcastRaw('--chat -100 hi\nthere'), { chat: '-100', now: false, projects: null, text: 'hi\nthere', error: null });
+  assert.deepEqual(parseBroadcastRaw('--chat=-100   hi'), { chat: '-100', now: false, projects: null, text: 'hi', error: null });
   assert.match(parseBroadcastRaw('hi --chat -100').error, /--chat phải đứng đầu/, 'a later --chat is refused, never a broadcast to every group');
   assert.match(parseBroadcastRaw('--chat -100 a --chat=-200').error, /đứng đầu/);
   assert.match(parseBroadcastRaw('"--chat" -100 hi').error, /đứng đầu/, 'a quoted --chat never widens to every group');
