@@ -269,6 +269,9 @@ export function lsIdentities({ screens = [], procs = [] } = {}) {
   return out;
 }
 
+// Short /ls shows the state as an emoji only; full shows emoji + text (Thi 13524).
+export const STATUS_EMOJI = { busy: '⏳', idle: '💤', waiting: '✋', shell: '🐚' };
+
 export function formatAgentList({ screens = [], procs = [], personaOf = () => null, home = os.homedir(), statusLinesOf = () => [], mailOf = () => null, convoOfHashtag = () => null, ctxOf = () => null, linksOf = () => [], showSession = true, full = true, listenerOf = () => null, tokensOf = () => null } = {}) {
   // Folder name only (Thi: "chỉ hiện tên folder") — the full path is noise on a phone.
   const short = (p) => (p ? (p === home ? '~' : path.basename(p)) : null);
@@ -294,8 +297,7 @@ export function formatAgentList({ screens = [], procs = [], personaOf = () => nu
     const tag = rowTag(r);
     const links = safe(() => linksOf(r), []);
     // A guessed session's persona/hashtag is a guess too: say so in the title (both forms, UUID shown or not).
-    // The #hashtag is dropped when a /kill_<hash> link shows it anyway.
-    const title = ([persona(tag) || r.name, tag && !hasKill(links) ? `#${tag}` : null].filter(Boolean).join(' ') || `${r.screen ? '📺' : '💻'} PID ${r.pid}`) + (r.guessed ? ' (đoán)' : '');
+    const title = ([persona(tag) || r.name, tag ? `#${tag}` : null].filter(Boolean).join(' ') || `${r.screen ? '📺' : '💻'} PID ${r.pid}`) + (r.guessed ? ' (đoán)' : '');
     const convo = convoOf(r);
     const ctx = safe(() => ctxOf(r), null);
     const mail = convo != null ? safe(() => mailOf(convo), null) : null;
@@ -307,7 +309,7 @@ export function formatAgentList({ screens = [], procs = [], personaOf = () => nu
       // 📨 = the session's name — the address for Claude's cross-session messages (SendMessage to=<name>)
       r.name ? `📨 Session: ${r.name}` : null,
       showSession && r.sessionId ? `🆔 Session: ${r.sessionId}${r.guessed ? ' (đoán)' : ''}` : null,
-      r.status ? `🚦 Trạng thái: ${r.status}` : null,
+      r.status ? `🚦 Trạng thái: ${STATUS_EMOJI[r.status] ? `${STATUS_EMOJI[r.status]} ` : ''}${r.status}` : null,
       short(r.cwd) ? `📁 Folder: ${short(r.cwd)}` : null,
       r.etime ? `🕒 Uptime: ${r.etime}` : null,
       ctx ? `🧠 Context: ${ctxText(ctx, r)}` : null,
@@ -325,10 +327,11 @@ export function formatAgentList({ screens = [], procs = [], personaOf = () => nu
     const ctx = safe(() => ctxOf(r), null);
     const mail = convo != null ? safe(() => mailOf(convo), null) : null;
     const off = convo != null && safe(() => listenerOf(convo), null) === 'off';
-    const links = safe(() => linksOf(r), []);
+    // Short form: no /compact_ link; the #hashtag is dropped when a /kill_<hash> link shows it; screen rows have no 📺 (💻 = terminal).
+    const links = safe(() => linksOf(r), []).filter((l) => !String(l).startsWith('/compact_'));
     const head = [
-      `${r.screen ? '📺' : '💻'} ${[persona(tag) || r.name, tag && !hasKill(links) ? `#${tag}` : null].filter(Boolean).join(' ') || `PID ${r.pid}`}${r.guessed ? ' (đoán)' : ''}`,
-      r.status, ctx ? ctxText(ctx, r) : null, off ? '🔇' : null, mail > 0 ? `📬${mail}` : null,
+      `${r.screen ? '' : '💻 '}${[persona(tag) || r.name, tag && !hasKill(links) ? `#${tag}` : null].filter(Boolean).join(' ') || `PID ${r.pid}`}${r.guessed ? ' (đoán)' : ''}`,
+      r.status ? (STATUS_EMOJI[r.status] || r.status) : null, ctx ? ctxText(ctx, r) : null, off ? '🔇' : null, mail > 0 ? `📬${mail}` : null,
     ].filter(Boolean).join(' · ');
     return links.length ? `${head}\n${links.join(' ')}` : head;
   };
@@ -341,7 +344,7 @@ export function formatAgentList({ screens = [], procs = [], personaOf = () => nu
     const rows = inScreen.get(name) || [];
     if (rows.length) return rows.map(full ? block : line);
     const p = name.startsWith('tele-') ? persona(name.slice(5)) : null;
-    return [`📺 ${[name, p].filter(Boolean).join(' · ')} · không thấy claude bên trong`];
+    return [`${full ? '📺 ' : ''}${[name, p].filter(Boolean).join(' · ')} · không thấy claude bên trong`];
   });
   if (!full) return [...screenBlocks, ...terminal.map(line)].join('\n\n') || '(không có agent nào)';
   const section = (head, blocks) => [head, ...(blocks.length ? blocks : ['(không có)'])].join('\n\n');

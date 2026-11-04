@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import {
   parsePsOutput, parseSessionFile, cwdToProjectSlug, hashtagForSession, styFromEnviron, styPidFromEnviron,
-  procStartFromStat, screenFromAncestors, buildProcRows, formatAgentList, parseKillPidArg, findUnidentifiedProcs,
+  procStartFromStat, screenFromAncestors, buildProcRows, formatAgentList, STATUS_EMOJI, parseKillPidArg, findUnidentifiedProcs,
   checkKillTarget, killClaudePid, findProcForSession, etimeToSeconds, guessSessionFromTranscripts,
   inspectPid, readPs, listClaudeProcs,
 } from './claude-procs.mjs';
@@ -153,7 +153,7 @@ test('formatAgentList: one block per claude process — title, `<emoji> <name>: 
     screens: [{ pid: '1', name: 'tele-i0744244' }, { pid: '2', name: 'tele-empty123' }], procs,
     personaOf: (h) => (h === 'i0744244' ? '🦛 Hà Mã' : null), home: '/home/u',
     ctxOf: (r) => (r.pid === 830318 ? 'ctx 172k (17%)' : null),
-    linksOf: (r) => (r.pid === 830318 ? ['/kill_a7611284'] : []),
+    linksOf: (r) => (r.pid === 830318 ? ['/compact_a7611284', '/kill_a7611284'] : []),
   });
   const iScreen = out.indexOf('📺 Screen (3)');
   const iTerm = out.indexOf('💻 Terminal (1)');
@@ -162,13 +162,13 @@ test('formatAgentList: one block per claude process — title, `<emoji> <name>: 
   assert.match(out, /\n\n📺 tele-empty123 · không thấy claude bên trong\n\n/);
   assert.match(out, /\n\nx\n📺 Screen: work\n🔢 PID: 11\n📨 Session: x\n📁 Folder: w\n🕒 Uptime: 00:02\n\n/); // non-tele screen hosting a claude
   const term = out.slice(iTerm);
-  assert.equal(term, `💻 Terminal (1)\n\n🪱 Giun\n🔢 PID: 830318\n📨 Session: 🪱 Giun\n🆔 Session: ${SID}\n🚦 Trạng thái: idle\n📁 Folder: umipay\n🕒 Uptime: 2-00:49:26\n🧠 Context: 172k\n📡 Remote Control: bật\n/kill_a7611284`);
+  assert.equal(term, `💻 Terminal (1)\n\n🪱 Giun #a7611284\n🔢 PID: 830318\n📨 Session: 🪱 Giun\n🆔 Session: ${SID}\n🚦 Trạng thái: 💤 idle\n📁 Folder: umipay\n🕒 Uptime: 2-00:49:26\n🧠 Context: 172k\n📡 Remote Control: bật\n/compact_a7611284 /kill_a7611284`);
   assert.doesNotMatch(out, /pts\//);   // no tty line
   assert.doesNotMatch(out, /\n\n\n/);  // exactly one empty line between blocks
   const hidden = formatAgentList({ procs, showSession: false });
   assert.doesNotMatch(hidden, /🆔|5ce13594/, 'UUIDs hidden on Telegram');
   assert.match(formatAgentList({ procs: [{ ...procs[1], name: 'g' }], showSession: false }), /🦛 Hà Mã #i0744244 \(đoán\)|g #i0744244 \(đoán\)/, 'a guess stays visible without the UUID');
-  assert.match(formatAgentList({ full: false, procs: [procs[1]] }), /^📺 #i0744244 \(đoán\)$/, 'short form too');
+  assert.match(formatAgentList({ full: false, procs: [procs[1]] }), /^#i0744244 \(đoán\)$/, 'short form too');
   assert.match(formatAgentList({ procs: [{ pid: 5 }] }), /💻 Terminal \(1\)\n\n💻 PID 5\n🔢 PID: 5$/);
   const empty = formatAgentList({});
   assert.equal(empty, '📺 Screen (0)\n\n(không có)\n\n💻 Terminal (0)\n\n(không có)');
@@ -185,25 +185,29 @@ test('formatAgentList full:false — one line per agent (icon, name #hash, state
     personaOf: (h) => (h === 'a7611284' ? '🪱 Giun' : null),
     ctxOf: (r) => (r.pid === 1 ? 'ctx 150k (15%)' : null),
     listenerOf: () => 'off', mailOf: () => 2,
-    linksOf: (r) => (r.pid === 1 ? ['/kill_a7611284', '/nudge_a7611284'] : []),
+    linksOf: (r) => (r.pid === 1 ? ['/compact_a7611284', '/kill_a7611284', '/nudge_a7611284'] : []),
   });
   assert.equal(out, [
-    '📺 tele-empty123 · không thấy claude bên trong',
-    '📺 🪱 Giun · busy · 150k · 🔇 · 📬2\n/kill_a7611284 /nudge_a7611284',
+    'tele-empty123 · không thấy claude bên trong',
+    '🪱 Giun · ⏳ · 150k · 🔇 · 📬2\n/kill_a7611284 /nudge_a7611284',
     '💻 term',
     '💻 PID 3',
   ].join('\n\n'));
   assert.equal(formatAgentList({ full: false }), '(không có agent nào)');
-  // No /kill_ link (non-owner etc.) → the #hashtag stays in the title; with one, it is dropped.
+  // Short form only: no /compact_ link, no 📺, status emoji; no /kill_ link (non-owner etc.) → the #hashtag stays; with one, it is dropped. Full keeps both.
   const p1 = [procs[0]];
-  assert.match(formatAgentList({ full: false, procs: p1, personaOf: () => '🪱 Giun' }), /^📺 🪱 Giun #a7611284 · busy/);
+  assert.match(formatAgentList({ full: false, procs: p1, personaOf: () => '🪱 Giun' }), /^🪱 Giun #a7611284 · ⏳/);
   assert.match(formatAgentList({ full: true, procs: p1, personaOf: () => '🪱 Giun' }), /\n🪱 Giun #a7611284\n/);
-  assert.match(formatAgentList({ full: false, procs: p1, personaOf: () => null, linksOf: () => ['/kill_a7611284'] }), /^📺 sess-a · busy/);
-  assert.match(formatAgentList({ full: false, procs: [{ ...procs[0], name: null }], linksOf: () => ['/kill_a7611284'] }), /^📺 PID 1 · busy/);
+  assert.match(formatAgentList({ full: false, procs: p1, personaOf: () => null, linksOf: () => ['/kill_a7611284'] }), /^sess-a · ⏳/);
+  assert.match(formatAgentList({ full: false, procs: [{ ...procs[0], name: null }], linksOf: () => ['/kill_a7611284'] }), /^PID 1 · ⏳/);
+  assert.match(formatAgentList({ full: true, procs: p1, linksOf: () => ['/compact_a7611284', '/kill_a7611284'] }), /\nsess-a #a7611284\n[\s\S]*🚦 Trạng thái: ⏳ busy[\s\S]*\/compact_a7611284 \/kill_a7611284\n/);
+  assert.deepEqual(STATUS_EMOJI, { busy: '⏳', idle: '💤', waiting: '✋', shell: '🐚' });
+  const st = (status) => formatAgentList({ full: false, procs: [{ ...procs[0], status }] });
+  assert.match(st('idle'), /· 💤$/); assert.match(st('waiting'), /· ✋$/); assert.match(st('shell'), /· 🐚$/); assert.match(st('weird'), /· weird$/);
   const hl = (n) => formatAgentList({ full: false, procs: [procs[0]], ctxOf: () => 'ctx Xk (9%)', tokensOf: () => n });
-  assert.match(hl(300_000), /busy · Xk$/);
-  assert.match(hl(300_001), /busy · 🟡 Xk$/);
-  assert.match(hl(700_001), /busy · 🔴 Xk$/);
+  assert.match(hl(300_000), /⏳ · Xk$/);
+  assert.match(hl(300_001), /⏳ · 🟡 Xk$/);
+  assert.match(hl(700_001), /⏳ · 🔴 Xk$/);
   assert.match(formatAgentList({ procs: [procs[0]], ctxOf: () => 'ctx 800k', tokensOf: () => 800_000 }), /🧠 Context: 🔴 800k/, 'full form too');
 });
 
