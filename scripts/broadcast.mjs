@@ -21,7 +21,9 @@ import { lsHashtagSet, personaByHashtag } from './spawn.mjs';
 import { formatPersona } from './persona.mjs';
 import { durableWrite } from './steer.mjs';
 import { DEFAULT_TMP_DIR } from './tele-listen.mjs';
-import { readProjectsConfig, resolveDefaultChatId, projectEntries } from './projects-config.mjs';
+import { readProjectsConfig, resolveDefaultChatId, projectEntries, resolveProjectKey } from './projects-config.mjs';
+import { lookupAllocationByConvo } from './convo-registry.mjs';
+import { worktreeOf, gitCommonDir } from './machine-lock.mjs';
 
 export const USAGE = 'usage: /broadcast [--chat <id>] <text>';
 
@@ -66,6 +68,100 @@ export function parseBroadcastRaw(raw) {
   // silently widen the scope to every group.
   else if (/--chat/i.test(out.text)) out.error = `--chat phải đứng đầu (không trong ngoặc) — ${USAGE}`;
   return out;
+}
+
+// ── RFC 37: the pieces the `/broadcast` button board is built from ──
+
+export const OTHER_PROJECT = 'khác';
+const normTag = (h) => String(h).replace(/^#/, '').toLowerCase();
+
+/**
+ * One candidate per convo (RFC 37 §3.2): listLiveTopics gives a row per (chat, convo); the chat kept is
+ * the one of the NEWEST topic (`ts`), a tie → the smaller chat id (string order). Pure.
+ */
+export function candidateTopics(store, chatIds) {
+  const best = new Map();
+  for (const t of listLiveTopics(store, chatIds)) {
+    const cur = best.get(t.convoId);
+    if (!cur || t.ts > cur.ts || (t.ts === cur.ts && t.chatId < cur.chatId)) best.set(t.convoId, t);
+  }
+  return [...best.values()];
+}
+
+/**
+ * Which of `targets` ({convoId, hashtag}) are running, in /ls order → [{ target, row, i }]. The SAME rule at
+ * board time and at Send time (RFC 37 §3.1): an /ls row with a convoId matches that convo exactly; a row with
+ * only a hashtag (an empty tele-* screen) matches only when that hashtag is UNIQUE across the whole store
+ * (every chat, distinct convoIds). Pure.
+ */
+export function resolveLive(targets, lsRows, store) {
+  const entries = [...(lsRows || [])];
+  const tagCount = new Map();
+  const seen = new Set();
+  for (const t of listLiveTopics(store, Object.keys(store || {}))) {
+    if (seen.has(t.convoId)) continue;
+    seen.add(t.convoId);
+    tagCount.set(normTag(t.hashtag), (tagCount.get(normTag(t.hashtag)) || 0) + 1);
+  }
+  const indexOf = (t) => entries.findIndex((e) => {
+    const isObj = e && typeof e === 'object';
+    if (isObj && e.convoId != null) return String(e.convoId) === String(t.convoId);
+    const h = isObj ? e.hashtag : e;
+    return !!h && normTag(h) === normTag(t.hashtag) && tagCount.get(normTag(t.hashtag)) === 1;
+  });
+  return targets.map((target) => ({ target, i: indexOf(target) })).filter((x) => x.i >= 0)
+    .sort((a, b) => a.i - b.i).map((x) => ({ ...x, row: entries[x.i] }));
+}
+
+/** Repo name from a git common dir: `/x/repo/.git` → `repo`, a bare `/x/repo.git` → `repo`. */
+const repoNameOf = (common) => {
+  const base = path.basename(common);
+  return base === '.git' ? path.basename(path.dirname(common)) : base.replace(/\.git$/, '');
+};
+
+/**
+ * The project of one running session (RFC 37 §3.2, RFC 15 order, no `git` subprocess):
+ * allocation of the convo → cwd's git repo (worktrees fold into the main repo; outside a repo: nothing) →
+ * the chat when it is the dedicated group of exactly ONE project → 'khác'.
+ */
+export function projectOf({ convoId, chatId, cwd }, { config = {}, allocRows = [], botId = null, worktreeFn = worktreeOf, commonDirFn = gitCommonDir } = {}) {
+  try {
+    const a = allocRows.length ? lookupAllocationByConvo(allocRows, Number(convoId), botId) : null;
+    if (a && a.projectKey) return resolveProjectKey(a.projectKey, config);
+  } catch { /* fall through */ }
+  if (cwd) {
+    try {
+      const common = commonDirFn(worktreeFn(cwd));
+      if (common) { const name = repoNameOf(common); if (name) return resolveProjectKey(name, config); }
+    } catch { /* fall through */ }
+  }
+  const owners = projectEntries(config).filter(([, p]) => p && p.chatId != null && String(p.chatId).trim() === String(chatId));
+  if (owners.length === 1) return owners[0][0];
+  return OTHER_PROJECT;
+}
+
+/**
+ * The running sessions for the board: [{ convoId, chatId, hashtag, project, label }], deduped by convo,
+ * in /ls order (projects are grouped by the caller in first-seen order). `ls` = /ls rows (with `cwd`).
+ */
+export function listTargets({ store, chatIds, ls, config = {}, allocRows = [], botId = null, projectDeps = {} }) {
+  const live = resolveLive(candidateTopics(store, chatIds), ls, store);
+  return live.map(({ target: t, row }) => ({
+    convoId: String(t.convoId), chatId: String(t.chatId), hashtag: t.hashtag,
+    project: projectOf({ convoId: t.convoId, chatId: t.chatId, cwd: row && typeof row === 'object' ? row.cwd : null }, { config, allocRows, botId, ...projectDeps }),
+    label: `${t.persona ? `${formatPersona(t.persona)} ` : ''}#${t.hashtag}`,
+  }));
+}
+
+/** Durable prompt write (RFC 03 §5.1) to each target → { sent: [target], failed: [target] }. One write per convo. */
+export async function sendTo(targets, text, from = {}, { tmpDir = DEFAULT_TMP_DIR, writePrompt = durableWrite } = {}) {
+  const sent = [], failed = [];
+  for (const t of targets) {
+    const prompt = buildBroadcastPrompt({ targetConvoId: t.convoId, targetChatId: t.chatId, fromUserId: from.id, fromName: from.name, fromRole: from.role || 'member', text });
+    try { await writePrompt(prompt, path.join(tmpDir, `prompt-convo-${t.convoId}.json`)); sent.push(t); }
+    catch { failed.push(t); }
+  }
+  return { sent, failed };
 }
 
 // The injected system prompt. `broadcast:true` marks it; non-privileged `fromRole`

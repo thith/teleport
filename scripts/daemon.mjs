@@ -25,7 +25,7 @@
 // [args]`, gates by the command's minRole, and runs `node scripts/<run>` (cwd =
 // the project when needsProject, else the workspace root), passing the sender's
 // identity via env (TELE_FROM_*) and relaying the script's stdout back to the DM.
-// Built-ins (spawn/headless/kill/ls/run/whisper/instruct/pending/broadcast/start)
+// Built-ins (spawn/headless/kill/ls/run/whisper/instruct/pending/start)
 // live in teleport's own commands.json so it stays self-sufficient. The one
 // in-process built-in is `/reload` (re-reads the registry; see reloadDaemonState). Plus the
 // heartbeat auto-reminder
@@ -77,6 +77,7 @@ import { machineWatch } from './health.mjs';
 import { longBuildWatch, handleLongBuildButton, stopTick, STOP_BUTTON_RE, STOP_TICK_MS, buildKickNoticePrompt } from './long-build.mjs';
 import { Q_BUTTON_RE } from './q-panel.mjs';
 import { handleQButton, runQCommand, topicConvoIds } from './q-cmd.mjs';
+import { BC_BUTTON_RE, handleBroadcastButton, runBroadcastCommand } from './broadcast-panel.mjs';
 import { deliverNotices } from './queue-control.mjs';
 import { LOCK_DIR } from './machine-lock.mjs';
 import { quietNow, syncQuietCpu } from './quiet-hours.mjs';
@@ -135,6 +136,7 @@ export function parseDaemonCommand(text) {
 // auto-attaches a .md document when it's too long for one Telegram message.
 export const COMMAND_TIMEOUT_MS = 5 * 60 * 1000;
 export const RELOAD_COMMAND = 'reload';
+export const BROADCAST_COMMAND = 'broadcast'; // RFC 37: the owner's recipient-picking board
 export const Q_COMMAND = 'q'; // RFC 29: the owner's build-queue board
 export const CLEANUP_COMMAND = 'cleanup'; // RFC 30: no argument = the kept-worktree list, <path|branch> = manual removal; run / --dry-run = the old launcher (registry)
 export const COMMAND_MAX_BUFFER = 8 * 1024 * 1024;
@@ -442,7 +444,7 @@ async function main() {
       const presses = updates.filter((u) => u.callback_query && String(u.callback_query.from?.id) === daemonUserId);
       for (const u of presses) {
         const data = String(u.callback_query.data || '');
-        const handler = Q_BUTTON_RE.test(data) ? handleQButton : STOP_BUTTON_RE.test(data) ? handleLongBuildButton : TYPE_BUTTON_RE.test(data) ? handleTypeButton : CLEANUP_BUTTON_RE.test(data) ? handleCleanupButton : handleMergeButton;
+        const handler = Q_BUTTON_RE.test(data) ? handleQButton : BC_BUTTON_RE.test(data) ? handleBroadcastButton : STOP_BUTTON_RE.test(data) ? handleLongBuildButton : TYPE_BUTTON_RE.test(data) ? handleTypeButton : CLEANUP_BUTTON_RE.test(data) ? handleCleanupButton : handleMergeButton;
         handler(u.callback_query, ctx, handler === handleLongBuildButton || handler === handleQButton ? { kick: () => { stopTick(stopCtx, { deliver: deliverResult }).catch(() => {}); } } : undefined).catch((e) => console.error(`[daemon] button: ${e?.message ?? e}`));
       }
       // Agent merge requests (file inbox) — one pass at a time.
@@ -1038,6 +1040,11 @@ export async function dispatchCommand(parsed, from, {
     // Owner only: it kicks / blocks other agents' builds and stops running ones.
     if (String(from?.id) !== String(daemonUserId)) { await sendText(daemonUserId, `❌ /${Q_COMMAND} chỉ owner dùng được.`); return; }
     await runQCommand(parsed.rest, { daemonUserId, projectsConfig, sendText, ...extra }, { procs: () => listClaudeProcs(), topics: () => topicConvoIds(), ...(extra.qDeps || {}) });
+    return;
+  }
+  if (parsed.cmd === BROADCAST_COMMAND) {
+    // Owner only (the daemon takes commands from the owner alone) + admin role; the board picks the recipients.
+    await runBroadcastCommand(parsed.rest, from, { daemonUserId, projectsConfig, sendText, ...extra }, { roleOf: (id) => resolveSenderRole(projectsConfig, id), ...(extra.broadcastDeps || {}) });
     return;
   }
   if (parsed.cmd === CLEANUP_COMMAND) {

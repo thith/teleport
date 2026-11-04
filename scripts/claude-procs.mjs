@@ -274,12 +274,13 @@ const folderKeyOf = (r, home) => { const f = folderOf(r, home); return f ? f.toL
  * session's convo + hashtag, else its `tele-` screen label); an EMPTY `tele-` screen counts by its
  * label. Pure.
  */
-export function lsIdentities({ screens = [], procs = [], home = os.homedir() } = {}) {
+export function lsIdentities({ screens = [], procs = [], home = os.homedir(), withCwd = false } = {}) {
   const items = [];
   const add = (r) => {
     const c = r.sessionId ? uuidToConvoInt(r.sessionId) : null;
     const tag = rowTag(r);
-    if (c != null || tag) items.push({ empty: 0, key: folderKeyOf(r, home), id: { convoId: c == null ? null : String(c), hashtag: tag ? String(tag).toLowerCase() : null } });
+    // `withCwd` (RFC 37): also the process's cwd — from the SAME snapshot, so a project can be derived without a second ps.
+    if (c != null || tag) items.push({ empty: 0, key: folderKeyOf(r, home), id: { convoId: c == null ? null : String(c), hashtag: tag ? String(tag).toLowerCase() : null, ...(withCwd ? { cwd: r.cwd ?? null } : {}) } });
   };
   const { screenItems, terminal } = lsLayout({ screens, procs });
   for (const { name, rows } of screenItems) {
