@@ -337,7 +337,8 @@ test('slots row: labels (forced / auto), sits right above the max row, callbacks
   const i = labels(auto2).indexOf('▶ −|▶ 2 (auto)|▶ +');
   assert.ok(i >= 0, labels(auto2).join(' / '));
   assert.match(labels(auto2)[i + 1], /^⏳ −\|⏳ tắt\|⏳ \+$/, 'max row directly below the slots row');
-  assert.deepEqual(auto2.rows[i].map((b) => b.callback_data.split(':')[3]), ['n-', 'nt', 'n+']);
+  assert.deepEqual(auto2.rows[i].map((b) => b.callback_data.split(':')[3]), ['n-', 'n-', 'n+'], 'auto board: the middle button targets 1');
+  assert.deepEqual(mk({ forcedOf: () => true, autoOf: () => 2 }).rows.find((row) => row[0].text === '▶ −').map((b) => b.callback_data.split(':')[3]), ['n-', 'n+', 'n+'], 'forced board: the middle button targets auto');
   assert.ok(auto2.rows[i].every((b) => Buffer.byteLength(b.callback_data) < 64 && Q_BUTTON_RE.test(b.callback_data)));
   assert.ok(labels(mk({ forcedOf: () => true, autoOf: () => 2 })).includes('▶ −|▶ 1|▶ +'));
   assert.ok(labels(mk({ forcedOf: () => false, autoOf: () => 1 })).includes('▶ −|▶ 1 (auto)|▶ +'));
@@ -358,12 +359,26 @@ test('press: slots − / + / toggle write and remove build.slots; no-op at the e
   assert.ok(cbs(ctx.edits.at(-1).rows).length && ctx.edits.at(-1).rows.flat().some((b) => b.text === '▶ 1'));
   assert.match(await press('n-'), /đã là 1 — không đổi/, '− when already 1: no-op');
   assert.equal(fs.existsSync(file), true);
-  assert.match(await press('nt'), /Build song song: auto \(\d\)/);
+  assert.match(await press('n+'), /Build song song: auto \(\d\)/);
   assert.equal(fs.existsSync(file), false);
-  await press('nt');
-  assert.equal(fs.existsSync(file), true, 'toggle auto → 1');
+  await press('n-');
+  assert.equal(fs.existsSync(file), true);
   await press('n+');
   assert.equal(fs.existsSync(file), false);
+});
+
+test('stale board: the middle slots button is an explicit target, never a toggle of the current state', async () => {
+  const dir = tmpDir(); ticket(dir, 'A');
+  const file = path.join(dir, 'build.slots');
+  const ctx = fakeCtx(dir);
+  await startQ(ctx); // shows auto
+  const { tok } = boardOf(ctx);
+  const mid = lastRows(ctx).flat().find((b) => /^▶ \d \(auto\)$/.test(b.text));
+  await runQCommand('slots 1', ctx); // meanwhile forced elsewhere
+  assert.equal(fs.existsSync(file), true);
+  await qPress(cqFor(ctx, mid.callback_data), ctx);
+  assert.equal(fs.existsSync(file), true, 'still forced');
+  assert.match(ctx.edits.at(-1).text, /đã là 1 — không đổi/);
 });
 
 test('typed /q slots <1|auto>; usage lists it', async () => {

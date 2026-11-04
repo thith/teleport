@@ -120,7 +120,7 @@ export function renderQ(g, { tok, rev, page = 0, view = 'main', pin = null, stop
     pol.blocks.forEach((b, i) => { lines.push(`${i + 1}. ${clean(b.label)} tới ${hhmm(b.until)}`); rows.push([{ text: `Bỏ chặn ${i + 1}`, callback_data: cb('u', i + 1) }]); });
   }
   if (pages > 1) rows.push([{ text: '‹', callback_data: cb('pg', Math.max(0, pg - 1)) }, { text: `${pg + 1}/${pages}`, callback_data: cb('r') }, { text: '›', callback_data: cb('pg', Math.min(pages - 1, pg + 1)) }]);
-  rows.push([{ text: '▶ −', callback_data: cb('n-') }, { text: g.slotsForced ? '▶ 1' : `▶ ${g.autoN ?? g.N} (auto)`, callback_data: cb('nt') }, { text: '▶ +', callback_data: cb('n+') }]);
+  rows.push([{ text: '▶ −', callback_data: cb('n-') }, { text: g.slotsForced ? '▶ 1' : `▶ ${g.autoN ?? g.N} (auto)`, callback_data: cb(g.slotsForced ? 'n+' : 'n-') }, { text: '▶ +', callback_data: cb('n+') }]);
   rows.push([{ text: '⏳ −', callback_data: cb('m-') }, { text: pol.max == null ? '⏳ tắt' : `⏳ ${pol.max}`, callback_data: cb('mt') }, { text: '⏳ +', callback_data: cb('m+') }]);
   // RFC 32 §4.4: switch the night rules off until the window ends / back on. The state is checked against the stored board on press.
   if (g.quiet?.active) rows.push([{ text: g.quiet.overridden ? '🌙 Bật lại' : `⏩ Tắt giờ im lặng tới ${hhmm(g.quiet.until)}`, callback_data: cb('qz') }]);

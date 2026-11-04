@@ -152,7 +152,6 @@ export async function qPress(cq, ctx, deps = {}) {
     case 'mt': await res(toggleMax(dir, { now })); break;
     case 'n-': note = applySlots('1', dir, deps); break;
     case 'n+': note = applySlots('auto', dir, deps); break;
-    case 'nt': note = applySlots(fs.existsSync(path.join(dir, 'build.slots')) ? 'auto' : '1', dir, deps); break;
     case 'p': await res(updatePolicy(dir, (p) => { p.paused = !p.paused; return { paused: p.paused }; }, { now })); break;
     case 'k': { const r = await res(kickTicket(dir, { name: row.file, pid: row.pid, procStart: row.procStart }, { now })); if (r.ok) note = `Đã kick ${row.label} (vé chưa chạy, agent được báo).`; break; }
     case 't': { const r = await res(topTicket(dir, { name: row.file, pid: row.pid, procStart: row.procStart, toggle: true }, { now })); if (r.ok) note = r.value.boosted ? `${row.label} lên đầu hàng.` : `Bỏ ưu tiên ${row.label}.`; break; }
