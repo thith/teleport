@@ -125,7 +125,8 @@ const repoNameOf = (common) => {
  * allocation of the convo → cwd's git repo (worktrees fold into the main repo; outside a repo: nothing) →
  * the chat when it is the dedicated group of exactly ONE project → 'khác'.
  */
-export function projectOf({ convoId, chatId, cwd }, { config = {}, allocRows = [], botId = null, worktreeFn = worktreeOf, commonDirFn = gitCommonDir } = {}) {
+export function projectOf({ convoId, chatId, cwd }, { config = {}, allocRows: rawRows = [], botId = null, worktreeFn = worktreeOf, commonDirFn = gitCommonDir } = {}) {
+  const allocRows = Array.isArray(rawRows) ? rawRows : rawRows?.rows ?? []; // readRows() returns { rows, … }
   try {
     const a = allocRows.length ? lookupAllocationByConvo(allocRows, Number(convoId), botId) : null;
     if (a && a.projectKey) return resolveProjectKey(a.projectKey, config);

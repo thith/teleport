@@ -386,3 +386,48 @@ test("'sending' record survives a failed interruption edit (press and sweep); a 
   assert.equal(h.buttons.get(h.tok), undefined);
   assert.equal(h.out.edits.at(-1).text, MSG_INTERRUPTED); assert.equal(h.writes.length, 0);
 });
+
+// ── review round 1b ──
+
+test('projectOf: accepts the readRows() shape { rows } as well as an array', () => {
+  const o = { config: CFG, botId: BOT };
+  assert.equal(projectOf({ convoId: A, chatId: '-100', cwd: null }, { ...o, allocRows: { rows: [alloc(A, 'umipay')], malformed: 0, rawLines: [] } }), 'umipay');
+  assert.equal(projectOf({ convoId: A, chatId: '-100', cwd: null }, { ...o, allocRows: [alloc(A, 'umipay')] }), 'umipay');
+});
+
+test("generic merge-button sweep never removes a broadcast 'sending' entry (an open expired one is fine)", async () => {
+  const { takeMergeButton } = await import('./daemon.mjs');
+  const store = new Map([
+    ['s', { kind: 'broadcast', state: 'sending', createdAt: 0 }], ['o', { kind: 'broadcast', state: 'open', createdAt: 0 }],
+    ['m', { createdAt: 0 }], ['x', { createdAt: 1000 }],
+  ]);
+  takeMergeButton('x', { now: 10_000_000, store, ttlMs: 1000 });
+  assert.ok(store.has('s')); assert.ok(!store.has('o')); assert.ok(!store.has('m'));
+});
+
+test('press: redraw fails on a toggle → stored entry rolled back, a tap with the old rev still works', async () => {
+  const h = mk2(); await h.start();
+  const ok = h.ctx.editButtonRows;
+  h.ctx.editButtonRows = async () => { throw new Error('tg down'); };
+  await h.press('t', 0, 0);
+  assert.equal(h.buttons.get(h.tok).rev, 0); assert.equal(h.buttons.get(h.tok).selected.length, 5);
+  h.ctx.editButtonRows = ok;
+  await h.press('t', 0, 0);
+  assert.equal(h.buttons.get(h.tok).rev, 1); assert.equal(h.buttons.get(h.tok).selected.length, 4);
+});
+
+test('daemon dispatch: /broadcast reaches the builtin with role check; multiline and quoted rest preserved', async () => {
+  const { parseDaemonCommand, dispatchCommand } = await import('./daemon.mjs');
+  const text = '/broadcast dòng 1\n"dòng 2" [x]';
+  const parsed = parseDaemonCommand(text);
+  assert.equal(parsed.cmd, 'broadcast');
+  for (const [role, ok] of [['member', false], ['admin', true]]) {
+    const h = mk2();
+    await dispatchCommand(parsed, { id: Number(OWNER) }, {
+      daemonUserId: OWNER, projectsConfig: CFG, registry: {}, sendText: h.ctx.sendText, sendButtonRows: h.ctx.sendButtonRows,
+      editButtonRows: h.ctx.editButtonRows, buttonStore: h.ctx.buttonStore, token: h.ctx.token, broadcastDeps: { ...h.deps, roleOf: () => role },
+    });
+    if (ok) { assert.equal(h.out.boards.length, 1); assert.equal(h.buttons.get(h.tok).text, 'dòng 1\n"dòng 2" [x]'); }
+    else { assert.equal(h.out.boards.length, 0); assert.match(h.out.sent.at(-1), /quyền admin/); }
+  }
+});

@@ -614,7 +614,7 @@ export function takeMergeButton(tok, { now = Date.now(), store = pendingMergeBut
   const e = store.get(tok);
   if (e?.kind) return null; // allow-list: merge entries carry no kind (cleanup / type have their own takers)
   store.delete(tok);
-  for (const [k, v] of store) if (v?.kind !== 'stop' && now - v.createdAt > ttlMs) store.delete(k); // sweep (an in-flight build stop — RFC 24 — stays)
+  for (const [k, v] of store) if (v?.kind !== 'stop' && !(v?.kind === 'broadcast' && v.state === 'sending') && now - v.createdAt > ttlMs) store.delete(k); // sweep (an in-flight build stop — RFC 24 — and a broadcast mid-send stay: their own sweeps own them)
   if (!e || now - e.createdAt > ttlMs) return null;
   return e;
 }

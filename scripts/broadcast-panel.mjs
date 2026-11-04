@@ -137,7 +137,7 @@ async function runBroadcastUnlocked(rest, from, ctx, deps) {
   try { ls = [...await (deps.lsRows ?? (() => lsHashtagSet({ withCwd: true })))()]; }
   catch (e) { await say(`📢 broadcast: không liệt kê được agent đang chạy (${e?.message || e}) — nothing sent.`); dropGone(); return; }
   let allocRows = [];
-  try { allocRows = (deps.allocRows ?? (() => readRows()))(); } catch { /* no allocation info → cwd / chat fallbacks */ }
+  try { allocRows = (deps.allocRows ?? (() => readRows().rows))(); } catch { /* no allocation info → cwd / chat fallbacks */ }
   const all = listTargets({ store: topics, chatIds, ls, config, allocRows, botId: deps.botId ?? extractBotId(ctx.token), projectDeps: deps.projectDeps });
   if (!all.length) { await say('📢 broadcast — không có session nào đang chạy (/ls trống), không gửi gì.'); dropGone(); return; }
 
@@ -212,7 +212,12 @@ export async function bcPress(cq, ctx, deps = {}) {
     try { store.setStrict(tok, next); } catch { await answer('❌ không lưu được trạng thái nút — gõ /broadcast lại.'); return; }
     const r = renderBroadcast(next, tok);
     try { await edit(chatId, messageId, r.text, r.rows); }
-    catch (e) { console.error(`[broadcast] redraw failed: ${e?.message ?? e}`); await answer('❌ không vẽ lại được bảng — gõ /broadcast lại.'); return; }
+    catch (e) {
+      console.error(`[broadcast] redraw failed: ${e?.message ?? e}`);
+      // the screen still shows the OLD revision: put the stored entry back to match it (else every tap would be stale)
+      try { store.setStrict(tok, entry); } catch { try { store.delete(tok); } catch { /* the board dies on its TTL */ } }
+      await answer('❌ không vẽ lại được bảng — gõ /broadcast lại.'); return;
+    }
     await answer();
     return;
   }
