@@ -405,15 +405,27 @@ test("generic merge-button sweep never removes a broadcast 'sending' entry (an o
   assert.ok(store.has('s')); assert.ok(!store.has('o')); assert.ok(!store.has('m'));
 });
 
-test('press: redraw fails on a toggle → stored entry rolled back, a tap with the old rev still works', async () => {
+test('press: redraw fails on a toggle → NO rollback; the new rev stays, a Send with the old rev is stale and writes nothing', async () => {
   const h = mk2(); await h.start();
-  const ok = h.ctx.editButtonRows;
   h.ctx.editButtonRows = async () => { throw new Error('tg down'); };
   await h.press('t', 0, 0);
-  assert.equal(h.buttons.get(h.tok).rev, 0); assert.equal(h.buttons.get(h.tok).selected.length, 5);
-  h.ctx.editButtonRows = ok;
-  await h.press('t', 0, 0);
   assert.equal(h.buttons.get(h.tok).rev, 1); assert.equal(h.buttons.get(h.tok).selected.length, 4);
+  await h.press('s', undefined, 0);
+  assert.equal(h.writes.length, 0); assert.equal(h.buttons.get(h.tok).state, 'open');
+  await h.press('t', 1, 0);
+  assert.equal(h.out.answers.at(-1), MSG_STALE); assert.equal(h.buttons.get(h.tok).rev, 1);
+});
+
+test("button store: the cap never evicts a broadcast 'sending' record (set and setStrict)", () => {
+  for (const strict of [false, true]) {
+    const m = new PersistentMap(path.join(tmp(), 'b.json'), { cap: 5 });
+    m.set('keep', { kind: 'broadcast', state: 'sending', createdAt: 0 });
+    for (let i = 1; i <= 12; i++) { const v = { kind: 'x', createdAt: i }; if (strict) m.setStrict(`k${i}`, v); else m.set(`k${i}`, v); }
+    assert.ok(m.get('keep')); assert.ok(m.size <= 5);
+    const m2 = new PersistentMap(path.join(tmp(), 'c.json'), { cap: 2 }); // everything exempt: no loop, nothing dropped
+    m2.set('a', { kind: 'broadcast', state: 'sending', createdAt: 1 }); m2.set('b', { kind: 'stop', createdAt: 2 }); m2.set('c', { kind: 'broadcast', state: 'sending', createdAt: 3 });
+    assert.equal(m2.size, 3);
+  }
 });
 
 test('daemon dispatch: /broadcast reaches the builtin with role check; multiline and quoted rest preserved', async () => {

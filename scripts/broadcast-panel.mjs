@@ -214,8 +214,7 @@ export async function bcPress(cq, ctx, deps = {}) {
     try { await edit(chatId, messageId, r.text, r.rows); }
     catch (e) {
       console.error(`[broadcast] redraw failed: ${e?.message ?? e}`);
-      // the screen still shows the OLD revision: put the stored entry back to match it (else every tap would be stale)
-      try { store.setStrict(tok, entry); } catch { try { store.delete(tok); } catch { /* the board dies on its TTL */ } }
+      // no rollback: the edit may have been applied (only the reply failed). The new revision stays; stale old buttons fail safe.
       await answer('❌ không vẽ lại được bảng — gõ /broadcast lại.'); return;
     }
     await answer();

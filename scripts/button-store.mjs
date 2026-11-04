@@ -25,6 +25,9 @@ function writeAtomic(file, content) {
   fs.renameSync(tmp, file);
 }
 
+/** Entries the cap sweep never evicts: an in-flight stop job (RFC 24) and a broadcast whose send began (RFC 37). */
+const keepOnEvict = (e) => e?.kind === 'stop' || (e?.kind === 'broadcast' && e.state === 'sending');
+
 export class PersistentMap extends Map {
   constructor(file = BUTTON_STORE_FILE, { cap = BUTTON_STORE_CAP } = {}) {
     super();
@@ -39,8 +42,8 @@ export class PersistentMap extends Map {
 
   set(k, v) {
     super.set(k, v);
-    if (this.size > this.cap) { // (an in-flight stop job — RFC 24 — is never evicted)
-      const oldest = [...this.entries()].filter(([, e]) => e?.kind !== 'stop').sort((a, b) => (a[1].createdAt || 0) - (b[1].createdAt || 0));
+    if (this.size > this.cap) { // (an in-flight stop job — RFC 24 — and a broadcast mid-send are never evicted)
+      const oldest = [...this.entries()].filter(([, e]) => !keepOnEvict(e)).sort((a, b) => (a[1].createdAt || 0) - (b[1].createdAt || 0));
       for (const [key] of oldest.slice(0, this.size - this.cap)) super.delete(key);
     }
     try { this.flush(); } catch (e) { console.error(`[button-store] write failed: ${e?.message ?? e}`); } // still works in memory
@@ -57,7 +60,7 @@ export class PersistentMap extends Map {
     for (const key of remove) if (key !== k) super.delete(key);
     super.set(k, v);
     if (this.size > this.cap) {
-      const oldest = [...this.entries()].filter(([key, e]) => key !== k && e?.kind !== 'stop').sort((a, b) => (a[1].createdAt || 0) - (b[1].createdAt || 0));
+      const oldest = [...this.entries()].filter(([key, e]) => key !== k && !keepOnEvict(e)).sort((a, b) => (a[1].createdAt || 0) - (b[1].createdAt || 0));
       for (const [key] of oldest.slice(0, this.size - this.cap)) super.delete(key);
     }
     try { this.flush(); } catch (e) {
