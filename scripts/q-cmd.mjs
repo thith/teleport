@@ -6,6 +6,8 @@
 // redraw (strict edit) → answer. A crash between "consume" and "act" loses the press, never replays it.
 
 import crypto from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
 import { LOCK_DIR, readQueue, readHolders, quietNowFor } from './machine-lock.mjs';
 import { writeOverride, clearOverride, syncQuietCpu } from './quiet-hours.mjs';
 import { parseDuration, readPolicy } from './build-policy.mjs';
@@ -13,7 +15,8 @@ import {
   setMax, stepMax, toggleMax, setRetry, setPaused, updatePolicy, kickTicket, topTicket, blockPlan, plainOwnerPlan, blockOwner, unblockOwner, resetPolicy,
   resolveQueueTarget, blockMatches, parseBlockArgs,
 } from './queue-control.mjs';
-import { gatherQ, renderQ, Q_BUTTON_RE, Q_TTL_MS } from './q-panel.mjs';
+import { gatherQ, renderQ, Q_BUTTON_RE, Q_TTL_MS, autoSlots } from './q-panel.mjs';
+import { setSlots } from './lock-queue.mjs';
 import { verifyHolder, holderKey, createStopJob, retireLongBuildAlert } from './long-build.mjs';
 import { shortConvoHash } from './convo-hash.mjs';
 import { peekPersona } from './persona-store.mjs';
@@ -85,6 +88,15 @@ export function handleQButton(cq, ctx, deps = {}) {
   return exclusive(() => qPress(cq, ctx, deps));
 }
 
+/** Set the build slots to 1 (forced) or auto → a note for the board. No-op (and says so) when already there. */
+export function applySlots(value, dir, deps = {}) {
+  const forced = fs.existsSync(path.join(dir, 'build.slots'));
+  const shown = value === '1' ? '1' : `auto (${(deps.autoSlots ?? autoSlots)()})`;
+  if ((value === '1') === forced) return `Build song song: đã là ${shown} — không đổi.`;
+  try { setSlots(value, { dir }); } catch (e) { return `Không đổi được build song song: ${e.message}`; }
+  return `Build song song: ${shown} (áp dụng cho build lấy chỗ từ giờ; build đang chạy chạy nốt).`;
+}
+
 export async function qPress(cq, ctx, deps = {}) {
   const dir = dirOf(ctx, deps), now = nowOf(deps), store = ctx.buttonStore;
   const m = String(cq.data || '').match(Q_BUTTON_RE);
@@ -138,6 +150,9 @@ export async function qPress(cq, ctx, deps = {}) {
     case 'm-': await res(stepMax(dir, -1, { now })); break;
     case 'm+': await res(stepMax(dir, +1, { now })); break;
     case 'mt': await res(toggleMax(dir, { now })); break;
+    case 'n-': note = applySlots('1', dir, deps); break;
+    case 'n+': note = applySlots('auto', dir, deps); break;
+    case 'nt': note = applySlots(fs.existsSync(path.join(dir, 'build.slots')) ? 'auto' : '1', dir, deps); break;
     case 'p': await res(updatePolicy(dir, (p) => { p.paused = !p.paused; return { paused: p.paused }; }, { now })); break;
     case 'k': { const r = await res(kickTicket(dir, { name: row.file, pid: row.pid, procStart: row.procStart }, { now })); if (r.ok) note = `Đã kick ${row.label} (vé chưa chạy, agent được báo).`; break; }
     case 't': { const r = await res(topTicket(dir, { name: row.file, pid: row.pid, procStart: row.procStart, toggle: true }, { now })); if (r.ok) note = r.value.boosted ? `${row.label} lên đầu hàng.` : `Bỏ ưu tiên ${row.label}.`; break; }
@@ -215,7 +230,7 @@ export function topicConvoIds(store = readTopicsStore()) {
   return [...out];
 }
 
-const MAN_USAGE = 'usage: /q  ·  /q max <n|off>  ·  /q retry <phút>  ·  /q kick <số>  ·  /q top <số>  ·  /q block <số|persona|#hash> <30m|1h|2h30m|today>  ·  /q unblock <số|persona|#hash>  ·  /q pause|resume';
+const MAN_USAGE = 'usage: /q  ·  /q max <n|off>  ·  /q slots <1|auto>  ·  /q retry <phút>  ·  /q kick <số>  ·  /q top <số>  ·  /q block <số|persona|#hash> <30m|1h|2h30m|today>  ·  /q unblock <số|persona|#hash>  ·  /q pause|resume';
 
 /** `/q …` typed. No argument = the board. Numbers refer to the newest board. */
 export async function runQCommand(rest, ctx, deps = {}) {
@@ -235,6 +250,12 @@ export async function runQCommand(rest, ctx, deps = {}) {
       const v = args[0]?.toLowerCase();
       if (args.length !== 1 || !(v === 'off' || /^\d{1,2}$/.test(v))) { await say('usage: /q max <0..20 | off>'); return; }
       await out(await setMax(dir, v === 'off' ? null : Number(v), { now }), (r) => (r.value.max == null ? '✅ max hàng chờ: tắt.' : `✅ max hàng chờ: ${r.value.max} (vé đã xếp không bị đuổi).`));
+      return;
+    }
+    case 'slots': {
+      const v = args[0]?.toLowerCase();
+      if (args.length !== 1 || !(v === '1' || v === 'auto')) { await say('usage: /q slots <1|auto>'); return; }
+      await say(applySlots(v, dir, deps));
       return;
     }
     case 'retry': {
