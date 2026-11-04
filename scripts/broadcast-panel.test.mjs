@@ -515,7 +515,7 @@ test('RFC38 --now --p:: filters (case-insensitive), empty known project is repor
 test('RFC38 --p: unknown / near-miss / ambiguous → refused, nothing written; also with 0 sessions', async () => {
   for (const t of ['--now --p:umipay-typo hi', '--now --p:umipay,nope hi', '--p:nope hi']) {
     const h = mk2(); await h.start(t);
-    assert.equal(h.writes.length, 0); assert.equal(h.out.boards.length, 0); assert.match(h.out.sent.at(-1), /^❌ không có dự án: .*\. Đang chạy: /); assert.equal(h.buttons.size, 0);
+    assert.equal(h.writes.length, 0); assert.equal(h.out.boards.length, 0); assert.match(h.out.sent.at(-1), /^❌ không có dự án: .*\. Đang chạy: /); assert.ok([...h.buttons.keys()].every((k) => k.startsWith('bcnow:')));
   }
   const h0 = harness({ store: TOP(), ls: [] }); await h0.start('--now --p:nope hi');
   assert.match(h0.out.sent.at(-1), /không có dự án: nope/);
@@ -526,7 +526,7 @@ test('RFC38 --p: unknown / near-miss / ambiguous → refused, nothing written; a
 
 test('RFC38 --now: every project empty → "không có session nào khớp"; no sessions at all; owner/admin gates; syntax errors', async () => {
   const h = mk2(); await h.start('--now --p:shared1,shared2 hi');
-  assert.match(h.out.sent.at(-1), /không có session nào khớp, không gửi gì\.\n⏹ shared1.*\n⏹ shared2/); assert.equal(h.writes.length, 0); assert.equal(h.buttons.size, 0);
+  assert.match(h.out.sent.at(-1), /không có session nào khớp, không gửi gì\.\n⏹ shared1.*\n⏹ shared2/); assert.equal(h.writes.length, 0); assert.ok([...h.buttons.keys()].every((k) => k.startsWith('bcnow:')));
   const none = harness({ store: TOP(), ls: [] }); await none.start('--now hi');
   assert.match(none.out.sent.at(-1), /\/ls trống/);
   const m = mk2({ role: 'member' }); await m.start('--now hi'); assert.match(m.out.sent.at(-1), /quyền admin/); assert.equal(m.writes.length, 0);
@@ -624,4 +624,14 @@ test('RFC38 daemon dispatch: multi-line /broadcast --now passes chatId+messageId
   const { stripDmControlPrefix } = await import('./tele-listen.mjs');
   const dm = parseDaemonCommand(stripDmControlPrefix('/dm broadcast --now --p:umipay hi'));
   assert.equal(dm.cmd, 'broadcast'); assert.match(dm.rest, /^--now --p:umipay hi$/);
+});
+
+test('RFC38 --now: replay of the same message after an agent started (first run found none / /ls failed) writes nothing', async () => {
+  const h = mk2(); h.state.ls = []; await h.start('--now hi');
+  assert.match(h.out.sent.at(-1), /\/ls trống/); assert.ok(h.buttons.has(`bcnow:${OWNER}:900`));
+  h.state.ls = LS(); await h.start('--now hi');
+  assert.equal(h.writes.length, 0);
+  const f = mk2({ extra: { lsRows: async () => { throw new Error('ls down'); } } }); await f.start('--now hi');
+  f.deps.lsRows = async () => LS(); await f.start('--now hi');
+  assert.equal(f.writes.length, 0);
 });

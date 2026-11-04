@@ -169,6 +169,10 @@ async function runBroadcastUnlocked(rest, from, ctx, deps) {
   const now = nowOf(deps);
   const gone = await sweep(store, ctx, now);
   const dropGone = () => { for (const k of gone) { try { store.delete(k); } catch { /* the next sweep retries */ } } };
+  if (args.now) { // RFC 38 §3.3: the dedupe key is on disk BEFORE discovery, so a replay never sends what was reported as "không gửi gì"
+    try { store.setStrict(nowKey, { kind: 'broadcast-now', createdAt: now }, { remove: gone }); gone.length = 0; }
+    catch (e) { await say(`❌ không ghi được khoá chống gửi đúp (${e?.message || e}) — không gửi gì.`); return; }
+  }
   const chatIds = args.chat ? [String(args.chat)] : groupChatIds(config, { env: deps.env ?? process.env, envFile: deps.envFile ?? {} });
   const topics = deps.store ?? readTopicsStore();
   let ls;
@@ -194,9 +198,7 @@ async function runBroadcastUnlocked(rest, from, ctx, deps) {
   if (!all.length) { await say('📢 broadcast — không có session nào đang chạy (/ls trống), không gửi gì.'); dropGone(); return; }
   const fromInfo = { id: from?.id ?? null, name: from?.first_name || from?.username || from?.name || 'admin', role };
 
-  if (args.now) { // RFC 38 §3.3: the dedupe key is on disk BEFORE the first prompt; a failed write sends nothing
-    try { store.setStrict(nowKey, { kind: 'broadcast-now', createdAt: now }, { remove: gone }); }
-    catch (e) { await say(`❌ không ghi được khoá chống gửi đúp (${e?.message || e}) — không gửi gì.`); return; }
+  if (args.now) {
     const { sent, failed } = await sendTo(all, args.text, fromInfo, { tmpDir: deps.tmpDir ?? DEFAULT_TMP_DIR, writePrompt: deps.writePrompt ?? durableWrite });
     await say(renderNowResult({ text: args.text, projects: shown, sent, failed, empty }));
     return;
