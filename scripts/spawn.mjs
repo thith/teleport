@@ -1467,7 +1467,7 @@ if (isDirectRun) {
     const reachable = new Set(typeTargets(procs));
     const tagCount = new Map();
     for (const r of procs) if (r.hashtag) tagCount.set(r.hashtag, (tagCount.get(r.hashtag) || 0) + 1);
-    const usageOf = new Map(); // one transcript read per row (context line + /compact_x gate)
+    const usageOf = new Map(); // one transcript read per row (context line)
     const usage = (r) => {
       if (!r.sessionId || r.guessed) return null;
       if (!usageOf.has(r)) { let u = null; try { u = transcriptState(r.sessionId, r.cwd).usage; } catch {} usageOf.set(r, u); }
@@ -1490,7 +1490,7 @@ if (isDirectRun) {
         if (!owner) return [];
         const convo = r.sessionId ? uuidToConvoInt(r.sessionId) : null;
         const sig = (f) => { try { return convo == null ? null : f(convo); } catch { return null; } };
-        return lsLinks(r, { reachable: reachable.has(r), unique: tagCount.get(r.hashtag) === 1, tokens: usage(r)?.tokens ?? null, listener: sig((c) => statusOf?.listener(c) ?? null), mail: sig(mailOf) });
+        return lsLinks(r, { reachable: reachable.has(r), unique: tagCount.get(r.hashtag) === 1, listener: sig((c) => statusOf?.listener(c) ?? null), mail: sig(mailOf) });
       },
         });
     console.log(fromId === '' ? padNarrowEmoji(out) : out);
