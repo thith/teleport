@@ -338,3 +338,51 @@ test('callback prefix does not collide with other button handlers', async () => 
   assert.ok(BC_BUTTON_RE.test(d));
   for (const re of [Q_BUTTON_RE, STOP_BUTTON_RE, TYPE_BUTTON_RE, CLEANUP_BUTTON_RE, /^(mg|cl|mc):/]) assert.ok(!re.test(d));
 });
+
+// ── review round 1 ──
+
+test('resolveLive: a hashtag-only row never marks a target live when another convo now owns the hashtag', () => {
+  const X = 1205483045424020, Y = 2205483045424020;
+  const tg = [{ convoId: String(X), hashtag: shortConvoHash(X) }];
+  const row = [{ convoId: null, hashtag: shortConvoHash(X) }];
+  assert.equal(resolveLive(tg, row, { '-100': { [Y]: 6, _ts: {} } }).length, 0);   // X replaced by Y in the store
+  assert.equal(resolveLive(tg, row, { '-100': { [X]: 6, _ts: {} } }).length, 1);
+});
+
+test('press: store changes between board and Send (hashtag now owned by another convo) → stopped target gets no prompt', async () => {
+  const X = 1205483045424020, Y = 2205483045424020;
+  const tgt = { convoId: String(X), chatId: '-100', hashtag: shortConvoHash(X), project: 'p', label: 'x' };
+  const h = harness({ store: { '-100': { [X]: 5, _ts: {} } }, ls: [{ convoId: null, hashtag: shortConvoHash(X), cwd: null }] });
+  h.buttons.setStrict(h.tok, { ...entryOf([tgt]), createdAt: h.state.now, chatId: OWNER, messageId: 77, state: 'open' });
+  h.deps.store = { '-100': { [Y]: 6, _ts: {} } };
+  await h.press('s', undefined, 0);
+  assert.equal(h.writes.length, 0);
+});
+
+test('/broadcast: sweep of an interrupted board runs even with empty /ls and with failing /ls', async () => {
+  for (const extra of [{ lsRows: async () => [] }, { lsRows: async () => { throw new Error('ps failed'); } }]) {
+    const h = mk2({ extra }); h.deps.rand = () => 'ffffffffffff';
+    h.buttons.setStrict('oldtoken0000', { kind: 'broadcast', state: 'sending', chatId: OWNER, messageId: 55, createdAt: h.state.now, rev: 1, targets: [], projects: [], selected: [] });
+    await h.start('hi');
+    assert.equal(h.out.boards.length, 0);
+    assert.equal(h.out.edits.at(-1).text, MSG_INTERRUPTED); assert.equal(h.out.edits.at(-1).m, 55);
+    assert.equal(h.buttons.get('oldtoken0000'), undefined);
+  }
+});
+
+test("'sending' record survives a failed interruption edit (press and sweep); a later working edit removes it; never re-sends", async () => {
+  const h = mk2(); await h.start();
+  h.buttons.setStrict(h.tok, { ...h.buttons.get(h.tok), state: 'sending', rev: 1 });
+  const ok = h.ctx.editButtonRows;
+  h.ctx.editButtonRows = async () => { throw new Error('tg down'); };
+  await h.press('s', undefined, 1);
+  assert.ok(h.buttons.get(h.tok)); assert.equal(h.buttons.get(h.tok).state, 'sending');
+  assert.match(h.out.answers.at(-1), /gián đoạn/); assert.equal(h.writes.length, 0);
+  h.deps.rand = () => 'ffffffffffff';
+  await h.start('again');                      // sweep with failing edit: still kept
+  assert.ok(h.buttons.get(h.tok));
+  h.ctx.editButtonRows = ok;
+  await h.start('third');                      // sweep with working edit: removed
+  assert.equal(h.buttons.get(h.tok), undefined);
+  assert.equal(h.out.edits.at(-1).text, MSG_INTERRUPTED); assert.equal(h.writes.length, 0);
+});

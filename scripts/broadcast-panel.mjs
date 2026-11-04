@@ -98,7 +98,8 @@ async function sweep(store, ctx, now) {
   const gone = [];
   for (const [k, v] of [...store.entries()]) {
     if (v?.kind !== 'broadcast') continue;
-    if (v.state === 'sending') { if (v.messageId != null) await finalEdit(ctx, v.chatId, v.messageId, MSG_INTERRUPTED); gone.push(k); }
+    // 'sending' is dropped only once the owner has been told (a failed edit keeps it for the next sweep / press)
+    if (v.state === 'sending') { if (v.messageId == null || await finalEdit(ctx, v.chatId, v.messageId, MSG_INTERRUPTED)) gone.push(k); }
     else if (now - v.createdAt > BC_TTL_MS) { if (v.messageId != null) await finalEdit(ctx, v.chatId, v.messageId, '⌛ Hết hạn — không gửi gì.'); gone.push(k); }
   }
   return gone;
@@ -126,25 +127,27 @@ async function runBroadcastUnlocked(rest, from, ctx, deps) {
   if ((parseBroadcastArgs(tokenizeArgs(rest)).chat ?? null) !== (args.chat ?? null)) { await say(`❌ --chat phải đứng đầu, không trong ngoặc — ${USAGE}`); return; }
   if (args.text.length > BC_MAX_TEXT) { await say(`❌ nội dung quá dài (${args.text.length} > ${BC_MAX_TEXT} ký tự).`); return; }
 
+  // recovery of leftover boards runs first, whatever the discovery below turns out to be
+  const now = nowOf(deps);
+  const gone = await sweep(store, ctx, now);
+  const dropGone = () => { for (const k of gone) { try { store.delete(k); } catch { /* the next sweep retries */ } } };
   const chatIds = args.chat ? [String(args.chat)] : groupChatIds(config, { env: deps.env ?? process.env, envFile: deps.envFile ?? {} });
   const topics = deps.store ?? readTopicsStore();
   let ls;
   try { ls = [...await (deps.lsRows ?? (() => lsHashtagSet({ withCwd: true })))()]; }
-  catch (e) { await say(`📢 broadcast: không liệt kê được agent đang chạy (${e?.message || e}) — nothing sent.`); return; }
+  catch (e) { await say(`📢 broadcast: không liệt kê được agent đang chạy (${e?.message || e}) — nothing sent.`); dropGone(); return; }
   let allocRows = [];
   try { allocRows = (deps.allocRows ?? (() => readRows()))(); } catch { /* no allocation info → cwd / chat fallbacks */ }
   const all = listTargets({ store: topics, chatIds, ls, config, allocRows, botId: deps.botId ?? extractBotId(ctx.token), projectDeps: deps.projectDeps });
-  if (!all.length) { await say('📢 broadcast — không có session nào đang chạy (/ls trống), không gửi gì.'); return; }
+  if (!all.length) { await say('📢 broadcast — không có session nào đang chạy (/ls trống), không gửi gì.'); dropGone(); return; }
 
   const targets = all.slice(0, BC_MAX_TARGETS);
-  const now = nowOf(deps);
   const tok = (deps.rand ?? (() => crypto.randomBytes(6).toString('hex')))();
   const entry = {
     kind: 'broadcast', createdAt: now, chatId: daemonUserId, messageId: null, rev: 0, state: 'open',
     text: args.text, from: { id: from?.id ?? null, name: from?.first_name || from?.username || from?.name || 'admin', role },
     targets, projects: projectsOf(targets), selected: targets.map((_, i) => i), hidden: all.length - targets.length,
   };
-  const gone = await sweep(store, ctx, now);
   const r = renderBroadcast(entry, tok);
   const sent = await sendButtonRows(daemonUserId, r.text, r.rows);
   entry.messageId = sent?.message_id ?? null;
@@ -173,8 +176,8 @@ export async function bcPress(cq, ctx, deps = {}) {
   if (!entry || entry.kind !== 'broadcast') { await answer(MSG_STALE); return; }
   if (String(entry.chatId) !== String(chatId) || entry.messageId !== messageId) { await answer(MSG_STALE); return; }
   if (entry.state === 'sending') { // the daemon died (or the write below failed) after the send began: never send again
-    try { store.delete(tok); } catch { /* stays: the next press says the same */ }
-    await finalEdit(ctx, chatId, messageId, MSG_INTERRUPTED);
+    // dropped only after the warning is out; a failed edit keeps it so the next press / sweep can still warn
+    if (await finalEdit(ctx, chatId, messageId, MSG_INTERRUPTED)) { try { store.delete(tok); } catch { /* stays: the next press says the same */ } }
     await answer('⚠️ Gửi bị gián đoạn — không gửi lại.');
     return;
   }

@@ -96,18 +96,19 @@ export function candidateTopics(store, chatIds) {
  */
 export function resolveLive(targets, lsRows, store) {
   const entries = [...(lsRows || [])];
-  const tagCount = new Map();
-  const seen = new Set();
+  const tagOwners = new Map(); // hashtag → distinct convoIds in the store
   for (const t of listLiveTopics(store, Object.keys(store || {}))) {
-    if (seen.has(t.convoId)) continue;
-    seen.add(t.convoId);
-    tagCount.set(normTag(t.hashtag), (tagCount.get(normTag(t.hashtag)) || 0) + 1);
+    const k = normTag(t.hashtag);
+    if (!tagOwners.has(k)) tagOwners.set(k, new Set());
+    tagOwners.get(k).add(String(t.convoId));
   }
   const indexOf = (t) => entries.findIndex((e) => {
     const isObj = e && typeof e === 'object';
     if (isObj && e.convoId != null) return String(e.convoId) === String(t.convoId);
     const h = isObj ? e.hashtag : e;
-    return !!h && normTag(h) === normTag(t.hashtag) && tagCount.get(normTag(t.hashtag)) === 1;
+    if (!h || normTag(h) !== normTag(t.hashtag)) return false;
+    const owners = tagOwners.get(normTag(t.hashtag)); // the UNIQUE current owner of the hashtag must be this very target
+    return !!owners && owners.size === 1 && owners.has(String(t.convoId));
   });
   return targets.map((target) => ({ target, i: indexOf(target) })).filter((x) => x.i >= 0)
     .sort((a, b) => a.i - b.i).map((x) => ({ ...x, row: entries[x.i] }));
