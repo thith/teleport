@@ -2,9 +2,10 @@
 // the message text, the inline keyboard and the maps (button number → ticket / running build / block)
 // that the daemon stores in the button store and checks again on every press. Pure but for gatherQ's reads.
 
+import fs from 'node:fs';
 import path from 'node:path';
 import {
-  LOCK_DIR, readHolders, readQueue, readClaimed, readServed, queueOrder, hasLegacyWaiter, hasPreBoostWaiter, slotsFor, cpuGateNote, quietNowFor,
+  LOCK_DIR, readHolders, readQueue, readClaimed, readServed, queueOrder, hasLegacyWaiter, hasPreBoostWaiter, slotsFor, cpuGateNote, quietNowFor, memTotal, TWO_SLOT_MIN_RAM,
 } from './machine-lock.mjs';
 import { readPolicy, TICKET_V } from './build-policy.mjs';
 import { shortCmd, ticketWorktree } from './lock-queue.mjs';
@@ -24,8 +25,12 @@ const hhmm = (ms) => new Date(ms).toTimeString().slice(0, 5);
 const clean = (s) => escapeControls(String(s ?? ''));
 const wtName = (t) => { const w = ticketWorktree(t); return w ? ` · ${clean(path.basename(w))}` : ''; };
 
+/** What N=auto resolves to on this machine (RAM only; ignores build.slots). */
+export const autoSlots = (total = memTotal()) => (total >= TWO_SLOT_MIN_RAM ? 2 : 1);
+const slotsForcedIn = (dir) => fs.existsSync(path.join(dir, 'build.slots'));
+
 /** Read everything the board shows. */
-export function gatherQ({ dir = LOCK_DIR, now = Date.now(), read = readQueue, holdersOf = readHolders, claimedOf = readClaimed, servedOf = readServed, policyOf = readPolicy, slotsOf = slotsFor, gate, quietOf = quietNowFor } = {}) {
+export function gatherQ({ dir = LOCK_DIR, now = Date.now(), read = readQueue, holdersOf = readHolders, claimedOf = readClaimed, servedOf = readServed, policyOf = readPolicy, slotsOf = slotsFor, gate, quietOf = quietNowFor, forcedOf = slotsForcedIn, autoOf = autoSlots } = {}) {
   const pr = policyOf(dir, { now });
   const holders = holdersOf('build', { dir }).sort((a, b) => a.startedAt - b.startedAt || a.slot - b.slot);
   const tickets = read('build', { dir, now }).filter((t) => t.status !== 'dead');
@@ -37,7 +42,7 @@ export function gatherQ({ dir = LOCK_DIR, now = Date.now(), read = readQueue, ho
   return {
     gateNote: pr.policy.paused ? '' : cpuGateNote({ dir, N, holders, claimed: claimedOf('build', { dir }), now, gate }), // RFC 32: why a free slot is not handed out
     quiet: (({ active, overridden, until }) => ({ active: !!active, overridden: !!overridden, until: until ?? null }))(quietOf(dir, now)),
-    now, policy: pr.policy, corrupt: pr.corrupt, error: pr.error ?? null, holders, tickets: order, N,
+    now, policy: pr.policy, corrupt: pr.corrupt, error: pr.error ?? null, holders, tickets: order, N, slotsForced: !!forcedOf(dir), autoN: autoOf(),
     preBoost: hasPreBoostWaiter(tickets), oldCode: tickets.filter((t) => t.status === 'live' && !(t.v >= TICKET_V)).length,
   };
 }
@@ -89,6 +94,7 @@ export function renderQ(g, { tok, rev, page = 0, view = 'main', pin = null, stop
   if (pol.paused && g.oldCode) lines.push(`⏸ (còn ${g.oldCode} vé code cũ không theo pause)`);
   if (g.preBoost) lines.push('⬆ tạm tắt: còn người chờ chạy code cũ — chờ họ xong');
   const rows = [];
+  if (g.holders.length) lines.push('', `▶ Đang chạy (${g.holders.length}):`);
   g.holders.forEach((h) => {
     const idx = h.exclusive ? null : runnable.indexOf(h) + 1;
     const stopping = h.stopping || stoppingKeys.has(`${h.pid}:${h.startedAt}`) || h.stopAck;
@@ -97,6 +103,7 @@ export function renderQ(g, { tok, rev, page = 0, view = 'main', pin = null, stop
   });
   const pages = Math.max(1, Math.ceil(g.tickets.length / Q_PAGE_SIZE));
   const pg = Math.min(Math.max(0, page), pages - 1);
+  if (g.tickets.length) lines.push('', `⏳ Chờ (${g.tickets.length}):`);
   g.tickets.forEach((t, i) => {
     const boosted = Number.isFinite(pol.boosts[t.name]);
     const state = t.status === 'live' ? `chờ ${mins(now - t.createdAt)}'` : t.status === 'stalled' ? 'mất nhịp tim' : t.status === 'stopped' ? 'ctrl-Z' : t.status;
@@ -109,11 +116,12 @@ export function renderQ(g, { tok, rev, page = 0, view = 'main', pin = null, stop
   });
   if (pages > 1) lines.push(`(trang ${pg + 1}/${pages})`);
   if (pol.blocks.length) {
-    lines.push('⛔ Đang chặn:');
+    lines.push('', '⛔ Đang chặn:');
     pol.blocks.forEach((b, i) => { lines.push(`${i + 1}. ${clean(b.label)} tới ${hhmm(b.until)}`); rows.push([{ text: `Bỏ chặn ${i + 1}`, callback_data: cb('u', i + 1) }]); });
   }
   if (pages > 1) rows.push([{ text: '‹', callback_data: cb('pg', Math.max(0, pg - 1)) }, { text: `${pg + 1}/${pages}`, callback_data: cb('r') }, { text: '›', callback_data: cb('pg', Math.min(pages - 1, pg + 1)) }]);
-  rows.push([{ text: 'Max −', callback_data: cb('m-') }, { text: pol.max == null ? 'Max tắt' : `Max ${pol.max}`, callback_data: cb('mt') }, { text: 'Max +', callback_data: cb('m+') }]);
+  rows.push([{ text: '▶ −', callback_data: cb('n-') }, { text: g.slotsForced ? '▶ 1' : `▶ ${g.autoN ?? g.N} (auto)`, callback_data: cb(g.slotsForced ? 'n+' : 'n-') }, { text: '▶ +', callback_data: cb('n+') }]);
+  rows.push([{ text: '⏳ −', callback_data: cb('m-') }, { text: pol.max == null ? '⏳ tắt' : `⏳ ${pol.max}`, callback_data: cb('mt') }, { text: '⏳ +', callback_data: cb('m+') }]);
   // RFC 32 §4.4: switch the night rules off until the window ends / back on. The state is checked against the stored board on press.
   if (g.quiet?.active) rows.push([{ text: g.quiet.overridden ? '🌙 Bật lại' : `⏩ Tắt giờ im lặng tới ${hhmm(g.quiet.until)}`, callback_data: cb('qz') }]);
   rows.push([{ text: pol.paused ? '▶' : '⏸', callback_data: cb('p') }, { text: '🔄', callback_data: cb('r') }]);

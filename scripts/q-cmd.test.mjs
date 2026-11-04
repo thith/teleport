@@ -68,8 +68,10 @@ test('renderQ: header, running + waiting lines, buttons (⬆ only live; ⬆✓ b
   const r = renderQ(g, { tok: 'a'.repeat(12), rev: 35 });
   assert.match(r.text, /^🔒 build 2\/\d · chờ 3 · max 4 \(thử lại sau 10'\)/);
   assert.match(r.text, /▶ Tiên0 · l30 — cargo nextest \(12'\)/);
+  assert.match(r.text, /\n\n▶ Đang chạy \(2\):\n▶ /, 'running header with count, before the ▶ lines');
+  assert.match(r.text, /\n\n⏳ Chờ \(3\):\n1\. /, 'waiting header with total count, before the numbered lines');
   assert.match(r.text, /⬆ B/, 'boosted ticket marked');
-  assert.match(r.text, /⛔ Đang chặn:\n1\. 🦊 Cáo tới \d\d:\d\d/);
+  assert.match(r.text, /\n\n⛔ Đang chặn:\n1\. 🦊 Cáo tới \d\d:\d\d/);
   assert.equal(Object.keys(r.maps.rows).length, 3, 'stalled tickets are numbered too (they count toward max)');
   assert.equal(r.maps.rows['1'].file, b, 'boosted first');
   assert.deepEqual(r.maps.blocks, { 1: 'convo:Z' });
@@ -81,14 +83,14 @@ test('renderQ: header, running + waiting lines, buttons (⬆ only live; ⬆✓ b
   assert.equal(btn(r.rows, /^⬆ 3$/), undefined, 'no ⬆ on the stalled ticket');
   assert.ok(btn(r.rows, /^✖ 3$/) && btn(r.rows, /^⛔ 3$/), 'but kick/block yes');
   assert.ok(btn(r.rows, /^⏹ Tuộc$/));
-  assert.ok(btn(r.rows, /^Max −$/) && btn(r.rows, /^Max 4$/) && btn(r.rows, /^Max \+$/));
+  assert.ok(btn(r.rows, /^⏳ −$/) && btn(r.rows, /^⏳ 4$/) && btn(r.rows, /^⏳ \+$/));
   assert.ok(btn(r.rows, /^⏸$/) && btn(r.rows, /🔄/) && btn(r.rows, /Bỏ chặn 1/));
   void a;
   // max off, paused
   setPolicy(dir, { paused: true });
   const r2 = renderQ(gatherQ({ dir }), { tok: 'a'.repeat(12), rev: 0 });
   assert.match(r2.text, /max tắt/); assert.match(r2.text, / · ⏸/);
-  assert.ok(btn(r2.rows, /Max tắt/) && btn(r2.rows, /^▶$/));
+  assert.ok(btn(r2.rows, /^⏳ tắt$/) && btn(r2.rows, /^▶$/));
   // rev is base36 in the callback
   assert.equal(qCallback('a'.repeat(12), 35, 'k', 2), `q:${'a'.repeat(12)}:z:k:2`);
 });
@@ -123,9 +125,13 @@ test('renderQ: block menu shows the scope (git: = WHOLE repo warning) and 4 dura
   const p0 = renderQ(gatherQ({ dir: dir2 }), { tok: 'd'.repeat(12), rev: 0, page: 0 });
   assert.equal((p0.text.match(/^\d+\. /gm) || []).length, Q_PAGE_SIZE);
   assert.match(p0.text, /trang 1\/2/);
+  assert.match(p0.text, /\d+\. [^\n]*\n\(trang 1\/2\)/, 'page note right under the waiting list');
+  assert.match(p0.text, /\n\n⏳ Chờ \(10\):\n1\. /);
+  assert.doesNotMatch(p0.text, /Đang chạy/, 'no running header when nothing runs');
   assert.ok(btn(p0.rows, /^1\/2$/) && btn(p0.rows, /^›$/));
   const p1 = renderQ(gatherQ({ dir: dir2 }), { tok: 'd'.repeat(12), rev: 0, page: 1 });
   assert.equal((p1.text.match(/^\d+\. /gm) || []).length, 2);
+  assert.match(p1.text, /\n\n⏳ Chờ \(10\):\n9\. /, 'waiting header on page 2 too (total count)');
   assert.equal(Object.keys(p1.maps.rows).length, 10, 'numbers are global, not per page');
   assert.ok(btn(p1.rows, /^✖ 9$/));
 });
@@ -321,6 +327,68 @@ test('press: ⏹ asks first, then creates a SEPARATE status message + one stop j
   await qPress(cqFor(ctx2, qCallback(tok, entry.rev, 'sy', 1)), ctx2, { verify: () => ({ why: 'chỗ đã đổi người' }) });
   assert.match(ctx2.edits.at(-1).text, /Không dừng: chỗ đã đổi người/);
   assert.equal([...ctx2.buttonStore.keys()].filter((k) => k.startsWith('stop:')).length, 0);
+});
+
+test('slots row: labels (forced / auto), sits right above the max row, callbacks fit', () => {
+  const dir = tmpDir();
+  const mk = (o) => renderQ(gatherQ({ dir, ...o }), { tok: 'a'.repeat(12), rev: 0 });
+  const auto2 = mk({ forcedOf: () => false, autoOf: () => 2 });
+  const labels = (r) => r.rows.map((row) => row.map((b) => b.text).join('|'));
+  const i = labels(auto2).indexOf('▶ −|▶ 2 (auto)|▶ +');
+  assert.ok(i >= 0, labels(auto2).join(' / '));
+  assert.match(labels(auto2)[i + 1], /^⏳ −\|⏳ tắt\|⏳ \+$/, 'max row directly below the slots row');
+  assert.deepEqual(auto2.rows[i].map((b) => b.callback_data.split(':')[3]), ['n-', 'n-', 'n+'], 'auto board: the middle button targets 1');
+  assert.deepEqual(mk({ forcedOf: () => true, autoOf: () => 2 }).rows.find((row) => row[0].text === '▶ −').map((b) => b.callback_data.split(':')[3]), ['n-', 'n+', 'n+'], 'forced board: the middle button targets auto');
+  assert.ok(auto2.rows[i].every((b) => Buffer.byteLength(b.callback_data) < 64 && Q_BUTTON_RE.test(b.callback_data)));
+  assert.ok(labels(mk({ forcedOf: () => true, autoOf: () => 2 })).includes('▶ −|▶ 1|▶ +'));
+  assert.ok(labels(mk({ forcedOf: () => false, autoOf: () => 1 })).includes('▶ −|▶ 1 (auto)|▶ +'));
+});
+
+test('press: slots − / + / toggle write and remove build.slots; no-op at the ends', async () => {
+  const dir = tmpDir(); ticket(dir, 'A');
+  const file = path.join(dir, 'build.slots');
+  const ctx = fakeCtx(dir);
+  await startQ(ctx);
+  const { tok } = boardOf(ctx);
+  let rev = 0;
+  const press = async (op) => { await qPress(cqFor(ctx, qCallback(tok, rev, op)), ctx); rev++; return ctx.edits.at(-1).text; };
+  assert.match(await press('n+'), /đã là auto/, '+ when already auto: no-op');
+  assert.equal(fs.existsSync(file), false);
+  assert.match(await press('n-'), /Build song song: 1 \(áp dụng cho build lấy chỗ từ giờ; build đang chạy chạy nốt\)/);
+  assert.equal(fs.existsSync(file), true);
+  assert.ok(cbs(ctx.edits.at(-1).rows).length && ctx.edits.at(-1).rows.flat().some((b) => b.text === '▶ 1'));
+  assert.match(await press('n-'), /đã là 1 — không đổi/, '− when already 1: no-op');
+  assert.equal(fs.existsSync(file), true);
+  assert.match(await press('n+'), /Build song song: auto \(\d\)/);
+  assert.equal(fs.existsSync(file), false);
+  await press('n-');
+  assert.equal(fs.existsSync(file), true);
+  await press('n+');
+  assert.equal(fs.existsSync(file), false);
+});
+
+test('stale board: the middle slots button is an explicit target, never a toggle of the current state', async () => {
+  const dir = tmpDir(); ticket(dir, 'A');
+  const file = path.join(dir, 'build.slots');
+  const ctx = fakeCtx(dir);
+  await startQ(ctx); // shows auto
+  const { tok } = boardOf(ctx);
+  const mid = lastRows(ctx).flat().find((b) => /^▶ \d \(auto\)$/.test(b.text));
+  await runQCommand('slots 1', ctx); // meanwhile forced elsewhere
+  assert.equal(fs.existsSync(file), true);
+  await qPress(cqFor(ctx, mid.callback_data), ctx);
+  assert.equal(fs.existsSync(file), true, 'still forced');
+  assert.match(ctx.edits.at(-1).text, /đã là 1 — không đổi/);
+});
+
+test('typed /q slots <1|auto>; usage lists it', async () => {
+  const dir = tmpDir();
+  const file = path.join(dir, 'build.slots');
+  const ctx = fakeCtx(dir);
+  await runQCommand('slots 1', ctx); assert.equal(fs.existsSync(file), true); assert.match(ctx.texts.at(-1), /Build song song: 1/);
+  await runQCommand('slots auto', ctx); assert.equal(fs.existsSync(file), false); assert.match(ctx.texts.at(-1), /auto/);
+  await runQCommand('slots 2', ctx); assert.match(ctx.texts.at(-1), /^usage: \/q slots <1\|auto>/);
+  await runQCommand('bogus', ctx); assert.match(ctx.texts.at(-1), /\/q slots <1\|auto>/);
 });
 
 test('typed /q forms: max, retry, pause/resume, kick/top/block by number or persona, unblock; usage', async () => {
@@ -641,6 +709,7 @@ test('RFC32 /q header: appends " · <note>" when a slot is free but the CPU gate
   const closed = { ok: false, reason: 'cpu', load1: 11.2, cores: 12 };
   const r = renderQ(gatherQ({ dir, slotsOf: () => 2, gate: () => closed }), { tok: 'a'.repeat(12), rev: 0 });
   assert.match(r.text, /^🔒 build 1\/2 · chờ 0 · max tắt · chờ CPU \(load 11\.2\/12\)\n/);
+  assert.match(r.text, /▶ Đang chạy \(1\):/); assert.doesNotMatch(r.text, /Chờ \(/, 'no waiting header when no tickets');
   const q = renderQ(gatherQ({ dir, slotsOf: () => 2, gate: () => ({ ok: false, reason: 'quiet', load1: 0, cores: 12 }) }), { tok: 'a'.repeat(12), rev: 0 });
   assert.match(q.text, /^🔒 build 1\/2 · chờ 0 · max tắt · 🌙 giờ im lặng\n/);
   const open = renderQ(gatherQ({ dir, slotsOf: () => 2, gate: () => ({ ok: true }) }), { tok: 'a'.repeat(12), rev: 0 });
