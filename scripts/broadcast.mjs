@@ -12,6 +12,7 @@
 // per-convo write-lock — a busy topic no longer bounces (nothing skipped); a dead
 // agent's prompt just waits. Prints a sent summary for the daemon to relay.
 
+import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isMainModule } from './is-direct-run.mjs';
@@ -22,10 +23,12 @@ import { formatPersona } from './persona.mjs';
 import { durableWrite } from './steer.mjs';
 import { DEFAULT_TMP_DIR } from './tele-listen.mjs';
 import { readProjectsConfig, resolveDefaultChatId, projectEntries, resolveProjectKey } from './projects-config.mjs';
-import { lookupAllocationByConvo } from './convo-registry.mjs';
+import { lookupAllocationByConvo, CONVO_SCHEMA_VERSION } from './convo-registry.mjs';
+import { tokenizeArgs } from './commands.mjs';
+import { PARENT_DIR } from './workspace.mjs';
 import { worktreeOf, gitCommonDir } from './machine-lock.mjs';
 
-export const USAGE = 'usage: /broadcast [--chat <id>] <text>';
+export const USAGE = 'usage: /broadcast [--now] [--p:<dự án>[,…]] [--chat <id>] <text>';
 
 // All group chat ids (catch-all + dedicated) — the default broadcast scope.
 export function groupChatIds(config, { env = process.env, envFile = {} } = {}) {
@@ -36,38 +39,54 @@ export function groupChatIds(config, { env = process.env, envFile = {} } = {}) {
   return [...ids];
 }
 
-// Parse argv → { chat, text, error }. `--chat <id>` (or `--chat=<id>`) optional first;
-// everything else joins into the system message text.
-export function parseBroadcastArgs(argv) {
-  const out = { chat: null, text: '', error: null };
-  const rest = [];
-  for (let i = 0; i < argv.length; i++) {
-    const a = argv[i];
-    if (a === '--chat') out.chat = argv[++i];
-    else if (a.startsWith('--chat=')) out.chat = a.slice('--chat='.length);
-    else rest.push(a);
+/**
+ * RFC 38 §3.1 — the ONE parser of the LEADING options, in any order: `--now`, `--p:<a>[,<b>]` (also `--p=`,
+ * `--project:`, `--project=`), `--chat <id>` / `--chat=<id>`. `input` = the raw text (the rest stays VERBATIM:
+ * quotes, newlines) or a token array. The first word NOT starting with `--` begins the text; an unknown `--word`,
+ * an empty `--p:` part, a repeated option, no text → `error` (nothing is ever sent on an error). A `--chat`
+ * inside the text is refused (RFC 37 compat: an old `… --chat` at the end must not widen the scope). Pure.
+ */
+export function parseBroadcastOptions(input) {
+  const raw = typeof input === 'string';
+  let s = raw ? input.trim() : '', i = 0;
+  const head = () => (raw ? (s.match(/^\S+/)?.[0] ?? null) : (input[i] ?? null));
+  const shift = () => { if (raw) s = s.replace(/^\S+\s*/, ''); else i++; };
+  const out = { chat: null, now: false, projects: null, text: '', error: null };
+  const bad = (m) => ({ ...out, text: '', error: `${m} — ${USAGE}` });
+  for (let w = head(); w != null && w.startsWith('--'); w = head()) {
+    shift();
+    const low = w.toLowerCase();
+    let m;
+    if (low === '--now') { if (out.now) return bad('--now lặp lại'); out.now = true; }
+    else if ((m = low.match(/^--(?:p|project)[:=]/))) {
+      if (out.projects) return bad('--p lặp lại');
+      const parts = w.slice(m[0].length).split(',').map((x) => x.trim());
+      if (!parts.length || parts.some((x) => !x || /\s/.test(x))) return bad('--p: có phần rỗng');
+      out.projects = [...new Set(parts.map((x) => x.toLowerCase()))];
+    } else if (low === '--chat' || low.startsWith('--chat=')) {
+      if (out.chat != null) return bad('--chat lặp lại');
+      let id = low === '--chat' ? head() : w.slice('--chat='.length);
+      if (low === '--chat') shift();
+      if (!id || id.startsWith('--')) return bad('--chat thiếu id');
+      out.chat = id;
+    } else return bad(/chat/i.test(w) ? '--chat phải đứng đầu (không trong ngoặc)' : `tuỳ chọn lạ: ${w.slice(0, 40)} (tuỳ chọn phải đứng đầu, không trong ngoặc)`);
   }
-  out.text = rest.join(' ').trim();
-  if (!out.text) out.error = USAGE;
+  out.text = (raw ? s : input.slice(i).join(' ')).trim();
+  if (!out.text) return bad('thiếu nội dung');
+  if (/--chat/i.test(out.text)) return bad('--chat phải đứng đầu (không trong ngoặc)');
   return out;
 }
+export const parseBroadcastRaw = parseBroadcastOptions;
+export const parseBroadcastArgs = parseBroadcastOptions;
 
-/**
- * The daemon's raw text (TELE_RAW_ARGS, RFC 26 §3.8) → { chat, text, error }: an optional LEADING
- * `--chat <id>` / `--chat=<id>`, then the message VERBATIM (quotes, newlines kept). A `--chat`
- * anywhere else is refused: argv mode took it anywhere, so silently sending to EVERY group would
- * widen an admin-wide action. Pure.
- */
-export function parseBroadcastRaw(raw) {
-  const s = String(raw ?? '').trim();
-  const m = s.match(/^--chat(?:=(\S*)|\s+(\S+))(?:\s+([\s\S]*))?$/) || s.match(/^--chat()()$/);
-  const out = m ? { chat: m[1] || m[2] || null, text: (m[3] || '').trim(), error: null } : { chat: null, text: s, error: null };
-  if (m && !out.chat) out.error = USAGE;
-  else if (!out.text) out.error = USAGE;
-  // Any other `--chat` (quoted, mid-text…) is refused — argv mode honoured it, so dropping it would
-  // silently widen the scope to every group.
-  else if (/--chat/i.test(out.text)) out.error = `--chat phải đứng đầu (không trong ngoặc) — ${USAGE}`;
-  return out;
+/** Raw text AND its tokenized reading (quotes honoured) must both parse and agree on the options (RFC 38 §3.1). */
+export function parseBroadcastBoth(raw) {
+  const a = parseBroadcastOptions(raw);
+  if (a.error) return a;
+  const b = parseBroadcastOptions(tokenizeArgs(raw));
+  const key = (x) => JSON.stringify([x.chat, x.now, x.projects]);
+  if (b.error || key(a) !== key(b)) return { ...a, text: '', error: `❌ tuỳ chọn phải đứng đầu, không trong ngoặc — ${USAGE}` };
+  return a;
 }
 
 // ── RFC 37: the pieces the `/broadcast` button board is built from ──
@@ -155,6 +174,46 @@ export function listTargets({ store, chatIds, ls, config = {}, allocRows = [], b
   }));
 }
 
+/**
+ * RFC 38 §3.2 — every project name `--p:` may use → Map(lowercase → [names]). Exact names only (the typed text never
+ * goes through resolveProjectKey): config keys, running sessions, VALID allocation rows (same rule as
+ * lookupAllocationByConvo), sibling git dirs of the teleport dir (worktrees fold into their repo), and 'khác'.
+ */
+export function knownProjects({ config = {}, targets = [], allocRows: rawRows = [], botId = null, parentDir = PARENT_DIR, listDirs = null, worktreeFn = worktreeOf, commonDirFn = gitCommonDir } = {}) {
+  const names = new Set([OTHER_PROJECT, ...projectEntries(config).map(([k]) => k), ...targets.map((t) => t.project)]);
+  const rows = Array.isArray(rawRows) ? rawRows : rawRows?.rows ?? [];
+  for (const r of rows) {
+    if (!r || (typeof r.v === 'number' && r.v > CONVO_SCHEMA_VERSION) || r.botId !== botId || r.messageId !== r.convoId || !r.projectKey || r.resolvedBy === 'default-unresolved') continue;
+    names.add(resolveProjectKey(r.projectKey, config));
+  }
+  try {
+    const dirs = listDirs ? listDirs() : fs.readdirSync(parentDir, { withFileTypes: true }).filter((d) => d.isDirectory() || d.isSymbolicLink()).map((d) => path.join(parentDir, d.name));
+    for (const dir of dirs) {
+      try {
+        if (!fs.existsSync(path.join(dir, '.git'))) continue;
+        const common = commonDirFn(worktreeFn(dir));
+        const name = common ? repoNameOf(common) : '';
+        if (name) names.add(resolveProjectKey(name, config));
+      } catch { /* skip this dir */ }
+    }
+  } catch { /* no sibling dirs known */ }
+  const map = new Map();
+  for (const n of names) { const k = n.toLowerCase(); map.set(k, [...(map.get(k) || []), n]); }
+  return map;
+}
+
+/** `wanted` (lowercase names) against the known set → { set: Set(lowercase), names: Map(lower → name) } | { error }. */
+export function checkProjects(wanted, known, running = []) {
+  const unknown = wanted.filter((w) => !known.has(w));
+  if (unknown.length) {
+    const list = running.join(', ');
+    return { error: `❌ không có dự án: ${unknown.join(', ')}. Đang chạy: ${list.length > 600 ? `${list.slice(0, 600)}…` : list || '(không có)'}` };
+  }
+  const amb = wanted.filter((w) => known.get(w).length > 1);
+  if (amb.length) return { error: `❌ tên dự án mơ hồ (chỉ khác hoa thường): ${amb.map((w) => known.get(w).join(' / ')).join('; ')}` };
+  return { set: new Set(wanted), names: new Map(wanted.map((w) => [w, known.get(w)[0]])) };
+}
+
 /** Durable prompt write (RFC 03 §5.1) to each target → { sent: [target], failed: [target] }. One write per convo. */
 export async function sendTo(targets, text, from = {}, { tmpDir = DEFAULT_TMP_DIR, writePrompt = durableWrite } = {}) {
   const sent = [], failed = [];
@@ -197,13 +256,10 @@ export async function doBroadcast(argv, {
   lsHashtags = lsHashtagSet,       // () => /ls rows ({convoId,hashtag} | hashtag); throws → fail closed
   personaOf = null,                // (hashtag) → name; default = /ls's lookup (personaByHashtag + formatPersona)
 } = {}) {
-  const args = raw ? parseBroadcastRaw(raw) : parseBroadcastArgs(argv);
+  // Raw mode keeps the text verbatim but must agree with the tokenized reading: never send wider.
+  const args = raw ? parseBroadcastBoth(raw) : parseBroadcastOptions(argv);
   if (args.error) return { ok: false, message: args.error };
-  // The scope must agree with the tokenized argv (which honours quotes like `--"chat"`): raw mode may
-  // keep the text verbatim, never send wider than the old reading would.
-  if (raw && (parseBroadcastArgs(argv).chat ?? null) !== (args.chat ?? null)) {
-    return { ok: false, message: `--chat phải đứng đầu, không trong ngoặc — ${USAGE}` };
-  }
+  if (args.now || args.projects) return { ok: false, message: '❌ --now / --p: chỉ dùng qua daemon (/broadcast trong Telegram).' };
   const chatIds = args.chat ? [String(args.chat)] : groupChatIds(config, { env, envFile });
   const all = listLiveTopics(store, chatIds);
   if (!all.length) return { ok: false, message: '📢 broadcast: no live topics found (nothing sent).' };

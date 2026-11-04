@@ -25,8 +25,11 @@ function writeAtomic(file, content) {
   fs.renameSync(tmp, file);
 }
 
-/** Entries the cap sweep never evicts: an in-flight stop job (RFC 24) and a broadcast whose send began (RFC 37). */
-const keepOnEvict = (e) => e?.kind === 'stop' || (e?.kind === 'broadcast' && e.state === 'sending');
+export const BC_NOW_TTL_MS = 24 * 60 * 60 * 1000; // RFC 38: the `/broadcast --now` dedupe key lives this long
+
+/** Entries the cap sweep never evicts: an in-flight stop job (RFC 24), a broadcast whose send began (RFC 37), an unexpired `--now` key (RFC 38). */
+const keepOnEvict = (e) => e?.kind === 'stop' || (e?.kind === 'broadcast' && e.state === 'sending')
+  || (e?.kind === 'broadcast-now' && Date.now() - (e.createdAt || 0) < BC_NOW_TTL_MS);
 
 export class PersistentMap extends Map {
   constructor(file = BUTTON_STORE_FILE, { cap = BUTTON_STORE_CAP } = {}) {

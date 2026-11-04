@@ -5,9 +5,9 @@ import os from 'node:os';
 import path from 'node:path';
 import { shortConvoHash } from './convo-hash.mjs';
 import { PersistentMap } from './button-store.mjs';
-import { listTargets, projectOf, resolveLive, candidateTopics, OTHER_PROJECT } from './broadcast.mjs';
+import { parseBroadcastOptions, parseBroadcastBoth, knownProjects, doBroadcast, listTargets, projectOf, resolveLive, candidateTopics, OTHER_PROJECT } from './broadcast.mjs';
 import {
-  renderBroadcast, runBroadcastCommand, bcPress, handleBroadcastButton, bcCallback, BC_BUTTON_RE, BC_MAX_TARGETS, BC_TTL_MS, MSG_STALE, MSG_INTERRUPTED,
+  renderBroadcast, runBroadcastCommand, bcPress, handleBroadcastButton, bcCallback, BC_BUTTON_RE, BC_MAX_TARGETS, BC_TTL_MS, MSG_STALE, MSG_INTERRUPTED, renderNowResult,
 } from './broadcast-panel.mjs';
 
 const OWNER = '42';
@@ -37,7 +37,7 @@ function harness({ store: topicStore, ls, allocRows = [], role = 'admin', config
   const state = { ls, now: 1_000_000 };
   const deps = {
     store: topicStore, lsRows: async () => state.ls, allocRows: () => allocRows, config, roleOf: () => role, botId: BOT, rand: () => 'a1b2c3d4e5f6',
-    now: () => state.now, tmpDir: '/x', writePrompt: async (p, f) => { writes.push({ p, f }); }, ...extra,
+    now: () => state.now, listDirs: () => [], chatId: OWNER, messageId: 900, tmpDir: '/x', writePrompt: async (p, f) => { writes.push({ p, f }); }, ...extra,
   };
   const tok = 'a1b2c3d4e5f6';
   const cq = (data, o = {}) => ({ id: 'cq', data, from: { id: Number(OWNER) }, message: { chat: { id: OWNER }, message_id: 77, ...(o.message || {}) }, ...o.top });
@@ -442,4 +442,186 @@ test('daemon dispatch: /broadcast reaches the builtin with role check; multiline
     if (ok) { assert.equal(h.out.boards.length, 1); assert.equal(h.buttons.get(h.tok).text, 'dòng 1\n"dòng 2" [x]'); }
     else { assert.equal(h.out.boards.length, 0); assert.match(h.out.sent.at(-1), /quyền admin/); }
   }
+});
+
+// ── RFC 38: --now and --p: ──
+
+test('RFC38 parse: every --p spelling, any option order, --chat with a negative id', () => {
+  for (const o of ['--p:a,B', '--p=a,B', '--project:a,B', '--project=a,B']) {
+    assert.deepEqual(parseBroadcastOptions(`${o} hi`), { chat: null, now: false, projects: ['a', 'b'], text: 'hi', error: null });
+  }
+  const r = parseBroadcastOptions('--p:x --chat -100123 --now hello\nworld "q"');
+  assert.deepEqual([r.chat, r.now, r.projects, r.text], ['-100123', true, ['x'], 'hello\nworld "q"']);
+  assert.deepEqual(parseBroadcastOptions('--now --chat=-5 hi').chat, '-5');
+  assert.deepEqual(parseBroadcastOptions('--p:a,A hi').projects, ['a']);
+});
+
+test('RFC38 parse: unknown / empty / repeated / no text → refused; --now and --p: mid-text are plain text', () => {
+  for (const bad of ['--nwo hi', '--prject:umipay hi', '--p hi', '--p: hi', '--p:a, hi', '--p:,a hi', '--p:a,,b hi', '--now --now hi', '--p:a --p:b hi',
+    '--chat -1 --chat -2 hi', '--now', '--p:a', '--chat --now hi', '-- hi']) {
+    assert.ok(parseBroadcastOptions(bad).error, bad);
+  }
+  assert.match(parseBroadcastOptions('hello --now --p:x').text, /^hello --now --p:x$/);
+  const r = parseBroadcastOptions('hi --now'); assert.equal(r.now, false); assert.equal(r.error, null);
+  assert.ok(parseBroadcastOptions('hi --chat -1').error);
+});
+
+test('RFC38 parse: raw and tokenized readings must agree (quotes cannot widen the scope)', () => {
+  for (const bad of ['"--now" hi', '--now "--prject:x" hi', '--now --"p:x" hi', '--"now" hi']) assert.ok(parseBroadcastBoth(bad).error, bad);
+  assert.equal(parseBroadcastBoth('--now --p:x multi\nline "z"').error, null);
+  assert.equal(parseBroadcastBoth('--now --p:x multi\nline "z"').text, 'multi\nline "z"');
+  assert.equal(parseBroadcastBoth('"hello" --now').now, false);
+});
+
+test('RFC38 CLI doBroadcast refuses --now / --p: (daemon only), sends nothing', async () => {
+  for (const argv of [['--now', 'hi'], ['--p:a', 'hi']]) {
+    const w = [];
+    const r = await doBroadcast(argv, { store: TOP(), lsHashtags: () => LS(), writePrompt: async (p) => { w.push(p); }, config: CFG });
+    assert.equal(r.ok, false); assert.match(r.message, /chỉ dùng qua daemon/); assert.equal(w.length, 0);
+  }
+});
+
+test('RFC38 knownProjects: config / sessions / valid allocation / sibling dirs (worktree → repo) / khác; default-unresolved ignored', () => {
+  const root = tmp();
+  const repo = path.join(root, 'acme'); fs.mkdirSync(path.join(repo, '.git', 'worktrees', 'ui'), { recursive: true });
+  fs.writeFileSync(path.join(repo, '.git', 'worktrees', 'ui', 'commondir'), '../..\n');
+  const wt = path.join(root, 'acme-uifix'); fs.mkdirSync(wt); fs.writeFileSync(path.join(wt, '.git'), `gitdir: ${path.join(repo, '.git', 'worktrees', 'ui')}\n`);
+  fs.mkdirSync(path.join(root, 'plain'));
+  const rows = [alloc(A, 'ghost'), { ...alloc(B, 'unres'), resolvedBy: 'default-unresolved' }, { ...alloc(D, 'otherbot'), botId: 1 }, { ...alloc(E, 'badmsg'), messageId: 5 }];
+  const k = knownProjects({ config: CFG, targets: [{ project: 'live' }], allocRows: rows, botId: BOT, parentDir: root });
+  const names = [...k.keys()].sort();
+  assert.deepEqual(names, ['acme', 'digesty', 'ghost', 'khác', 'live', 'shared1', 'shared2', 'umipay']);
+});
+
+const nowMsg = (o = {}) => ({ chatId: OWNER, messageId: 901, ...o });
+
+test('RFC38 --now: sends to everyone at once, no board, one result message, key stored', async () => {
+  const h = mk2(); await h.start('--now chào\nmọi người');
+  assert.equal(h.out.boards.length, 0); assert.equal(h.writes.length, 5);
+  assert.equal(h.writes[0].p.text, 'chào\nmọi người'); assert.equal(h.writes[0].p.broadcast.from.role, 'admin');
+  assert.match(h.out.sent.at(-1), /^📢 Broadcast --now — đã gửi 5\/5\n✅ 5 · ❌ lỗi 0 · ⏹ đã tắt 0 · dự án trống 0/);
+  assert.equal(h.buttons.get(`bcnow:${OWNER}:900`).kind, 'broadcast-now');
+  assert.equal([...h.buttons.keys()].filter((k) => !k.startsWith('bcnow:')).length, 0);
+});
+
+test('RFC38 --now --p:: filters (case-insensitive), empty known project is reported, still sends the rest', async () => {
+  const h = mk2(); await h.start('--now --p:UMIPAY,shared1 go');
+  assert.deepEqual(h.writes.map((w) => w.p.convoId).sort(), [Number(A), Number(B)]);
+  const msg = h.out.sent.at(-1);
+  assert.match(msg, /đã gửi 2\/2 · dự án: UMIPAY, shared1|đã gửi 2\/2 · dự án: umipay, shared1/);
+  assert.match(msg, /dự án trống 1/); assert.match(msg, /⏹ shared1: không có session đang chạy/);
+});
+
+test('RFC38 --p: unknown / near-miss / ambiguous → refused, nothing written; also with 0 sessions', async () => {
+  for (const t of ['--now --p:umipay-typo hi', '--now --p:umipay,nope hi', '--p:nope hi']) {
+    const h = mk2(); await h.start(t);
+    assert.equal(h.writes.length, 0); assert.equal(h.out.boards.length, 0); assert.match(h.out.sent.at(-1), /^❌ không có dự án: .*\. Đang chạy: /); assert.equal(h.buttons.size, 0);
+  }
+  const h0 = harness({ store: TOP(), ls: [] }); await h0.start('--now --p:nope hi');
+  assert.match(h0.out.sent.at(-1), /không có dự án: nope/);
+  const amb = harness({ store: TOP(), ls: LS(), config: { ...CFG, Umipay: { chatId: '-9' } }, extra: { config: { ...CFG, Umipay: { chatId: '-9' } } } });
+  await amb.start('--now --p:umipay hi');
+  assert.match(amb.out.sent.at(-1), /mơ hồ/); assert.equal(amb.writes.length, 0);
+});
+
+test('RFC38 --now: every project empty → "không có session nào khớp"; no sessions at all; owner/admin gates; syntax errors', async () => {
+  const h = mk2(); await h.start('--now --p:shared1,shared2 hi');
+  assert.match(h.out.sent.at(-1), /không có session nào khớp, không gửi gì\.\n⏹ shared1.*\n⏹ shared2/); assert.equal(h.writes.length, 0); assert.equal(h.buttons.size, 0);
+  const none = harness({ store: TOP(), ls: [] }); await none.start('--now hi');
+  assert.match(none.out.sent.at(-1), /\/ls trống/);
+  const m = mk2({ role: 'member' }); await m.start('--now hi'); assert.match(m.out.sent.at(-1), /quyền admin/); assert.equal(m.writes.length, 0);
+  const o = mk2(); await o.start('--now hi', { id: 7 }); assert.match(o.out.sent.at(-1), /chỉ owner/); assert.equal(o.writes.length, 0);
+  for (const t of ['--now --nwo hi', '--now', '--now --p:a, hi', '--now "--prject:x" hi']) { const e = mk2(); await e.start(t); assert.equal(e.writes.length, 0, t); }
+});
+
+test('RFC38 --now: same chat+message dispatched twice → sent once; key write failure → nothing sent; no messageId → refused', async () => {
+  const h = mk2(); await h.start('--now hi'); await h.start('--now hi');
+  assert.equal(h.writes.length, 5);
+  const f = mk2(); f.buttons.flush = () => { throw new Error('disk full'); };
+  await f.start('--now hi');
+  assert.equal(f.writes.length, 0); assert.match(f.out.sent.at(-1), /không gửi gì/); assert.equal(f.buttons.size, 0);
+  const n = mk2({ extra: { messageId: null } }); await n.start('--now hi');
+  assert.equal(n.writes.length, 0); assert.match(n.out.sent.at(-1), /messageId/);
+});
+
+test('RFC38 --now: a failed prompt write is reported with ❌ and the exact counts', async () => {
+  let n = 0;
+  const h = mk2({ extra: { writePrompt: async (p) => { if (++n === 2) throw new Error('x'); } } }); await h.start('--now hi');
+  const msg = h.out.sent.at(-1);
+  assert.match(msg, /đã gửi 4\/5\n✅ 4 · ❌ lỗi 1 · /); assert.match(msg, /❌ .* — không ghi được hàng đợi/);
+});
+
+test('RFC38 result message: 200 ok / 200 failed / mixed + long preview + many projects → ≤ 3900, exact counts, … +n', () => {
+  const mk = (n, tag) => Array.from({ length: n }, (_, i) => ({ label: `🦊 Cáo ${tag}${i} #${shortConvoHash(C(i))}` }));
+  const text = 'y'.repeat(3500);
+  const projects = Array.from({ length: 80 }, (_, i) => `project-number-${i}-${'z'.repeat(60)}`);
+  for (const [sent, failed, dead] of [[mk(200, 'o'), [], []], [[], mk(200, 'f'), []], [mk(120, 'o'), mk(60, 'f'), mk(20, 'd')]]) {
+    const m = renderNowResult({ text, projects, sent, failed, dead, empty: projects.slice(0, 30) });
+    assert.ok(m.length <= 3900, `${m.length}`);
+    assert.ok(m.includes(`✅ ${sent.length} · ❌ lỗi ${failed.length} · ⏹ đã tắt ${dead.length} · dự án trống 30`));
+    assert.match(m, /… \+\d+/);
+    assert.match(m.split('\n')[0], /^📢 Broadcast --now — đã gửi \d+\/200 · dự án: .*… \+\d+$/);
+    assert.ok(m.split('\n')[0].length < 400);
+  }
+  const mixed = renderNowResult({ text: 'hi', sent: mk(100, 'o'), failed: mk(3, 'f') });
+  assert.ok(mixed.indexOf('❌ 🦊 Cáo f0') < mixed.indexOf('✅ 🦊 Cáo o0'));   // priority: failures first
+  const small = renderNowResult({ text: 'hi', sent: mk(2, 'o') });
+  assert.ok(!small.includes('…'));
+});
+
+test('RFC38 --p without --now: the board holds only those projects, filtered BEFORE the 40 cut; empty ones on top', async () => {
+  const spec = {}, ls = [], rows = [];
+  for (let i = 0; i < 45; i++) { spec[C(100 + i)] = 10; ls.push({ convoId: C(100 + i), hashtag: shortConvoHash(C(100 + i)) }); rows.push(alloc(C(100 + i), i < 3 ? 'umipay' : 'digesty')); }
+  const h = harness({ store: topics({ '-100': spec }), ls, allocRows: rows });
+  await h.start('--p:umipay,shared1 board');
+  const e = h.buttons.get(h.tok);
+  assert.equal(e.targets.length, 3); assert.equal(e.hidden, 0); assert.deepEqual(e.projects, ['umipay']); assert.deepEqual(e.emptyProjects, ['shared1']);
+  assert.match(h.out.boards[0].text, /⏹ shared1: không có session đang chạy\nGửi tới 3\/3 session/);
+  const h2 = harness({ store: topics({ '-100': spec }), ls, allocRows: rows });
+  await h2.start('--p:digesty x');
+  assert.equal(h2.buttons.get(h2.tok).targets.length, 40); assert.equal(h2.buttons.get(h2.tok).hidden, 2);
+  const h3 = mk2(); await h3.start('--p:shared1 x');
+  assert.match(h3.out.sent.at(-1), /không có session nào khớp/); assert.equal(h3.out.boards.length, 0);
+});
+
+test('RFC38 button store: unexpired --now keys survive the cap (set and setStrict); expired ones are swept; takeMergeButton keeps fresh keys', async () => {
+  for (const strict of [false, true]) {
+    const m = new PersistentMap(path.join(tmp(), 'b.json'), { cap: 4 });
+    m.set('bcnow:1:1', { kind: 'broadcast-now', createdAt: Date.now() });
+    m.set('bcnow:1:0', { kind: 'broadcast-now', createdAt: Date.now() - 25 * 3600_000 });
+    for (let i = 1; i <= 10; i++) { const v = { kind: 'x', createdAt: Date.now() + i }; if (strict) m.setStrict(`k${i}`, v); else m.set(`k${i}`, v); }
+    assert.ok(m.get('bcnow:1:1')); assert.ok(!m.has('bcnow:1:0'));
+  }
+  const { takeMergeButton } = await import('./daemon.mjs');
+  const now = 100 * 3600_000;
+  const store = new Map([['fresh', { kind: 'broadcast-now', createdAt: now - 3600_000 }], ['old', { kind: 'broadcast-now', createdAt: now - 25 * 3600_000 }], ['x', { createdAt: now }]]);
+  takeMergeButton('x', { now, store, ttlMs: 1000 });
+  assert.ok(store.has('fresh')); assert.ok(!store.has('old')); // a key past 24h is dropped by either sweep
+});
+
+test('RFC38 sweep drops --now keys older than 24h (next /broadcast), keeps fresh ones', async () => {
+  const h = mk2();
+  h.buttons.setStrict('bcnow:9:1', { kind: 'broadcast-now', createdAt: h.state.now - 25 * 3600_000 });
+  h.buttons.setStrict('bcnow:9:2', { kind: 'broadcast-now', createdAt: h.state.now - 3600_000 });
+  await h.start('x');
+  assert.ok(!h.buttons.has('bcnow:9:1')); assert.ok(h.buttons.has('bcnow:9:2'));
+});
+
+test('RFC38 daemon dispatch: multi-line /broadcast --now passes chatId+messageId; the same message twice sends once; /dm in a group', async () => {
+  const { parseDaemonCommand, dispatchCommand } = await import('./daemon.mjs');
+  const parsed = parseDaemonCommand('/broadcast --now --p:umipay dòng 1\n"dòng 2"');
+  const h = mk2();
+  const run = (p, chatId, messageId) => dispatchCommand(p, { id: Number(OWNER) }, {
+    daemonUserId: OWNER, projectsConfig: CFG, registry: {}, sendText: h.ctx.sendText, sendButtonRows: h.ctx.sendButtonRows,
+    editButtonRows: h.ctx.editButtonRows, buttonStore: h.ctx.buttonStore, token: h.ctx.token, broadcastDeps: { ...h.deps, chatId: undefined, messageId: undefined },
+  }, null, messageId, chatId);
+  await run(parsed, 123, 50); await run(parsed, 123, 50);
+  assert.equal(h.writes.length, 2); assert.equal(h.writes[0].p.text, 'dòng 1\n"dòng 2"'); assert.ok(h.buttons.has('bcnow:123:50'));
+  await run(parsed, -1009, 50);       // another chat, same message id → a different message
+  assert.equal(h.writes.length, 4);
+  await run(parsed, null, null);      // internal call without ids
+  assert.match(h.out.sent.at(-1), /messageId/);
+  const { stripDmControlPrefix } = await import('./tele-listen.mjs');
+  const dm = parseDaemonCommand(stripDmControlPrefix('/dm broadcast --now --p:umipay hi'));
+  assert.equal(dm.cmd, 'broadcast'); assert.match(dm.rest, /^--now --p:umipay hi$/);
 });
