@@ -269,7 +269,7 @@ export function lsIdentities({ screens = [], procs = [] } = {}) {
   return out;
 }
 
-// Short /ls shows the state as an emoji (full keeps the text).
+// Short /ls shows the state as an emoji only; full shows emoji + text (Thi 13524).
 export const STATUS_EMOJI = { busy: '⏳', idle: '💤', waiting: '✋', shell: '🐚' };
 
 export function formatAgentList({ screens = [], procs = [], personaOf = () => null, home = os.homedir(), statusLinesOf = () => [], mailOf = () => null, convoOfHashtag = () => null, ctxOf = () => null, linksOf = () => [], showSession = true, full = true, listenerOf = () => null, tokensOf = () => null } = {}) {
@@ -309,7 +309,7 @@ export function formatAgentList({ screens = [], procs = [], personaOf = () => nu
       // 📨 = the session's name — the address for Claude's cross-session messages (SendMessage to=<name>)
       r.name ? `📨 Session: ${r.name}` : null,
       showSession && r.sessionId ? `🆔 Session: ${r.sessionId}${r.guessed ? ' (đoán)' : ''}` : null,
-      r.status ? `🚦 Trạng thái: ${r.status}` : null,
+      r.status ? `🚦 Trạng thái: ${STATUS_EMOJI[r.status] ? `${STATUS_EMOJI[r.status]} ` : ''}${r.status}` : null,
       short(r.cwd) ? `📁 Folder: ${short(r.cwd)}` : null,
       r.etime ? `🕒 Uptime: ${r.etime}` : null,
       ctx ? `🧠 Context: ${ctxText(ctx, r)}` : null,

@@ -162,7 +162,7 @@ test('formatAgentList: one block per claude process — title, `<emoji> <name>: 
   assert.match(out, /\n\n📺 tele-empty123 · không thấy claude bên trong\n\n/);
   assert.match(out, /\n\nx\n📺 Screen: work\n🔢 PID: 11\n📨 Session: x\n📁 Folder: w\n🕒 Uptime: 00:02\n\n/); // non-tele screen hosting a claude
   const term = out.slice(iTerm);
-  assert.equal(term, `💻 Terminal (1)\n\n🪱 Giun #a7611284\n🔢 PID: 830318\n📨 Session: 🪱 Giun\n🆔 Session: ${SID}\n🚦 Trạng thái: idle\n📁 Folder: umipay\n🕒 Uptime: 2-00:49:26\n🧠 Context: 172k\n📡 Remote Control: bật\n/compact_a7611284 /kill_a7611284`);
+  assert.equal(term, `💻 Terminal (1)\n\n🪱 Giun #a7611284\n🔢 PID: 830318\n📨 Session: 🪱 Giun\n🆔 Session: ${SID}\n🚦 Trạng thái: 💤 idle\n📁 Folder: umipay\n🕒 Uptime: 2-00:49:26\n🧠 Context: 172k\n📡 Remote Control: bật\n/compact_a7611284 /kill_a7611284`);
   assert.doesNotMatch(out, /pts\//);   // no tty line
   assert.doesNotMatch(out, /\n\n\n/);  // exactly one empty line between blocks
   const hidden = formatAgentList({ procs, showSession: false });
@@ -200,7 +200,7 @@ test('formatAgentList full:false — one line per agent (icon, name #hash, state
   assert.match(formatAgentList({ full: true, procs: p1, personaOf: () => '🪱 Giun' }), /\n🪱 Giun #a7611284\n/);
   assert.match(formatAgentList({ full: false, procs: p1, personaOf: () => null, linksOf: () => ['/kill_a7611284'] }), /^sess-a · ⏳/);
   assert.match(formatAgentList({ full: false, procs: [{ ...procs[0], name: null }], linksOf: () => ['/kill_a7611284'] }), /^PID 1 · ⏳/);
-  assert.match(formatAgentList({ full: true, procs: p1, linksOf: () => ['/compact_a7611284', '/kill_a7611284'] }), /\nsess-a #a7611284\n[\s\S]*🚦 Trạng thái: busy[\s\S]*\/compact_a7611284 \/kill_a7611284\n/);
+  assert.match(formatAgentList({ full: true, procs: p1, linksOf: () => ['/compact_a7611284', '/kill_a7611284'] }), /\nsess-a #a7611284\n[\s\S]*🚦 Trạng thái: ⏳ busy[\s\S]*\/compact_a7611284 \/kill_a7611284\n/);
   assert.deepEqual(STATUS_EMOJI, { busy: '⏳', idle: '💤', waiting: '✋', shell: '🐚' });
   const st = (status) => formatAgentList({ full: false, procs: [{ ...procs[0], status }] });
   assert.match(st('idle'), /· 💤$/); assert.match(st('waiting'), /· ✋$/); assert.match(st('shell'), /· 🐚$/); assert.match(st('weird'), /· weird$/);
