@@ -103,9 +103,15 @@ export function allowedOps(state, bridgeSessionId) {
   return [];
 }
 
+// A real tmux screen capture is bounded by terminal rows×cols; anything far beyond that is
+// not a screen a terminal could have produced and must not be fed to the regex below.
+const MAX_SCREEN_TEXT_LEN = 20_000;
+
 /** Claude shows this while messages are queued for after the turn. Pure. */
 export function hasQueuedInput(screenText) {
-  return /Press up to edit queued messages/.test(String(screenText || '').replace(/\0/g, ''));
+  const text = String(screenText || '').replace(/\0/g, '');
+  if (text.length > MAX_SCREEN_TEXT_LEN) return false;
+  return /Press up to edit queued messages/.test(text);
 }
 
 /**
