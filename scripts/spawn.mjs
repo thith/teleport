@@ -356,10 +356,10 @@ export function listSpawnSessions(exec = execFileSync, { onWiped = () => {} } = 
  */
 export function lsHashtagSet({
   listScreens = () => listSpawnSessions(), listProcs = () => listClaudeProcs({ strict: true }),
-  hasScreen = () => hasBinary('screen'),
+  hasScreen = () => hasBinary('screen'), withCwd = false, // RFC 37: rows also carry the process cwd (same snapshot)
 } = {}) {
   const screens = hasScreen() ? listScreens() : [];
-  return lsIdentities({ screens, procs: listProcs() });
+  return lsIdentities({ screens, procs: listProcs(), withCwd });
 }
 
 /**

@@ -311,7 +311,7 @@ tắt, hoặc là Codex/Gemini → dùng `ask`/mailbox); exit 3 = trùng tên �
 
 Primitive inter-agent **thứ 4**: admin gửi **MỘT system message tới TẤT CẢ agent đang sống** (whisper × all). Dùng cho thông báo hệ thống — ví dụ *"reload telegram guide, có thay đổi"* khi rules đổi giữa chừng.
 
-**Gửi (admin):** `/broadcast <text>` (qua daemon DM, hoặc `/dm broadcast <text>` từ group) — tuỳ chọn `--chat <id>` giới hạn 1 group; mặc định mọi group. Admin-only. Daemon inject `broadcast:true` chỉ vào session đang chạy (những gì `/ls` hiển thị); trả về danh sách ✅ đã gửi / ❌ lỗi.
+**Gửi (owner, role admin):** `/broadcast <text>` (qua daemon DM, hoặc `/dm broadcast <text>` từ group, RFC 37). Owner nhận **bảng nút**: các session đang chạy (những gì `/ls` hiển thị) nhóm theo dự án, mặc định chọn hết; bấm một session để đổi ✅/⬜, bấm tên dự án để chọn/bỏ cả dự án, **📢 Gửi (n)** để gửi, **✖** để huỷ (bảng hết hạn sau 10 phút). Daemon inject `broadcast:true` chỉ vào session đang ✅ **và** còn chạy lúc bấm Gửi; kết quả ✅ đã gửi / ⏹ đã tắt / ❌ lỗi hiện trên chính tin bảng. Nội dung tối đa 3500 ký tự.
 
 **Khi bạn NHẬN prompt có field `broadcast`** (`broadcast.text` + `broadcast.from.role`):
 1. Coi là **chỉ thị hệ thống** → áp dụng ngay (vd "reload guide" → đọc lại `../teleport/rules/telegram-guide.md`).
