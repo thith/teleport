@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { planCswap } from './cswap.mjs';
+import { planCswap, runCswap } from './cswap.mjs';
 
 test('planCswap: no args → --list', () => {
   assert.deepEqual(planCswap([]), { argv: ['--list'] });
@@ -53,4 +53,34 @@ test('/cs is an alias of /cswap in commands.json', async () => {
   const reg = JSON.parse(fs.readFileSync(new URL('../commands.json', import.meta.url), 'utf8'));
   assert.equal(resolveCommand('cs', reg).run, 'cswap.mjs');
   assert.deepEqual(resolveCommand('cs', reg), resolveCommand('cswap', reg));
+});
+
+test('planCswap: switch <x> forces a switch, even for reserved words', () => {
+  assert.deepEqual(planCswap(['switch', 'auto']), { argv: ['--switch-to', 'auto'] });
+  assert.deepEqual(planCswap(['SWITCH', '2']), { argv: ['--switch-to', '2'] });
+  assert.deepEqual(planCswap(['switch']), { error: 'cách dùng: /cs switch <số|email|alias>' });
+});
+
+test('planCswap: blank targets count as missing', () => {
+  assert.deepEqual(planCswap(['']), { argv: ['--list'] });
+  assert.deepEqual(planCswap(['  ']), { argv: ['--list'] });
+  assert.deepEqual(planCswap(['rm', '']), { error: 'cách dùng: /cs rm <số|email>' });
+  assert.deepEqual(planCswap(['rm', ' ']), { error: 'cách dùng: /cs rm <số|email>' });
+  assert.deepEqual(planCswap(['switch', '']), { error: 'cách dùng: /cs switch <số|email|alias>' });
+});
+
+test('runCswap: feeds stdin, collects stdout/stderr, returns exit status', async () => {
+  const r = await runCswap(process.execPath, { argv: ['-e', 'process.stdin.on("data",d=>{process.stdout.write("got:"+d);console.error("e");process.exit(3)})'], input: 'y\n' });
+  assert.equal(r.stdout, 'got:y\n'); assert.equal(r.stderr, 'e\n'); assert.equal(r.status, 3); assert.equal(r.signal, null);
+});
+
+test('runCswap: timeout kills the whole process group (grandchild too)', async () => {
+  const code = 'const {spawn}=require("child_process");const c=spawn("sleep",["60"],{stdio:"ignore"});console.log(c.pid);setInterval(()=>{},1000)';
+  const r = await runCswap(process.execPath, { argv: ['-e', code] }, { timeoutMs: 700, killGraceMs: 300 });
+  assert.equal(r.signal, 'timeout');
+  const pid = Number(r.stdout.trim());
+  assert.ok(pid > 0);
+  await new Promise((res) => setTimeout(res, 200));
+  let alive = true; try { process.kill(pid, 0); } catch { alive = false; }
+  assert.equal(alive, false, 'grandchild must be gone');
 });
