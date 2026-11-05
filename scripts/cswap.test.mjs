@@ -17,3 +17,40 @@ test('planCswap: email target passes through verbatim (cswap itself validates NU
 test('planCswap: only the first token is used as target', () => {
   assert.deepEqual(planCswap(['2', 'extra']), { argv: ['--switch-to', '2'] });
 });
+
+test('planCswap: add', () => {
+  assert.deepEqual(planCswap(['add']), { argv: ['add'] });
+});
+
+test('planCswap: rm/remove <target> → remove with "y" on stdin', () => {
+  assert.deepEqual(planCswap(['rm', '2']), { argv: ['remove', '2'], input: 'y\n' });
+  assert.deepEqual(planCswap(['remove', 'a@b.com']), { argv: ['remove', 'a@b.com'], input: 'y\n' });
+});
+
+test('planCswap: rm without target → usage error, no argv', () => {
+  assert.deepEqual(planCswap(['rm']), { error: 'cách dùng: /cs rm <số|email>' });
+  assert.equal(planCswap(['remove']).argv, undefined);
+});
+
+test('planCswap: auto → auto --once', () => {
+  assert.deepEqual(planCswap(['auto']), { argv: ['auto', '--once'] });
+});
+
+test('planCswap: upgrade/update → upgrade with a long timeout', () => {
+  assert.deepEqual(planCswap(['upgrade']), { argv: ['upgrade'], timeoutMs: 180000 });
+  assert.deepEqual(planCswap(['update']), { argv: ['upgrade'], timeoutMs: 180000 });
+});
+
+test('planCswap: keywords are case-insensitive; target keeps its case', () => {
+  assert.deepEqual(planCswap(['ADD']), { argv: ['add'] });
+  assert.deepEqual(planCswap(['Rm', 'A@B.com']), { argv: ['remove', 'A@B.com'], input: 'y\n' });
+  assert.deepEqual(planCswap(['Auto']), { argv: ['auto', '--once'] });
+});
+
+test('/cs is an alias of /cswap in commands.json', async () => {
+  const fs = await import('node:fs');
+  const { resolveCommand } = await import('./commands.mjs');
+  const reg = JSON.parse(fs.readFileSync(new URL('../commands.json', import.meta.url), 'utf8'));
+  assert.equal(resolveCommand('cs', reg).run, 'cswap.mjs');
+  assert.deepEqual(resolveCommand('cs', reg), resolveCommand('cswap', reg));
+});
