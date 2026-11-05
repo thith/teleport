@@ -608,7 +608,7 @@ export function pruneBackups({
         const main = path.dirname(info.commonDir);
         try { git(['-C', main, 'update-ref', '--no-deref', '-d', info.keepRef, info.head]); } catch (e) {
           let gone = false; // already deleted by hand: nothing to report
-          try { git(['-C', main, 'rev-parse', '--verify', '-q', info.keepRef]); } catch { gone = true; }
+          try { git(['-C', main, 'rev-parse', '--verify', '-q', info.keepRef]); } catch (e2) { gone = e2?.status === 1; } // exit 1 = absent; any other failure is reported
           if (!gone) (res.refErrors ||= []).push(`không gỡ được ref ${info.keepRef} của sao lưu ${ent.name}: ${String(e?.stderr || e?.message || e).trim().split('\n')[0].slice(0, 160)}`);
         }
       }

@@ -452,6 +452,22 @@ test('ref drop fails AND the lookup fails (not "absent") → the record stays, n
   assert.equal(g(w.main, 'rev-parse', info.keepRef), a.head);
 });
 
+test('pruneBackups: ref delete fails and the lookup fails with exit 128 → reported in refErrors, not treated as gone', async () => {
+  const w = world();
+  const a = w.det('sweepblind', 1);
+  const res = await remove(w, a.path);
+  const f = path.join(res.backupDir, 'info.json');
+  fs.writeFileSync(f, JSON.stringify({ ...JSON.parse(fs.readFileSync(f, 'utf8')), createdAt: Date.now() - 8 * 24 * 3600_000 }));
+  const git = (args) => {
+    if (args.includes('-d')) throw Object.assign(new Error('cannot lock'), { status: 128 });
+    if (args.includes('rev-parse')) throw Object.assign(new Error('fatal: bad config'), { status: 128 });
+    return ''; // check-ref-format
+  };
+  const r = pruneBackups({ dir: w.backups, parentDir: w.parent, git });
+  assert.equal(r.refErrors?.length, 1);
+  assert.match(r.refErrors[0], /không gỡ được ref refs\/teleport-backup\//);
+});
+
 test('pruneBackups: malformed types (head as an array, keepRef as a number) → odd, dir and ref kept', async () => {
   const w = world();
   const a = w.det('types', 1);
