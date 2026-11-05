@@ -107,3 +107,9 @@ test('timeout is a failure exit even if the child traps SIGTERM and exits 0', as
   assert.equal(exitCodeFor({ status: 3, signal: null }), 3);
   assert.equal(exitCodeFor({ status: null, signal: 'SIGKILL' }), 1);
 });
+
+test('CS_FOOTER: tappable /health and /ls shortcuts', async () => {
+  const { CS_FOOTER } = await import('./cswap.mjs');
+  assert.match(CS_FOOTER, /\/health/);
+  assert.match(CS_FOOTER, /\/ls/);
+});

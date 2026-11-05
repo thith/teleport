@@ -67,13 +67,17 @@ export function runCswap(cmd, plan, { timeoutMs = CSWAP_TIMEOUT_MS, killGraceMs 
 // Exit code for a finished run: any signal (incl. our 'timeout') is a failure, even if the child exited 0.
 export function exitCodeFor(r) { return r.signal ? (r.signal === 'timeout' ? 124 : 1) : (r.status == null ? 1 : r.status); }
 
+// Tappable shortcuts appended to every /cs result (Telegram links /commands).
+export const CS_FOOTER = "\n/health · /ls";
+
 if (isMainModule(import.meta.url)) {
   const plan = planCswap(process.argv.slice(2));
   if (plan.error) { process.stdout.write(`${plan.error}\n`); process.exit(2); }
   const r = await runCswap('cswap', plan, { timeoutMs: plan.timeoutMs ?? CSWAP_TIMEOUT_MS });
   if (r.error) { process.stdout.write(`❌ ${r.error.code === 'ENOENT' ? 'cswap not found on PATH' : r.error.message}\n`); process.exit(1); }
-  if (r.stdout) process.stdout.write(r.stdout);
+  if (r.stdout) process.stdout.write(r.stdout.trimEnd() + "\n");
   if (r.stderr) process.stdout.write(`\n[stderr]\n${r.stderr}`);
   if (r.signal) process.stdout.write(`\n[killed: ${r.signal}]\n`);
+  process.stdout.write(CS_FOOTER + '\n');
   process.exit(exitCodeFor(r));
 }
