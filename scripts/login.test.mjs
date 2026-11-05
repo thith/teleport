@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { parseArgs, validCode, extractLoginUrl, loginEnv, acquireLock, runLogin, shq } from './login.mjs';
 
 const HC = "Opening browser to sign in…\nIf the browser didn't open, visit: https://claude.com/cai/oauth/authorize?code=t\nrue&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e&response_type=code&redirect_u\nri=https%3A%2F%2Fplatform.claude.com%2Foauth%2Fcode%2Fcallback&scope=org%3Acreat\ne_api_key+user%3Aprofile&code_challenge=abc&code_challenge_method=S256&state=xyz\nPaste code here if prompted >";
@@ -49,10 +51,15 @@ test('lock: O_EXCL, live pid blocks, dead pid reclaimed, old lock reclaimed', ()
   assert.ok(r1);
   assert.equal(acquireLock(root, { now: () => t, alive: () => true }), null, 'second start loses');
   assert.ok(acquireLock(root, { now: () => t, alive: () => false })?.call, 'dead pid → reclaimed at once');
-  fs.writeFileSync(path.join(root, 'lock'), JSON.stringify({ pid: 1, at: t }));
+  fs.writeFileSync(path.join(root, 'lock'), JSON.stringify({ pid: 1, token: 'zz', at: t }));
   assert.equal(acquireLock(root, { now: () => t + 60_000, alive: () => true }), null);
-  assert.ok(acquireLock(root, { now: () => t + 4 * 60_000, alive: () => true }), 'alive but >3 min → reclaimed');
-  r1();
+  const r4 = acquireLock(root, { now: () => t + 4 * 60_000, alive: () => true });
+  assert.ok(r4, 'alive but >3 min → reclaimed');
+  r1(); // not the owner any more → must leave the new lock
+  assert.ok(fs.existsSync(path.join(root, 'lock')), 'release by a non-owner leaves the lock');
+  r4();
+  assert.ok(!fs.existsSync(path.join(root, 'lock')));
+  assert.deepEqual(fs.readdirSync(root), [], 'no tmp/grave files left');
   fs.rmSync(root, { recursive: true, force: true });
 });
 
@@ -152,11 +159,13 @@ test('flow: code → cswap add with forced env → report → cleanup', async ()
   cleanup(w);
 });
 
-test('flow: wrong code keeps the session; a later right code works', async () => {
-  const w = world({ stuff: 'wrong' });
+test('flow: no exit within 60 s → "maybe wrong code", session kept; a screen line with "error" does not abort', async () => {
+  const w = world({ stuff: 'wrong' }); // screen shows "Error: Invalid code" but nothing exits
   await runLogin('', w.deps());
+  const t0 = w.clock;
   const out = await runLogin(CODE, w.deps());
-  assert.equal(out, '❌ mã không đúng, gửi lại /login <mã>');
+  assert.equal(out, '⏳ chưa xong — có thể mã sai. Gửi lại /login <mã> hoặc /login cancel');
+  assert.ok(w.clock - t0 >= 60_000, 'waited the full 60 s');
   assert.ok(fs.existsSync(path.join(w.root, 'abc123', 'session.json')));
   assert.ok(!fs.existsSync(path.join(w.root, 'abc123', 'code')), 'code file removed');
   w.stuffMode = 'ok';
@@ -224,7 +233,61 @@ test('non-linux refused; missing tool reported; held lock → busy', async () =>
   const w = world();
   assert.equal(await runLogin('', w.deps({ platform: 'darwin' })), '❌ /login chưa hỗ trợ trên darwin');
   assert.match(await runLogin('', w.deps({ which: (n) => n !== 'screen' })), /thiếu trong PATH: screen/);
-  fs.writeFileSync(path.join(w.root, 'lock'), JSON.stringify({ pid: process.pid, at: w.clock }));
+  fs.writeFileSync(path.join(w.root, 'lock'), JSON.stringify({ pid: process.pid, token: 'held', at: w.clock }));
   assert.match(await runLogin('', w.deps()), /đang xử lý/);
+  cleanup(w);
+});
+
+test('lock: concurrent real processes → exactly one wins', async () => {
+  const root = tmp();
+  const mod = fileURLToPath(new URL('./login.mjs', import.meta.url));
+  const code = `import(${JSON.stringify(mod)}).then(async (m) => { const r = m.acquireLock(${JSON.stringify(root)}); console.log(r ? 'won' : 'lost'); await new Promise((x) => setTimeout(x, 1500)); });`;
+  const outs = await Promise.all(Array.from({ length: 4 }, () => new Promise((res) => {
+    let o = ''; const c = spawn(process.execPath, ['--input-type=module', '-e', code]);
+    c.stdout.on('data', (b) => { o += b; }); c.on('close', () => res(o.trim()));
+  })));
+  assert.equal(outs.filter((x) => x === 'won').length, 1, outs.join(','));
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('late completion: exit 0 already there → next /login finishes (cswap add) instead of deleting', async () => {
+  const w = world();
+  await runLogin('', w.deps());
+  fs.writeFileSync(path.join(w.root, 'abc123', 'exit'), '0\n');
+  const out = await runLogin('', w.deps());
+  assert.match(out, /✅ đã thêm account: new@x\.io · Acme/);
+  assert.deepEqual(fs.readdirSync(w.root), []);
+  cleanup(w);
+});
+test('late completion: a code sent after completion says it was not needed', async () => {
+  const w = world();
+  await runLogin('', w.deps());
+  fs.writeFileSync(path.join(w.root, 'abc123', 'exit'), '0\n');
+  const out = await runLogin(CODE, w.deps());
+  assert.match(out, /không cần mã nữa/);
+  assert.match(out, /✅ đã thêm account/);
+  assert.ok(!w.pasted);
+  cleanup(w);
+});
+test('late completion: exit ≠ 0 on disk → cleanup, then /login starts fresh', async () => {
+  const w = world();
+  await runLogin('', w.deps());
+  fs.writeFileSync(path.join(w.root, 'abc123', 'exit'), '1\n');
+  w.alive = false;
+  const out = await runLogin('', w.deps());
+  assert.ok(out.includes(URL_OK));
+  assert.equal(w.calls.filter((c) => c.argv[0] === '-dmS').length, 2);
+  cleanup(w);
+});
+test('restart recovery: session.json without url (died mid-start) → cleaned, fresh start', async () => {
+  const w = world();
+  const dir = path.join(w.root, 'dead01');
+  fs.mkdirSync(path.join(dir, 'config'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'session.json'), JSON.stringify({ id: 'dead01', screen: 'tele-login-dead01', startedAt: w.clock, expiresAt: w.clock + 600000 }));
+  w.dir = dir; w.alive = true; // pretend its screen is up
+  const out = await runLogin('', w.deps());
+  assert.ok(out.includes(URL_OK));
+  assert.ok(!fs.existsSync(dir), 'incomplete session removed');
+  assert.deepEqual(fs.readdirSync(w.root), ['abc123']);
   cleanup(w);
 });

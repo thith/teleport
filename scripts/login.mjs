@@ -71,26 +71,43 @@ function pidAlive(pid) {
   try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; }
 }
 
-/** O_EXCL lock; dead pid → reclaim now; alive but older than LOCK_STALE_MS → reclaim. Returns release fn or null. */
+/**
+ * Lock file created atomically complete (tmp file + link(2), which fails with EEXIST), content
+ * {pid, token, at}. A lock is reclaimed only if its content parses and is stale (dead pid, or older
+ * than LOCK_STALE_MS); reclaim = rename to a private name, then verify the content is still what we
+ * judged stale (else put it back). Release only removes a lock carrying our token.
+ * Returns a release fn, or null when someone else holds it.
+ */
 export function acquireLock(root, { now = Date.now, alive = pidAlive, pid = process.pid } = {}) {
   fs.mkdirSync(root, { recursive: true, mode: 0o700 });
   const file = path.join(root, 'lock');
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      const fd = fs.openSync(file, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY, 0o600);
-      fs.writeSync(fd, JSON.stringify({ pid, at: now() }));
-      fs.closeSync(fd);
-      return () => { try { fs.rmSync(file, { force: true }); } catch {} };
-    } catch (e) {
-      if (e.code !== 'EEXIST') throw e;
-      let held = null;
-      try { held = JSON.parse(fs.readFileSync(file, 'utf8')); } catch {}
-      const stale = !held || !alive(held.pid) || now() - Number(held.at) > LOCK_STALE_MS;
+  const token = crypto.randomBytes(8).toString('hex');
+  const tmp = path.join(root, `lock.${pid}.${token}.tmp`);
+  fs.writeFileSync(tmp, JSON.stringify({ pid, token, at: now() }), { mode: 0o600 });
+  try {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        fs.linkSync(tmp, file);
+        return () => {
+          try { if (JSON.parse(fs.readFileSync(file, 'utf8')).token === token) fs.rmSync(file, { force: true }); } catch {}
+        };
+      } catch (e) {
+        if (e.code !== 'EEXIST') throw e;
+      }
+      let raw = null, held = null;
+      try { raw = fs.readFileSync(file, 'utf8'); held = JSON.parse(raw); } catch {}
+      if (raw === null) continue; // vanished meanwhile → retry
+      const stale = !held || typeof held.token !== 'string' || !alive(held.pid) || now() - Number(held.at) > LOCK_STALE_MS;
       if (!stale) return null;
-      try { fs.rmSync(file, { force: true }); } catch {}
+      const grave = path.join(root, `lock.${pid}.${token}.grave`);
+      try { fs.renameSync(file, grave); } catch { continue; }
+      let same = false;
+      try { same = fs.readFileSync(grave, 'utf8') === raw; } catch {}
+      if (!same) { try { fs.linkSync(grave, file); } catch {} }
+      try { fs.rmSync(grave, { force: true }); } catch {}
     }
-  }
-  return null;
+    return null;
+  } finally { try { fs.rmSync(tmp, { force: true }); } catch {} }
 }
 
 // ── session storage ──
@@ -157,7 +174,7 @@ async function cleanup(d, entry) {
 
 async function current(d) {
   const all = readSessions(d.root);
-  const valid = all.filter((e) => e.session && e.session.id).sort((a, b) => b.session.startedAt - a.session.startedAt);
+  const valid = all.filter((e) => e.session && e.session.id && e.session.url).sort((a, b) => b.session.startedAt - a.session.startedAt);
   for (const e of all) if (e !== valid[0]) await cleanup(d, e);
   return valid[0] || null;
 }
@@ -170,6 +187,16 @@ async function live(d, entry) {
 
 async function handle(cmd, d) {
   let entry = await current(d);
+  // A session whose `claude` already finished (exit file): complete it now (late completion) or drop it.
+  if (entry && fs.existsSync(path.join(entry.dir, 'exit'))) {
+    let ec = '';
+    try { ec = fs.readFileSync(path.join(entry.dir, 'exit'), 'utf8').trim(); } catch {}
+    if (ec === '0') {
+      const r = await finishLogin(entry, d);
+      return cmd.kind === 'submit' ? `ℹ️ login đã xong từ trước, không cần mã nữa.\n${r}` : r;
+    }
+    await cleanup(d, entry); entry = null;
+  }
   if (cmd.kind === 'cancel') {
     if (!entry) return 'ℹ️ không có phiên login nào đang chờ';
     await cleanup(d, entry);
@@ -228,18 +255,9 @@ async function start(d) {
   return startMessage(url, Math.round(SESSION_MS / 60000));
 }
 
-const readHc = async (d, name, hc) => {
-  await d.run('screen', ['-S', name, '-X', 'hardcopy', hc], {});
-  try { fs.chmodSync(hc, 0o600); return fs.readFileSync(hc, 'utf8'); } catch { return ''; }
-};
-
 async function submit(code, entry, d) {
   const { dir, session } = entry;
   const name = session.screen;
-  const configDir = path.join(dir, 'config');
-  const env = loginEnv(d.env, configDir);
-  const hc = path.join(dir, 'hc.txt');
-  const baseline = new Set((await readHc(d, name, hc)).split('\n').map((l) => l.trimEnd()));
   const codeFile = path.join(dir, 'code');
   fs.writeFileSync(codeFile, code, { mode: 0o600 });
   try {
@@ -253,15 +271,19 @@ async function submit(code, entry, d) {
   while (true) {
     try { exitCode = fs.readFileSync(exitFile, 'utf8').trim(); } catch {}
     if (exitCode !== null) break;
-    const lines = (await readHc(d, name, hc)).split('\n').map((l) => l.trimEnd());
-    if (lines.some((l) => l && !baseline.has(l) && /invalid|error|failed/i.test(l))) {
-      return '❌ mã không đúng, gửi lại /login <mã>';
-    }
     if (d.now() >= deadline) break;
     await d.sleep(POLL_MS);
   }
-  if (exitCode === null) return '❌ chưa thấy login xong sau 60 s. Phiên vẫn giữ, thử gửi lại /login <mã> hoặc /login cancel';
+  if (exitCode === null) return '⏳ chưa xong — có thể mã sai. Gửi lại /login <mã> hoặc /login cancel';
   if (exitCode !== '0') { await cleanup(d, entry); return `❌ login thất bại (mã thoát ${exitCode}), gõ /login để thử lại`; }
+  return finishLogin(entry, d);
+}
+
+/** claude exited 0: verify the isolated profile is logged in, `cswap add`, report, clean up. */
+async function finishLogin(entry, d) {
+  const { dir } = entry;
+  const configDir = path.join(dir, 'config');
+  const env = loginEnv(d.env, configDir);
   const st = await d.run('claude', ['auth', 'status', '--json'], { env, cwd: dir });
   let status = null;
   try { status = JSON.parse(st.stdout); } catch {}
