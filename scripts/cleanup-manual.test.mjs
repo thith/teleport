@@ -127,11 +127,21 @@ test('probe: over 2 GiB / over 20 000 files → no ✅ (limit); the probe stops 
 
 const blocked = async (w, p, re, extra) => { const r = await probe(w, p, extra); assert.equal(r.ok, false, `should be blocked: ${re}`); assert.equal(r.hard, true); assert.match(r.reason, re); return r; };
 
-test('hard blocks: detached HEAD · git worktree lock', async () => {
+test('hard blocks: detached HEAD is no longer one (RFC 39) · a branch outside refs/heads still is · git worktree lock', async () => {
   const w = world();
   const d = path.join(w.parent, 'repo-det');
   g(w.main, 'worktree', 'add', '-q', '--detach', d);
-  await blocked(w, d, /detached HEAD/);
+  const pd = await probe(w, d);
+  assert.equal(pd.ok, true, pd.reason);
+  assert.equal(pd.branch, null);
+  assert.equal(pd.detached, true);
+  const odd = w.add('feat-odd');
+  const r = await probeManual(odd.path, { parentDir: w.parent, deps: { ...deps(), exec: async (c, a2, o) => {
+    const out = await deps().exec(c, a2, o);
+    return a2.includes('--porcelain') && a2.includes('worktree') ? String(out).replace('branch refs/heads/feat-odd', 'branch refs/remotes/origin/feat-odd') : out;
+  } } });
+  assert.equal(r.ok, false);
+  assert.match(r.reason, /nhánh lạ \(refs\/remotes\/origin\/feat-odd\)/);
   const a = w.add('feat-lock');
   g(w.main, 'worktree', 'lock', a.path);
   await blocked(w, a.path, /bị khoá/);

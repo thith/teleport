@@ -498,6 +498,18 @@ test('processCleanupRequests: kept ONLY for stray files → ONE [🗑 Xoá tay];
   assert.match(h.answers.at(-1), /Hết hạn|đã xử lý/);
 });
 
+test('processCleanupRequests: a detached worktree is still refused for auto-removal, and the owner gets [🗑 Xoá tay] (RFC 39)', async () => {
+  const w = world();
+  const det = w.add('det', { detached: true });
+  const h = buttonHarness();
+  writeRequest({ path: det.path, convoId: 5, dir: h.dir });
+  await processCleanupRequests(h.ctx, { ...h.opts, parentDir: w.parent, deps: deps() });
+  assert.ok(fs.existsSync(det.path), 'not removed automatically');
+  assert.equal(h.buttons.length, 1);
+  assert.match(h.buttons[0].t, /detached HEAD/);
+  assert.deepEqual(h.buttons[0].b.map((b) => b.text), ['🗑 Xoá tay']);
+});
+
 test('processCleanupRequests: every refusal gets the one button; stray files AND another blocker → the plain reason, not the file list', async () => {
   const w = world();
   const a = w.add('feat-a');

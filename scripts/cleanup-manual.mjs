@@ -17,7 +17,7 @@ import zlib from 'node:zlib';
 import { spawn } from 'node:child_process';
 import {
   defaultDeps, locateWorktree, listLinkedWorktrees, judgeWorktree, parseWorktreePorcelain, hiddenEdits, isBuildPath, looksLikeRepo,
-  procsInside, duBytes, fmtGB, WALK_MAX_ENTRIES, MANUAL_BACKUP_DIR, TRANSCRIPT_WINDOW_MS,
+  procsInside, duBytes, fmtGB, WALK_MAX_ENTRIES, MANUAL_BACKUP_DIR, TRANSCRIPT_WINDOW_MS, KEEP_REF_PREFIX, refName,
 } from './cleanup.mjs';
 import { acquireLock } from './machine-lock.mjs';
 import { PARENT_DIR } from './workspace.mjs';
@@ -128,7 +128,17 @@ export async function hardBlocks(L, deps, { realParent, nested = true, maxEntrie
   const blocks = [];
   const attempt = async (fn) => { try { await fn(); } catch (e) { blocks.push(`lỗi probe: ${firstLine(e)}`); } };
   if (wt.locked) blocks.push('bị khoá (git worktree lock)');
-  if (wt.detached || !wt.branch || !wt.branch.startsWith('refs/heads/')) blocks.push('detached HEAD (commit có thể không nằm trên nhánh nào)');
+  // RFC 39: a detached HEAD is no longer a hard block (its commits are kept by a ref); a branch outside refs/heads/ still is.
+  if (wt.branch && !wt.branch.startsWith('refs/heads/')) blocks.push(`nhánh lạ (${wt.branch})`);
+  if (!wt.branch) { // detached: the worktree's own HEAD reflog dies with it — commits only it can reach (e.g. after a `reset`) would be lost
+    await attempt(async () => {
+      const shas = [...new Set(String(await gitIn(deps, real, ['log', '-g', '--format=%H', 'HEAD'])).split('\n').map((x) => x.trim()).filter(Boolean))];
+      if (!shas.length) return;
+      const n = Number(String(await gitIn(deps, real, ['rev-list', '--count', ...shas, '--not', 'HEAD', '--branches', '--remotes', '--tags'])).trim());
+      if (!Number.isFinite(n)) throw new Error('rev-list ra số lạ');
+      if (n > 0) blocks.push(`reflog có ${n} commit đã bị reset bỏ, không nằm trên nhánh nào — xử lý tay`);
+    });
+  }
   await attempt(async () => {
     const procs = procsInside(deps, real);
     if (procs.length) {
@@ -220,6 +230,7 @@ export async function probeManual(target, {
     const blocks = await hardBlocks(L, deps, { realParent, nested: true, maxEntries, trackedPaths });
     if (headNow !== wt.head) blocks.push('HEAD vừa đổi');
     if (blocks.length) return { ok: false, hard: true, path: shown, reason: blocks.join('; '), blocks };
+    const detached = !wt.branch;
     if (quick) return { ok: true, quick: true, path: shown, head: headNow, branch, commonDir };
 
     // ── the inventory: what a removal would lose ──
@@ -294,11 +305,14 @@ export async function probeManual(target, {
     const fingerprint = fp.digest('hex');
 
     // `fast` (the late re-probe right before the removal): only the volatile safety facts above — no PR query, no du, no table extras
-    if (fast) return { ok: true, fast: true, path: shown, real, main: L.main, repo: L.repo, commonDir, branch, head: headNow, files, patches: patchIn, fingerprint };
+    if (fast) return { ok: true, fast: true, path: shown, real, main: L.main, repo: L.repo, commonDir, branch, head: headNow, files, patches: patchIn, fingerprint, detached };
 
     // table extras: upstream / unpushed, PR, sizes of the skipped build dirs (best effort)
-    let upstream = null, aheadCommits = 0;
-    try {
+    let upstream = null, aheadCommits = 0, orphanCommits = 0, containedIn = null;
+    if (detached) { // RFC 39 §2.2: display only — the commit is kept by a ref either way. refs/teleport-backup/* deliberately does not count.
+      try { orphanCommits = Number(String(await git(['rev-list', '--count', 'HEAD', '--not', '--branches', '--remotes', '--tags'])).trim()) || 0; } catch {}
+      try { containedIn = String(await git(['for-each-ref', '--contains', 'HEAD', '--count=1', '--format=%(refname:short)', '--exclude=refs/remotes/*/HEAD', 'refs/heads', 'refs/remotes', 'refs/tags'])).trim().split('\n')[0] || null; } catch {}
+    } else try {
       upstream = String(await git(['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{u}'])).trim() || null;
       aheadCommits = Number(String(await git(['rev-list', '--count', '@{u}..HEAD'])).trim()) || 0;
     } catch {
@@ -319,7 +333,7 @@ export async function probeManual(target, {
     const staged = st.tracked.filter((t) => t.xy[0] !== ' ' && t.xy[0] !== '?').map((t) => t.p);
 
     return {
-      ok: true, path: shown, real, main: L.main, repo: L.repo, commonDir, branch, head: headNow, upstream, aheadCommits, pr,
+      ok: true, path: shown, real, main: L.main, repo: L.repo, commonDir, branch, head: headNow, upstream, aheadCommits, pr, detached, orphanCommits, containedIn,
       tracked: { count: trackedPaths.length, staged: staged.length, names: trackedPaths.slice(0, 6) },
       entries: display.slice(0, 6), entryCount: display.length, skipped: skippedInfo, skippedMore: Math.max(0, skipped.length - 5),
       fileCount: files.length, bytes: bytes + patchBytes, files, patches: patchIn, fingerprint,
@@ -415,6 +429,7 @@ export async function readTgz(file) {
 
 const shq = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
 const stamp = (ms) => new Date(ms).toISOString().replace(/[-:]/g, '').replace('T', '-').slice(0, 15);
+const keepRefFor = (dirName) => `${KEEP_REF_PREFIX}${refName(dirName)}`;
 const safeName = (s, max = 60) => String(s ?? 'x').replace(/[^A-Za-z0-9._-]/g, '_').slice(0, max) || 'x';
 
 /** The restore script: re-create the worktree, then re-apply staged / unstaged / untracked. Every argument shell-quoted. Pure. */
@@ -428,26 +443,58 @@ export function buildRestoreScript({ main, wtPath, branch, head, hasStaged, hasU
     '# Khôi phục worktree đã xoá tay (RFC 30). Chạy: bash restore.sh',
     'D="$(cd "$(dirname "$0")" && pwd)"',
     'fail() { echo "lỗi ở bước: $1" >&2; shift; echo "làm tiếp tay các bước còn lại:" >&2; for c in "$@"; do echo "  $c" >&2; done; exit 1; }',
-    `MAIN=${shq(main)}`, `BR=${shq(branch)}`, `HEAD_SHA=${shq(head)}`,
+    `MAIN=${shq(main)}`, `HEAD_SHA=${shq(head)}`,
+  ];
+  if (branch == null) { // RFC 39: a detached worktree — straight to the commit (kept by refs/teleport-backup/…)
+    L.push(`git -C "$MAIN" worktree add --detach ${shq(wtPath)} "$HEAD_SHA" || fail 'git worktree add --detach' ${steps.map(shq).join(' ')}`);
+  } else L.push(
+    `BR=${shq(branch)}`,
     `if [ "$(git -C "$MAIN" rev-parse --verify -q "refs/heads/$BR")" = "$HEAD_SHA" ] && ! git -C "$MAIN" worktree list --porcelain | grep -qxF "branch refs/heads/$BR"; then`,
     `  git -C "$MAIN" worktree add ${shq(wtPath)} "$BR" || fail 'git worktree add' ${steps.map(shq).join(' ')}`,
     'else',
     '  echo "nhánh $BR đã đổi — đang ở đúng commit cũ (detached)"',
     `  git -C "$MAIN" worktree add --detach ${shq(wtPath)} "$HEAD_SHA" || fail 'git worktree add --detach' ${steps.map(shq).join(' ')}`,
     'fi',
-  ];
+  );
   steps.forEach((s, i) => L.push(`${s} || fail ${shq(s)} ${steps.slice(i + 1).map(shq).join(' ')}`.trimEnd()));
   L.push('echo "đã khôi phục"', '');
   return L.join('\n');
 }
 
+/** RFC 39 §2.3: drop the keep-ref THIS run created (compare-and-delete on `head`, never follows a symref). Never throws. */
+export async function dropKeepRef(deps, main, ref, head) {
+  if (!ref) return { ok: true };
+  try { await deps.exec('git', ['-C', main, 'update-ref', '--no-deref', '-d', ref, head]); return { ok: true }; } catch (e) {
+    try { await deps.exec('git', ['-C', main, 'rev-parse', '--verify', '-q', ref]); } catch (e2) { if (e2?.code === 1) return { ok: true }; } // exit 1 = already gone; any other failure = unknown → keep the record
+    return { ok: false, err: firstLine(e) };
+  }
+}
+
+/**
+ * Abort a backup `dir`: drop the keep-ref this run created, then delete the directory. When the ref can not be dropped the
+ * directory STAYS with a minimal info.json (so the 7-day sweep can validate and delete ref + dir) → the suffix for the reason.
+ */
+async function abortBackup(dir, p, deps, state, now = Date.now()) {
+  if (!dir) { if (state.keepRef) { const d = await dropKeepRef(deps, p.main, state.keepRef, p.head); if (d.ok) state.keepRef = null; } return ''; }
+  const d = await dropKeepRef(deps, p.main, state.keepRef, p.head);
+  if (d.ok) { rmDir(dir); state.keepRef = null; state.dropErr = null; return ''; }
+  try {
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(dir, 'info.json'), JSON.stringify({ v: 1, complete: true, aborted: true, path: p.path, commonDir: p.commonDir, head: p.head, keepRef: state.keepRef, createdAt: now, files: [], bytes: 0 }), { mode: 0o600 });
+  } catch {}
+  state.dir = dir; state.dropErr = d.err;
+  return ` · không gỡ được ref ${state.keepRef}: ${d.err} — sẽ dọn sau 7 ngày`;
+}
+
 /**
  * Write the backup for probe `p` → its directory. Throws on any error (the caller deletes the directory).
  * `info.json` is written LAST: no `info.json` = an unfinished backup.
+ * A detached worktree (RFC 39) also gets `refs/teleport-backup/…` → its HEAD, created after the patches/tar and before the
+ * caller verifies; `state.keepRef` is set only while THIS call owns that ref (any failure here rolls it back).
  */
-export async function writeBackup(p, { root = MANUAL_BACKUP_DIR, now = Date.now(), rand = () => crypto.randomBytes(2).toString('hex') } = {}) {
+export async function writeBackup(p, { root = MANUAL_BACKUP_DIR, now = Date.now(), rand = () => crypto.randomBytes(2).toString('hex'), deps = defaultDeps(), state = {} } = {}) {
   fs.mkdirSync(root, { recursive: true, mode: 0o700 });
-  const dir = path.join(root, `${safeName(p.repo)}-${safeName(p.branch, 80)}-${stamp(now)}-${rand()}`);
+  const dir = path.join(root, `${safeName(p.repo)}-${p.detached ? `detached-${String(p.head).slice(0, 7)}` : safeName(p.branch, 80)}-${stamp(now)}-${rand()}`);
   if (path.dirname(path.resolve(dir)) !== path.resolve(root)) throw new Error('thư mục sao lưu không nằm ngay dưới thư mục gốc');
   fs.mkdirSync(dir, { mode: 0o700 }); // not recursive: EEXIST is an error
   const made = { dir };
@@ -473,15 +520,26 @@ export async function writeBackup(p, { root = MANUAL_BACKUP_DIR, now = Date.now(
         child.stdin.end(`${p.files.map((f) => f.path).join('\0')}\0`);
       });
     }
+    if (p.detached) {
+      const ref = keepRefFor(path.basename(dir));
+      await deps.exec('git', ['check-ref-format', ref]);
+      await deps.exec('git', ['-C', p.main, 'update-ref', '--no-deref', ref, p.head, '']); // '' = the ref must not exist yet
+      state.keepRef = ref; // from here on it is ours to roll back
+      if (String(await deps.exec('git', ['-C', p.main, 'rev-parse', '--verify', ref])).trim() !== p.head) throw new Error('ref giữ commit không trỏ đúng HEAD');
+    }
     fs.writeFileSync(path.join(dir, 'restore.sh'), buildRestoreScript({
       main: p.main, wtPath: p.path, branch: p.branch, head: p.head, hasStaged: fs.existsSync(staged), hasUnstaged: fs.existsSync(unstaged), hasTar,
     }), { mode: 0o700 });
     fs.writeFileSync(path.join(dir, 'info.json'), JSON.stringify({
       v: 1, complete: true, path: p.path, commonDir: p.commonDir, branch: p.branch, head: p.head, upstream: p.upstream, aheadCommits: p.aheadCommits,
-      files: p.files, bytes: p.bytes, createdAt: now,
+      files: p.files, bytes: p.bytes, createdAt: now, detached: !!p.detached,
+      ...(p.detached ? { orphanCommits: p.orphanCommits ?? 0, keepRef: state.keepRef } : {}),
     }), { mode: 0o600 });
     return made.dir;
-  } catch (e) { try { fs.rmSync(dir, { recursive: true, force: true }); } catch {} throw e; }
+  } catch (e) {
+    await abortBackup(dir, p, deps, state, now);
+    throw e;
+  }
 }
 
 /** §2.3 step 3: the tar has exactly the planned files; the patches exist iff there is a diff and apply cleanly to a scratch index. Throws. */
@@ -552,24 +610,26 @@ export async function manualRemove(target, { expectFingerprint, backupDir = MANU
   if (!p1.ok) return slim(p1);
   if (!expectFingerprint || p1.fingerprint !== expectFingerprint) return { ok: false, changed: true, path: p1.path, probe: slim(p1), note: '⚠️ worktree đã thay đổi — xem lại' };
   let dir = null;
+  const st = {}; // st.keepRef: the RFC 39 ref this run created (rolled back on every abort that removes the backup dir)
+  const abort = async () => { const x = await abortBackup(dir || st.dir, p1, deps, st, now); dir = null; return x; };
   try {
     if (hooks.beforeBackup) await hooks.beforeBackup();
-    dir = await writeBackup(p1, { root: backupDir, now, ...(rand ? { rand } : {}) });
+    dir = await writeBackup(p1, { root: backupDir, now, deps, state: st, ...(rand ? { rand } : {}) });
     await verifyBackup(dir, p1, deps);
     if (hooks.afterBackup) await hooks.afterBackup();
     // the late probe: fast (no gh / du), immediately before the removal
     const p2 = await probeManual(target, { ...probeOpts, deps, fast: true });
-    if (!p2.ok) { rmDir(dir); return slim(p2); }
+    if (!p2.ok) { const x = await abort(); return x ? { ...slim(p2), reason: `${p2.reason}${x}` } : slim(p2); }
     if (p2.fingerprint !== p1.fingerprint) {
-      rmDir(dir); dir = null;
+      const x = await abort();
       // the fast probe has no inventory: the table the owner sees again must come from a FULL probe
       const full = await probeManual(target, { ...probeOpts, deps });
       if (!full.ok) return slim(full);
-      return { ok: false, changed: true, path: full.path, probe: slim(full), note: '⚠️ worktree đã thay đổi trong lúc sao lưu' };
+      return { ok: false, changed: true, path: full.path, probe: slim(full), note: `⚠️ worktree đã thay đổi trong lúc sao lưu${x}` };
     }
   } catch (e) {
-    if (dir) rmDir(dir);
-    return { ok: false, path: p1.path, backupFailed: true, reason: `sao lưu lỗi, chưa xoá gì: ${firstLine(e)}` };
+    const x = await abort();
+    return { ok: false, path: p1.path, backupFailed: true, reason: `sao lưu lỗi, chưa xoá gì: ${firstLine(e)}${x}` };
   }
   // If this process is killed mid-removal, this marker tells the daemon which backup belongs to the half-removed tree.
   const marker = path.join(dir, REMOVING_MARKER);
@@ -586,7 +646,7 @@ export async function manualRemove(target, { expectFingerprint, backupDir = MANU
   } catch (e) { try { fs.rmSync(marker, { force: true }); } catch {} return { ok: false, removeFailed: true, path: p1.path, backupDir: dir, reason: `git worktree remove lỗi: ${firstLine(e)}` }; }
   try { fs.rmSync(marker, { force: true }); } catch {}
   deps.log(`removed ${p1.path} (manual, backup ${dir})`);
-  return { ok: true, path: p1.path, branch: p1.branch, backupDir: dir, bytes: p1.bytes };
+  return { ok: true, path: p1.path, branch: p1.branch, head: p1.head, detached: !!p1.detached, keepRef: st.keepRef ?? null, backupDir: dir, bytes: p1.bytes };
 }
 
 // ── target resolution + list (§2.6) ──────────────────────────────────────────
