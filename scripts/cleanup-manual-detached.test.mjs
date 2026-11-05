@@ -433,6 +433,25 @@ test('a ref that can not be dropped on abort: the backup dir stays with a minima
   noBackups(w);
 });
 
+test('ref drop fails AND the lookup fails (not "absent") → the record stays, never a silent leak', async () => {
+  const w = world();
+  const a = w.det('blind', 1);
+  const base = deps(w);
+  const d = { ...base, exec: async (c, args, o) => {
+    if (c === 'git' && args.includes('read-tree')) throw new Error('verify boom');
+    if (c === 'git' && args.includes('update-ref') && args.includes('-d')) throw new Error('cannot lock');
+    if (c === 'git' && args.includes('rev-parse') && args.includes('-q')) throw Object.assign(new Error('fatal: not a git repository'), { code: 128 });
+    return base.exec(c, args, o);
+  } };
+  const r = await remove(w, a.path, { deps: d });
+  assert.equal(r.backupFailed, true);
+  assert.match(r.reason, /không gỡ được ref/);
+  const [name] = fs.readdirSync(w.backups);
+  const info = JSON.parse(fs.readFileSync(path.join(w.backups, name, 'info.json'), 'utf8'));
+  assert.equal(info.aborted, true);
+  assert.equal(g(w.main, 'rev-parse', info.keepRef), a.head);
+});
+
 test('pruneBackups: malformed types (head as an array, keepRef as a number) → odd, dir and ref kept', async () => {
   const w = world();
   const a = w.det('types', 1);

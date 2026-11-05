@@ -465,7 +465,7 @@ export function buildRestoreScript({ main, wtPath, branch, head, hasStaged, hasU
 export async function dropKeepRef(deps, main, ref, head) {
   if (!ref) return { ok: true };
   try { await deps.exec('git', ['-C', main, 'update-ref', '--no-deref', '-d', ref, head]); return { ok: true }; } catch (e) {
-    try { await deps.exec('git', ['-C', main, 'rev-parse', '--verify', '-q', ref]); } catch { return { ok: true }; } // already gone
+    try { await deps.exec('git', ['-C', main, 'rev-parse', '--verify', '-q', ref]); } catch (e2) { if (e2?.code === 1) return { ok: true }; } // exit 1 = already gone; any other failure = unknown → keep the record
     return { ok: false, err: firstLine(e) };
   }
 }
