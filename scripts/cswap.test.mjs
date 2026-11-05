@@ -1,6 +1,7 @@
 import { test } from 'node:test';
+import fs from 'node:fs';
 import assert from 'node:assert/strict';
-import { planCswap, runCswap } from './cswap.mjs';
+import { planCswap, runCswap, exitCodeFor } from './cswap.mjs';
 
 test('planCswap: no args → --list', () => {
   assert.deepEqual(planCswap([]), { argv: ['--list'] });
@@ -74,13 +75,35 @@ test('runCswap: feeds stdin, collects stdout/stderr, returns exit status', async
   assert.equal(r.stdout, 'got:y\n'); assert.equal(r.stderr, 'e\n'); assert.equal(r.status, 3); assert.equal(r.signal, null);
 });
 
+test('planCswap: targets are trimmed', () => {
+  assert.deepEqual(planCswap(['rm', ' 2 ']), { argv: ['remove', '2'], input: 'y\n' });
+  assert.deepEqual(planCswap(['switch', ' 3 ']), { argv: ['--switch-to', '3'] });
+  assert.deepEqual(planCswap([' 4 ']), { argv: ['--switch-to', '4'] });
+});
+
+const isDead = (pid) => {
+  try { process.kill(pid, 0); } catch { return true; }
+  try { return /^\d+ \([^)]*\) Z/.test(fs.readFileSync(`/proc/${pid}/stat`, 'utf8')); } catch { return false; }
+};
+
 test('runCswap: timeout kills the whole process group (grandchild too)', async () => {
+  // child prints the grandchild pid right away; generous timeout so Node startup can't eat it
   const code = 'const {spawn}=require("child_process");const c=spawn("sleep",["60"],{stdio:"ignore"});console.log(c.pid);setInterval(()=>{},1000)';
-  const r = await runCswap(process.execPath, { argv: ['-e', code] }, { timeoutMs: 700, killGraceMs: 300 });
+  const r = await runCswap(process.execPath, { argv: ['-e', code] }, { timeoutMs: 1500, killGraceMs: 300 });
   assert.equal(r.signal, 'timeout');
   const pid = Number(r.stdout.trim());
   assert.ok(pid > 0);
-  await new Promise((res) => setTimeout(res, 200));
-  let alive = true; try { process.kill(pid, 0); } catch { alive = false; }
-  assert.equal(alive, false, 'grandchild must be gone');
+  const deadline = Date.now() + 3000;
+  while (!isDead(pid) && Date.now() < deadline) await new Promise((res) => setTimeout(res, 50));
+  assert.equal(isDead(pid), true, 'grandchild must be gone');
+});
+
+test('timeout is a failure exit even if the child traps SIGTERM and exits 0', async () => {
+  const code = 'process.on("SIGTERM",()=>process.exit(0));console.log("up");setInterval(()=>{},1000)';
+  const r = await runCswap(process.execPath, { argv: ['-e', code] }, { timeoutMs: 1500, killGraceMs: 300 });
+  assert.equal(r.status, 0); assert.equal(r.signal, 'timeout');
+  assert.equal(exitCodeFor(r), 124);
+  assert.equal(exitCodeFor({ status: 0, signal: null }), 0);
+  assert.equal(exitCodeFor({ status: 3, signal: null }), 3);
+  assert.equal(exitCodeFor({ status: null, signal: 'SIGKILL' }), 1);
 });

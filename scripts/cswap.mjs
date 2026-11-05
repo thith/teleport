@@ -11,9 +11,7 @@
 // `cswap` must already be installed and on PATH (it is on this host). Switching
 // accounts is host-wide — it affects every agent sharing this machine's Claude
 // Code login — so the command is gated to maintainer in commands.json.
-import { fileURLToPath } from 'node:url';
 import { isMainModule } from './is-direct-run.mjs';
-import path from 'node:path';
 import { spawn } from 'node:child_process';
 
 export const CSWAP_TIMEOUT_MS = 30 * 1000;
@@ -31,15 +29,15 @@ export function planCswap(args) {
     case 'add': return { argv: ['add'] };
     case 'switch':
       if (blank(args[1])) return { error: 'cách dùng: /cs switch <số|email|alias>' };
-      return { argv: ['--switch-to', args[1]] };
+      return { argv: ['--switch-to', String(args[1]).trim()] };
     case 'rm':
     case 'remove':
       if (blank(args[1])) return { error: 'cách dùng: /cs rm <số|email>' };
-      return { argv: ['remove', args[1]], input: 'y\n' };
+      return { argv: ['remove', String(args[1]).trim()], input: 'y\n' };
     case 'auto': return { argv: ['auto', '--once'] };
     case 'upgrade':
     case 'update': return { argv: ['upgrade'], timeoutMs: CSWAP_UPGRADE_TIMEOUT_MS };
-    default: return { argv: ['--switch-to', first] };
+    default: return { argv: ['--switch-to', String(first).trim()] };
   }
 }
 
@@ -53,7 +51,8 @@ export function runCswap(cmd, plan, { timeoutMs = CSWAP_TIMEOUT_MS, killGraceMs 
     catch (error) { return resolve({ stdout: '', stderr: '', status: null, signal: null, error }); }
     let stdout = '', stderr = '', timedOut = false, done = false, hardKill = null;
     const grp = (sig) => { try { process.kill(-child.pid, sig); } catch { try { child.kill(sig); } catch {} } };
-    const add = (cur, d) => (cur.length >= maxBytes ? cur : (cur + d.toString('utf8')).slice(0, maxBytes));
+    const add = (cur, d) => (cur.length >= maxBytes ? cur : (cur + d).slice(0, maxBytes));
+    child.stdout.setEncoding('utf8'); child.stderr.setEncoding('utf8');
     child.stdout.on('data', (d) => { stdout = add(stdout, d); });
     child.stderr.on('data', (d) => { stderr = add(stderr, d); });
     child.stdin.on('error', () => {});
@@ -65,6 +64,9 @@ export function runCswap(cmd, plan, { timeoutMs = CSWAP_TIMEOUT_MS, killGraceMs 
   });
 }
 
+// Exit code for a finished run: any signal (incl. our 'timeout') is a failure, even if the child exited 0.
+export function exitCodeFor(r) { return r.signal ? (r.signal === 'timeout' ? 124 : 1) : (r.status == null ? 1 : r.status); }
+
 if (isMainModule(import.meta.url)) {
   const plan = planCswap(process.argv.slice(2));
   if (plan.error) { process.stdout.write(`${plan.error}\n`); process.exit(2); }
@@ -73,5 +75,5 @@ if (isMainModule(import.meta.url)) {
   if (r.stdout) process.stdout.write(r.stdout);
   if (r.stderr) process.stdout.write(`\n[stderr]\n${r.stderr}`);
   if (r.signal) process.stdout.write(`\n[killed: ${r.signal}]\n`);
-  process.exit(r.status == null ? 1 : r.status);
+  process.exit(exitCodeFor(r));
 }
