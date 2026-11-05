@@ -322,6 +322,14 @@ Primitive inter-agent **thứ 4**: admin gửi **MỘT system message tới TẤ
 2. **Khác whisper (kín):** broadcast là system → bạn **được phép ack NGẮN** trong topic ("đã reload guide"). Không bắt buộc giấu.
 3. **Vẫn role-gate** theo `broadcast.from.role`: nếu nội dung yêu cầu action nhạy cảm → chỉ làm khi role đủ (`broadcast` tự nó không nâng quyền).
 
+## /login — thêm account Claude vào cswap từ Telegram (RFC 40)
+
+`/login` (daemon, **chỉ owner, chỉ trong DM riêng với bot**; `/dm /login` từ group bị từ chối). Linux thôi (macOS báo `chưa hỗ trợ`); cần `claude`, `cswap`, `screen`, `timeout` trong PATH.
+- `/login` → bot DM một URL; mở trên thiết bị bất kỳ, chọn account, trang web hiện **mã** (`<code>#<state>`). Gõ `/login` lần nữa khi phiên còn sống thì nhận lại URL cũ + số phút còn lại.
+- `/login <mã>` → bot gõ mã vào phiên, chạy `cswap add`, báo email + tổ chức. Mã dùng **một lần**, phiên hết hạn sau 10 phút. Daemon xoá tin chứa mã (nếu không xoá được thì nhắc xoá tay). Mã còn nằm trong cache update của teleport nhưng vô dụng sau khi dùng.
+- `/login cancel` → huỷ phiên.
+- Login chạy trong **profile tạm** (`CLAUDE_CONFIG_DIR` + `CLAUDE_SECURESTORAGE_CONFIG_DIR` trỏ vào `scripts/tmp/login/<id>/config`): credential của máy và account đang dùng **không đổi**, không tự chuyển sang account mới, dùng `/cs <số>` khi muốn đổi. Lưu ý: `cswap add` đổi `activeAccountNumber` trong kho cswap thành slot vừa thêm; cswap tự xác định account active theo login thật nên không ảnh hưởng `/cs <n>`, chỉ `cswap switch` không tham số (xoay vòng) còn dựa vào số ghi lại.
+
 ## DM cho admin — đẩy riêng cho owner (RFC 12)
 
 Mặc định mọi thứ bạn gửi đi vào **group topic**. Đôi khi user muốn bạn **DM riêng cho admin**

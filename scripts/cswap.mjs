@@ -44,10 +44,10 @@ export function planCswap(args) {
 // Run `cmd` with the plan; resolves { stdout, stderr, status, signal, error }. The child is its own
 // process group so on timeout the whole tree (e.g. `uv tool upgrade`) is killed: SIGTERM, then
 // SIGKILL after killGraceMs.
-export function runCswap(cmd, plan, { timeoutMs = CSWAP_TIMEOUT_MS, killGraceMs = 5000, maxBytes = 1024 * 1024 } = {}) {
+export function runCswap(cmd, plan, { timeoutMs = CSWAP_TIMEOUT_MS, killGraceMs = 5000, maxBytes = 1024 * 1024, env, cwd } = {}) {
   return new Promise((resolve) => {
     let child;
-    try { child = spawn(cmd, plan.argv, { detached: true, stdio: ['pipe', 'pipe', 'pipe'] }); }
+    try { child = spawn(cmd, plan.argv, { detached: true, stdio: ['pipe', 'pipe', 'pipe'], ...(env ? { env } : {}), ...(cwd ? { cwd } : {}) }); }
     catch (error) { return resolve({ stdout: '', stderr: '', status: null, signal: null, error }); }
     let stdout = '', stderr = '', timedOut = false, done = false, hardKill = null;
     const grp = (sig) => { try { process.kill(-child.pid, sig); } catch { try { child.kill(sig); } catch {} } };

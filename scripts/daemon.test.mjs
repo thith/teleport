@@ -1130,3 +1130,47 @@ test('takeRestartNotify: file vanishes between read and unlink (ENOENT) → gone
   const out = await notifyAfterRestart('x', { take: () => r, deliver: async () => { delivered = true; } });
   assert.equal(out, null); assert.equal(delivered, false);
 });
+
+// RFC 40: privateOnly / secretArgs / wantsMessageId (+ deleting the secret command message).
+test('dispatchCommand: privateOnly refuses outside the owner private chat, before spawning', async () => {
+  const reg = { login: { run: 'login.mjs', minRole: 'admin', rawText: true, privateOnly: true, secretArgs: true, wantsMessageId: true } };
+  const run = async (chatType, extra = {}) => {
+    const sent = []; let spawned = 0;
+    await dispatchCommand({ cmd: 'login', rest: 'abc#def' }, { id: '7' }, {
+      daemonUserId: '1', projectsConfig: { _default: { roles: { '7': { role: 'admin' } } } }, registry: reg, scriptsDir: '/s',
+      sendText: async (_c, t) => sent.push(t), runner: async () => { spawned++; return { stdout: 'ok', stderr: '' }; }, ...extra,
+    }, null, 55, 7, chatType);
+    return { sent, spawned };
+  };
+  const g = await run('supergroup');
+  assert.equal(g.spawned, 0);
+  assert.match(g.sent[0], /chỉ dùng trong DM riêng/);
+  assert.equal((await run(null)).spawned, 0);
+  assert.equal((await run('private', { deleteMessage: async () => {} })).spawned, 1);
+});
+
+test('dispatchCommand: secretArgs keeps args off argv; wantsMessageId passes TELE_MESSAGE_ID only to opted-in commands', async () => {
+  const reg = {
+    login: { run: 'login.mjs', minRole: 'admin', rawText: true, privateOnly: true, secretArgs: true, wantsMessageId: true },
+    ls: { run: 'spawn.mjs', minRole: 'member' },
+  };
+  const grab = async (cmd, rest, extra = {}) => { let call; const sent = []; await dispatchCommand({ cmd, rest }, { id: '7' }, {
+    daemonUserId: '1', projectsConfig: { _default: { roles: { '7': { role: 'admin' } } } }, registry: reg, scriptsDir: '/s',
+    sendText: async (_c, t) => sent.push(t), runner: async (_b, a, o) => { call = { argv: a, env: o.env }; return { stdout: 'done', stderr: '' }; }, ...extra,
+  }, null, 99, 7, 'private'); return { ...call, sent }; };
+  const deleted = [];
+  const l = await grab('login', 'abc#def', { deleteMessage: async (c, m) => deleted.push([c, m]) });
+  assert.deepEqual(l.argv, ['/s/login.mjs']);
+  assert.equal(l.env.TELE_RAW_ARGS, 'abc#def');
+  assert.equal(l.env.TELE_MESSAGE_ID, '99');
+  assert.deepEqual(deleted, [[7, 99]]);
+  assert.deepEqual(l.sent, ['done']);
+  const nodel = []; // no arguments → nothing to delete
+  await grab('login', '', { deleteMessage: async (c, m) => nodel.push(m) });
+  assert.deepEqual(nodel, []);
+  const bad = await grab('login', 'abc#def', { deleteMessage: async () => { throw new Error('nope'); } });
+  assert.match(bad.sent[0], /done\n⚠️ không xoá được tin chứa mã/);
+  const ls = await grab('ls', 'x');
+  assert.equal(ls.env.TELE_MESSAGE_ID, '');
+  assert.deepEqual(ls.argv, ['/s/spawn.mjs', 'x']);
+});
