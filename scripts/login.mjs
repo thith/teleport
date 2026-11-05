@@ -73,19 +73,21 @@ function pidAlive(pid) {
 
 /**
  * Lock file created atomically complete (tmp file + link(2), which fails with EEXIST), content
- * {pid, token, at}. A lock is reclaimed only if its content parses and is stale (dead pid, or older
- * than LOCK_STALE_MS); reclaim = rename to a private name, then verify the content is still what we
- * judged stale (else put it back). Release only removes a lock carrying our token.
- * Returns a release fn, or null when someone else holds it.
+ * {pid, token, at}. A stale lock (dead pid, no token, or older than LOCK_STALE_MS) is reclaimed under
+ * a separate mutex file `lock.reclaim` (O_EXCL; a mutex older than 10 s is itself stale): while holding
+ * it we re-read `lock` and unlink it only if it is still exactly the content we judged stale, so a
+ * lock someone else acquired in between is never touched. Release removes only a lock with our token.
+ * Returns a release fn, or null when someone else holds it. `onStale` is a test hook.
  */
-export function acquireLock(root, { now = Date.now, alive = pidAlive, pid = process.pid } = {}) {
+export function acquireLock(root, { now = Date.now, alive = pidAlive, pid = process.pid, onStale = null } = {}) {
   fs.mkdirSync(root, { recursive: true, mode: 0o700 });
   const file = path.join(root, 'lock');
+  const mutex = path.join(root, 'lock.reclaim');
   const token = crypto.randomBytes(8).toString('hex');
   const tmp = path.join(root, `lock.${pid}.${token}.tmp`);
   fs.writeFileSync(tmp, JSON.stringify({ pid, token, at: now() }), { mode: 0o600 });
   try {
-    for (let attempt = 0; attempt < 3; attempt++) {
+    for (let attempt = 0; attempt < 4; attempt++) {
       try {
         fs.linkSync(tmp, file);
         return () => {
@@ -99,12 +101,21 @@ export function acquireLock(root, { now = Date.now, alive = pidAlive, pid = proc
       if (raw === null) continue; // vanished meanwhile → retry
       const stale = !held || typeof held.token !== 'string' || !alive(held.pid) || now() - Number(held.at) > LOCK_STALE_MS;
       if (!stale) return null;
-      const grave = path.join(root, `lock.${pid}.${token}.grave`);
-      try { fs.renameSync(file, grave); } catch { continue; }
-      let same = false;
-      try { same = fs.readFileSync(grave, 'utf8') === raw; } catch {}
-      if (!same) { try { fs.linkSync(grave, file); } catch {} }
-      try { fs.rmSync(grave, { force: true }); } catch {}
+      if (onStale) onStale();
+      let haveMutex = false;
+      try { fs.closeSync(fs.openSync(mutex, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY, 0o600)); haveMutex = true; }
+      catch (e) {
+        if (e.code !== 'EEXIST') throw e;
+        let old = false;
+        try { old = Date.now() - fs.statSync(mutex).mtimeMs > 10_000; } catch {}
+        if (old) { try { fs.rmSync(mutex, { force: true }); } catch {} continue; }
+        return null; // another reclaimer is working: busy
+      }
+      try {
+        let again = null;
+        try { again = fs.readFileSync(file, 'utf8'); } catch {}
+        if (again === raw) { try { fs.rmSync(file, { force: true }); } catch {} }
+      } finally { if (haveMutex) { try { fs.rmSync(mutex, { force: true }); } catch {} } }
     }
     return null;
   } finally { try { fs.rmSync(tmp, { force: true }); } catch {} }
@@ -199,6 +210,10 @@ async function handle(cmd, d) {
   }
   if (cmd.kind === 'cancel') {
     if (!entry) return 'ℹ️ không có phiên login nào đang chờ';
+    if (!(await screenAlive(d, entry.session.screen))) {
+      const r = await settle(entry, d); // claude may have finished just now
+      if (r) return `ℹ️ login đã xong trước khi huỷ.\n${r}`;
+    }
     await cleanup(d, entry);
     return '🗑️ đã huỷ phiên login';
   }
@@ -208,7 +223,11 @@ async function handle(cmd, d) {
   }
   if (cmd.kind === 'submit') {
     if (!entry) return 'chưa có phiên login nào, gõ /login trước';
-    if (!(await live(d, entry))) { await cleanup(d, entry); return 'phiên login đã hết hạn, gõ /login lại'; }
+    if (!(await live(d, entry))) {
+      const r = await settle(entry, d);
+      if (r) return `ℹ️ login đã xong từ trước, không cần mã nữa.\n${r}`;
+      await cleanup(d, entry); return 'phiên login đã hết hạn, gõ /login lại';
+    }
     return submit(cmd.code, entry, d);
   }
   // start
@@ -216,8 +235,19 @@ async function handle(cmd, d) {
     const mins = Math.max(1, Math.ceil((entry.session.expiresAt - d.now()) / 60000));
     return startMessage(entry.session.url, mins);
   }
-  if (entry) { await cleanup(d, entry); entry = null; }
+  if (entry) {
+    const r = await settle(entry, d);
+    if (r) return r;
+    await cleanup(d, entry); entry = null;
+  }
   return start(d);
+}
+
+/** The screen is gone / the session expired: if `claude` exited 0 in the meantime, finish the login (returns its report); else null. */
+async function settle(entry, d) {
+  let ec = '';
+  try { ec = fs.readFileSync(path.join(entry.dir, 'exit'), 'utf8').trim(); } catch {}
+  return ec === '0' ? finishLogin(entry, d) : null;
 }
 
 const startMessage = (url, mins) => `🔑 Mở link này, chọn account, rồi gửi lại: /login <mã>\n${url}\n⏳ Hết hạn sau ${mins} phút · /login cancel để huỷ`;

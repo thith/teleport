@@ -291,3 +291,49 @@ test('restart recovery: session.json without url (died mid-start) → cleaned, f
   assert.deepEqual(fs.readdirSync(w.root), ['abc123']);
   cleanup(w);
 });
+
+test('lock: reclaim race (two reclaimers + a third acquirer) never yields two owners', () => {
+  const root = tmp();
+  const t = 5_000_000;
+  fs.writeFileSync(path.join(root, 'lock'), JSON.stringify({ pid: 1, token: 'old', at: t - 10 * 60_000 }));
+  const opts = { now: () => t, alive: (p) => p === process.pid };
+  let b = null, c = null;
+  // A judged the lock stale; before it can reclaim, B reclaims AND acquires; C then tries too.
+  const a = acquireLock(root, { ...opts, onStale: () => { b = acquireLock(root, opts); c = acquireLock(root, opts); } });
+  assert.ok(b, 'B owns the lock');
+  assert.equal(c, null);
+  assert.equal(a, null, 'A must not take over (and must not delete B\'s lock)');
+  assert.equal(JSON.parse(fs.readFileSync(path.join(root, 'lock'), 'utf8')).pid, process.pid);
+  b();
+  assert.ok(!fs.existsSync(path.join(root, 'lock')));
+  fs.rmSync(root, { recursive: true, force: true });
+});
+test('lock: a live reclaim mutex → busy; an old one is cleared', () => {
+  const root = tmp();
+  const t = Date.now();
+  fs.writeFileSync(path.join(root, 'lock'), JSON.stringify({ pid: 1, token: 'old', at: t - 10 * 60_000 }));
+  fs.writeFileSync(path.join(root, 'lock.reclaim'), '');
+  const opts = { now: () => t, alive: () => false };
+  assert.equal(acquireLock(root, opts), null);
+  const old = new Date(t - 60_000);
+  fs.utimesSync(path.join(root, 'lock.reclaim'), old, old);
+  assert.ok(acquireLock(root, opts));
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('completion race: exit appears while checking the screen → finish, not delete (submit, start, cancel)', async () => {
+  for (const kind of ['submit', 'start', 'cancel']) {
+    const w = world();
+    await runLogin('', w.deps());
+    const orig = w.run; let armed = true;
+    const deps = w.deps({ run: async (cmd, argv, o) => {
+      if (armed && cmd === 'screen' && argv[0] === '-ls') { armed = false; fs.writeFileSync(path.join(w.dir, 'exit'), '0\n'); w.alive = false; }
+      return orig(cmd, argv, o);
+    } });
+    const out = await runLogin(kind === 'submit' ? CODE : kind === 'cancel' ? 'cancel' : '', deps);
+    assert.match(out, /✅ đã thêm account/, kind);
+    if (kind === 'cancel') assert.match(out, /xong trước khi huỷ/);
+    assert.deepEqual(fs.readdirSync(w.root), [], kind);
+    cleanup(w);
+  }
+});
