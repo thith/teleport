@@ -281,7 +281,10 @@ export function manualEntryMatchesMessage(e, text) {
   if (!lines.some((l) => l === `🔑 ${d}` || (l.startsWith('💾 ') && l.endsWith(`  🔑 ${d}`)))) return false;
   if (e.mode === 'list') return true;
   if (typeof e.path !== 'string') return false;
-  if (e.stage === 'confirm') return lines[0].startsWith(`🗑 Xoá tay ${escapeControls(e.path)} (nhánh ${escapeControls(e.branch)} `);
+  if (e.stage === 'confirm') { // RFC 39: no branch → the detached first line
+    if (e.branch == null) return typeof e.head === 'string' && e.head.length >= 7 && lines[0].startsWith(`🗑 Xoá tay ${escapeControls(e.path)} (detached ở ${e.head.slice(0, 7)})`);
+    return lines[0].startsWith(`🗑 Xoá tay ${escapeControls(e.path)} (nhánh ${escapeControls(e.branch)} `);
+  }
   return t.includes(escapeControls(e.path));
 }
 
@@ -420,11 +423,16 @@ const more = (shown, total) => (total > shown ? `, … (+${total - shown})` : ''
 
 /** The "what will be lost" table (RFC 30 §2.2) for probe `p`, ending in the 🔑 digest of `entry` (the confirm entry). Pure. */
 export function formatManualTable(p, entry) {
-  const L = [`🗑 Xoá tay ${escapeControls(p.path)} (nhánh ${escapeControls(p.branch)} — nhánh GIỮ NGUYÊN)`];
-  const push = p.upstream
-    ? (p.aheadCommits > 0 ? `${p.aheadCommits} commit chưa push lên ${p.upstream} (vẫn nằm trong nhánh)` : `đã push (${p.upstream})`)
-    : (p.aheadCommits > 0 ? `nhánh chưa push (${p.aheadCommits} commit chỉ có ở máy này — vẫn nằm trong nhánh)` : 'nhánh không có upstream');
-  L.push(`• ${p.pr ? esc(p.pr) : 'PR: không xác định'} · ${esc(push, 200)}`);
+  const det = p.branch == null; // RFC 39: detached — no branch, no PR; the commit is kept by a ref instead
+  const L = [det ? `🗑 Xoá tay ${escapeControls(p.path)} (detached ở ${String(p.head).slice(0, 7)})` : `🗑 Xoá tay ${escapeControls(p.path)} (nhánh ${escapeControls(p.branch)} — nhánh GIỮ NGUYÊN)`];
+  if (det) {
+    L.push(`• commit: ${p.orphanCommits > 0 ? `${p.orphanCommits} commit không nằm trên nhánh/tag nào → giữ bằng` : `${p.containedIn ? `đã nằm trên ${esc(p.containedIn, 80)}` : 'đã nằm trên nhánh/tag khác'} · vẫn giữ bằng`} ref refs/teleport-backup/… (7 ngày)`);
+  } else {
+    const push = p.upstream
+      ? (p.aheadCommits > 0 ? `${p.aheadCommits} commit chưa push lên ${p.upstream} (vẫn nằm trong nhánh)` : `đã push (${p.upstream})`)
+      : (p.aheadCommits > 0 ? `nhánh chưa push (${p.aheadCommits} commit chỉ có ở máy này — vẫn nằm trong nhánh)` : 'nhánh không có upstream');
+    L.push(`• ${p.pr ? esc(p.pr) : 'PR: không xác định'} · ${esc(push, 200)}`);
+  }
   const tr = p.tracked || { count: 0, staged: 0, names: [] };
   if (tr.count) {
     const names = tr.names.slice(0, SHOWN);
@@ -451,7 +459,7 @@ export function renderCleanupList(e, tok) {
   const slice = nums.slice(page * CLEANUP_LIST_PAGE, (page + 1) * CLEANUP_LIST_PAGE);
   const lines = slice.map((n) => {
     const i = (e.info || {})[n] || {};
-    return `${n}. ${esc(i.repo, 40)}/${esc(i.name, 60)} · ${esc(i.branch ?? '?', 60)} — ${esc(i.reason, 120)}${i.blocked ? ` · 🚫 không xoá tay được: ${esc(i.blocked, 120)}` : ''}`;
+    return `${n}. ${esc(i.repo, 40)}/${esc(i.name, 60)} · ${esc(i.branch ?? 'detached', 60)} — ${esc(i.reason, 120)}${i.blocked ? ` · 🚫 không xoá tay được: ${esc(i.blocked, 120)}` : ''}`;
   });
   const head = nums.length ? `🧹 Worktree đang ${e.search ? `giữ, khớp "${esc(e.search, 60)}"` : 'được giữ lại'} (${nums.length})${pages > 1 ? ` — trang ${page + 1}/${pages}` : ''}:` : '🧹 Không có worktree nào đang được giữ lại.';
   const text = [head, ...lines, ...(slice.some((n) => !(e.info || {})[n]?.blocked) ? ['', 'Bấm 🗑 <số> để xem bảng "sẽ mất gì" trước khi xoá.'] : []), ...(e.errors || []).map((x) => `⚠️ ${esc(x, 200)}`), `🔑 ${manualDigest(e)}`].join('\n');
@@ -613,10 +621,13 @@ async function confirmRemove(c) {
   const deliver = o.deliver ?? deliverResult;
   const tell = async (text, ok) => entry.convoId && deliver({ convoId: entry.convoId, text, ok, path: entry.path }, { build: buildCleanupResultPrompt }).catch(() => {});
   if (v.ok) {
-    const text = escapeControls(`✅ đã xoá ${v.path} (nhánh ${v.branch} giữ nguyên) · sao lưu: ${v.backupDir} · khôi phục: bash ${v.backupDir}/restore.sh`);
+    const det = v.branch == null, sha7 = String(v.head ?? '').slice(0, 7); // RFC 39
+    const text = escapeControls(det
+      ? `✅ đã xoá ${v.path} (detached ở ${sha7}) · sao lưu: ${v.backupDir} · commit giữ ở ${v.keepRef} · khôi phục: bash ${v.backupDir}/restore.sh`
+      : `✅ đã xoá ${v.path} (nhánh ${v.branch} giữ nguyên) · sao lưu: ${v.backupDir} · khôi phục: bash ${v.backupDir}/restore.sh`);
     try { await swapAndEdit(ctx, c.store, c.tok, null, null, c.chatId, c.messageId, text, []); } catch (e) { console.error(`[cleanup] edit after removal: ${e?.message ?? e}`); try { c.store.delete(c.tok); } catch {} }
-    c.audit({ requester: entry.convoId, path: v.path, ok: true, mode: 'manual-remove', branch: v.branch, bytes: v.bytes, backup: v.backupDir });
-    await tell(escapeControls(`✅ owner xoá tay ${v.path} (nhánh ${v.branch} giữ nguyên); đã sao lưu phần chưa commit/ngoài git ở ${v.backupDir}`), true);
+    c.audit({ requester: entry.convoId, path: v.path, ok: true, mode: 'manual-remove', branch: v.branch, bytes: v.bytes, backup: v.backupDir, ...(det ? { head: v.head, keepRef: v.keepRef } : {}) });
+    await tell(escapeControls(`✅ owner xoá tay ${v.path} (${det ? `detached ở ${sha7}, commit giữ ở ${v.keepRef}` : `nhánh ${v.branch} giữ nguyên`}); đã sao lưu phần chưa commit/ngoài git ở ${v.backupDir}`), true);
     return;
   }
   if (v.changed) { await showProbe(c, v.probe, { note: v.note }); return; } // a new table, a new token

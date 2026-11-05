@@ -61,6 +61,9 @@ export const TRANSCRIPTS_DIR = path.join(os.homedir(), '.claude', 'projects');
 // RFC 30: where a manual cleanup (cleanup-manual.mjs) backs up what it would delete; kept 7 days.
 export const MANUAL_BACKUP_DIR = path.join(process.env.XDG_STATE_HOME || path.join(os.homedir(), '.local', 'state'), 'teleport', 'cleanup-backups');
 export const BACKUP_KEEP_MS = 7 * DAY;
+// RFC 39: a detached worktree's commit is kept by refs/teleport-backup/<refName(backup dir name)> for as long as the backup lives.
+export const KEEP_REF_PREFIX = 'refs/teleport-backup/';
+export const refName = (s) => String(s).replace(/[^A-Za-z0-9_-]/g, '_');
 
 // ── Pure helpers ─────────────────────────────────────────────────────────────
 
@@ -560,10 +563,33 @@ export async function listLinkedWorktrees(parentDir, deps, errors = []) {
 /**
  * RFC 30 §2.5: delete manual-cleanup backups older than 7 days. Only a DIRECT child directory of `dir` (never a
  * symlink) with a valid `info.json` (complete: true, a createdAt) is ever removed; anything else is reported
- * as odd and left alone. → { removed: [name], odd: [name] }
+ * as odd and left alone. → { removed: [name], odd: [name] } (+ `refErrors: [line]` when a keep-ref could not be dropped).
+ * RFC 39: an `info.json` with a `keepRef` first has that ref dropped (`update-ref --no-deref -d <ref> <head>`, so only while it
+ * still points at `head`) — after checking the ref is the one the directory name implies, `head` is a hex id and `commonDir`
+ * is a repo under `parentDir`; otherwise nothing is touched and the directory is reported odd.
  */
-export function pruneBackups({ dir = MANUAL_BACKUP_DIR, now = Date.now(), dryRun = false, keepMs = BACKUP_KEEP_MS, rm = (p) => fs.rmSync(p, { recursive: true, force: true }) } = {}) {
+export function pruneBackups({
+  dir = MANUAL_BACKUP_DIR, now = Date.now(), dryRun = false, keepMs = BACKUP_KEEP_MS, rm = (p) => fs.rmSync(p, { recursive: true, force: true }),
+  parentDir = PARENT_DIR, git = (args) => execFileSync('git', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }),
+} = {}) {
   const res = { removed: [], odd: [] };
+  let managed = null; // realpaths of <parentDir>/*/.git, read on first use
+  const managedDirs = () => {
+    if (managed) return managed;
+    managed = new Set();
+    try {
+      for (const e of fs.readdirSync(parentDir, { withFileTypes: true })) {
+        try { const g = path.join(parentDir, e.name, '.git'); if (e.isDirectory() && fs.lstatSync(g).isDirectory()) managed.add(fs.realpathSync(g)); } catch {}
+      }
+    } catch {}
+    return managed;
+  };
+  const refValid = (ent, info) => {
+    try {
+      return info.keepRef === `${KEEP_REF_PREFIX}${refName(ent.name)}` && /^[0-9a-f]{40,64}$/.test(info.head)
+        && typeof info.commonDir === 'string' && managedDirs().has(info.commonDir) && (git(['check-ref-format', info.keepRef]), true);
+    } catch { return false; }
+  };
   let ents;
   try { ents = fs.readdirSync(dir, { withFileTypes: true }); } catch (e) { if (e.code === 'ENOENT') return res; throw e; }
   for (const ent of ents) {
@@ -576,6 +602,17 @@ export function pruneBackups({ dir = MANUAL_BACKUP_DIR, now = Date.now(), dryRun
     } catch {}
     if (!info || info.v !== 1 || info.complete !== true || !Number.isFinite(info.createdAt)) { res.odd.push(ent.name); continue; }
     if (now - info.createdAt <= keepMs) continue;
+    if (info.keepRef != null) {
+      if (!refValid(ent, info)) { res.odd.push(ent.name); continue; }
+      if (!dryRun) {
+        const main = path.dirname(info.commonDir);
+        try { git(['-C', main, 'update-ref', '--no-deref', '-d', info.keepRef, info.head]); } catch (e) {
+          let gone = false; // already deleted by hand: nothing to report
+          try { git(['-C', main, 'rev-parse', '--verify', '-q', info.keepRef]); } catch { gone = true; }
+          if (!gone) (res.refErrors ||= []).push(`không gỡ được ref ${info.keepRef} của sao lưu ${ent.name}: ${String(e?.stderr || e?.message || e).trim().split('\n')[0].slice(0, 160)}`);
+        }
+      }
+    }
     if (!dryRun) rm(sub);
     res.removed.push(ent.name);
   }
@@ -715,7 +752,7 @@ export async function runCleanup({
     }
   }
   // RFC 30 §2.5: manual-cleanup backups older than 7 days (we hold the `cleanup` lock here).
-  try { res.backups = pruneBackups({ dir: backupDir, now, dryRun }); } catch (e) { res.errors.push(`dọn bản sao lưu lỗi: ${e.message}`); }
+  try { res.backups = pruneBackups({ dir: backupDir, now, dryRun, parentDir }); } catch (e) { res.errors.push(`dọn bản sao lưu lỗi: ${e.message}`); }
   return res;
 }
 
@@ -762,6 +799,7 @@ export function formatReport(r) {
   const bk = r.backups || { removed: [], odd: [] };
   if (bk.removed.length) L.push('', `Bản sao lưu xoá tay cũ hơn 7 ngày ${verb} (${bk.removed.length}).`);
   for (const n of bk.odd) L.push(`sao lưu lạ: ${n}`);
+  for (const n of bk.refErrors || []) L.push(n);
   if (r.targets.length) {
     L.push('', `target/ bỏ hoang ${verb} (${r.targets.length}, ${fmtGB(sum(r.targets))}):`);
     for (const t of r.targets) L.push(`  • ${t.path} — ${fmtGB(t.bytes)}`);
