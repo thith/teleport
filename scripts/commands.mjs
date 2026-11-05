@@ -72,6 +72,12 @@ export function resolveCommand(name, registry) {
     // The untokenized text after the command, as TELE_RAW_ARGS (RFC 26 §3.8): /w, /i keep quotes,
     // newlines and spacing, and a quoted multi-word target.
     rawText: c.rawText === true,
+    // RFC 40: only from the owner's private chat (daemon refuses before spawning), arguments never on
+    // argv (TELE_RAW_ARGS only; the daemon also deletes the command message), and the command message
+    // id passed as TELE_MESSAGE_ID without opting in to reply text.
+    privateOnly: c.privateOnly === true,
+    secretArgs: c.secretArgs === true,
+    wantsMessageId: c.wantsMessageId === true,
     desc: typeof c.desc === 'string' ? c.desc : '',
   };
 }

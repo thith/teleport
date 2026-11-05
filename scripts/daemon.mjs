@@ -352,6 +352,7 @@ async function main() {
     sendButtonRows: (chatId, text, rows) => tg('sendMessage', { chat_id: chatId, text, reply_markup: { inline_keyboard: rows }, link_preview_options: { is_disabled: true } }),
     editButtonRows: (chatId, messageId, text, rows) => tg('editMessageText', { chat_id: chatId, message_id: messageId, text, reply_markup: { inline_keyboard: rows }, link_preview_options: { is_disabled: true } }).catch(() => {}),
     // The bot has no "/" menu: cleared at startup (clearBotMenus).
+    deleteMessage: (chatId, messageId) => tg('deleteMessage', { chat_id: chatId, message_id: messageId }),
     deleteCommands: (scope) => tg('deleteMyCommands', { scope }),
     // (RFC 24 stop report: failures must be seen, to retry; "message is not modified" counts as done)
     editButtonRowsStrict: (chatId, messageId, text, rows) => tg('editMessageText', { chat_id: chatId, message_id: messageId, text, reply_markup: { inline_keyboard: rows }, link_preview_options: { is_disabled: true } }).catch((e) => { if (!/not modified/i.test(e?.message || '')) throw e; }),
@@ -527,7 +528,7 @@ export function handleControlMessages(mine, ctx) {
     // auto-converted to a `.md` DOCUMENT whose text rides in `caption`, not `text`
     // — without this, replying to continue an instruct thread would find no #hash.
     const rt = msg.reply_to_message;
-    dispatchCommand(parsed, msg.from || {}, ctx, rt?.text ?? rt?.caption, msg.message_id, msg.chat?.id).catch((e) =>
+    dispatchCommand(parsed, msg.from || {}, ctx, rt?.text ?? rt?.caption, msg.message_id, msg.chat?.id, msg.chat?.type).catch((e) =>
       ctx.sendText(ctx.daemonUserId, `❌ /${parsed.cmd} failed: ${e instanceof Error ? e.message : e}`));
   }
 }
@@ -1008,7 +1009,7 @@ export async function dispatchCommand(parsed, from, {
   daemonUserId, projectsConfig, registry, sendText, secretEnvKeys = [],
   runner = execFileP, scriptsDir = __dirname, parentDir = PARENT_DIR, reload = null,
   automergeStateFile = AUTOMERGE_STATE_FILE, notifyOwners = true, notifyDeps = {}, ...extra
-}, replyText = null, messageId = null, chatId = null) {
+}, replyText = null, messageId = null, chatId = null, chatType = null) {
   if (parsed.tapError) { await sendText(daemonUserId, parsed.tapError); return; }
   // Built-in: handled in-process, never via the registry (a `_commands` entry
   // named `reload` can't shadow it). Admin-only.
@@ -1083,6 +1084,17 @@ export async function dispatchCommand(parsed, from, {
     await sendText(daemonUserId, `❌ /${parsed.cmd} cần quyền ${spec.minRole} (bạn: ${role}).`);
     return;
   }
+  // RFC 40: privateOnly commands (e.g. /login) run only from the owner's private chat, never from a
+  // group `/dm <cmd>` control message — refused BEFORE anything is spawned.
+  if (spec.privateOnly && chatType !== 'private') { await sendText(daemonUserId, `❌ /${parsed.cmd} chỉ dùng trong DM riêng với bot`); return; }
+  // secretArgs commands carry a secret (an OAuth code) in the command text: delete that Telegram message
+  // right away (the child has no bot token) and warn if that fails. Only when there are arguments.
+  let delWarn = '';
+  if (spec.secretArgs && String(parsed.rest ?? '').trim() && messageId != null && chatId != null) {
+    const del = extra.deleteMessage;
+    try { if (typeof del !== 'function') throw new Error('no deleteMessage'); await del(chatId, messageId); }
+    catch { delWarn = '\n⚠️ không xoá được tin chứa mã, anh xoá tay nhé'; }
+  }
   const parts = tokenizeArgs(parsed.rest); // quote-aware (`--grep "a b"` → one arg)
   let cwd = parentDir;
   let rest = parts;
@@ -1092,7 +1104,7 @@ export async function dispatchCommand(parsed, from, {
     cwd = r.cwd;
     rest = parts.slice(1); // drop the folder token
   }
-  const argv = [path.join(scriptsDir, spec.run), ...spec.args, ...rest];
+  const argv = [path.join(scriptsDir, spec.run), ...spec.args, ...(spec.secretArgs ? [] : rest)]; // secretArgs: TELE_RAW_ARGS only (argv shows in `ps`)
   const env = { ...process.env };
   for (const k of secretEnvKeys) delete env[k]; // strip teleport secrets (see secret boundary in main)
   Object.assign(env, {
@@ -1108,7 +1120,7 @@ export async function dispatchCommand(parsed, from, {
     // The sender's command message id — only for reply-context commands
     // (/whisper, /instruct). Lets kind-aware reply routing thread the agent's
     // reply under the sender's command in their DM. Not a privilege input.
-    TELE_MESSAGE_ID: (spec.wantsReplyText && messageId != null) ? String(messageId) : '',
+    TELE_MESSAGE_ID: ((spec.wantsReplyText || spec.wantsMessageId) && messageId != null) ? String(messageId) : '',
     // The text after the command, untokenized — ONLY for `rawText` commands; always set so a stray
     // value in the daemon's own env never reaches a child. Not a privilege input.
     TELE_RAW_ARGS: spec.rawText ? String(parsed.rest ?? '') : '',
@@ -1136,14 +1148,14 @@ export async function dispatchCommand(parsed, from, {
     const out = ((stdout || '') + (stderr ? `\n[stderr]\n${stderr}` : '')).trim();
     const tail = await notifyTail();
     if (spec.splitBlocks && out) { for (const part of splitAtBlocks(out + tail)) await sendText(daemonUserId, part); return; } // one at a time, in order
-    await sendText(daemonUserId, (out || '✅ (no output)') + tail);
+    await sendText(daemonUserId, (out || '✅ (no output)') + tail + delWarn);
   } catch (e) {
     // execFile rejects on non-zero exit / timeout / ENOENT — surface the child's
     // own output (scripts print their own ❌ messages) before falling back.
     const body = ((e.stdout || '') + (e.stderr ? `\n[stderr]\n${e.stderr}` : '') + (e.killed ? '\n[killed: timeout]' : '')).trim();
     const tail = await notifyTail();
     if (spec.splitBlocks && body) { for (const part of splitAtBlocks(body + tail)) await sendText(daemonUserId, part); return; }
-    await sendText(daemonUserId, (body || `❌ /${parsed.cmd} failed: ${e.message || e}`) + tail);
+    await sendText(daemonUserId, (body || `❌ /${parsed.cmd} failed: ${e.message || e}`) + tail + delWarn);
   } finally {
     if (resultsDir) { try { fs.rmSync(resultsDir, { recursive: true, force: true }); } catch {} }
   }
