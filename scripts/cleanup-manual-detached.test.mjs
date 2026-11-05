@@ -351,3 +351,99 @@ test('manualCommand manual-probe on a detached worktree returns the slim table d
   assert.equal(r.ok, true, r.reason);
   assert.deepEqual({ d: r.detached, o: r.orphanCommits, b: r.branch }, { d: true, o: 2, b: null });
 });
+
+// ── review round 1 ───────────────────────────────────────────────────────────
+
+const noBackups = (w) => assert.deepEqual(fs.existsSync(w.backups) ? fs.readdirSync(w.backups) : [], []);
+
+test('HEAD only on a tag: removal still creates the keep-ref', async () => {
+  const w = world();
+  const a = w.det('tagonly', 1);
+  g(w.main, 'tag', 'v9', a.head);
+  const r = await remove(w, a.path);
+  assert.equal(r.ok, true, r.reason);
+  assert.equal(g(w.main, 'rev-parse', r.keepRef), a.head);
+});
+
+test('the keep-ref fails verification after creation → ref rolled back, worktree kept, no backup dir', async () => {
+  const w = world();
+  const a = w.det('vf', 1);
+  const base = deps(w);
+  const d = { ...base, exec: async (c, args, o) => (c === 'git' && args.includes('rev-parse') && args.includes('--verify') && args.some((x) => x.startsWith('refs/teleport-backup/')) && !args.includes('-q') ? 'deadbeef' : base.exec(c, args, o)) };
+  const r = await remove(w, a.path, { deps: d });
+  assert.equal(r.backupFailed, true);
+  assert.ok(fs.existsSync(a.path));
+  assert.equal(refs(w), '');
+  noBackups(w);
+});
+
+test('restore.sh / info.json can not be written after the ref was created → same rollback', async () => {
+  const w = world();
+  const a = w.det('wf', 1);
+  const base = deps(w);
+  const d = { ...base, exec: async (c, args, o) => {
+    const out = await base.exec(c, args, o);
+    if (c === 'git' && args.includes('rev-parse') && args.includes('--verify') && !args.includes('-q') && args.some((x) => x.startsWith('refs/teleport-backup/'))) {
+      for (const e of fs.readdirSync(w.backups)) fs.mkdirSync(path.join(w.backups, e, 'restore.sh')); // writeFileSync → EISDIR
+    }
+    return out;
+  } };
+  const r = await remove(w, a.path, { deps: d });
+  assert.equal(r.backupFailed, true);
+  assert.ok(fs.existsSync(a.path));
+  assert.equal(refs(w), '');
+  noBackups(w);
+});
+
+test('pre-existing ref collision: the old ref is untouched (and nothing is left behind)', async () => {
+  const w = world();
+  const a = w.det('coll', 1);
+  const now = Date.parse('2026-11-05T11:00:00Z');
+  const ref = `refs/teleport-backup/${refName(`repo-detached-${a.head.slice(0, 7)}-${stamp(now)}-beef`)}`;
+  const old = g(w.main, 'rev-parse', 'main');
+  g(w.main, 'update-ref', ref, old);
+  const r = await remove(w, a.path, { now, rand: () => 'beef' });
+  assert.equal(r.backupFailed, true);
+  assert.equal(g(w.main, 'rev-parse', ref), old);
+  noBackups(w);
+});
+
+test('a ref that can not be dropped on abort: the backup dir stays with a minimal info.json, the reason says so, and the sweep deletes ref + dir later', async () => {
+  const w = world();
+  const a = w.det('stuck', 1);
+  const base = deps(w);
+  const d = { ...base, exec: async (c, args, o) => {
+    if (c === 'git' && args.includes('read-tree')) throw new Error('verify boom');
+    if (c === 'git' && args.includes('update-ref') && args.includes('-d')) throw new Error('cannot lock');
+    return base.exec(c, args, o);
+  } };
+  const r = await remove(w, a.path, { deps: d });
+  assert.equal(r.backupFailed, true);
+  assert.match(r.reason, /không gỡ được ref refs\/teleport-backup\/.*: cannot lock — sẽ dọn sau 7 ngày/);
+  assert.ok(fs.existsSync(a.path));
+  const [name] = fs.readdirSync(w.backups);
+  const infoF = path.join(w.backups, name, 'info.json');
+  const info = JSON.parse(fs.readFileSync(infoF, 'utf8'));
+  assert.deepEqual({ v: info.v, complete: info.complete, aborted: info.aborted, head: info.head, files: info.files }, { v: 1, complete: true, aborted: true, head: a.head, files: [] });
+  assert.equal(g(w.main, 'rev-parse', info.keepRef), a.head);
+  fs.writeFileSync(infoF, JSON.stringify({ ...info, createdAt: Date.now() - 8 * 24 * 3600_000 }));
+  const p = pruneBackups({ dir: w.backups, parentDir: w.parent });
+  assert.deepEqual(p.removed, [name]);
+  assert.equal(refs(w), '');
+  noBackups(w);
+});
+
+test('pruneBackups: malformed types (head as an array, keepRef as a number) → odd, dir and ref kept', async () => {
+  const w = world();
+  const a = w.det('types', 1);
+  const res = await remove(w, a.path);
+  const f = path.join(res.backupDir, 'info.json');
+  const info = JSON.parse(fs.readFileSync(f, 'utf8'));
+  for (const patch of [{ head: [a.head] }, { keepRef: 5 }, { commonDir: ['x'] }]) {
+    fs.writeFileSync(f, JSON.stringify({ ...info, createdAt: Date.now() - 8 * 24 * 3600_000, ...patch }));
+    const rr = pruneBackups({ dir: w.backups, parentDir: w.parent });
+    assert.deepEqual(rr.odd, [path.basename(res.backupDir)]);
+    assert.ok(fs.existsSync(res.backupDir));
+    assert.equal(g(w.main, 'rev-parse', res.keepRef), a.head);
+  }
+});

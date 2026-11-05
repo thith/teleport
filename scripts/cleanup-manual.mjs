@@ -463,8 +463,27 @@ export function buildRestoreScript({ main, wtPath, branch, head, hasStaged, hasU
 
 /** RFC 39 §2.3: drop the keep-ref THIS run created (compare-and-delete on `head`, never follows a symref). Never throws. */
 export async function dropKeepRef(deps, main, ref, head) {
-  if (!ref) return;
-  try { await deps.exec('git', ['-C', main, 'update-ref', '--no-deref', '-d', ref, head]); } catch {}
+  if (!ref) return { ok: true };
+  try { await deps.exec('git', ['-C', main, 'update-ref', '--no-deref', '-d', ref, head]); return { ok: true }; } catch (e) {
+    try { await deps.exec('git', ['-C', main, 'rev-parse', '--verify', '-q', ref]); } catch { return { ok: true }; } // already gone
+    return { ok: false, err: firstLine(e) };
+  }
+}
+
+/**
+ * Abort a backup `dir`: drop the keep-ref this run created, then delete the directory. When the ref can not be dropped the
+ * directory STAYS with a minimal info.json (so the 7-day sweep can validate and delete ref + dir) → the suffix for the reason.
+ */
+async function abortBackup(dir, p, deps, state, now = Date.now()) {
+  if (!dir) { if (state.keepRef) { const d = await dropKeepRef(deps, p.main, state.keepRef, p.head); if (d.ok) state.keepRef = null; } return ''; }
+  const d = await dropKeepRef(deps, p.main, state.keepRef, p.head);
+  if (d.ok) { rmDir(dir); state.keepRef = null; state.dropErr = null; return ''; }
+  try {
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(dir, 'info.json'), JSON.stringify({ v: 1, complete: true, aborted: true, path: p.path, commonDir: p.commonDir, head: p.head, keepRef: state.keepRef, createdAt: now, files: [], bytes: 0 }), { mode: 0o600 });
+  } catch {}
+  state.dir = dir; state.dropErr = d.err;
+  return ` · không gỡ được ref ${state.keepRef}: ${d.err} — sẽ dọn sau 7 ngày`;
 }
 
 /**
@@ -518,8 +537,7 @@ export async function writeBackup(p, { root = MANUAL_BACKUP_DIR, now = Date.now(
     }), { mode: 0o600 });
     return made.dir;
   } catch (e) {
-    try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
-    await dropKeepRef(deps, p.main, state.keepRef, p.head); state.keepRef = null;
+    await abortBackup(dir, p, deps, state, now);
     throw e;
   }
 }
@@ -593,7 +611,7 @@ export async function manualRemove(target, { expectFingerprint, backupDir = MANU
   if (!expectFingerprint || p1.fingerprint !== expectFingerprint) return { ok: false, changed: true, path: p1.path, probe: slim(p1), note: '⚠️ worktree đã thay đổi — xem lại' };
   let dir = null;
   const st = {}; // st.keepRef: the RFC 39 ref this run created (rolled back on every abort that removes the backup dir)
-  const abort = async () => { rmDir(dir); dir = null; await dropKeepRef(deps, p1.main, st.keepRef, p1.head); st.keepRef = null; };
+  const abort = async () => { const x = await abortBackup(dir || st.dir, p1, deps, st, now); dir = null; return x; };
   try {
     if (hooks.beforeBackup) await hooks.beforeBackup();
     dir = await writeBackup(p1, { root: backupDir, now, deps, state: st, ...(rand ? { rand } : {}) });
@@ -601,17 +619,17 @@ export async function manualRemove(target, { expectFingerprint, backupDir = MANU
     if (hooks.afterBackup) await hooks.afterBackup();
     // the late probe: fast (no gh / du), immediately before the removal
     const p2 = await probeManual(target, { ...probeOpts, deps, fast: true });
-    if (!p2.ok) { await abort(); return slim(p2); }
+    if (!p2.ok) { const x = await abort(); return x ? { ...slim(p2), reason: `${p2.reason}${x}` } : slim(p2); }
     if (p2.fingerprint !== p1.fingerprint) {
-      await abort();
+      const x = await abort();
       // the fast probe has no inventory: the table the owner sees again must come from a FULL probe
       const full = await probeManual(target, { ...probeOpts, deps });
       if (!full.ok) return slim(full);
-      return { ok: false, changed: true, path: full.path, probe: slim(full), note: '⚠️ worktree đã thay đổi trong lúc sao lưu' };
+      return { ok: false, changed: true, path: full.path, probe: slim(full), note: `⚠️ worktree đã thay đổi trong lúc sao lưu${x}` };
     }
   } catch (e) {
-    await abort();
-    return { ok: false, path: p1.path, backupFailed: true, reason: `sao lưu lỗi, chưa xoá gì: ${firstLine(e)}` };
+    const x = await abort();
+    return { ok: false, path: p1.path, backupFailed: true, reason: `sao lưu lỗi, chưa xoá gì: ${firstLine(e)}${x}` };
   }
   // If this process is killed mid-removal, this marker tells the daemon which backup belongs to the half-removed tree.
   const marker = path.join(dir, REMOVING_MARKER);

@@ -586,7 +586,7 @@ export function pruneBackups({
   };
   const refValid = (ent, info) => {
     try {
-      return info.keepRef === `${KEEP_REF_PREFIX}${refName(ent.name)}` && /^[0-9a-f]{40,64}$/.test(info.head)
+      return typeof info.keepRef === 'string' && typeof info.head === 'string' && info.keepRef === `${KEEP_REF_PREFIX}${refName(ent.name)}` && /^[0-9a-f]{40,64}$/.test(info.head)
         && typeof info.commonDir === 'string' && managedDirs().has(info.commonDir) && (git(['check-ref-format', info.keepRef]), true);
     } catch { return false; }
   };
