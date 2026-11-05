@@ -33,8 +33,8 @@ test('planCswap: rm without target → usage error, no argv', () => {
   assert.equal(planCswap(['remove']).argv, undefined);
 });
 
-test('planCswap: auto → auto --once', () => {
-  assert.deepEqual(planCswap(['auto']), { argv: ['auto', '--once'] });
+test('planCswap: auto → auto --once --strategy consume-first', () => {
+  assert.deepEqual(planCswap(['auto']), { argv: ['auto', '--once', '--strategy', 'consume-first'] });
 });
 
 test('planCswap: upgrade/update → upgrade with a long timeout', () => {
@@ -45,7 +45,7 @@ test('planCswap: upgrade/update → upgrade with a long timeout', () => {
 test('planCswap: keywords are case-insensitive; target keeps its case', () => {
   assert.deepEqual(planCswap(['ADD']), { argv: ['add'] });
   assert.deepEqual(planCswap(['Rm', 'A@B.com']), { argv: ['remove', 'A@B.com'], input: 'y\n' });
-  assert.deepEqual(planCswap(['Auto']), { argv: ['auto', '--once'] });
+  assert.deepEqual(planCswap(['Auto']), { argv: ['auto', '--once', '--strategy', 'consume-first'] });
 });
 
 test('/cs is an alias of /cswap in commands.json', async () => {
