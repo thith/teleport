@@ -12,7 +12,7 @@
   "pending":  { "run": "pending.mjs", "args": [],                "needsProject": false, "minRole": "member",     "desc": "list convos waiting on an admin reply" },
   "broadcast":{ "builtin": true,                                    "minRole": "admin",      "desc": "owner only — system message to running sessions (those in /ls); you get a board of buttons to pick who receives it (all selected, tap an agent or a project to toggle, 📢 Gửi): /broadcast [--now] [--p:<dự án>[,…]] <text> (--now = gửi ngay không bảng; --p: = chỉ các dự án đó)" },
   "start":    { "run": "start.mjs",   "args": [],                "needsProject": false, "minRole": "public",     "desc": "onboarding help" },
-  "cswap":    { "run": "cswap.mjs",   "args": [],                "needsProject": false, "minRole": "maintainer", "desc": "Claude account switcher: /cswap = list accounts, /cswap <n> = switch to account n" },
+  "cswap":    { "run": "cswap.mjs",   "args": [],                "needsProject": false, "minRole": "maintainer", "desc": "Claude account switcher: /cswap (/cs) = list, <n> = switch, add, rm <n>, auto (one check, switch if near limit), upgrade; add/rm/remove/auto/upgrade/update/switch are reserved words, use switch <x> to force a switch" },
   "help":     { "run": "help.mjs",    "args": [],                "needsProject": false, "minRole": "public",     "splitBlocks": true, "desc": "list all commands + their sample syntax" },
   "merge":    { "run": "merge.mjs",   "args": [],                "needsProject": false, "minRole": "admin",      "desc": "merge GitHub PRs in order: /merge <project> <pr#> [<pr#> …] or /merge <PR URL> [<PR URL> …] [--squash|--merge|--rebase] [--keep-branch] [--force] (default squash; stops at the first failure; via the API, local checkout untouched); add --close to close PRs without merging" },
   "cleanup":  { "run": "cleanup-launch.mjs", "args": [],        "needsProject": false, "minRole": "admin",      "desc": "clean up now (runs daily anyway): removes worktrees whose PR is merged and that are clean + idle, and abandoned cargo target/ dirs; DMs a report when done. /cleanup --dry-run only lists. RFC 30 (owner): /cleanup alone lists the worktrees kept (a [🗑 n] button each, manual removal with a backup); /cleanup <word> shows only the kept worktrees whose repo, folder or branch contains it (no match → exact branch lookup); /cleanup </path or ~path> goes straight to one; /cleanup run = clean up now" },
@@ -25,5 +25,6 @@
   "reload":   { "builtin": true,                                    "minRole": "admin",      "desc": "re-read commands.json + projects.json without restarting the daemon" },
   "w":        { "alias": "whisper" },
   "i":        { "alias": "instruct" },
-  "m":        { "alias": "merge" }
+  "m":        { "alias": "merge" },
+  "cs":       { "alias": "cswap" }
 }
