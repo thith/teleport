@@ -4,7 +4,7 @@
 //   /cswap <n>      → cswap --switch-to <n>  (switch the active account; number or email)
 //   /cswap add      → cswap add              (add the current login as an account)
 //   /cswap rm <n>   → cswap remove <n>       (confirmation "y" is piped in; typing it is the consent)
-//   /cswap auto     → cswap auto --once      (one check; switch if near the limit)
+//   /cswap auto     → cswap auto --once --strategy consume-first  (one check; if near the limit, switch to the account whose weekly window resets soonest)
 //   /cswap upgrade  → cswap upgrade          (download the latest cswap)
 //   /cswap switch <x> → cswap --switch-to <x> (force a switch; add/rm/remove/auto/upgrade/update
 //                       are reserved words, so an account with such a name needs `switch`)
@@ -34,7 +34,7 @@ export function planCswap(args) {
     case 'remove':
       if (blank(args[1])) return { error: 'cách dùng: /cs rm <số|email>' };
       return { argv: ['remove', String(args[1]).trim()], input: 'y\n' };
-    case 'auto': return { argv: ['auto', '--once'] };
+    case 'auto': return { argv: ['auto', '--once', '--strategy', 'consume-first'] };
     case 'upgrade':
     case 'update': return { argv: ['upgrade'], timeoutMs: CSWAP_UPGRADE_TIMEOUT_MS };
     default: return { argv: ['--switch-to', String(first).trim()] };
