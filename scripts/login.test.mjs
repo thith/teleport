@@ -64,7 +64,7 @@ test('lock: O_EXCL, live pid blocks, dead pid reclaimed, old lock reclaimed', ()
 });
 
 // A fake world: screen/claude/cswap behind the injected runner.
-function world({ stuff = 'ok', noUrl = false, cswapFail = false, loggedIn = true } = {}) {
+function world({ stuff = 'ok', noUrl = false, cswapFail = false, loggedIn = true, active = { email: 'old@x.io' }, switchFail = false, orgId, addOut = 'Added Account 4: new@x.io\n', statusFail = false } = {}) {
   const w = { calls: [], alive: false, text: '', reg: '', dir: null, clock: 1_000_000, stuffMode: stuff, deletedCodeFile: false };
   const root = tmp();
   w.root = root;
@@ -87,9 +87,10 @@ function world({ stuff = 'ok', noUrl = false, cswapFail = false, loggedIn = true
       }
       if (op === 'quit') { w.alive = false; w.quit = true; return ok(); }
     }
-    if (cmd === 'claude') { w.statusEnv = o.env; return ok(JSON.stringify({ loggedIn, email: 'new@x.io', orgName: 'Acme' })); }
-    if (cmd === 'cswap' && argv[0] === 'add') { w.addEnv = o.env; w.addInput = o.input; return cswapFail ? { stdout: '', stderr: 'boom https://secret/url', status: 1, signal: null, error: null } : ok('Added Account 4: new@x.io\n'); }
-    if (cmd === 'cswap' && argv[0] === 'status') { w.statusDefaultEnv = o.env; return ok(JSON.stringify({ active: { email: 'old@x.io' } })); }
+    if (cmd === 'claude') { w.statusEnv = o.env; return ok(JSON.stringify({ loggedIn, email: 'new@x.io', orgName: 'Acme', orgId })); }
+    if (cmd === 'cswap' && argv[0] === 'add') { w.addEnv = o.env; w.addInput = o.input; return cswapFail ? { stdout: '', stderr: 'boom https://secret/url', status: 1, signal: null, error: null } : ok(addOut); }
+    if (cmd === 'cswap' && argv[0] === 'status') { w.statusDefaultEnv = o.env; if (statusFail) return { stdout: '', stderr: 'x', status: 1, signal: null, error: null }; return ok(JSON.stringify({ active })); }
+    if (cmd === 'cswap' && argv[0] === '--switch-to') { w.switchCall = { argv, env: o.env, input: o.input }; return switchFail ? { stdout: '', stderr: 'nope https://x/y', status: 1, signal: null, error: null } : ok('switched\n'); }
     throw new Error('unexpected ' + cmd + argv);
   };
   w.deps = (extra = {}) => ({
@@ -155,7 +156,83 @@ test('flow: code → cswap add with forced env → report → cleanup', async ()
   assert.match(out, /new@x\.io · Acme/);
   assert.match(out, /Added Account 4: new@x\.io/);
   assert.match(out, /đang dùng vẫn là: old@x\.io/);
+  assert.equal(w.switchCall, undefined, 'different active account → machine untouched');
   assert.ok(!w.calls.some((c) => c.argv.some((a) => String(a).includes(CODE))), 'code never on any argv');
+  cleanup(w);
+});
+
+async function loginWith(opts) {
+  const w = world(opts);
+  await runLogin('', w.deps());
+  const out = await runLogin(CODE, w.deps());
+  return { w, out };
+}
+
+test('flow: same account active → cswap --switch-to N --force with default env', async () => {
+  const { w, out } = await loginWith({ active: { number: 4, email: 'new@x.io' } });
+  assert.deepEqual(w.switchCall.argv, ['--switch-to', '4', '--force']);
+  assert.ok(!('CLAUDE_CONFIG_DIR' in w.switchCall.env));
+  assert.equal(w.switchCall.input, '');
+  assert.match(out, /đã nạp credential mới vào máy \(account đang dùng\)/);
+  assert.match(out, /^✅/);
+  assert.ok(!/\/cs <số>/.test(out), 'no misleading hint after refresh');
+  cleanup(w);
+});
+
+test('flow: real re-login output (Updated credentials, matching org) → refresh that slot', async () => {
+  const { w, out } = await loginWith({
+    active: { number: 1, email: 'new@x.io', organizationUuid: 'org-A' },
+    orgId: 'org-A',
+    addOut: 'Notice: could not verify that the stored credential belongs to new@x.io.\nUpdated credentials for Account 1 (new@x.io [Acme]).\n',
+  });
+  assert.deepEqual(w.switchCall.argv, ['--switch-to', '1', '--force']);
+  assert.match(out, /đã nạp credential mới vào máy/);
+  cleanup(w);
+});
+
+test('flow: no switch when identity not exact', async () => {
+  const cases = [
+    { active: { number: 3, email: 'new@x.io' } }, // add slot 4 != active 3
+    { active: { number: 4, email: 'new@x.io' }, addOut: 'something odd\n' }, // unparseable
+    { active: { number: 4, email: 'new@x.io', organizationUuid: 'org-A' } }, // org asymmetric
+    { active: { number: 4, email: 'new@x.io' }, orgId: 'org-B' }, // org asymmetric other side
+    { active: { number: 4, email: 'New@x.io' } }, // case differs
+  ];
+  for (const c of cases) {
+    const { w, out } = await loginWith(c);
+    assert.equal(w.switchCall, undefined, JSON.stringify(c));
+    assert.match(out, /^✅/);
+    cleanup(w);
+  }
+});
+
+test('flow: cswap status fails → warning, still ✅', async () => {
+  const { w, out } = await loginWith({ statusFail: true });
+  assert.match(out, /^✅/);
+  assert.match(out, /⚠️ không kiểm tra được account đang dùng/);
+  assert.equal(w.switchCall, undefined);
+  cleanup(w);
+});
+
+test('flow: different account active → no switch call', async () => {
+  const { w, out } = await loginWith({ active: { number: 2, email: 'other@x.io' } });
+  assert.equal(w.switchCall, undefined);
+  assert.match(out, /đang dùng vẫn là: other@x\.io/);
+  cleanup(w);
+});
+
+test('flow: switch fails → warning, still ✅, cleanup done', async () => {
+  const { w, out } = await loginWith({ active: { number: 4, email: 'new@x.io' }, switchFail: true });
+  assert.match(out, /^✅/);
+  assert.match(out, /⚠️ chưa nạp được vào máy: nope <url>; chạy \/cs 4 để thử lại/);
+  assert.deepEqual(fs.readdirSync(w.root), []);
+  cleanup(w);
+});
+
+test('flow: same email but different org → no switch call', async () => {
+  const { w, out } = await loginWith({ active: { number: 4, email: 'new@x.io', organizationUuid: 'org-A' }, orgId: 'org-B' });
+  assert.equal(w.switchCall, undefined);
+  assert.match(out, /đang dùng vẫn là: new@x\.io/);
   cleanup(w);
 });
 

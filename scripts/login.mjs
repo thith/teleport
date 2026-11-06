@@ -4,7 +4,9 @@
 //                     replies with the OAuth URL (or the existing one + minutes left)
 //   /login <code>   → types the code into that screen, then `cswap add` (same isolated profile)
 //   /login cancel   → tear the session down
-// The machine's own credentials and the active cswap account are never touched. The daemon passes the
+// The machine's own credentials and the active cswap account are untouched, except when the logged-in account
+// IS the active one: then its live credential is refreshed via `cswap --switch-to N --force` (same account,
+// no switch). The daemon passes the
 // text via TELE_RAW_ARGS only (secretArgs: nothing on argv) and deletes the Telegram message with the code.
 import fs from 'node:fs';
 import path from 'node:path';
@@ -326,11 +328,29 @@ async function finishLogin(entry, d) {
   }
   const addLine = String(add.stdout || '').split('\n').map((l) => l.trim()).filter(Boolean).pop() || '';
   let activeLine = '';
+  let refreshed = false;
+  const addSlot = Number((/\bAccount[- ](\d+)\b/.exec(String(add.stdout || '')) || [])[1]);
   const act = await d.run('cswap', ['status', '--json'], { env: d.env, input: '' });
-  try { const j = JSON.parse(act.stdout); if (j?.active?.email) activeLine = `\nđang dùng vẫn là: ${j.active.email}`; } catch {}
+  let a = null;
+  if (!act.error && !act.signal && act.status === 0) { try { a = JSON.parse(act.stdout)?.active || null; } catch {} }
+  if (!a?.email) activeLine = '\n⚠️ không kiểm tra được account đang dùng';
+  else {
+    const n = Number(a.number);
+    const same = Number.isInteger(n) && n > 0 && addSlot === n && a.email === status.email
+      && (a.organizationUuid || '') === (status.orgId || '');
+    if (!same) activeLine = `\nđang dùng vẫn là: ${a.email}`;
+    else {
+      // The active account is the one just stored: its live credential is stale, refresh it from the slot.
+      const sw = await d.run('cswap', ['--switch-to', String(n), '--force'], { env: d.env, input: '', timeoutMs: 60000 });
+      if (sw.error || sw.signal || sw.status !== 0) {
+        const m = tail(`${sw.stdout || ''}\n${sw.stderr || ''}\n${sw.error?.message || ''}`);
+        activeLine = `\n⚠️ chưa nạp được vào máy: ${m || '(không có output)'}; chạy /cs ${n} để thử lại`;
+      } else { activeLine = '\nđã nạp credential mới vào máy (account đang dùng)'; refreshed = true; }
+    }
+  }
   await cleanup(d, entry);
   const who = [status.email, status.orgName].filter(Boolean).join(' · ');
-  return `✅ đã thêm account${who ? `: ${who}` : ''}${addLine ? `\n${addLine}` : ''}${activeLine}\nđổi sang account mới bằng /cs <số>`;
+  return `✅ đã thêm account${who ? `: ${who}` : ''}${addLine ? `\n${addLine}` : ''}${activeLine}${refreshed ? '' : '\nđổi sang account mới bằng /cs <số>'}`;
 }
 
 if (isMainModule(import.meta.url)) {
